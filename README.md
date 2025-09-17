@@ -19,7 +19,7 @@ Add to your `Cargo.toml`:
 
 ```
 [dependencies]
-repe = "0.1.0"
+repe = "0.1.1"
 ```
 
 Quick start
