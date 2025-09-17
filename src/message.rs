@@ -75,7 +75,14 @@ impl Message {
     }
 
     pub fn query_utf8(&self) -> String {
-        String::from_utf8_lossy(&self.query).into_owned()
+        match self.query_str() {
+            Ok(s) => s.to_owned(),
+            Err(_) => String::from_utf8_lossy(&self.query).into_owned(),
+        }
+    }
+
+    pub fn query_str(&self) -> Result<&str, std::str::Utf8Error> {
+        std::str::from_utf8(&self.query)
     }
 
     pub fn body_utf8(&self) -> String {

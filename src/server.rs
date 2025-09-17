@@ -280,7 +280,21 @@ fn handle_connection(
         }
         let qf = QueryFormat::try_from(req.header.query_format).unwrap_or(QueryFormat::RawBinary);
         let path = match qf {
-            QueryFormat::JsonPointer => req.query_utf8(),
+            QueryFormat::JsonPointer => match req.query_str() {
+                Ok(s) => s,
+                Err(_) => {
+                    if !notify {
+                        let resp = create_error_response_like(
+                            &req,
+                            ErrorCode::InvalidQuery,
+                            "Query must be valid UTF-8",
+                        );
+                        write_message(&mut writer, &resp)?;
+                        writer.flush()?;
+                    }
+                    continue;
+                }
+            },
             QueryFormat::RawBinary => {
                 if !notify {
                     let resp = create_error_response_like(
@@ -294,7 +308,7 @@ fn handle_connection(
                 continue;
             }
         };
-        let resp = match router.get(&path) {
+        let resp = match router.get(path) {
             Some(handler) => match handler.handle(&req) {
                 Ok(m) => m,
                 Err(e) => create_error_response_like(&req, e.to_error_code(), e.to_string()),
