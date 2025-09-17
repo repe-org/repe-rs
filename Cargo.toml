@@ -1,6 +1,6 @@
 [package]
 name = "repe"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Rust implementation of the REPE RPC protocol (JSON-focused)"
 license = "MIT"
