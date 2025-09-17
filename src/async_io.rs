@@ -5,23 +5,29 @@ pub async fn read_message_async<R: AsyncRead + Unpin>(r: &mut R) -> Result<Messa
     let mut hdr = [0u8; HEADER_SIZE];
     r.read_exact(&mut hdr).await?;
     let header = Header::decode(&hdr)?;
-    let total = (header.query_length + header.body_length) as usize;
-    let mut rest = vec![0u8; total];
-    if total > 0 {
-        r.read_exact(&mut rest).await?;
+    let mut query = vec![0u8; header.query_length as usize];
+    if !query.is_empty() {
+        r.read_exact(&mut query).await?;
     }
-    let mut full = Vec::with_capacity(HEADER_SIZE + total);
-    full.extend_from_slice(&hdr);
-    full.extend_from_slice(&rest);
-    Message::from_slice(&full)
+    let mut body = vec![0u8; header.body_length as usize];
+    if !body.is_empty() {
+        r.read_exact(&mut body).await?;
+    }
+    Message::new(header, query, body)
 }
 
 pub async fn write_message_async<W: AsyncWrite + Unpin>(
     w: &mut W,
     msg: &Message,
 ) -> Result<(), RepeError> {
-    let bytes = msg.to_vec();
-    w.write_all(&bytes).await?;
+    let header_bytes = msg.header.encode();
+    w.write_all(&header_bytes).await?;
+    if !msg.query.is_empty() {
+        w.write_all(&msg.query).await?;
+    }
+    if !msg.body.is_empty() {
+        w.write_all(&msg.body).await?;
+    }
     Ok(())
 }
 

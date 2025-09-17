@@ -7,21 +7,27 @@ pub fn read_message<R: Read>(r: &mut R) -> Result<Message, RepeError> {
     let mut hdr_buf = [0u8; HEADER_SIZE];
     read_exact(r, &mut hdr_buf)?;
     let header = Header::decode(&hdr_buf)?;
-    let total = header.query_length as usize + header.body_length as usize;
-    let mut rest = vec![0u8; total];
-    if total > 0 {
-        read_exact(r, &mut rest)?;
+    let mut query = vec![0u8; header.query_length as usize];
+    if !query.is_empty() {
+        read_exact(r, &mut query)?;
     }
-    let mut full = Vec::with_capacity(HEADER_SIZE + total);
-    full.extend_from_slice(&hdr_buf);
-    full.extend_from_slice(&rest);
-    Message::from_slice(&full)
+    let mut body = vec![0u8; header.body_length as usize];
+    if !body.is_empty() {
+        read_exact(r, &mut body)?;
+    }
+    Message::new(header, query, body)
 }
 
 /// Write a full REPE message to a stream implementing `Write`.
 pub fn write_message<W: Write>(w: &mut W, msg: &Message) -> Result<(), RepeError> {
-    let bytes = msg.to_vec();
-    w.write_all(&bytes)?;
+    let header_bytes = msg.header.encode();
+    w.write_all(&header_bytes)?;
+    if !msg.query.is_empty() {
+        w.write_all(&msg.query)?;
+    }
+    if !msg.body.is_empty() {
+        w.write_all(&msg.body)?;
+    }
     Ok(())
 }
 

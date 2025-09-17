@@ -12,7 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub struct Client {
-    stream: TcpStream,
+    reader: BufReader<TcpStream>,
+    writer: BufWriter<TcpStream>,
     next_id: Arc<AtomicU64>,
 }
 
@@ -20,17 +21,19 @@ impl Client {
     pub fn connect<A: ToSocketAddrs>(addr: A) -> std::io::Result<Self> {
         let stream = TcpStream::connect(addr)?;
         stream.set_nodelay(true).ok();
+        let reader_stream = stream.try_clone()?;
         Ok(Self {
-            stream,
+            reader: BufReader::new(reader_stream),
+            writer: BufWriter::new(stream),
             next_id: Arc::new(AtomicU64::new(1)),
         })
     }
 
     pub fn set_read_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
-        self.stream.set_read_timeout(d)
+        self.reader.get_ref().set_read_timeout(d)
     }
     pub fn set_write_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
-        self.stream.set_write_timeout(d)
+        self.writer.get_ref().set_write_timeout(d)
     }
 
     fn next_request_id(&self) -> u64 {
@@ -50,12 +53,10 @@ impl Client {
             .query_format(QueryFormat::JsonPointer)
             .body_json(body)?
             .build();
-        let mut writer = BufWriter::new(self.stream.try_clone()?);
-        write_message(&mut writer, &msg)?;
-        writer.flush()?;
+        write_message(&mut self.writer, &msg)?;
+        self.writer.flush()?;
 
-        let mut reader = BufReader::new(self.stream.try_clone()?);
-        let resp = read_message(&mut reader)?;
+        let resp = read_message(&mut self.reader)?;
         if resp.header.version != REPE_VERSION {
             return Err(RepeError::VersionMismatch(resp.header.version));
         }
@@ -89,9 +90,8 @@ impl Client {
             .query_format(QueryFormat::JsonPointer)
             .body_json(body)?
             .build();
-        let mut writer = BufWriter::new(self.stream.try_clone()?);
-        write_message(&mut writer, &msg)?;
-        writer.flush()?;
+        write_message(&mut self.writer, &msg)?;
+        self.writer.flush()?;
         Ok(())
     }
 }
