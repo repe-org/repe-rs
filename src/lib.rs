@@ -1,0 +1,29 @@
+//! REPE (Remote Efficient Protocol Extension) - Rust implementation
+//!
+//! Focus: JSON body format. Raw binary and UTF-8 helpers included for errors and bytes.
+//! Spec reference: see `reference/REPE/README.md` in the repository.
+
+#![deny(warnings)]
+
+pub mod async_client;
+pub mod async_io;
+pub mod async_server;
+pub mod client;
+pub mod constants;
+pub mod error;
+pub mod header;
+pub mod io;
+pub mod json_pointer;
+pub mod message;
+pub mod server;
+
+pub use async_client::AsyncClient;
+pub use async_server::AsyncServer;
+pub use client::Client;
+pub use constants::{BodyFormat, ErrorCode, QueryFormat, HEADER_SIZE, REPE_SPEC, REPE_VERSION};
+pub use error::RepeError;
+pub use header::Header;
+pub use io::{read_message, write_message};
+pub use json_pointer::{evaluate as eval_json_pointer, parse as parse_json_pointer};
+pub use message::Message;
+pub use server::{JsonTypedHandler, Router, Server};

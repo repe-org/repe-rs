@@ -1,0 +1,19 @@
+[package]
+name = "repe"
+version = "0.1.0"
+edition = "2021"
+description = "Rust implementation of the REPE RPC protocol (JSON-focused)"
+license = "MIT"
+repository = "https://example.com/repe-rs"
+readme = "README.md"
+keywords = ["rpc", "protocol", "repe", "json"]
+categories = ["network-programming", "encoding"]
+
+[dependencies]
+serde = { version = "1", features = ["derive" ] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "io-util"] }
+
+[dev-dependencies]
+rand = "0.8"
