@@ -18,8 +18,10 @@ Add to your `Cargo.toml`:
 
 ```
 [dependencies]
-repe = "0.1.1"
+repe = "0.1"
 ```
+
+> Tip: run `cargo add repe` to automatically pull the latest compatible release.
 
 Quick start
 
