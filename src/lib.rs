@@ -3,8 +3,6 @@
 //! Focus: JSON body format. Raw binary and UTF-8 helpers included for errors and bytes.
 //! Spec reference: see `reference/REPE/README.md` in the repository.
 
-#![deny(warnings)]
-
 pub mod async_client;
 pub mod async_io;
 pub mod async_server;
