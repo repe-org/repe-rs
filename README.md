@@ -18,7 +18,7 @@ Add to your `Cargo.toml`:
 
 ```
 [dependencies]
-repe = { path = "." } # or use a version once published
+repe = "0.1.0"
 ```
 
 Quick start
