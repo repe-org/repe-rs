@@ -171,7 +171,7 @@ mod tests {
 
         // Drop client to close connection; handler future should finish
         drop(client);
-        let _ = accept_handle.await;
+        accept_handle.await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -193,6 +193,6 @@ mod tests {
         let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
 
         // Await server task; if it hangs, test will time out (but should finish)
-        let _ = accept_handle.await.unwrap();
+        accept_handle.await.unwrap();
     }
 }

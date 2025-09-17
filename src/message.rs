@@ -170,8 +170,8 @@ mod tests {
             .body_utf8("{}");
         let req = req.build();
 
-        let resp = create_response(&req, serde_json::json!({"ignored": true}), BodyFormat::Beve)
-            .unwrap();
+        let resp =
+            create_response(&req, serde_json::json!({"ignored": true}), BodyFormat::Beve).unwrap();
         assert_eq!(resp.header.id, req.header.id);
         assert_eq!(resp.query, req.query);
         assert!(resp.body.is_empty());

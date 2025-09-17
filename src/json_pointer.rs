@@ -3,10 +3,10 @@ use serde_json::Value;
 /// Parse a JSON Pointer string into unescaped reference tokens.
 /// Implements RFC 6901 unescaping: `~1` -> `/`, `~0` -> `~`.
 pub fn parse(ptr: &str) -> Vec<String> {
-    if ptr.is_empty() || ptr == "/" && ptr.len() == 0 {
+    if ptr.is_empty() {
         return Vec::new();
     }
-    let s = if ptr.starts_with('/') { &ptr[1..] } else { ptr };
+    let s = ptr.strip_prefix('/').unwrap_or(ptr);
     s.split('/')
         .map(|t| t.replace("~1", "/").replace("~0", "~"))
         .collect()

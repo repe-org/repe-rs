@@ -81,10 +81,7 @@ mod tests {
                 ErrorCode::InvalidHeader,
             ),
             (
-                RepeError::BufferTooSmall {
-                    need: 10,
-                    have: 1,
-                },
+                RepeError::BufferTooSmall { need: 10, have: 1 },
                 ErrorCode::ParseError,
             ),
             (
@@ -95,17 +92,11 @@ mod tests {
                 ErrorCode::InvalidHeader,
             ),
             (
-                RepeError::Io(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "io",
-                )),
+                RepeError::Io(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "io")),
                 ErrorCode::ParseError,
             ),
             (
-                RepeError::Json(serde_json::Error::io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "json",
-                ))),
+                RepeError::Json(serde_json::Error::io(std::io::Error::other("json"))),
                 ErrorCode::ParseError,
             ),
             (RepeError::UnknownEnumValue(9), ErrorCode::ParseError),
