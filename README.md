@@ -4,6 +4,7 @@ Rust implementation of the REPE RPC protocol, focused on JSON as the body format
 
 - Spec reference: `reference/REPE/README.md`
 - Julia example: `reference/REPE.jl`
+- Crate: [repe on crates.io](https://crates.io/crates/repe)
 
 This crate provides:
 
