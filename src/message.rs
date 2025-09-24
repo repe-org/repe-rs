@@ -1,6 +1,7 @@
 use crate::constants::{BodyFormat, ErrorCode, QueryFormat, HEADER_SIZE};
 use crate::error::RepeError;
 use crate::header::Header;
+use beve::{from_slice as beve_from_slice, to_vec as beve_to_vec, Error as BeveError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
@@ -99,6 +100,15 @@ impl Message {
             }
         }
     }
+
+    pub fn beve_body<T: serde::de::DeserializeOwned>(&self) -> Result<T, RepeError> {
+        match BodyFormat::try_from(self.header.body_format) {
+            Ok(BodyFormat::Beve) => Ok(beve_from_slice(&self.body)?),
+            Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) | Ok(BodyFormat::RawBinary) | Err(_) => {
+                Err(RepeError::from(BeveError::msg("body_format is not BEVE")))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -169,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn create_response_beve_leaves_empty_body() {
+    fn create_response_beve_serializes_body() {
         let req = Message::builder()
             .id(3)
             .query_str("/noop")
@@ -181,8 +191,11 @@ mod tests {
             create_response(&req, serde_json::json!({"ignored": true}), BodyFormat::Beve).unwrap();
         assert_eq!(resp.header.id, req.header.id);
         assert_eq!(resp.query, req.query);
-        assert!(resp.body.is_empty());
-        assert_eq!(resp.header.body_format, BodyFormat::RawBinary as u16);
+        assert!(!resp.body.is_empty());
+        assert_eq!(resp.header.body_format, BodyFormat::Beve as u16);
+
+        let value: serde_json::Value = resp.beve_body().unwrap();
+        assert_eq!(value["ignored"], true);
     }
 
     #[test]
@@ -207,6 +220,49 @@ mod tests {
 
         let err = create_response(&req, Fails, BodyFormat::Json).unwrap_err();
         matches!(err, RepeError::Json(_));
+    }
+
+    #[test]
+    fn body_beve_roundtrip() {
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct Data {
+            x: i32,
+            y: String,
+        }
+
+        let msg = Message::builder()
+            .id(7)
+            .query_str("/d")
+            .query_format(QueryFormat::JsonPointer)
+            .body_beve(&Data {
+                x: 10,
+                y: "ok".into(),
+            })
+            .unwrap()
+            .build();
+
+        assert_eq!(msg.header.body_format, BodyFormat::Beve as u16);
+        let decoded: Data = msg.beve_body().unwrap();
+        assert_eq!(
+            decoded,
+            Data {
+                x: 10,
+                y: "ok".into()
+            }
+        );
+    }
+
+    #[test]
+    fn beve_body_non_beve_errors() {
+        let msg = Message::builder()
+            .id(2)
+            .query_str("/a")
+            .query_format(QueryFormat::JsonPointer)
+            .body_utf8("text")
+            .build();
+
+        let err = msg.beve_body::<serde_json::Value>().unwrap_err();
+        matches!(err, RepeError::Beve(_));
     }
 }
 
@@ -262,6 +318,12 @@ impl MessageBuilder {
     pub fn body_json<T: serde::Serialize>(mut self, v: &T) -> Result<Self, RepeError> {
         self.body = serde_json::to_vec(v)?;
         self.body_format = BodyFormat::Json as u16;
+        Ok(self)
+    }
+
+    pub fn body_beve<T: serde::Serialize>(mut self, v: &T) -> Result<Self, RepeError> {
+        self.body = beve_to_vec(v)?;
+        self.body_format = BodyFormat::Beve as u16;
         Ok(self)
     }
 
@@ -336,7 +398,7 @@ pub fn create_response(
             let v = serde_json::to_vec(&result)?;
             builder.body_bytes(v).body_format(BodyFormat::RawBinary)
         }
-        BodyFormat::Beve => builder, // not implemented; keep empty
+        BodyFormat::Beve => builder.body_beve(&result)?,
     };
     Ok(builder.build())
 }

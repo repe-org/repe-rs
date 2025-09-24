@@ -2,6 +2,7 @@ use crate::constants::{BodyFormat, ErrorCode, QueryFormat, REPE_VERSION};
 use crate::error::RepeError;
 use crate::io::{read_message, write_message};
 use crate::message::{create_error_response_like, create_response, Message};
+use beve::from_slice as beve_from_slice;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
@@ -34,6 +35,7 @@ where
             Ok(BodyFormat::Utf8) => {
                 serde_json::from_str(&req.body_utf8()).map_err(RepeError::from)?
             }
+            Ok(BodyFormat::Beve) => beve_from_slice(&req.body)?,
             _ => {
                 return Ok(create_error_response_like(
                     req,
@@ -67,6 +69,7 @@ where
             Ok(BodyFormat::Utf8) => {
                 serde_json::from_str(&req.body_utf8()).map_err(RepeError::from)?
             }
+            Ok(BodyFormat::Beve) => beve_from_slice(&req.body)?,
             _ => {
                 return Ok(create_error_response_like(
                     req,
@@ -172,6 +175,7 @@ impl<H: JsonTypedHandler> HandlerErased for JsonTypedAdapter<H> {
             Ok(BodyFormat::Utf8) => {
                 serde_json::from_str(&req.body_utf8()).map_err(RepeError::from)?
             }
+            Ok(BodyFormat::Beve) => beve_from_slice(&req.body)?,
             _ => {
                 return Ok(create_error_response_like(
                     req,
