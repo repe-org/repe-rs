@@ -339,6 +339,110 @@ mod tests {
     use std::io::Read;
 
     #[test]
+    fn typed_handler_accepts_beve_payload() {
+        #[derive(Serialize, Deserialize, Debug)]
+        struct DeviceMeta {
+            id: String,
+            location: String,
+        }
+
+        #[derive(Serialize, Deserialize, Debug)]
+        struct SampleStream {
+            channel: String,
+            samples: Vec<f64>,
+        }
+
+        #[derive(Serialize, Deserialize, Debug)]
+        struct SensorFrame {
+            device: DeviceMeta,
+            streams: Vec<SampleStream>,
+            tags: std::collections::HashMap<String, String>,
+        }
+
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct Aggregate {
+            device: String,
+            location: String,
+            sample_count: usize,
+            average: f64,
+            tags: std::collections::HashMap<String, String>,
+        }
+
+        let router = Router::new().with_typed::<SensorFrame, Aggregate, _>("/aggregate", |frame| {
+            let mut total = 0.0;
+            let mut count = 0usize;
+            for stream in &frame.streams {
+                for value in &stream.samples {
+                    total += *value;
+                    count += 1;
+                }
+            }
+            let average = if count == 0 {
+                0.0
+            } else {
+                total / count as f64
+            };
+            Ok(Aggregate {
+                device: frame.device.id,
+                location: frame.device.location,
+                sample_count: count,
+                average,
+                tags: frame.tags,
+            })
+        });
+
+        let mut tags = std::collections::HashMap::new();
+        tags.insert("site".to_string(), "warehouse".to_string());
+        tags.insert("line".to_string(), "A-1".to_string());
+
+        let frame = SensorFrame {
+            device: DeviceMeta {
+                id: "sensor-42".into(),
+                location: "north-wing".into(),
+            },
+            streams: vec![
+                SampleStream {
+                    channel: "temperature".into(),
+                    samples: vec![20.5, 21.0, 20.7],
+                },
+                SampleStream {
+                    channel: "humidity".into(),
+                    samples: vec![47.0, 46.5],
+                },
+            ],
+            tags: tags.clone(),
+        };
+
+        let expected_total: f64 = frame
+            .streams
+            .iter()
+            .flat_map(|s| s.samples.iter())
+            .copied()
+            .sum();
+        let expected_count: usize = frame.streams.iter().map(|s| s.samples.len()).sum();
+
+        let request = Message::builder()
+            .id(101)
+            .query_str("/aggregate")
+            .query_format(QueryFormat::JsonPointer)
+            .body_beve(&frame)
+            .unwrap()
+            .build();
+
+        let handler = router.get("/aggregate").expect("handler to exist");
+        let response = handler.handle(&request).unwrap();
+
+        assert_eq!(response.header.ec, ErrorCode::Ok as u32);
+        assert_eq!(response.header.body_format, BodyFormat::Json as u16);
+        let aggregate: Aggregate = response.json_body().unwrap();
+        assert_eq!(aggregate.device, "sensor-42");
+        assert_eq!(aggregate.location, "north-wing");
+        assert_eq!(aggregate.sample_count, expected_count);
+        assert!((aggregate.average - expected_total / expected_count as f64).abs() < 1e-12);
+        assert_eq!(aggregate.tags, tags);
+    }
+
+    #[test]
     fn router_with_json_and_typed_handlers() {
         #[derive(Serialize, Deserialize, Debug, PartialEq)]
         struct In {
@@ -400,6 +504,160 @@ mod tests {
 
         // Close client to end the server loop and join
         drop(client);
+        let _ = srv.join().unwrap();
+    }
+
+    #[test]
+    fn beve_request_roundtrip_over_tcp() {
+        #[derive(Serialize, Deserialize, Debug)]
+        struct DeviceMeta {
+            id: String,
+            location: String,
+        }
+
+        #[derive(Serialize, Deserialize, Debug)]
+        struct SampleStream {
+            channel: String,
+            samples: Vec<f64>,
+        }
+
+        #[derive(Serialize, Deserialize, Debug)]
+        struct SensorFrame {
+            device: DeviceMeta,
+            streams: Vec<SampleStream>,
+            alerts: Vec<String>,
+        }
+
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct Summary {
+            device: String,
+            max_sample: f64,
+            average_sample: f64,
+            alert_count: usize,
+        }
+
+        struct BeveHandler;
+
+        impl HandlerErased for BeveHandler {
+            fn handle(&self, req: &Message) -> Result<Message, RepeError> {
+                let frame: SensorFrame = req.beve_body()?;
+                let mut max_sample = f64::MIN;
+                let mut total = 0.0f64;
+                let mut count = 0usize;
+                for stream in &frame.streams {
+                    for value in &stream.samples {
+                        if *value > max_sample {
+                            max_sample = *value;
+                        }
+                        total += *value;
+                        count += 1;
+                    }
+                }
+                if count == 0 {
+                    max_sample = 0.0;
+                }
+                let avg = if count == 0 {
+                    0.0
+                } else {
+                    total / count as f64
+                };
+                let summary = Summary {
+                    device: frame.device.id,
+                    max_sample,
+                    average_sample: avg,
+                    alert_count: frame.alerts.len(),
+                };
+                create_response(req, summary, BodyFormat::Beve)
+            }
+        }
+
+        let router = {
+            let mut map = HashMap::new();
+            map.insert(
+                "/telemetry".to_string(),
+                Arc::new(BeveHandler) as Arc<dyn HandlerErased>,
+            );
+            Router {
+                inner: Arc::new(map),
+            }
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router_clone = router.clone();
+        let running = Arc::new(AtomicBool::new(true));
+        let running_worker = running.clone();
+
+        let srv = thread::spawn(move || {
+            let (stream, _addr) = listener.accept().unwrap();
+            handle_connection(stream, router_clone, running_worker, None, None).unwrap();
+        });
+
+        let frame = SensorFrame {
+            device: DeviceMeta {
+                id: "sensor-007".into(),
+                location: "test-bench".into(),
+            },
+            streams: vec![
+                SampleStream {
+                    channel: "temp".into(),
+                    samples: vec![34.2, 35.1, 36.0],
+                },
+                SampleStream {
+                    channel: "vibration".into(),
+                    samples: vec![0.2, 0.4, 0.3, 0.5],
+                },
+            ],
+            alerts: vec![
+                "overheat".to_string(),
+                "door-open".to_string(),
+                "power-cycle".to_string(),
+            ],
+        };
+
+        let expected_samples: Vec<f64> = frame
+            .streams
+            .iter()
+            .flat_map(|s| s.samples.iter())
+            .copied()
+            .collect();
+        let expected_max = expected_samples
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let expected_avg = expected_samples.iter().sum::<f64>() / expected_samples.len() as f64;
+
+        let request = Message::builder()
+            .id(314)
+            .query_str("/telemetry")
+            .query_format(QueryFormat::JsonPointer)
+            .body_beve(&frame)
+            .unwrap()
+            .build();
+
+        let socket = TcpStream::connect(addr).unwrap();
+        socket.set_nodelay(true).ok();
+
+        {
+            let mut writer = BufWriter::new(socket.try_clone().unwrap());
+            write_message(&mut writer, &request).unwrap();
+            writer.flush().unwrap();
+        }
+
+        let mut reader = BufReader::new(socket);
+        let response = read_message(&mut reader).unwrap();
+        assert_eq!(response.header.id, 314);
+        assert_eq!(response.header.body_format, BodyFormat::Beve as u16);
+        assert_eq!(response.header.ec, ErrorCode::Ok as u32);
+
+        let summary: Summary = response.beve_body().unwrap();
+        assert_eq!(summary.device, "sensor-007");
+        assert_eq!(summary.alert_count, 3);
+        assert!((summary.max_sample - expected_max).abs() < 1e-12);
+        assert!((summary.average_sample - expected_avg).abs() < 1e-12);
+
+        running.store(false, Ordering::SeqCst);
+        drop(reader);
         let _ = srv.join().unwrap();
     }
 
