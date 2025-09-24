@@ -658,7 +658,7 @@ mod tests {
 
         running.store(false, Ordering::SeqCst);
         drop(reader);
-        let _ = srv.join().unwrap();
+        srv.join().unwrap();
     }
 
     #[test]
