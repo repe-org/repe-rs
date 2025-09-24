@@ -1,6 +1,6 @@
 //! REPE (Remote Efficient Protocol Extension) - Rust implementation
 //!
-//! Focus: JSON body format. Raw binary and UTF-8 helpers included for errors and bytes.
+//! Supports JSON, UTF-8, raw binary, and BEVE body formats.
 //! Spec reference: <https://github.com/beve-org/beve>
 
 pub mod async_client;

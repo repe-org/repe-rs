@@ -80,7 +80,7 @@ impl core::convert::TryFrom<u16> for QueryFormat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BodyFormat {
     RawBinary = 0,
-    Beve = 1, // placeholder to reserve value; not implemented here
+    Beve = 1, // BEVE binary body
     Json = 2,
     Utf8 = 3,
 }

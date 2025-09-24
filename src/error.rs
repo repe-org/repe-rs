@@ -21,6 +21,8 @@ pub enum RepeError {
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("beve error: {0}")]
+    Beve(#[from] beve::Error),
     #[error("unknown value for enum conversion: {0}")]
     UnknownEnumValue(u64),
     #[error("server error {code}: {message}")]
@@ -39,6 +41,7 @@ impl RepeError {
             RepeError::ResponseIdMismatch { .. } => ErrorCode::InvalidHeader,
             RepeError::Io(_) => ErrorCode::ParseError,
             RepeError::Json(_) => ErrorCode::ParseError,
+            RepeError::Beve(_) => ErrorCode::ParseError,
             RepeError::UnknownEnumValue(_) => ErrorCode::ParseError,
             RepeError::ServerError { code, .. } => *code,
         }
@@ -97,6 +100,10 @@ mod tests {
             ),
             (
                 RepeError::Json(serde_json::Error::io(std::io::Error::other("json"))),
+                ErrorCode::ParseError,
+            ),
+            (
+                RepeError::Beve(beve::Error::msg("beve")),
                 ErrorCode::ParseError,
             ),
             (RepeError::UnknownEnumValue(9), ErrorCode::ParseError),

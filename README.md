@@ -1,6 +1,6 @@
 # repe-rs
 
-Rust implementation of the REPE RPC protocol, focused on JSON as the body format.
+Rust implementation of the REPE RPC protocol with JSON and BEVE body support.
 
 - Spec reference: <https://github.com/beve-org/beve>
 - Crate: [repe on crates.io](https://crates.io/crates/repe)
@@ -10,6 +10,7 @@ This crate provides:
 - REPE header and message types with correct little-endian encoding
 - Message encode/decode to/from bytes and I/O helpers for streams
 - JSON body helpers using `serde`/`serde_json`
+- BEVE binary body helpers via the [`beve`](https://crates.io/crates/beve) crate
 - Error codes and formats aligned with the spec
 
 Installation
@@ -46,6 +47,25 @@ let val: serde_json::Value = parsed.json_body()?;
 assert_eq!(val["ping"], true);
 ```
 
+```rust
+use repe::{Message, QueryFormat, BodyFormat};
+
+// Build a BEVE message
+let msg = Message::builder()
+    .id(43)
+    .query_str("/status")
+    .query_format(QueryFormat::JsonPointer)
+    .body_beve(&serde_json::json!({"ping": true}))?
+    .build();
+
+let bytes = msg.to_vec();
+let parsed = repe::Message::from_slice(&bytes)?;
+
+assert_eq!(parsed.header.body_format, BodyFormat::Beve as u16);
+let val: serde_json::Value = parsed.beve_body()?;
+assert_eq!(val["ping"], true);
+```
+
 Examples
 
 - `examples/json_roundtrip.rs` – construct/serialize/parse a JSON message.
@@ -56,7 +76,7 @@ Examples
 
 Notes
 
-- Only JSON, UTF-8 (for error messages), and raw bytes helpers are implemented. BEVE is intentionally not implemented.
+- BEVE helpers encode/decode via serde, so your existing request/response types continue to work.
 - The header `reserved` field is currently ignored (per spec receivers must not reject non-zero values).
 - The header length is validated to be `48 + query_length + body_length`.
 
