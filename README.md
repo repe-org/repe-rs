@@ -2,7 +2,7 @@
 
 Rust implementation of the REPE RPC protocol with JSON and BEVE body support.
 
-- Spec reference: <https://github.com/beve-org/beve>
+- Spec reference: <https://github.com/repe-org/REPE>
 - Crate: [repe on crates.io](https://crates.io/crates/repe)
 
 This crate provides:
