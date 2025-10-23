@@ -2,6 +2,7 @@ use crate::constants::{BodyFormat, ErrorCode, QueryFormat, REPE_VERSION};
 use crate::error::RepeError;
 use crate::io::{read_message, write_message};
 use crate::message::{create_error_response_like, create_response, Message};
+use crate::structs::RepeStruct;
 use beve::from_slice as beve_from_slice;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -10,6 +11,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::io::{BufReader, BufWriter};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::Mutex;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -85,15 +87,21 @@ where
     }
 }
 
-#[derive(Default, Clone)]
+trait StructRouterEntry: Send + Sync {
+    fn handler_for(&self, path: &str) -> Option<Arc<dyn HandlerErased>>;
+}
+
+#[derive(Clone)]
 pub struct Router {
     inner: Arc<HashMap<String, Arc<dyn HandlerErased>>>,
+    structs: Arc<Vec<Arc<dyn StructRouterEntry>>>,
 }
 
 impl Router {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(HashMap::new()),
+            structs: Arc::new(Vec::new()),
         }
     }
 
@@ -153,8 +161,172 @@ impl Router {
         self
     }
 
+    /// Register a struct that implements [`RepeStruct`].
+    ///
+    /// The struct is wrapped in an `Arc<Mutex<_>>` so that the caller can retain shared ownership
+    /// and mutate state while the router serves requests.
+    pub fn with_struct_shared<T>(mut self, root: &str, shared: Arc<Mutex<T>>) -> Self
+    where
+        T: RepeStruct + 'static,
+    {
+        let mut entries = (*self.structs).clone();
+        entries.push(Arc::new(RegisteredStruct::<T>::new(root, shared)));
+        self.structs = Arc::new(entries);
+        self
+    }
+
+    /// Convenience helper to register an owned struct value. Returns the shared handle so callers
+    /// can keep interacting with the registered object.
+    pub fn with_struct<T>(self, root: &str, value: T) -> (Self, Arc<Mutex<T>>)
+    where
+        T: RepeStruct + 'static,
+    {
+        let shared = Arc::new(Mutex::new(value));
+        (self.with_struct_shared(root, shared.clone()), shared)
+    }
+
     pub fn get(&self, path: &str) -> Option<Arc<dyn HandlerErased>> {
-        self.inner.get(path).cloned()
+        if let Some(handler) = self.inner.get(path) {
+            return Some(handler.clone());
+        }
+        for entry in self.structs.iter() {
+            if let Some(handler) = entry.handler_for(path) {
+                return Some(handler);
+            }
+        }
+        None
+    }
+}
+
+impl Default for Router {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+struct RegisteredStruct<T: RepeStruct + 'static> {
+    root: String,
+    shared: Arc<Mutex<T>>,
+}
+
+impl<T: RepeStruct + 'static> RegisteredStruct<T> {
+    fn new(root: &str, shared: Arc<Mutex<T>>) -> Self {
+        let normalized = if root.is_empty() || root == "/" {
+            String::new()
+        } else if root.starts_with('/') {
+            root.to_string()
+        } else {
+            format!("/{}", root)
+        };
+        Self {
+            root: normalized,
+            shared,
+        }
+    }
+
+    fn relative_pointer<'a>(&'a self, path: &'a str) -> Option<&'a str> {
+        if self.root.is_empty() {
+            Some(path)
+        } else if path == self.root {
+            Some("")
+        } else if path.starts_with(&self.root) {
+            let remainder = &path[self.root.len()..];
+            if remainder.starts_with('/') {
+                Some(remainder)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+}
+
+impl<T: RepeStruct + 'static> StructRouterEntry for RegisteredStruct<T> {
+    fn handler_for(&self, path: &str) -> Option<Arc<dyn HandlerErased>> {
+        let relative = self.relative_pointer(path)?;
+        let tokens = crate::json_pointer::parse(relative);
+        let full_path = if path.is_empty() {
+            String::from("")
+        } else {
+            path.to_string()
+        };
+        Some(Arc::new(StructRequestHandler::<T>::new(
+            self.shared.clone(),
+            tokens,
+            full_path,
+        )))
+    }
+}
+
+struct StructRequestHandler<T: RepeStruct + 'static> {
+    shared: Arc<Mutex<T>>,
+    segments: Vec<String>,
+    full_path: String,
+}
+
+impl<T: RepeStruct + 'static> StructRequestHandler<T> {
+    fn new(shared: Arc<Mutex<T>>, segments: Vec<String>, full_path: String) -> Self {
+        Self {
+            shared,
+            segments,
+            full_path,
+        }
+    }
+}
+
+impl<T: RepeStruct + 'static> HandlerErased for StructRequestHandler<T> {
+    fn handle(&self, req: &Message) -> Result<Message, RepeError> {
+        let body = if req.body.is_empty() {
+            None
+        } else {
+            match BodyFormat::try_from(req.header.body_format) {
+                Ok(BodyFormat::Json) => {
+                    Some(serde_json::from_slice::<Value>(&req.body).map_err(RepeError::from)?)
+                }
+                Ok(BodyFormat::Utf8) => {
+                    Some(serde_json::from_str::<Value>(&req.body_utf8()).map_err(RepeError::from)?)
+                }
+                Ok(BodyFormat::Beve) => Some(beve_from_slice(&req.body)?),
+                Ok(BodyFormat::RawBinary) | Err(_) => {
+                    return Ok(create_error_response_like(
+                        req,
+                        ErrorCode::InvalidBody,
+                        format!(
+                            "struct handler `{}` requires JSON or BEVE body, got format {}",
+                            self.full_path, req.header.body_format
+                        ),
+                    ))
+                }
+            }
+        };
+
+        let mut guard = match self.shared.lock() {
+            Ok(g) => g,
+            Err(poison) => {
+                return Ok(create_error_response_like(
+                    req,
+                    ErrorCode::ParseError,
+                    format!(
+                        "struct handler `{}` mutex poisoned: {}",
+                        self.full_path, poison
+                    ),
+                ))
+            }
+        };
+
+        let mut seg_refs = Vec::with_capacity(self.segments.len());
+        for segment in &self.segments {
+            seg_refs.push(segment.as_str());
+        }
+
+        match guard.repe_handle(&seg_refs, body) {
+            Ok(result) => {
+                let value = result.unwrap_or(Value::Null);
+                create_response(req, value, BodyFormat::Json)
+            }
+            Err(err) => Ok(create_error_response_like(req, err.code(), err.to_string())),
+        }
     }
 }
 
@@ -579,6 +751,7 @@ mod tests {
             );
             Router {
                 inner: Arc::new(map),
+                structs: Arc::new(Vec::new()),
             }
         };
 

@@ -137,6 +137,27 @@ let listener = server.listen("127.0.0.1:8081")?;
 server.serve(listener)?;
 ```
 
+- Register a struct and expose its fields/methods through JSON pointer paths:
+
+```rust
+use repe::Router;
+
+#[derive(Default, serde::Serialize, serde::Deserialize, repe::derive::RepeStruct)]
+#[repe(methods(hello(&self) -> String))]
+struct MyStruct {
+    counter: i32,
+}
+
+impl MyStruct {
+    fn hello(&self) -> String {
+        format!("count = {}", self.counter)
+    }
+}
+
+let (router, shared) = Router::new().with_struct("", MyStruct::default());
+// `shared` is an Arc<Mutex<_>> so you can keep mutating the registered value.
+```
+
 Client
 
 - Connect and call JSON-pointer routes with JSON bodies:
