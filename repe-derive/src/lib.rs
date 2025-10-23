@@ -148,10 +148,7 @@ fn parse_field(field: &Field) -> syn::Result<FieldSpec> {
         })?;
     }
 
-    let endpoint = attrs
-        .rename
-        .clone()
-        .unwrap_or_else(|| ident.to_string());
+    let endpoint = attrs.rename.clone().unwrap_or_else(|| ident.to_string());
 
     Ok(FieldSpec {
         ident,
