@@ -91,6 +91,68 @@ trait StructRouterEntry: Send + Sync {
     fn handler_for(&self, path: &str) -> Option<Arc<dyn HandlerErased>>;
 }
 
+#[derive(Debug)]
+pub enum LockError {
+    Poisoned(String),
+    Other(String),
+}
+
+impl LockError {
+    pub fn poisoned(err: impl std::fmt::Display) -> Self {
+        Self::Poisoned(err.to_string())
+    }
+
+    pub fn other(message: impl Into<String>) -> Self {
+        Self::Other(message.into())
+    }
+}
+
+impl std::fmt::Display for LockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LockError::Poisoned(msg) | LockError::Other(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl std::error::Error for LockError {}
+
+pub trait Lockable<T: ?Sized>: Send + Sync {
+    type Guard<'a>: std::ops::DerefMut<Target = T> + 'a
+    where
+        Self: 'a;
+
+    fn lock(&self) -> Result<Self::Guard<'_>, LockError>;
+}
+
+impl<T: ?Sized + Send> Lockable<T> for Mutex<T> {
+    type Guard<'a>
+        = std::sync::MutexGuard<'a, T>
+    where
+        Self: 'a;
+
+    fn lock(&self) -> Result<Self::Guard<'_>, LockError> {
+        std::sync::Mutex::lock(self).map_err(LockError::from)
+    }
+}
+
+impl<G> From<std::sync::PoisonError<G>> for LockError {
+    fn from(err: std::sync::PoisonError<G>) -> Self {
+        LockError::Poisoned(err.to_string())
+    }
+}
+
+impl<T: ?Sized + Send + Sync> Lockable<T> for std::sync::RwLock<T> {
+    type Guard<'a>
+        = std::sync::RwLockWriteGuard<'a, T>
+    where
+        Self: 'a;
+
+    fn lock(&self) -> Result<Self::Guard<'_>, LockError> {
+        std::sync::RwLock::write(self).map_err(LockError::from)
+    }
+}
+
 #[derive(Clone)]
 pub struct Router {
     inner: Arc<HashMap<String, Arc<dyn HandlerErased>>>,
@@ -163,14 +225,15 @@ impl Router {
 
     /// Register a struct that implements [`RepeStruct`].
     ///
-    /// The struct is wrapped in an `Arc<Mutex<_>>` so that the caller can retain shared ownership
-    /// and mutate state while the router serves requests.
-    pub fn with_struct_shared<T>(mut self, root: &str, shared: Arc<Mutex<T>>) -> Self
+    /// The struct is wrapped in an [`Arc`] of any lock implementing [`Lockable`] so that the
+    /// caller can retain shared ownership and mutate state while the router serves requests.
+    pub fn with_struct_shared<T, L>(mut self, root: &str, shared: Arc<L>) -> Self
     where
         T: RepeStruct + 'static,
+        L: Lockable<T> + 'static,
     {
         let mut entries = (*self.structs).clone();
-        entries.push(Arc::new(RegisteredStruct::<T>::new(root, shared)));
+        entries.push(Arc::new(RegisteredStruct::<T, L>::new(root, shared)));
         self.structs = Arc::new(entries);
         self
     }
@@ -204,13 +267,22 @@ impl Default for Router {
     }
 }
 
-struct RegisteredStruct<T: RepeStruct + 'static> {
+struct RegisteredStruct<T, L>
+where
+    T: RepeStruct + 'static,
+    L: Lockable<T> + 'static,
+{
     root: String,
-    shared: Arc<Mutex<T>>,
+    shared: Arc<L>,
+    phantom: std::marker::PhantomData<T>,
 }
 
-impl<T: RepeStruct + 'static> RegisteredStruct<T> {
-    fn new(root: &str, shared: Arc<Mutex<T>>) -> Self {
+impl<T, L> RegisteredStruct<T, L>
+where
+    T: RepeStruct + 'static,
+    L: Lockable<T> + 'static,
+{
+    fn new(root: &str, shared: Arc<L>) -> Self {
         let normalized = if root.is_empty() || root == "/" {
             String::new()
         } else if root.starts_with('/') {
@@ -221,6 +293,7 @@ impl<T: RepeStruct + 'static> RegisteredStruct<T> {
         Self {
             root: normalized,
             shared,
+            phantom: std::marker::PhantomData,
         }
     }
 
@@ -242,7 +315,11 @@ impl<T: RepeStruct + 'static> RegisteredStruct<T> {
     }
 }
 
-impl<T: RepeStruct + 'static> StructRouterEntry for RegisteredStruct<T> {
+impl<T, L> StructRouterEntry for RegisteredStruct<T, L>
+where
+    T: RepeStruct + 'static,
+    L: Lockable<T> + 'static,
+{
     fn handler_for(&self, path: &str) -> Option<Arc<dyn HandlerErased>> {
         let relative = self.relative_pointer(path)?;
         let tokens = crate::json_pointer::parse(relative);
@@ -251,7 +328,7 @@ impl<T: RepeStruct + 'static> StructRouterEntry for RegisteredStruct<T> {
         } else {
             path.to_string()
         };
-        Some(Arc::new(StructRequestHandler::<T>::new(
+        Some(Arc::new(StructRequestHandler::<T, L>::new(
             self.shared.clone(),
             tokens,
             full_path,
@@ -259,23 +336,37 @@ impl<T: RepeStruct + 'static> StructRouterEntry for RegisteredStruct<T> {
     }
 }
 
-struct StructRequestHandler<T: RepeStruct + 'static> {
-    shared: Arc<Mutex<T>>,
+struct StructRequestHandler<T, L>
+where
+    T: RepeStruct + 'static,
+    L: Lockable<T> + 'static,
+{
+    shared: Arc<L>,
     segments: Vec<String>,
     full_path: String,
+    phantom: std::marker::PhantomData<T>,
 }
 
-impl<T: RepeStruct + 'static> StructRequestHandler<T> {
-    fn new(shared: Arc<Mutex<T>>, segments: Vec<String>, full_path: String) -> Self {
+impl<T, L> StructRequestHandler<T, L>
+where
+    T: RepeStruct + 'static,
+    L: Lockable<T> + 'static,
+{
+    fn new(shared: Arc<L>, segments: Vec<String>, full_path: String) -> Self {
         Self {
             shared,
             segments,
             full_path,
+            phantom: std::marker::PhantomData,
         }
     }
 }
 
-impl<T: RepeStruct + 'static> HandlerErased for StructRequestHandler<T> {
+impl<T, L> HandlerErased for StructRequestHandler<T, L>
+where
+    T: RepeStruct + 'static,
+    L: Lockable<T> + 'static,
+{
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
         let body = if req.body.is_empty() {
             None
@@ -303,15 +394,20 @@ impl<T: RepeStruct + 'static> HandlerErased for StructRequestHandler<T> {
 
         let mut guard = match self.shared.lock() {
             Ok(g) => g,
-            Err(poison) => {
+            Err(err) => {
+                let detail = match err {
+                    LockError::Poisoned(msg) => {
+                        format!("struct handler `{}` lock poisoned: {}", self.full_path, msg)
+                    }
+                    LockError::Other(msg) => {
+                        format!("struct handler `{}` lock error: {}", self.full_path, msg)
+                    }
+                };
                 return Ok(create_error_response_like(
                     req,
                     ErrorCode::ParseError,
-                    format!(
-                        "struct handler `{}` mutex poisoned: {}",
-                        self.full_path, poison
-                    ),
-                ))
+                    detail,
+                ));
             }
         };
 

@@ -4,7 +4,7 @@ use repe::constants::{ErrorCode, QueryFormat};
 use repe::{Message, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
 #[repe(methods(
@@ -353,6 +353,33 @@ fn example_functions() {
         .unwrap();
     assert_eq!(parse_body(&custom_name), Value::Null);
     assert_eq!(shared.lock().unwrap().name, "Alice");
+}
+
+#[test]
+fn struct_shared_accepts_rwlock() {
+    let shared = Arc::new(RwLock::new(ExampleFunctions::default()));
+    {
+        let mut guard = shared.write().unwrap();
+        guard.set_name("Initial".into());
+    }
+
+    let router = Router::new().with_struct_shared("", shared.clone());
+
+    let get_name = router
+        .get("/get_name")
+        .unwrap()
+        .handle(&request_empty("/get_name"))
+        .unwrap();
+    assert_eq!(parse_body(&get_name), Value::String("Initial".into()));
+
+    let set_name = router
+        .get("/set_name")
+        .unwrap()
+        .handle(&request_json("/set_name", &json!("Updated")))
+        .unwrap();
+    assert_eq!(parse_body(&set_name), Value::Null);
+
+    assert_eq!(shared.read().unwrap().name, "Updated");
 }
 
 #[test]
