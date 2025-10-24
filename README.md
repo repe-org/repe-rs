@@ -85,8 +85,9 @@ JSON Pointer Routing and Typed Handlers
 - Router keys are JSON Pointer paths (e.g., `/ping`, `/echo`, `/status`). Raw-binary queries are rejected with an explicit `Invalid query` error.
 - Add JSON Value handlers with `.with("/path", |v: serde_json::Value| -> Result<Value, (ErrorCode,String)>)`.
 - Add typed handlers with `.with_typed("/path", |req: T| -> Result<R, (ErrorCode,String)>)` where `T: Deserialize`, `R: Serialize`.
-  - Typed handlers auto-deserialize JSON bodies into `T` and serialize `R` to JSON responses.
-  - If a non-JSON body is sent to a typed/JSON handler, the server returns `Invalid body`.
+  - Typed handlers auto-deserialize JSON, UTF-8, or BEVE bodies into `T`. Responses default to JSON.
+  - Wrap the return value with `TypedResponse::beve(...)` / `TypedResponse::utf8(...)` / etc. to pick a different response [`BodyFormat`].
+  - If a body arrives with an unsupported format for typed handlers, the server returns `Invalid body`.
 
 - Implement the pluggable trait `JsonTypedHandler` to attach methods from a service type:
 

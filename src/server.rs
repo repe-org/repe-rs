@@ -53,17 +53,85 @@ where
     }
 }
 
+/// Wrapper that lets typed handlers override the response [`BodyFormat`].
+/// Use helpers like [`TypedResponse::json`] or [`TypedResponse::beve`] to keep call sites concise.
+pub struct TypedResponse<R> {
+    value: R,
+    format: BodyFormat,
+}
+
+impl<R> TypedResponse<R> {
+    pub fn new(value: R, format: BodyFormat) -> Self {
+        Self { value, format }
+    }
+
+    pub fn json(value: R) -> Self {
+        Self::new(value, BodyFormat::Json)
+    }
+
+    pub fn beve(value: R) -> Self {
+        Self::new(value, BodyFormat::Beve)
+    }
+
+    pub fn utf8(value: R) -> Self {
+        Self::new(value, BodyFormat::Utf8)
+    }
+
+    pub fn raw_binary(value: R) -> Self {
+        Self::new(value, BodyFormat::RawBinary)
+    }
+}
+
+pub trait IntoTypedResponse<R> {
+    fn into_typed_response(self) -> (R, BodyFormat);
+}
+
+impl<R> IntoTypedResponse<R> for R {
+    fn into_typed_response(self) -> (R, BodyFormat) {
+        (self, BodyFormat::Json)
+    }
+}
+
+impl<R> IntoTypedResponse<R> for TypedResponse<R> {
+    fn into_typed_response(self) -> (R, BodyFormat) {
+        (self.value, self.format)
+    }
+}
+
+pub trait TypedHandlerFn<T, R>: Send + Sync + 'static
+where
+    T: DeserializeOwned + Send + Sync + 'static,
+    R: Serialize + Send + Sync + 'static,
+{
+    type Response: IntoTypedResponse<R>;
+    fn call(&self, input: T) -> Result<Self::Response, (ErrorCode, String)>;
+}
+
+impl<T, R, S, F> TypedHandlerFn<T, R> for F
+where
+    T: DeserializeOwned + Send + Sync + 'static,
+    R: Serialize + Send + Sync + 'static,
+    S: IntoTypedResponse<R>,
+    F: Fn(T) -> Result<S, (ErrorCode, String)> + Send + Sync + 'static,
+{
+    type Response = S;
+
+    fn call(&self, input: T) -> Result<Self::Response, (ErrorCode, String)> {
+        (self)(input)
+    }
+}
+
 struct TypedHandler<T, R, F>(F, std::marker::PhantomData<(T, R)>)
 where
     T: DeserializeOwned + Send + Sync + 'static,
     R: Serialize + Send + Sync + 'static,
-    F: Fn(T) -> Result<R, (ErrorCode, String)> + Send + Sync + 'static;
+    F: TypedHandlerFn<T, R>;
 
 impl<T, R, F> HandlerErased for TypedHandler<T, R, F>
 where
     T: DeserializeOwned + Send + Sync + 'static,
     R: Serialize + Send + Sync + 'static,
-    F: Fn(T) -> Result<R, (ErrorCode, String)> + Send + Sync + 'static,
+    F: TypedHandlerFn<T, R>,
 {
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
         let t: T = match BodyFormat::try_from(req.header.body_format) {
@@ -80,8 +148,11 @@ where
                 ))
             }
         };
-        match (self.0)(t) {
-            Ok(r) => create_response(req, r, BodyFormat::Json),
+        match self.0.call(t) {
+            Ok(r) => {
+                let (value, format) = r.into_typed_response();
+                create_response(req, value, format)
+            }
             Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
         }
     }
@@ -191,12 +262,14 @@ impl Router {
         self.with_json(path, handler)
     }
 
-    /// Add a typed handler that auto-deserializes JSON into `T` and serializes `R`.
+    /// Add a typed handler that auto-deserializes JSON/UTF-8/BEVE into `T` and serializes `R`.
+    /// Return `Ok(value)` for JSON responses or wrap results with [`TypedResponse`] to pick a
+    /// different [`BodyFormat`].
     pub fn with_typed<T, R, F>(mut self, path: &str, f: F) -> Self
     where
         T: DeserializeOwned + Send + Sync + 'static,
         R: Serialize + Send + Sync + 'static,
-        F: Fn(T) -> Result<R, (ErrorCode, String)> + Send + Sync + 'static,
+        F: TypedHandlerFn<T, R>,
     {
         let mut map = self.inner.as_ref().clone();
         map.insert(
@@ -659,28 +732,31 @@ mod tests {
             tags: std::collections::HashMap<String, String>,
         }
 
-        let router = Router::new().with_typed::<SensorFrame, Aggregate, _>("/aggregate", |frame| {
-            let mut total = 0.0;
-            let mut count = 0usize;
-            for stream in &frame.streams {
-                for value in &stream.samples {
-                    total += *value;
-                    count += 1;
+        let router = Router::new().with_typed::<SensorFrame, Aggregate, _>(
+            "/aggregate",
+            |frame: SensorFrame| {
+                let mut total = 0.0;
+                let mut count = 0usize;
+                for stream in &frame.streams {
+                    for value in &stream.samples {
+                        total += *value;
+                        count += 1;
+                    }
                 }
-            }
-            let average = if count == 0 {
-                0.0
-            } else {
-                total / count as f64
-            };
-            Ok(Aggregate {
-                device: frame.device.id,
-                location: frame.device.location,
-                sample_count: count,
-                average,
-                tags: frame.tags,
-            })
-        });
+                let average = if count == 0 {
+                    0.0
+                } else {
+                    total / count as f64
+                };
+                Ok(Aggregate {
+                    device: frame.device.id,
+                    location: frame.device.location,
+                    sample_count: count,
+                    average,
+                    tags: frame.tags,
+                })
+            },
+        );
 
         let mut tags = std::collections::HashMap::new();
         tags.insert("site".to_string(), "warehouse".to_string());
@@ -747,7 +823,7 @@ mod tests {
 
         let router = Router::new()
             .with_json("/echo", |v: Value| Ok(v))
-            .with_typed::<In, Out, _>("/sum", |inp| Ok(Out { sum: inp.x + inp.y }));
+            .with_typed::<In, Out, _>("/sum", |inp: In| Ok(Out { sum: inp.x + inp.y }));
 
         let msg = Message::builder()
             .id(1)
@@ -848,11 +924,9 @@ mod tests {
             alert_count: usize,
         }
 
-        struct BeveHandler;
-
-        impl HandlerErased for BeveHandler {
-            fn handle(&self, req: &Message) -> Result<Message, RepeError> {
-                let frame: SensorFrame = req.beve_body()?;
+        let router = Router::new().with_typed::<SensorFrame, Summary, _>(
+            "/telemetry",
+            |frame: SensorFrame| {
                 let mut max_sample = f64::MIN;
                 let mut total = 0.0f64;
                 let mut count = 0usize;
@@ -879,21 +953,9 @@ mod tests {
                     average_sample: avg,
                     alert_count: frame.alerts.len(),
                 };
-                create_response(req, summary, BodyFormat::Beve)
-            }
-        }
-
-        let router = {
-            let mut map = HashMap::new();
-            map.insert(
-                "/telemetry".to_string(),
-                Arc::new(BeveHandler) as Arc<dyn HandlerErased>,
-            );
-            Router {
-                inner: Arc::new(map),
-                structs: Arc::new(Vec::new()),
-            }
-        };
+                Ok(TypedResponse::beve(summary))
+            },
+        );
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
