@@ -177,7 +177,8 @@ impl Device {
     }
 }
 
-let (router, device_handle) = Router::new().with_struct("/device", Device::default());
+let mut router = Router::new();
+let device_handle = router.register_struct("/device", Device::default());
 
 // Update initial state before serving.
 {

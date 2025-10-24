@@ -384,7 +384,8 @@ fn struct_shared_accepts_rwlock() {
 
 #[test]
 fn struct_attributes_control_behavior() {
-    let (router, shared) = Router::new().with_struct(
+    let mut router = Router::new();
+    let shared = router.register_struct(
         "",
         AttributeStruct {
             value: 7,
@@ -459,7 +460,8 @@ fn struct_attributes_control_behavior() {
 
 #[test]
 fn root_write_replaces_struct() {
-    let (router, shared) = Router::new().with_struct(
+    let mut router = Router::new();
+    let shared = router.register_struct(
         "",
         RootStruct {
             foo: 1,

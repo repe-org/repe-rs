@@ -232,20 +232,43 @@ impl Router {
         T: RepeStruct + 'static,
         L: Lockable<T> + 'static,
     {
-        let mut entries = (*self.structs).clone();
-        entries.push(Arc::new(RegisteredStruct::<T, L>::new(root, shared)));
-        self.structs = Arc::new(entries);
+        self.register_struct_shared::<T, L>(root, shared);
         self
+    }
+
+    /// Register a struct in-place and get back the shared handle without breaking builder chains.
+    pub fn register_struct_shared<T, L>(&mut self, root: &str, shared: Arc<L>) -> Arc<L>
+    where
+        T: RepeStruct + 'static,
+        L: Lockable<T> + 'static,
+    {
+        let mut entries = (*self.structs).clone();
+        entries.push(Arc::new(RegisteredStruct::<T, L>::new(
+            root,
+            Arc::clone(&shared),
+        )));
+        self.structs = Arc::new(entries);
+        shared
     }
 
     /// Convenience helper to register an owned struct value. Returns the shared handle so callers
     /// can keep interacting with the registered object.
-    pub fn with_struct<T>(self, root: &str, value: T) -> (Self, Arc<Mutex<T>>)
+    pub fn with_struct<T>(mut self, root: &str, value: T) -> (Self, Arc<Mutex<T>>)
+    where
+        T: RepeStruct + 'static,
+    {
+        let shared = self.register_struct(root, value);
+        (self, shared)
+    }
+
+    /// Builder-friendly helper to register owned structs while keeping the router.
+    pub fn register_struct<T>(&mut self, root: &str, value: T) -> Arc<Mutex<T>>
     where
         T: RepeStruct + 'static,
     {
         let shared = Arc::new(Mutex::new(value));
-        (self.with_struct_shared(root, shared.clone()), shared)
+        self.register_struct_shared::<T, Mutex<T>>(root, Arc::clone(&shared));
+        shared
     }
 
     pub fn get(&self, path: &str) -> Option<Arc<dyn HandlerErased>> {
