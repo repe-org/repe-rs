@@ -34,6 +34,7 @@ pub use io::{read_message, write_message};
 pub use json_pointer::{evaluate as eval_json_pointer, parse as parse_json_pointer};
 pub use message::Message;
 pub use server::{
-    IntoTypedResponse, JsonTypedHandler, LockError, Lockable, Router, Server, TypedResponse,
+    IntoTypedResponse, JsonTypedHandler, LockError, Lockable, Middleware, Next, Router, Server,
+    TypedResponse,
 };
 pub use structs::{RepeStruct, StructError};

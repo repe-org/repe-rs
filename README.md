@@ -88,6 +88,7 @@ JSON Pointer Routing and Typed Handlers
   - Typed handlers auto-deserialize JSON, UTF-8, or BEVE bodies into `T`. Responses default to JSON.
   - Wrap the return value with `TypedResponse::beve(...)` / `TypedResponse::utf8(...)` / etc. to pick a different response [`BodyFormat`].
   - If a body arrives with an unsupported format for typed handlers, the server returns `Invalid body`.
+- Attach pre-request middleware with `.with_middleware(|req, next| { /* auth/logging */ next.run(req) })` to centralize auth, validation, or tracing without hand-wrapping handlers.
 
 - Implement the pluggable trait `JsonTypedHandler` to attach methods from a service type:
 
@@ -127,6 +128,12 @@ use serde_json::json;
 use std::time::Duration;
 
 let router = Router::new()
+    .with_middleware(|req, next| {
+        if let Ok(path) = req.query_str() {
+            println!("incoming request for {path}");
+        }
+        next.run(req)
+    })
     .with("/ping", |_v| Ok(json!({"pong": true})))
     .with("/echo", |v| Ok(json!({"echo": v})))
     .with("/status", |_v| Ok(json!({"status": "ok"})));

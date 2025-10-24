@@ -1,6 +1,7 @@
 # Changelog
 
 ## [Unreleased]
+- Router middleware hooks (`with_middleware` / `register_middleware`) let servers centralize auth, logging, or validation without manually wrapping each handler.
 - Router shared-struct registration now accepts any `Lockable` lock, including `tokio::sync`
   mutexes/RwLocks out of the box and `parking_lot` locks when the optional feature is enabled.
 

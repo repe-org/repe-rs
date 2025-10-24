@@ -23,6 +23,53 @@ pub trait HandlerErased: Send + Sync {
     fn handle(&self, req: &Message) -> Result<Message, RepeError>;
 }
 
+pub struct Next<'a> {
+    middlewares: &'a [Arc<dyn Middleware>],
+    handler: &'a dyn HandlerErased,
+}
+
+impl<'a> Next<'a> {
+    fn new(middlewares: &'a [Arc<dyn Middleware>], handler: &'a dyn HandlerErased) -> Self {
+        Self {
+            middlewares,
+            handler,
+        }
+    }
+
+    /// Continue to the next middleware (or final handler if this was the last middleware).
+    pub fn run(self, req: &Message) -> Result<Message, RepeError> {
+        if let Some((first, rest)) = self.middlewares.split_first() {
+            first.handle(req, Next::new(rest, self.handler))
+        } else {
+            self.handler.handle(req)
+        }
+    }
+}
+
+pub trait Middleware: Send + Sync {
+    fn handle(&self, req: &Message, next: Next<'_>) -> Result<Message, RepeError>;
+}
+
+impl<F> Middleware for F
+where
+    F: for<'a> Fn(&'a Message, Next<'a>) -> Result<Message, RepeError> + Send + Sync + 'static,
+{
+    fn handle(&self, req: &Message, next: Next<'_>) -> Result<Message, RepeError> {
+        (self)(req, next)
+    }
+}
+
+struct MiddlewarePipeline {
+    handler: Arc<dyn HandlerErased>,
+    middlewares: Arc<Vec<Arc<dyn Middleware>>>,
+}
+
+impl HandlerErased for MiddlewarePipeline {
+    fn handle(&self, req: &Message) -> Result<Message, RepeError> {
+        Next::new(self.middlewares.as_ref(), self.handler.as_ref()).run(req)
+    }
+}
+
 struct JsonHandler<F>(F)
 where
     F: Fn(Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static;
@@ -274,6 +321,7 @@ impl<T: ?Sized + Send + Sync> Lockable<T> for parking_lot::RwLock<T> {
 pub struct Router {
     inner: Arc<HashMap<String, Arc<dyn HandlerErased>>>,
     structs: Arc<Vec<Arc<dyn StructRouterEntry>>>,
+    middlewares: Arc<Vec<Arc<dyn Middleware>>>,
 }
 
 impl Router {
@@ -281,6 +329,7 @@ impl Router {
         Self {
             inner: Arc::new(HashMap::new()),
             structs: Arc::new(Vec::new()),
+            middlewares: Arc::new(Vec::new()),
         }
     }
 
@@ -297,6 +346,24 @@ impl Router {
         );
         self.inner = Arc::new(map);
         self
+    }
+
+    /// Attach a middleware that runs before handlers and can short-circuit requests.
+    pub fn with_middleware(mut self, middleware: impl Middleware + 'static) -> Self {
+        self.register_middleware(middleware);
+        self
+    }
+
+    /// Register middleware in-place so callers can retain the shared handle.
+    pub fn register_middleware(
+        &mut self,
+        middleware: impl Middleware + 'static,
+    ) -> Arc<dyn Middleware> {
+        let mut list = (*self.middlewares).clone();
+        let arc: Arc<dyn Middleware> = Arc::new(middleware);
+        list.push(arc.clone());
+        self.middlewares = Arc::new(list);
+        arc
     }
 
     /// Backwards-compatible alias for `with_json`.
@@ -393,15 +460,25 @@ impl Router {
     }
 
     pub fn get(&self, path: &str) -> Option<Arc<dyn HandlerErased>> {
-        if let Some(handler) = self.inner.get(path) {
-            return Some(handler.clone());
+        let handler = if let Some(handler) = self.inner.get(path) {
+            Some(handler.clone())
+        } else {
+            self.structs
+                .iter()
+                .find_map(|entry| entry.handler_for(path))
+        };
+        handler.map(|h| self.wrap_handler(h))
+    }
+
+    fn wrap_handler(&self, handler: Arc<dyn HandlerErased>) -> Arc<dyn HandlerErased> {
+        if self.middlewares.is_empty() {
+            handler
+        } else {
+            Arc::new(MiddlewarePipeline {
+                handler,
+                middlewares: Arc::clone(&self.middlewares),
+            })
         }
-        for entry in self.structs.iter() {
-            if let Some(handler) = entry.handler_for(path) {
-                return Some(handler);
-            }
-        }
-        None
     }
 }
 
@@ -749,6 +826,68 @@ mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
     use std::io::Read;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn middleware_runs_for_registered_handlers() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_middleware = Arc::clone(&hits);
+        let router = Router::new()
+            .with_middleware(move |req: &Message, next: Next<'_>| {
+                assert_eq!(req.query_str().unwrap(), "/echo");
+                hits_for_middleware.fetch_add(1, Ordering::SeqCst);
+                next.run(req)
+            })
+            .with_json("/echo", |v: Value| Ok(v));
+
+        let request = Message::builder()
+            .id(7)
+            .query_str("/echo")
+            .query_format(QueryFormat::JsonPointer)
+            .body_json(&serde_json::json!({"payload": 42}))
+            .unwrap()
+            .build();
+
+        let handler = router.get("/echo").expect("handler to exist");
+        let response = handler.handle(&request).unwrap();
+        assert_eq!(response.header.ec, ErrorCode::Ok as u32);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn middleware_can_short_circuit_requests() {
+        let handler_called = Arc::new(AtomicBool::new(false));
+        let handler_called_inner = Arc::clone(&handler_called);
+
+        let router = Router::new()
+            .with_middleware(|req: &Message, _next: Next<'_>| {
+                create_response(
+                    req,
+                    serde_json::json!({"status": "blocked"}),
+                    BodyFormat::Json,
+                )
+            })
+            .with_json("/blocked", move |_v: Value| {
+                handler_called_inner.store(true, Ordering::SeqCst);
+                Ok(serde_json::json!({"status": "allowed"}))
+            });
+
+        let request = Message::builder()
+            .id(11)
+            .query_str("/blocked")
+            .query_format(QueryFormat::JsonPointer)
+            .body_json(&serde_json::json!({}))
+            .unwrap()
+            .build();
+
+        let handler = router.get("/blocked").expect("handler to exist");
+        let response = handler.handle(&request).unwrap();
+
+        assert_eq!(response.header.ec, ErrorCode::Ok as u32);
+        let body: serde_json::Value = response.json_body().unwrap();
+        assert_eq!(body.get("status").and_then(|v| v.as_str()), Some("blocked"));
+        assert!(!handler_called.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn typed_handler_accepts_beve_payload() {
