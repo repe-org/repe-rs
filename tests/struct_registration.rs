@@ -3,7 +3,7 @@
 use repe::constants::{ErrorCode, QueryFormat};
 use repe::{Message, Router};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
 

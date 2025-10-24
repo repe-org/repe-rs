@@ -1,7 +1,8 @@
 [package]
 name = "repe"
 version = "0.3.2"
-edition = "2021"
+edition = "2024"
+rust-version = "1.85"
 description = "Rust implementation of the REPE RPC protocol (JSON-focused)"
 license = "MIT"
 repository = "https://github.com/repe-org/repe-rs"

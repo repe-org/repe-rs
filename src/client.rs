@@ -3,14 +3,14 @@ use crate::error::RepeError;
 use crate::io::{read_message, write_message};
 use crate::message::{Message, MessageBuilder};
 use beve::from_slice as beve_from_slice;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::io::Write;
 use std::io::{BufReader, BufWriter};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 pub struct Client {

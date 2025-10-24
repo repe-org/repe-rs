@@ -27,7 +27,7 @@ pub use repe_derive::RepeStruct;
 pub use async_client::AsyncClient;
 pub use async_server::AsyncServer;
 pub use client::Client;
-pub use constants::{BodyFormat, ErrorCode, QueryFormat, HEADER_SIZE, REPE_SPEC, REPE_VERSION};
+pub use constants::{BodyFormat, ErrorCode, HEADER_SIZE, QueryFormat, REPE_SPEC, REPE_VERSION};
 pub use error::RepeError;
 pub use header::Header;
 pub use io::{read_message, write_message};
