@@ -1,11 +1,11 @@
 use crate::constants::{BodyFormat, ErrorCode, QueryFormat, REPE_VERSION};
 use crate::error::RepeError;
 use crate::io::{read_message, write_message};
-use crate::message::{create_error_response_like, create_response, Message};
+use crate::message::{Message, create_error_response_like, create_response};
 use crate::structs::RepeStruct;
 use beve::from_slice as beve_from_slice;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::Write;
@@ -13,8 +13,8 @@ use std::io::{BufReader, BufWriter};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Mutex;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::thread;
 use std::time::Duration;
@@ -90,7 +90,7 @@ where
                     req,
                     ErrorCode::InvalidBody,
                     "Expected JSON body",
-                ))
+                ));
             }
         };
         match (self.0)(param) {
@@ -192,7 +192,7 @@ where
                     req,
                     ErrorCode::InvalidBody,
                     "Expected JSON body",
-                ))
+                ));
             }
         };
         match self.0.call(t) {
@@ -608,7 +608,7 @@ where
                             "struct handler `{}` requires JSON or BEVE body, got format {}",
                             self.full_path, req.header.body_format
                         ),
-                    ))
+                    ));
                 }
             }
         };
@@ -670,7 +670,7 @@ impl<H: JsonTypedHandler> HandlerErased for JsonTypedAdapter<H> {
                     req,
                     ErrorCode::InvalidBody,
                     "Expected JSON body",
-                ))
+                ));
             }
         };
         match self.0.call(t) {
@@ -1292,10 +1292,11 @@ mod tests {
         let resp = read_message(&mut reader).unwrap();
         assert_eq!(resp.header.id, 42);
         assert_eq!(resp.header.ec, ErrorCode::VersionMismatch as u32);
-        assert!(resp
-            .error_message_utf8()
-            .unwrap()
-            .contains("Unsupported REPE version"));
+        assert!(
+            resp.error_message_utf8()
+                .unwrap()
+                .contains("Unsupported REPE version")
+        );
 
         drop(reader);
         let _ = srv.join().unwrap();
@@ -1337,10 +1338,11 @@ mod tests {
         let resp = read_message(&mut reader).unwrap();
         assert_eq!(resp.header.id, 99);
         assert_eq!(resp.header.ec, ErrorCode::InvalidQuery as u32);
-        assert!(resp
-            .error_message_utf8()
-            .unwrap()
-            .contains("Raw binary queries"));
+        assert!(
+            resp.error_message_utf8()
+                .unwrap()
+                .contains("Raw binary queries")
+        );
 
         drop(reader);
         let _ = srv.join().unwrap();

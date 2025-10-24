@@ -1,7 +1,7 @@
-use crate::constants::{BodyFormat, ErrorCode, QueryFormat, HEADER_SIZE};
+use crate::constants::{BodyFormat, ErrorCode, HEADER_SIZE, QueryFormat};
 use crate::error::RepeError;
 use crate::header::Header;
-use beve::{from_slice as beve_from_slice, to_vec as beve_to_vec, Error as BeveError};
+use beve::{Error as BeveError, from_slice as beve_from_slice, to_vec as beve_to_vec};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {

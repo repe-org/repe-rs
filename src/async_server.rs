@@ -1,12 +1,12 @@
 use crate::async_io::{read_message_async, write_message_async};
 use crate::constants::{ErrorCode, QueryFormat, REPE_VERSION};
 use crate::error::RepeError;
-use crate::message::{create_error_response_like, Message};
+use crate::message::{Message, create_error_response_like};
 use crate::server::Router;
 use tokio::io::AsyncWriteExt;
 use tokio::io::{BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 pub struct AsyncServer {
     router: Router,

@@ -1,13 +1,13 @@
 use proc_macro::TokenStream;
+use proc_macro_crate::{FoundCrate, crate_name};
 use proc_macro2::{Span, TokenStream as TokenStream2};
-use proc_macro_crate::{crate_name, FoundCrate};
-use quote::{quote, ToTokens};
+use quote::{ToTokens, quote};
 use syn::{
+    Attribute, DeriveInput, Field, Ident, LitStr, Token, Type,
     parse::{Parse, ParseBuffer, ParseStream},
     parse_macro_input,
     punctuated::Punctuated,
     spanned::Spanned,
-    Attribute, DeriveInput, Field, Ident, LitStr, Token, Type,
 };
 
 #[proc_macro_derive(RepeStruct, attributes(repe))]
@@ -36,7 +36,7 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
             return Err(syn::Error::new_spanned(
                 &input.ident,
                 "RepeStruct requires named fields",
-            ))
+            ));
         }
     };
 
