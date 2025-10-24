@@ -1,7 +1,9 @@
-use crate::constants::{ErrorCode, QueryFormat, REPE_VERSION};
+use crate::constants::{BodyFormat, ErrorCode, QueryFormat, REPE_VERSION};
 use crate::error::RepeError;
 use crate::io::{read_message, write_message};
-use crate::message::Message;
+use crate::message::{Message, MessageBuilder};
+use beve::from_slice as beve_from_slice;
+use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 use std::io::Write;
@@ -46,23 +48,82 @@ impl Client {
         path: P,
         body: &T,
     ) -> Result<Value, RepeError> {
+        let resp = self.call_with_body(path, |builder| builder.body_json(body))?;
+        resp.json_body::<Value>()
+    }
+
+    /// Send a JSON-pointer request with JSON body and deserialize the typed result.
+    pub fn call_typed_json<P: AsRef<str>, T: Serialize, R: DeserializeOwned>(
+        &mut self,
+        path: P,
+        body: &T,
+    ) -> Result<R, RepeError> {
+        let resp = self.call_with_body(path, |builder| builder.body_json(body))?;
+        Self::decode_typed_response(&resp)
+    }
+
+    /// Send a JSON-pointer request with BEVE body and deserialize the typed result.
+    pub fn call_typed_beve<P: AsRef<str>, T: Serialize, R: DeserializeOwned>(
+        &mut self,
+        path: P,
+        body: &T,
+    ) -> Result<R, RepeError> {
+        let resp = self.call_with_body(path, |builder| builder.body_beve(body))?;
+        Self::decode_typed_response(&resp)
+    }
+
+    /// Send a JSON-pointer notify request (no response expected).
+    pub fn notify_json<P: AsRef<str>, T: Serialize>(
+        &mut self,
+        path: P,
+        body: &T,
+    ) -> Result<(), RepeError> {
+        self.notify_with_body(path, |builder| builder.body_json(body))
+    }
+
+    /// Notify a typed handler with a JSON payload, without waiting for a response.
+    pub fn notify_typed_json<P: AsRef<str>, T: Serialize>(
+        &mut self,
+        path: P,
+        body: &T,
+    ) -> Result<(), RepeError> {
+        self.notify_with_body(path, |builder| builder.body_json(body))
+    }
+
+    /// Notify a typed handler with a BEVE payload, without waiting for a response.
+    pub fn notify_typed_beve<P: AsRef<str>, T: Serialize>(
+        &mut self,
+        path: P,
+        body: &T,
+    ) -> Result<(), RepeError> {
+        self.notify_with_body(path, |builder| builder.body_beve(body))
+    }
+
+    fn call_with_body<P, F>(&mut self, path: P, body_fn: F) -> Result<Message, RepeError>
+    where
+        P: AsRef<str>,
+        F: FnOnce(MessageBuilder) -> Result<MessageBuilder, RepeError>,
+    {
         let id = self.next_request_id();
-        let msg = Message::builder()
+        let builder = Message::builder()
             .id(id)
             .query_str(path.as_ref())
-            .query_format(QueryFormat::JsonPointer)
-            .body_json(body)?
-            .build();
+            .query_format(QueryFormat::JsonPointer);
+        let msg = body_fn(builder)?.build();
         write_message(&mut self.writer, &msg)?;
         self.writer.flush()?;
 
         let resp = read_message(&mut self.reader)?;
+        Self::validate_response(id, resp)
+    }
+
+    fn validate_response(expected_id: u64, resp: Message) -> Result<Message, RepeError> {
         if resp.header.version != REPE_VERSION {
             return Err(RepeError::VersionMismatch(resp.header.version));
         }
-        if resp.header.id != id {
+        if resp.header.id != expected_id {
             return Err(RepeError::ResponseIdMismatch {
-                expected: id,
+                expected: expected_id,
                 got: resp.header.id,
             });
         }
@@ -73,25 +134,40 @@ impl Client {
                 .unwrap_or_else(|| code.to_string());
             return Err(RepeError::ServerError { code, message: msg });
         }
-        resp.json_body::<Value>()
+        Ok(resp)
     }
 
-    /// Send a JSON-pointer notify request (no response expected).
-    pub fn notify_json<P: AsRef<str>, T: Serialize>(
-        &mut self,
-        path: P,
-        body: &T,
-    ) -> Result<(), RepeError> {
+    fn notify_with_body<P, F>(&mut self, path: P, body_fn: F) -> Result<(), RepeError>
+    where
+        P: AsRef<str>,
+        F: FnOnce(MessageBuilder) -> Result<MessageBuilder, RepeError>,
+    {
         let id = self.next_request_id();
-        let msg = Message::builder()
+        let builder = Message::builder()
             .id(id)
             .notify(true)
             .query_str(path.as_ref())
-            .query_format(QueryFormat::JsonPointer)
-            .body_json(body)?
-            .build();
+            .query_format(QueryFormat::JsonPointer);
+        let msg = body_fn(builder)?.build();
         write_message(&mut self.writer, &msg)?;
         self.writer.flush()?;
         Ok(())
+    }
+
+    fn decode_typed_response<R: DeserializeOwned>(resp: &Message) -> Result<R, RepeError> {
+        match BodyFormat::try_from(resp.header.body_format) {
+            Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => {
+                serde_json::from_slice(&resp.body).map_err(RepeError::from)
+            }
+            Ok(BodyFormat::Beve) => beve_from_slice(&resp.body).map_err(RepeError::from),
+            Ok(BodyFormat::RawBinary) => {
+                let io_err = std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "response body is neither JSON nor BEVE",
+                );
+                Err(RepeError::Json(serde_json::Error::io(io_err)))
+            }
+            Err(_) => Err(RepeError::UnknownEnumValue(resp.header.body_format as u64)),
+        }
     }
 }

@@ -772,6 +772,17 @@ mod tests {
             Ok(serde_json::json!({"sum": a + b}))
         });
 
+        #[derive(Serialize, Deserialize)]
+        struct AddReq {
+            a: i64,
+            b: i64,
+        }
+
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct AddResp {
+            sum: i64,
+        }
+
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let router_clone = router.clone();
@@ -792,6 +803,16 @@ mod tests {
             .call_json("/add", &serde_json::json!({"a": 3, "b": 4}))
             .unwrap();
         assert_eq!(out["sum"], 7);
+
+        let typed: AddResp = client
+            .call_typed_json("/add", &AddReq { a: 5, b: 6 })
+            .unwrap();
+        assert_eq!(typed.sum, 11);
+
+        let beve: AddResp = client
+            .call_typed_beve("/add", &AddReq { a: 1, b: 2 })
+            .unwrap();
+        assert_eq!(beve.sum, 3);
 
         // Close client to end the server loop and join
         drop(client);

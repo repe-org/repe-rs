@@ -202,11 +202,36 @@ Client
 
 ```rust
 use repe::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+
+#[derive(Serialize)]
+struct AddReq {
+    a: i64,
+    b: i64,
+}
+
+#[derive(Deserialize)]
+struct AddResp {
+    sum: i64,
+}
 
 let mut client = Client::connect("127.0.0.1:8081")?;
 let pong = client.call_json("/ping", &json!({}))?;
 assert_eq!(pong["pong"], true);
+
+let typed: AddResp = client.call_typed_json("/add", &AddReq { a: 2, b: 3 })?;
+assert_eq!(typed.sum, 5);
+
+client.notify_typed_json("/jobs/refresh", &AddReq { a: 0, b: 0 })?;
+client.notify_typed_beve("/jobs/refresh_beve", &AddReq { a: 1, b: 2 })?;
+```
+
+Typed helpers work for BEVE payloads too:
+
+```rust
+let beve_sum: AddResp = client.call_typed_beve("/add", &AddReq { a: 4, b: 5 })?;
+assert_eq!(beve_sum.sum, 9);
 ```
 
 Notify semantics
@@ -214,6 +239,7 @@ Notify semantics
 - If a request is marked `notify = true`, the server will process the handler but will not send a response.
 - In the protocol, the `id` still increments client-side, but no matching response should be expected.
 - The `Client::notify_json` and `AsyncClient::notify_json` helpers set the flag accordingly.
+- `Client::notify_typed_json` / `Client::notify_typed_beve` and their async counterparts send typed payloads without waiting for a response, mirroring the call helpers.
 
 Error handling
 
@@ -229,6 +255,7 @@ Async usage (minimal end‑to‑end)
 
 ```rust
 use repe::{Router, AsyncServer, AsyncClient};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 # #[tokio::main]
@@ -238,9 +265,32 @@ let listener = AsyncServer::listen(("127.0.0.1", 0)).await?;
 let addr = listener.local_addr()?;
 tokio::spawn(async move { let _ = AsyncServer::new(router).serve(listener).await; });
 
+#[derive(Serialize)]
+struct AddReq {
+    a: i64,
+    b: i64,
+}
+
+#[derive(Deserialize)]
+struct AddResp {
+    sum: i64,
+}
+
 let mut client = AsyncClient::connect(addr).await.unwrap();
 let pong = client.call_json("/ping", &json!({})).await.unwrap();
 assert_eq!(pong["pong"], true);
+
+let typed: AddResp = client
+    .call_typed_json("/add", &AddReq { a: 8, b: 1 })
+    .await
+    .unwrap();
+assert_eq!(typed.sum, 9);
+
+let beve: AddResp = client
+    .call_typed_beve("/add", &AddReq { a: 5, b: 6 })
+    .await
+    .unwrap();
+assert_eq!(beve.sum, 11);
 # Ok(()) }
 ```
 
