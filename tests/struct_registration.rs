@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
-#[derive(Default, Serialize, Deserialize, repe::derive::RepeStruct)]
+#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
 #[repe(methods(
     hello(&self) -> String,
     world(&self) -> String,
@@ -38,7 +38,7 @@ impl MyFunctions {
     }
 }
 
-#[derive(Default, Serialize, Deserialize, repe::derive::RepeStruct)]
+#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
 #[repe(methods(
     hello(&self) -> String,
     world(&self) -> String,
@@ -60,7 +60,7 @@ impl MetaFunctions {
     }
 }
 
-#[derive(Default, Serialize, Deserialize, repe::derive::RepeStruct)]
+#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
 #[repe(methods(
     append_awesome(&self, input: String) -> String
 ))]
@@ -78,7 +78,7 @@ impl MyNestedFunctions {
     }
 }
 
-#[derive(Default, Serialize, Deserialize, repe::derive::RepeStruct)]
+#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
 #[repe(methods(
     get_name(&self) -> String,
     set_name(&mut self, new_name: String) -> (),
@@ -99,7 +99,7 @@ impl ExampleFunctions {
 }
 
 #[allow(unreachable_code)]
-#[derive(Default, Serialize, Deserialize, repe::derive::RepeStruct)]
+#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
 #[repe(methods(
     alias = describe(&self) -> String
 ))]
@@ -118,7 +118,7 @@ impl AttributeStruct {
     }
 }
 
-#[derive(Default, Serialize, Deserialize, repe::derive::RepeStruct)]
+#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
 struct RootStruct {
     foo: i32,
     bar: String,

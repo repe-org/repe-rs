@@ -16,9 +16,13 @@ pub mod message;
 pub mod server;
 pub mod structs;
 
+#[doc(hidden)]
 pub mod derive {
     pub use repe_derive::RepeStruct;
 }
+
+/// Derive macro to generate [`structs::RepeStruct`](crate::structs::RepeStruct) implementations.
+pub use repe_derive::RepeStruct;
 
 pub use async_client::AsyncClient;
 pub use async_server::AsyncServer;

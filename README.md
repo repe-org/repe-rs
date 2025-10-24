@@ -141,21 +141,58 @@ server.serve(listener)?;
 
 ```rust
 use repe::Router;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 
-#[derive(Default, serde::Serialize, serde::Deserialize, repe::derive::RepeStruct)]
-#[repe(methods(hello(&self) -> String))]
-struct MyStruct {
-    counter: i32,
+#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+#[repe(methods(
+    greet(&self) -> String,
+    set_status(&mut self, new_status: String) -> (),
+    reset_metrics(&mut self) -> ()
+))]
+struct Device {
+    id: String,
+    status: String,
+    #[repe(nested)]
+    metrics: Metrics,
 }
 
-impl MyStruct {
-    fn hello(&self) -> String {
-        format!("count = {}", self.counter)
+#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+struct Metrics {
+    temperature: f64,
+    humidity: f64,
+}
+
+impl Device {
+    fn greet(&self) -> String {
+        format!("device {} reporting {}", self.id, self.status)
+    }
+
+    fn set_status(&mut self, new_status: String) {
+        self.status = new_status;
+    }
+
+    fn reset_metrics(&mut self) {
+        self.metrics = Metrics::default();
     }
 }
 
-let (router, shared) = Router::new().with_struct("", MyStruct::default());
-// `shared` is an Arc<Mutex<_>> so you can keep mutating the registered value.
+let (router, device_handle) = Router::new().with_struct("/device", Device::default());
+
+// Update initial state before serving.
+{
+    let mut device = device_handle.lock().unwrap();
+    device.id = "sensor-42".into();
+    device.status = "online".into();
+    device.metrics.temperature = 21.5;
+    device.metrics.humidity = 0.55;
+}
+
+// Example calls (JSON Pointer paths):
+// - `/device/greet` -> "device sensor-42 reporting online"
+// - `/device/status` with body "offline" writes the field and returns null
+// - `/device/metrics/temperature` reads the nested value (21.5)
+// - `/device/reset_metrics` zeroes out the metrics
 ```
 
 Client
