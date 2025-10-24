@@ -1,9 +1,13 @@
 # Changelog
 
 ## [Unreleased]
+- _Nothing yet._
+
+## [0.4.0] - 2025-10-24
 - Router middleware hooks (`with_middleware` / `register_middleware`) let servers centralize auth, logging, or validation without manually wrapping each handler.
 - Router shared-struct registration now accepts any `Lockable` lock, including `tokio::sync`
   mutexes/RwLocks out of the box and `parking_lot` locks when the optional feature is enabled.
+- Bumped the edition to Rust 2024 and raised the MSRV to 1.85.
 
 ## [0.2.0] - 2025-09-18
 - Added full BEVE body support (builder helpers, response serialization, and message decoding) backed by the official `beve` crate.
