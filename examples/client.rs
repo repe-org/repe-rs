@@ -1,4 +1,5 @@
 use repe::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -12,6 +13,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let status = client.call_json("/status", &json!({}))?;
     println!("/status => {}", status);
+
+    #[derive(Serialize)]
+    struct AddReq {
+        a: i64,
+        b: i64,
+    }
+
+    #[derive(Deserialize)]
+    struct AddResp {
+        sum: i64,
+    }
+
+    let add: AddResp = client.call_typed_json("/add", &AddReq { a: 4, b: 5 })?;
+    println!("/add => {}", add.sum);
 
     Ok(())
 }

@@ -14,6 +14,15 @@ pub mod io;
 pub mod json_pointer;
 pub mod message;
 pub mod server;
+pub mod structs;
+
+#[doc(hidden)]
+pub mod derive {
+    pub use repe_derive::RepeStruct;
+}
+
+/// Derive macro to generate [`structs::RepeStruct`](crate::structs::RepeStruct) implementations.
+pub use repe_derive::RepeStruct;
 
 pub use async_client::AsyncClient;
 pub use async_server::AsyncServer;
@@ -24,4 +33,8 @@ pub use header::Header;
 pub use io::{read_message, write_message};
 pub use json_pointer::{evaluate as eval_json_pointer, parse as parse_json_pointer};
 pub use message::Message;
-pub use server::{JsonTypedHandler, Router, Server};
+pub use server::{
+    IntoTypedResponse, JsonTypedHandler, LockError, Lockable, Middleware, Next, Router, Server,
+    TypedResponse,
+};
+pub use structs::{RepeStruct, StructError};

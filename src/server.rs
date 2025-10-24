@@ -2,6 +2,7 @@ use crate::constants::{BodyFormat, ErrorCode, QueryFormat, REPE_VERSION};
 use crate::error::RepeError;
 use crate::io::{read_message, write_message};
 use crate::message::{create_error_response_like, create_response, Message};
+use crate::structs::RepeStruct;
 use beve::from_slice as beve_from_slice;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -10,6 +11,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::io::{BufReader, BufWriter};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::Mutex;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -19,6 +21,53 @@ use std::time::Duration;
 
 pub trait HandlerErased: Send + Sync {
     fn handle(&self, req: &Message) -> Result<Message, RepeError>;
+}
+
+pub struct Next<'a> {
+    middlewares: &'a [Arc<dyn Middleware>],
+    handler: &'a dyn HandlerErased,
+}
+
+impl<'a> Next<'a> {
+    fn new(middlewares: &'a [Arc<dyn Middleware>], handler: &'a dyn HandlerErased) -> Self {
+        Self {
+            middlewares,
+            handler,
+        }
+    }
+
+    /// Continue to the next middleware (or final handler if this was the last middleware).
+    pub fn run(self, req: &Message) -> Result<Message, RepeError> {
+        if let Some((first, rest)) = self.middlewares.split_first() {
+            first.handle(req, Next::new(rest, self.handler))
+        } else {
+            self.handler.handle(req)
+        }
+    }
+}
+
+pub trait Middleware: Send + Sync {
+    fn handle(&self, req: &Message, next: Next<'_>) -> Result<Message, RepeError>;
+}
+
+impl<F> Middleware for F
+where
+    F: for<'a> Fn(&'a Message, Next<'a>) -> Result<Message, RepeError> + Send + Sync + 'static,
+{
+    fn handle(&self, req: &Message, next: Next<'_>) -> Result<Message, RepeError> {
+        (self)(req, next)
+    }
+}
+
+struct MiddlewarePipeline {
+    handler: Arc<dyn HandlerErased>,
+    middlewares: Arc<Vec<Arc<dyn Middleware>>>,
+}
+
+impl HandlerErased for MiddlewarePipeline {
+    fn handle(&self, req: &Message) -> Result<Message, RepeError> {
+        Next::new(self.middlewares.as_ref(), self.handler.as_ref()).run(req)
+    }
 }
 
 struct JsonHandler<F>(F)
@@ -51,17 +100,85 @@ where
     }
 }
 
+/// Wrapper that lets typed handlers override the response [`BodyFormat`].
+/// Use helpers like [`TypedResponse::json`] or [`TypedResponse::beve`] to keep call sites concise.
+pub struct TypedResponse<R> {
+    value: R,
+    format: BodyFormat,
+}
+
+impl<R> TypedResponse<R> {
+    pub fn new(value: R, format: BodyFormat) -> Self {
+        Self { value, format }
+    }
+
+    pub fn json(value: R) -> Self {
+        Self::new(value, BodyFormat::Json)
+    }
+
+    pub fn beve(value: R) -> Self {
+        Self::new(value, BodyFormat::Beve)
+    }
+
+    pub fn utf8(value: R) -> Self {
+        Self::new(value, BodyFormat::Utf8)
+    }
+
+    pub fn raw_binary(value: R) -> Self {
+        Self::new(value, BodyFormat::RawBinary)
+    }
+}
+
+pub trait IntoTypedResponse<R> {
+    fn into_typed_response(self) -> (R, BodyFormat);
+}
+
+impl<R> IntoTypedResponse<R> for R {
+    fn into_typed_response(self) -> (R, BodyFormat) {
+        (self, BodyFormat::Json)
+    }
+}
+
+impl<R> IntoTypedResponse<R> for TypedResponse<R> {
+    fn into_typed_response(self) -> (R, BodyFormat) {
+        (self.value, self.format)
+    }
+}
+
+pub trait TypedHandlerFn<T, R>: Send + Sync + 'static
+where
+    T: DeserializeOwned + Send + Sync + 'static,
+    R: Serialize + Send + Sync + 'static,
+{
+    type Response: IntoTypedResponse<R>;
+    fn call(&self, input: T) -> Result<Self::Response, (ErrorCode, String)>;
+}
+
+impl<T, R, S, F> TypedHandlerFn<T, R> for F
+where
+    T: DeserializeOwned + Send + Sync + 'static,
+    R: Serialize + Send + Sync + 'static,
+    S: IntoTypedResponse<R>,
+    F: Fn(T) -> Result<S, (ErrorCode, String)> + Send + Sync + 'static,
+{
+    type Response = S;
+
+    fn call(&self, input: T) -> Result<Self::Response, (ErrorCode, String)> {
+        (self)(input)
+    }
+}
+
 struct TypedHandler<T, R, F>(F, std::marker::PhantomData<(T, R)>)
 where
     T: DeserializeOwned + Send + Sync + 'static,
     R: Serialize + Send + Sync + 'static,
-    F: Fn(T) -> Result<R, (ErrorCode, String)> + Send + Sync + 'static;
+    F: TypedHandlerFn<T, R>;
 
 impl<T, R, F> HandlerErased for TypedHandler<T, R, F>
 where
     T: DeserializeOwned + Send + Sync + 'static,
     R: Serialize + Send + Sync + 'static,
-    F: Fn(T) -> Result<R, (ErrorCode, String)> + Send + Sync + 'static,
+    F: TypedHandlerFn<T, R>,
 {
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
         let t: T = match BodyFormat::try_from(req.header.body_format) {
@@ -78,22 +195,141 @@ where
                 ))
             }
         };
-        match (self.0)(t) {
-            Ok(r) => create_response(req, r, BodyFormat::Json),
+        match self.0.call(t) {
+            Ok(r) => {
+                let (value, format) = r.into_typed_response();
+                create_response(req, value, format)
+            }
             Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
         }
     }
 }
 
-#[derive(Default, Clone)]
+trait StructRouterEntry: Send + Sync {
+    fn handler_for(&self, path: &str) -> Option<Arc<dyn HandlerErased>>;
+}
+
+#[derive(Debug)]
+pub enum LockError {
+    Poisoned(String),
+    Other(String),
+}
+
+impl LockError {
+    pub fn poisoned(err: impl std::fmt::Display) -> Self {
+        Self::Poisoned(err.to_string())
+    }
+
+    pub fn other(message: impl Into<String>) -> Self {
+        Self::Other(message.into())
+    }
+}
+
+impl std::fmt::Display for LockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LockError::Poisoned(msg) | LockError::Other(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl std::error::Error for LockError {}
+
+pub trait Lockable<T: ?Sized>: Send + Sync {
+    type Guard<'a>: std::ops::DerefMut<Target = T> + 'a
+    where
+        Self: 'a;
+
+    fn lock(&self) -> Result<Self::Guard<'_>, LockError>;
+}
+
+impl<T: ?Sized + Send> Lockable<T> for Mutex<T> {
+    type Guard<'a>
+        = std::sync::MutexGuard<'a, T>
+    where
+        Self: 'a;
+
+    fn lock(&self) -> Result<Self::Guard<'_>, LockError> {
+        std::sync::Mutex::lock(self).map_err(LockError::from)
+    }
+}
+
+impl<G> From<std::sync::PoisonError<G>> for LockError {
+    fn from(err: std::sync::PoisonError<G>) -> Self {
+        LockError::Poisoned(err.to_string())
+    }
+}
+
+impl<T: ?Sized + Send + Sync> Lockable<T> for std::sync::RwLock<T> {
+    type Guard<'a>
+        = std::sync::RwLockWriteGuard<'a, T>
+    where
+        Self: 'a;
+
+    fn lock(&self) -> Result<Self::Guard<'_>, LockError> {
+        std::sync::RwLock::write(self).map_err(LockError::from)
+    }
+}
+
+impl<T: ?Sized + Send> Lockable<T> for tokio::sync::Mutex<T> {
+    type Guard<'a>
+        = tokio::sync::MutexGuard<'a, T>
+    where
+        Self: 'a;
+
+    fn lock(&self) -> Result<Self::Guard<'_>, LockError> {
+        Ok(self.blocking_lock())
+    }
+}
+
+impl<T: ?Sized + Send + Sync> Lockable<T> for tokio::sync::RwLock<T> {
+    type Guard<'a>
+        = tokio::sync::RwLockWriteGuard<'a, T>
+    where
+        Self: 'a;
+
+    fn lock(&self) -> Result<Self::Guard<'_>, LockError> {
+        Ok(self.blocking_write())
+    }
+}
+
+#[cfg(feature = "parking-lot")]
+impl<T: ?Sized + Send> Lockable<T> for parking_lot::Mutex<T> {
+    type Guard<'a>
+        = parking_lot::MutexGuard<'a, T>
+    where
+        Self: 'a;
+
+    fn lock(&self) -> Result<Self::Guard<'_>, LockError> {
+        Ok(self.lock())
+    }
+}
+
+#[cfg(feature = "parking-lot")]
+impl<T: ?Sized + Send + Sync> Lockable<T> for parking_lot::RwLock<T> {
+    type Guard<'a>
+        = parking_lot::RwLockWriteGuard<'a, T>
+    where
+        Self: 'a;
+
+    fn lock(&self) -> Result<Self::Guard<'_>, LockError> {
+        Ok(self.write())
+    }
+}
+
+#[derive(Clone)]
 pub struct Router {
     inner: Arc<HashMap<String, Arc<dyn HandlerErased>>>,
+    structs: Arc<Vec<Arc<dyn StructRouterEntry>>>,
+    middlewares: Arc<Vec<Arc<dyn Middleware>>>,
 }
 
 impl Router {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(HashMap::new()),
+            structs: Arc::new(Vec::new()),
+            middlewares: Arc::new(Vec::new()),
         }
     }
 
@@ -112,6 +348,24 @@ impl Router {
         self
     }
 
+    /// Attach a middleware that runs before handlers and can short-circuit requests.
+    pub fn with_middleware(mut self, middleware: impl Middleware + 'static) -> Self {
+        self.register_middleware(middleware);
+        self
+    }
+
+    /// Register middleware in-place so callers can retain the shared handle.
+    pub fn register_middleware(
+        &mut self,
+        middleware: impl Middleware + 'static,
+    ) -> Arc<dyn Middleware> {
+        let mut list = (*self.middlewares).clone();
+        let arc: Arc<dyn Middleware> = Arc::new(middleware);
+        list.push(arc.clone());
+        self.middlewares = Arc::new(list);
+        arc
+    }
+
     /// Backwards-compatible alias for `with_json`.
     pub fn with(
         self,
@@ -121,12 +375,14 @@ impl Router {
         self.with_json(path, handler)
     }
 
-    /// Add a typed handler that auto-deserializes JSON into `T` and serializes `R`.
+    /// Add a typed handler that auto-deserializes JSON/UTF-8/BEVE into `T` and serializes `R`.
+    /// Return `Ok(value)` for JSON responses or wrap results with [`TypedResponse`] to pick a
+    /// different [`BodyFormat`].
     pub fn with_typed<T, R, F>(mut self, path: &str, f: F) -> Self
     where
         T: DeserializeOwned + Send + Sync + 'static,
         R: Serialize + Send + Sync + 'static,
-        F: Fn(T) -> Result<R, (ErrorCode, String)> + Send + Sync + 'static,
+        F: TypedHandlerFn<T, R>,
     {
         let mut map = self.inner.as_ref().clone();
         map.insert(
@@ -153,8 +409,241 @@ impl Router {
         self
     }
 
+    /// Register a struct that implements [`RepeStruct`].
+    ///
+    /// The struct is wrapped in an [`Arc`] of any lock implementing [`Lockable`] so that the
+    /// caller can retain shared ownership and mutate state while the router serves requests.
+    /// This includes `std::sync::Mutex`/`RwLock`, `tokio::sync::Mutex`/`RwLock`, and (with the
+    /// `parking-lot` feature) `parking_lot` synchronization primitives.
+    pub fn with_struct_shared<T, L>(mut self, root: &str, shared: Arc<L>) -> Self
+    where
+        T: RepeStruct + 'static,
+        L: Lockable<T> + 'static,
+    {
+        self.register_struct_shared::<T, L>(root, shared);
+        self
+    }
+
+    /// Register a struct in-place and get back the shared handle without breaking builder chains.
+    pub fn register_struct_shared<T, L>(&mut self, root: &str, shared: Arc<L>) -> Arc<L>
+    where
+        T: RepeStruct + 'static,
+        L: Lockable<T> + 'static,
+    {
+        let mut entries = (*self.structs).clone();
+        entries.push(Arc::new(RegisteredStruct::<T, L>::new(
+            root,
+            Arc::clone(&shared),
+        )));
+        self.structs = Arc::new(entries);
+        shared
+    }
+
+    /// Convenience helper to register an owned struct value. Returns the shared handle so callers
+    /// can keep interacting with the registered object.
+    pub fn with_struct<T>(mut self, root: &str, value: T) -> (Self, Arc<Mutex<T>>)
+    where
+        T: RepeStruct + 'static,
+    {
+        let shared = self.register_struct(root, value);
+        (self, shared)
+    }
+
+    /// Builder-friendly helper to register owned structs while keeping the router.
+    pub fn register_struct<T>(&mut self, root: &str, value: T) -> Arc<Mutex<T>>
+    where
+        T: RepeStruct + 'static,
+    {
+        let shared = Arc::new(Mutex::new(value));
+        self.register_struct_shared::<T, Mutex<T>>(root, Arc::clone(&shared));
+        shared
+    }
+
     pub fn get(&self, path: &str) -> Option<Arc<dyn HandlerErased>> {
-        self.inner.get(path).cloned()
+        let handler = if let Some(handler) = self.inner.get(path) {
+            Some(handler.clone())
+        } else {
+            self.structs
+                .iter()
+                .find_map(|entry| entry.handler_for(path))
+        };
+        handler.map(|h| self.wrap_handler(h))
+    }
+
+    fn wrap_handler(&self, handler: Arc<dyn HandlerErased>) -> Arc<dyn HandlerErased> {
+        if self.middlewares.is_empty() {
+            handler
+        } else {
+            Arc::new(MiddlewarePipeline {
+                handler,
+                middlewares: Arc::clone(&self.middlewares),
+            })
+        }
+    }
+}
+
+impl Default for Router {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+struct RegisteredStruct<T, L>
+where
+    T: RepeStruct + 'static,
+    L: Lockable<T> + 'static,
+{
+    root: String,
+    shared: Arc<L>,
+    phantom: std::marker::PhantomData<T>,
+}
+
+impl<T, L> RegisteredStruct<T, L>
+where
+    T: RepeStruct + 'static,
+    L: Lockable<T> + 'static,
+{
+    fn new(root: &str, shared: Arc<L>) -> Self {
+        let normalized = if root.is_empty() || root == "/" {
+            String::new()
+        } else if root.starts_with('/') {
+            root.to_string()
+        } else {
+            format!("/{}", root)
+        };
+        Self {
+            root: normalized,
+            shared,
+            phantom: std::marker::PhantomData,
+        }
+    }
+
+    fn relative_pointer<'a>(&'a self, path: &'a str) -> Option<&'a str> {
+        if self.root.is_empty() {
+            Some(path)
+        } else if path == self.root {
+            Some("")
+        } else if path.starts_with(&self.root) {
+            let remainder = &path[self.root.len()..];
+            if remainder.starts_with('/') {
+                Some(remainder)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+}
+
+impl<T, L> StructRouterEntry for RegisteredStruct<T, L>
+where
+    T: RepeStruct + 'static,
+    L: Lockable<T> + 'static,
+{
+    fn handler_for(&self, path: &str) -> Option<Arc<dyn HandlerErased>> {
+        let relative = self.relative_pointer(path)?;
+        let tokens = crate::json_pointer::parse(relative);
+        let full_path = if path.is_empty() {
+            String::from("")
+        } else {
+            path.to_string()
+        };
+        Some(Arc::new(StructRequestHandler::<T, L>::new(
+            self.shared.clone(),
+            tokens,
+            full_path,
+        )))
+    }
+}
+
+struct StructRequestHandler<T, L>
+where
+    T: RepeStruct + 'static,
+    L: Lockable<T> + 'static,
+{
+    shared: Arc<L>,
+    segments: Vec<String>,
+    full_path: String,
+    phantom: std::marker::PhantomData<T>,
+}
+
+impl<T, L> StructRequestHandler<T, L>
+where
+    T: RepeStruct + 'static,
+    L: Lockable<T> + 'static,
+{
+    fn new(shared: Arc<L>, segments: Vec<String>, full_path: String) -> Self {
+        Self {
+            shared,
+            segments,
+            full_path,
+            phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T, L> HandlerErased for StructRequestHandler<T, L>
+where
+    T: RepeStruct + 'static,
+    L: Lockable<T> + 'static,
+{
+    fn handle(&self, req: &Message) -> Result<Message, RepeError> {
+        let body = if req.body.is_empty() {
+            None
+        } else {
+            match BodyFormat::try_from(req.header.body_format) {
+                Ok(BodyFormat::Json) => {
+                    Some(serde_json::from_slice::<Value>(&req.body).map_err(RepeError::from)?)
+                }
+                Ok(BodyFormat::Utf8) => {
+                    Some(serde_json::from_str::<Value>(&req.body_utf8()).map_err(RepeError::from)?)
+                }
+                Ok(BodyFormat::Beve) => Some(beve_from_slice(&req.body)?),
+                Ok(BodyFormat::RawBinary) | Err(_) => {
+                    return Ok(create_error_response_like(
+                        req,
+                        ErrorCode::InvalidBody,
+                        format!(
+                            "struct handler `{}` requires JSON or BEVE body, got format {}",
+                            self.full_path, req.header.body_format
+                        ),
+                    ))
+                }
+            }
+        };
+
+        let mut guard = match self.shared.lock() {
+            Ok(g) => g,
+            Err(err) => {
+                let detail = match err {
+                    LockError::Poisoned(msg) => {
+                        format!("struct handler `{}` lock poisoned: {}", self.full_path, msg)
+                    }
+                    LockError::Other(msg) => {
+                        format!("struct handler `{}` lock error: {}", self.full_path, msg)
+                    }
+                };
+                return Ok(create_error_response_like(
+                    req,
+                    ErrorCode::ParseError,
+                    detail,
+                ));
+            }
+        };
+
+        let mut seg_refs = Vec::with_capacity(self.segments.len());
+        for segment in &self.segments {
+            seg_refs.push(segment.as_str());
+        }
+
+        match guard.repe_handle(&seg_refs, body) {
+            Ok(result) => {
+                let value = result.unwrap_or(Value::Null);
+                create_response(req, value, BodyFormat::Json)
+            }
+            Err(err) => Ok(create_error_response_like(req, err.code(), err.to_string())),
+        }
     }
 }
 
@@ -337,6 +826,68 @@ mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
     use std::io::Read;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn middleware_runs_for_registered_handlers() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_middleware = Arc::clone(&hits);
+        let router = Router::new()
+            .with_middleware(move |req: &Message, next: Next<'_>| {
+                assert_eq!(req.query_str().unwrap(), "/echo");
+                hits_for_middleware.fetch_add(1, Ordering::SeqCst);
+                next.run(req)
+            })
+            .with_json("/echo", |v: Value| Ok(v));
+
+        let request = Message::builder()
+            .id(7)
+            .query_str("/echo")
+            .query_format(QueryFormat::JsonPointer)
+            .body_json(&serde_json::json!({"payload": 42}))
+            .unwrap()
+            .build();
+
+        let handler = router.get("/echo").expect("handler to exist");
+        let response = handler.handle(&request).unwrap();
+        assert_eq!(response.header.ec, ErrorCode::Ok as u32);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn middleware_can_short_circuit_requests() {
+        let handler_called = Arc::new(AtomicBool::new(false));
+        let handler_called_inner = Arc::clone(&handler_called);
+
+        let router = Router::new()
+            .with_middleware(|req: &Message, _next: Next<'_>| {
+                create_response(
+                    req,
+                    serde_json::json!({"status": "blocked"}),
+                    BodyFormat::Json,
+                )
+            })
+            .with_json("/blocked", move |_v: Value| {
+                handler_called_inner.store(true, Ordering::SeqCst);
+                Ok(serde_json::json!({"status": "allowed"}))
+            });
+
+        let request = Message::builder()
+            .id(11)
+            .query_str("/blocked")
+            .query_format(QueryFormat::JsonPointer)
+            .body_json(&serde_json::json!({}))
+            .unwrap()
+            .build();
+
+        let handler = router.get("/blocked").expect("handler to exist");
+        let response = handler.handle(&request).unwrap();
+
+        assert_eq!(response.header.ec, ErrorCode::Ok as u32);
+        let body: serde_json::Value = response.json_body().unwrap();
+        assert_eq!(body.get("status").and_then(|v| v.as_str()), Some("blocked"));
+        assert!(!handler_called.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn typed_handler_accepts_beve_payload() {
@@ -368,28 +919,31 @@ mod tests {
             tags: std::collections::HashMap<String, String>,
         }
 
-        let router = Router::new().with_typed::<SensorFrame, Aggregate, _>("/aggregate", |frame| {
-            let mut total = 0.0;
-            let mut count = 0usize;
-            for stream in &frame.streams {
-                for value in &stream.samples {
-                    total += *value;
-                    count += 1;
+        let router = Router::new().with_typed::<SensorFrame, Aggregate, _>(
+            "/aggregate",
+            |frame: SensorFrame| {
+                let mut total = 0.0;
+                let mut count = 0usize;
+                for stream in &frame.streams {
+                    for value in &stream.samples {
+                        total += *value;
+                        count += 1;
+                    }
                 }
-            }
-            let average = if count == 0 {
-                0.0
-            } else {
-                total / count as f64
-            };
-            Ok(Aggregate {
-                device: frame.device.id,
-                location: frame.device.location,
-                sample_count: count,
-                average,
-                tags: frame.tags,
-            })
-        });
+                let average = if count == 0 {
+                    0.0
+                } else {
+                    total / count as f64
+                };
+                Ok(Aggregate {
+                    device: frame.device.id,
+                    location: frame.device.location,
+                    sample_count: count,
+                    average,
+                    tags: frame.tags,
+                })
+            },
+        );
 
         let mut tags = std::collections::HashMap::new();
         tags.insert("site".to_string(), "warehouse".to_string());
@@ -456,7 +1010,7 @@ mod tests {
 
         let router = Router::new()
             .with_json("/echo", |v: Value| Ok(v))
-            .with_typed::<In, Out, _>("/sum", |inp| Ok(Out { sum: inp.x + inp.y }));
+            .with_typed::<In, Out, _>("/sum", |inp: In| Ok(Out { sum: inp.x + inp.y }));
 
         let msg = Message::builder()
             .id(1)
@@ -481,6 +1035,17 @@ mod tests {
             Ok(serde_json::json!({"sum": a + b}))
         });
 
+        #[derive(Serialize, Deserialize)]
+        struct AddReq {
+            a: i64,
+            b: i64,
+        }
+
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct AddResp {
+            sum: i64,
+        }
+
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let router_clone = router.clone();
@@ -501,6 +1066,16 @@ mod tests {
             .call_json("/add", &serde_json::json!({"a": 3, "b": 4}))
             .unwrap();
         assert_eq!(out["sum"], 7);
+
+        let typed: AddResp = client
+            .call_typed_json("/add", &AddReq { a: 5, b: 6 })
+            .unwrap();
+        assert_eq!(typed.sum, 11);
+
+        let beve: AddResp = client
+            .call_typed_beve("/add", &AddReq { a: 1, b: 2 })
+            .unwrap();
+        assert_eq!(beve.sum, 3);
 
         // Close client to end the server loop and join
         drop(client);
@@ -536,11 +1111,9 @@ mod tests {
             alert_count: usize,
         }
 
-        struct BeveHandler;
-
-        impl HandlerErased for BeveHandler {
-            fn handle(&self, req: &Message) -> Result<Message, RepeError> {
-                let frame: SensorFrame = req.beve_body()?;
+        let router = Router::new().with_typed::<SensorFrame, Summary, _>(
+            "/telemetry",
+            |frame: SensorFrame| {
                 let mut max_sample = f64::MIN;
                 let mut total = 0.0f64;
                 let mut count = 0usize;
@@ -567,20 +1140,9 @@ mod tests {
                     average_sample: avg,
                     alert_count: frame.alerts.len(),
                 };
-                create_response(req, summary, BodyFormat::Beve)
-            }
-        }
-
-        let router = {
-            let mut map = HashMap::new();
-            map.insert(
-                "/telemetry".to_string(),
-                Arc::new(BeveHandler) as Arc<dyn HandlerErased>,
-            );
-            Router {
-                inner: Arc::new(map),
-            }
-        };
+                Ok(TypedResponse::beve(summary))
+            },
+        );
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();

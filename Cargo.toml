@@ -19,12 +19,18 @@ include = [
 ]
 exclude = ["Cargo.toml.orig"]
 
+[features]
+default = []
+parking-lot = ["dep:parking_lot"]
+
 [dependencies]
 beve = "0.1"
 serde = { version = "1", features = ["derive" ] }
 serde_json = "1"
 thiserror = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "io-util", "sync"] }
+repe-derive = { path = "repe-derive" }
+parking_lot = { version = "0.12", optional = true }
 
 [dev-dependencies]
 rand = "0.8"

@@ -1,4 +1,5 @@
 use repe::*;
+use serde::{Deserialize, Serialize};
 use std::io::{BufReader, BufWriter, Write};
 use std::net::TcpListener;
 use std::thread;
@@ -41,6 +42,16 @@ fn client_detects_id_mismatch() {
 
 #[test]
 fn client_notify_sets_flag_and_does_not_wait_for_response() {
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    struct NotifyPayload {
+        ok: bool,
+    }
+
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    struct BevePayload {
+        value: i32,
+    }
+
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let srv = thread::spawn(move || {
@@ -51,12 +62,32 @@ fn client_notify_sets_flag_and_does_not_wait_for_response() {
         assert_eq!(msg.query_utf8(), "/notify");
         let body: serde_json::Value = serde_json::from_slice(&msg.body).unwrap();
         assert_eq!(body["ok"], true);
-        // No response sent back; ensure the client was a pure notify.
+        let typed_msg = read_message(&mut reader).unwrap();
+        assert_eq!(typed_msg.header.notify, 1);
+        assert_eq!(typed_msg.query_utf8(), "/notify_typed_json");
+        let typed_body: NotifyPayload = serde_json::from_slice(&typed_msg.body).unwrap();
+        assert_eq!(typed_body, NotifyPayload { ok: true });
+
+        let beve_msg = read_message(&mut reader).unwrap();
+        assert_eq!(beve_msg.header.notify, 1);
+        assert_eq!(beve_msg.header.body_format, BodyFormat::Beve as u16);
+        assert_eq!(beve_msg.query_utf8(), "/notify_beve");
+        let beve_body: BevePayload = beve_msg.beve_body().unwrap();
+        assert_eq!(beve_body, BevePayload { value: 42 });
+        // No response sent back; ensure the client was a pure notify for every request.
     });
 
     let mut client = client::Client::connect(addr).unwrap();
     client
         .notify_json("/notify", &serde_json::json!({"ok": true}))
+        .unwrap();
+
+    client
+        .notify_typed_json("/notify_typed_json", &NotifyPayload { ok: true })
+        .unwrap();
+
+    client
+        .notify_typed_beve("/notify_beve", &BevePayload { value: 42 })
         .unwrap();
 
     drop(client);
