@@ -5,6 +5,10 @@ use repe::{Message, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex, RwLock};
+use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
+
+#[cfg(feature = "parking-lot")]
+use parking_lot::RwLock as ParkingRwLock;
 
 #[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
 #[repe(methods(
@@ -379,7 +383,91 @@ fn struct_shared_accepts_rwlock() {
         .unwrap();
     assert_eq!(parse_body(&set_name), Value::Null);
 
-    assert_eq!(shared.read().unwrap().name, "Updated");
+    assert_eq!(shared.read().unwrap().name.as_str(), "Updated");
+}
+
+#[test]
+fn struct_shared_accepts_tokio_mutex() {
+    let shared = Arc::new(TokioMutex::new(ExampleFunctions::default()));
+    {
+        let mut guard = shared.blocking_lock();
+        guard.set_name("Initial".into());
+    }
+
+    let router = Router::new().with_struct_shared("", shared.clone());
+
+    let get_name = router
+        .get("/get_name")
+        .unwrap()
+        .handle(&request_empty("/get_name"))
+        .unwrap();
+    assert_eq!(parse_body(&get_name), Value::String("Initial".into()));
+
+    let set_name = router
+        .get("/set_name")
+        .unwrap()
+        .handle(&request_json("/set_name", &json!("Updated")))
+        .unwrap();
+    assert_eq!(parse_body(&set_name), Value::Null);
+
+    assert_eq!(shared.blocking_lock().name.as_str(), "Updated");
+}
+
+#[test]
+fn struct_shared_accepts_tokio_rwlock() {
+    let shared = Arc::new(TokioRwLock::new(ExampleFunctions::default()));
+    {
+        let mut guard = shared.blocking_write();
+        guard.set_name("Initial".into());
+    }
+
+    let router = Router::new().with_struct_shared("", shared.clone());
+
+    let get_name = router
+        .get("/get_name")
+        .unwrap()
+        .handle(&request_empty("/get_name"))
+        .unwrap();
+    assert_eq!(parse_body(&get_name), Value::String("Initial".into()));
+
+    let set_name = router
+        .get("/set_name")
+        .unwrap()
+        .handle(&request_json("/set_name", &json!("Updated")))
+        .unwrap();
+    assert_eq!(parse_body(&set_name), Value::Null);
+
+    let guard = shared.blocking_read();
+    assert_eq!(guard.name.as_str(), "Updated");
+}
+
+#[cfg(feature = "parking-lot")]
+#[test]
+fn struct_shared_accepts_parking_lot_rwlock() {
+    let shared = Arc::new(ParkingRwLock::new(ExampleFunctions::default()));
+    {
+        let mut guard = shared.write();
+        guard.set_name("Initial".into());
+    }
+
+    let router = Router::new().with_struct_shared("", shared.clone());
+
+    let get_name = router
+        .get("/get_name")
+        .unwrap()
+        .handle(&request_empty("/get_name"))
+        .unwrap();
+    assert_eq!(parse_body(&get_name), Value::String("Initial".into()));
+
+    let set_name = router
+        .get("/set_name")
+        .unwrap()
+        .handle(&request_json("/set_name", &json!("Updated")))
+        .unwrap();
+    assert_eq!(parse_body(&set_name), Value::Null);
+
+    let guard = shared.read();
+    assert_eq!(guard.name.as_str(), "Updated");
 }
 
 #[test]

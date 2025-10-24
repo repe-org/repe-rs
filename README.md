@@ -195,6 +195,10 @@ let device_handle = router.register_struct("/device", Device::default());
 // - `/device/status` with body "offline" writes the field and returns null
 // - `/device/metrics/temperature` reads the nested value (21.5)
 // - `/device/reset_metrics` zeroes out the metrics
+
+Router handles `Arc<L>` for any lock implementing `repe::Lockable<T>`, so you can swap in
+`tokio::sync::Mutex`/`RwLock` (via their `blocking_*` APIs) or enable the optional
+`parking-lot` feature to use `parking_lot::Mutex`/`RwLock` without extra wrapper types.
 ```
 
 Client

@@ -224,6 +224,52 @@ impl<T: ?Sized + Send + Sync> Lockable<T> for std::sync::RwLock<T> {
     }
 }
 
+impl<T: ?Sized + Send> Lockable<T> for tokio::sync::Mutex<T> {
+    type Guard<'a>
+        = tokio::sync::MutexGuard<'a, T>
+    where
+        Self: 'a;
+
+    fn lock(&self) -> Result<Self::Guard<'_>, LockError> {
+        Ok(self.blocking_lock())
+    }
+}
+
+impl<T: ?Sized + Send + Sync> Lockable<T> for tokio::sync::RwLock<T> {
+    type Guard<'a>
+        = tokio::sync::RwLockWriteGuard<'a, T>
+    where
+        Self: 'a;
+
+    fn lock(&self) -> Result<Self::Guard<'_>, LockError> {
+        Ok(self.blocking_write())
+    }
+}
+
+#[cfg(feature = "parking-lot")]
+impl<T: ?Sized + Send> Lockable<T> for parking_lot::Mutex<T> {
+    type Guard<'a>
+        = parking_lot::MutexGuard<'a, T>
+    where
+        Self: 'a;
+
+    fn lock(&self) -> Result<Self::Guard<'_>, LockError> {
+        Ok(self.lock())
+    }
+}
+
+#[cfg(feature = "parking-lot")]
+impl<T: ?Sized + Send + Sync> Lockable<T> for parking_lot::RwLock<T> {
+    type Guard<'a>
+        = parking_lot::RwLockWriteGuard<'a, T>
+    where
+        Self: 'a;
+
+    fn lock(&self) -> Result<Self::Guard<'_>, LockError> {
+        Ok(self.write())
+    }
+}
+
 #[derive(Clone)]
 pub struct Router {
     inner: Arc<HashMap<String, Arc<dyn HandlerErased>>>,
@@ -300,6 +346,8 @@ impl Router {
     ///
     /// The struct is wrapped in an [`Arc`] of any lock implementing [`Lockable`] so that the
     /// caller can retain shared ownership and mutate state while the router serves requests.
+    /// This includes `std::sync::Mutex`/`RwLock`, `tokio::sync::Mutex`/`RwLock`, and (with the
+    /// `parking-lot` feature) `parking_lot` synchronization primitives.
     pub fn with_struct_shared<T, L>(mut self, root: &str, shared: Arc<L>) -> Self
     where
         T: RepeStruct + 'static,
