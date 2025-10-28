@@ -685,6 +685,7 @@ pub struct Server {
     read_timeout: Option<Duration>,
     write_timeout: Option<Duration>,
     running: Arc<AtomicBool>,
+    tcp_nodelay: bool,
 }
 
 impl Server {
@@ -694,6 +695,7 @@ impl Server {
             read_timeout: None,
             write_timeout: None,
             running: Arc::new(AtomicBool::new(false)),
+            tcp_nodelay: true,
         }
     }
 
@@ -703,6 +705,13 @@ impl Server {
     }
     pub fn write_timeout(mut self, d: Option<Duration>) -> Self {
         self.write_timeout = d;
+        self
+    }
+
+    /// Control whether accepted connections call `set_nodelay`.
+    /// `true` disables Nagle's algorithm (the default); `false` leaves it enabled.
+    pub fn tcp_nodelay(mut self, enabled: bool) -> Self {
+        self.tcp_nodelay = enabled;
         self
     }
 
@@ -727,8 +736,9 @@ impl Server {
             let running = self.running.clone();
             let rt = self.read_timeout;
             let wt = self.write_timeout;
+            let nodelay = self.tcp_nodelay;
             thread::spawn(move || {
-                if let Err(e) = handle_connection(stream, router, running, rt, wt) {
+                if let Err(e) = handle_connection(stream, router, running, rt, wt, nodelay) {
                     eprintln!("[repe] connection error: {e}");
                 }
             });
@@ -747,7 +757,9 @@ fn handle_connection(
     running: Arc<AtomicBool>,
     read_timeout: Option<Duration>,
     write_timeout: Option<Duration>,
+    tcp_nodelay: bool,
 ) -> Result<(), RepeError> {
+    stream.set_nodelay(tcp_nodelay)?;
     stream.set_read_timeout(read_timeout)?;
     stream.set_write_timeout(write_timeout)?;
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -1057,6 +1069,7 @@ mod tests {
                 Arc::new(AtomicBool::new(true)),
                 None,
                 None,
+                true,
             )
         });
 
@@ -1152,7 +1165,7 @@ mod tests {
 
         let srv = thread::spawn(move || {
             let (stream, _addr) = listener.accept().unwrap();
-            handle_connection(stream, router_clone, running_worker, None, None).unwrap();
+            handle_connection(stream, router_clone, running_worker, None, None, true).unwrap();
         });
 
         let frame = SensorFrame {
@@ -1237,6 +1250,7 @@ mod tests {
                 Arc::new(AtomicBool::new(true)),
                 None,
                 None,
+                true,
             )
         });
 
@@ -1269,6 +1283,7 @@ mod tests {
                 Arc::new(AtomicBool::new(true)),
                 None,
                 None,
+                true,
             )
         });
 
@@ -1316,6 +1331,7 @@ mod tests {
                 Arc::new(AtomicBool::new(true)),
                 None,
                 None,
+                true,
             )
         });
 
@@ -1389,6 +1405,7 @@ mod tests {
                 Arc::new(AtomicBool::new(true)),
                 None,
                 None,
+                true,
             )
         });
 
@@ -1448,7 +1465,7 @@ mod tests {
         let router_clone = router.clone();
         let srv = thread::spawn(move || {
             let (stream, _addr) = listener.accept().unwrap();
-            handle_connection(stream, router_clone, runner, None, None)
+            handle_connection(stream, router_clone, runner, None, None, true)
         });
 
         let mut stream = TcpStream::connect(addr).unwrap();
