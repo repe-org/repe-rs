@@ -15,7 +15,7 @@ struct AddResp {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = AsyncClient::connect("127.0.0.1:8082").await?;
+    let client = AsyncClient::connect("127.0.0.1:8082").await?;
 
     let pong = client.call_json("/ping", &json!({})).await?;
     println!("/ping => {}", pong);

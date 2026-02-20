@@ -246,6 +246,18 @@ let beve_sum: AddResp = client.call_typed_beve("/add", &AddReq { a: 4, b: 5 })?;
 assert_eq!(beve_sum.sum, 9);
 ```
 
+Multiplexed calls, timeouts, and batching
+
+- `Client` and `AsyncClient` can run multiple in-flight requests on one connection.
+- Clone the client handle and issue calls concurrently; responses are matched by request `id` even if the server replies out of order.
+- Use per-call timeout helpers:
+  - `call_json_with_timeout`
+  - `call_typed_json_with_timeout`
+  - `call_typed_beve_with_timeout`
+- Use batch helpers for JSON calls:
+  - `batch_json(Vec<(String, Value)>)`
+  - `batch_json_with_timeout(Vec<(String, Value)>, Duration)`
+
 Notify semantics
 
 - If a request is marked `notify = true`, the server will process the handler but will not send a response.
@@ -261,7 +273,8 @@ Error handling
   - JSON deserialization/serialization issues → `ParseError`.
   - Missing routes → `MethodNotFound` with the requested path in the message.
   - Application failures from handlers → return `(ErrorCode, String)` to control both fields.
-- Clients also surface mismatched response IDs as `RepeError::ResponseIdMismatch` and mismatched protocol versions as `RepeError::VersionMismatch`.
+- Clients surface mismatched protocol versions as `RepeError::VersionMismatch`.
+- Responses with unknown request IDs are treated as protocol violations unless they match a recently timed-out request ID (late response), in which case they are dropped.
 
 Async usage (minimal end‑to‑end)
 
