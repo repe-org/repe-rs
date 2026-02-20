@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 type PendingSender = mpsc::Sender<Result<Message, RepeError>>;
 type PendingRequests = HashMap<u64, PendingSender>;
 type TimedOutRequests = HashMap<u64, Instant>;
+type BatchResults = Vec<Option<Result<Value, RepeError>>>;
 
 const TIMED_OUT_REQUEST_TOMBSTONE_TTL: Duration = Duration::from_secs(30);
 const MAX_BATCH_WORKERS: usize = 64;
@@ -222,7 +223,7 @@ impl Client {
             .map(|(index, (path, body))| (index, path, body))
             .collect();
         let work_queue = Arc::new(Mutex::new(queue));
-        let results: Arc<Mutex<Vec<Option<Result<Value, RepeError>>>>> = Arc::new(Mutex::new(
+        let results: Arc<Mutex<BatchResults>> = Arc::new(Mutex::new(
             std::iter::repeat_with(|| None)
                 .take(request_count)
                 .collect(),
@@ -363,29 +364,27 @@ impl Client {
         receiver: mpsc::Receiver<Result<Message, RepeError>>,
         timeout: Option<Duration>,
     ) -> Result<Message, RepeError> {
-        let received = match timeout {
+        match timeout {
             Some(duration) => match receiver.recv_timeout(duration) {
                 Ok(value) => value,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     self.remove_pending(id);
                     self.mark_timed_out_request(id);
-                    return Err(request_timeout_error(id, duration));
+                    Err(request_timeout_error(id, duration))
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     self.remove_pending(id);
-                    return Err(response_channel_closed_error(id));
+                    Err(response_channel_closed_error(id))
                 }
             },
             None => match receiver.recv() {
                 Ok(value) => value,
                 Err(_) => {
                     self.remove_pending(id);
-                    return Err(response_channel_closed_error(id));
+                    Err(response_channel_closed_error(id))
                 }
             },
-        };
-
-        received
+        }
     }
 
     fn write_request(&self, msg: &Message) -> Result<(), RepeError> {
@@ -647,7 +646,7 @@ fn batch_worker_count(request_count: usize) -> usize {
     let parallelism = thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(1);
-    let cap = parallelism.saturating_mul(4).max(1).min(MAX_BATCH_WORKERS);
+    let cap = parallelism.saturating_mul(4).clamp(1, MAX_BATCH_WORKERS);
     request_count.min(cap)
 }
 
