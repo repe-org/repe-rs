@@ -308,8 +308,8 @@ impl AsyncClient {
                     return Err(response_channel_closed_error(id));
                 }
                 Err(_) => {
-                    self.remove_pending(id).await;
                     self.mark_timed_out_request(id).await;
+                    self.remove_pending(id).await;
                     return Err(request_timeout_error(id, duration));
                 }
             },

@@ -368,8 +368,8 @@ impl Client {
             Some(duration) => match receiver.recv_timeout(duration) {
                 Ok(value) => value,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    self.remove_pending(id);
                     self.mark_timed_out_request(id);
+                    self.remove_pending(id);
                     Err(request_timeout_error(id, duration))
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
