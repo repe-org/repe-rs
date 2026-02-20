@@ -198,33 +198,3 @@ fn sync_client_ignores_late_response_for_timed_out_request() {
 
     server.join().unwrap();
 }
-
-#[test]
-fn sync_client_read_timeout_does_not_stop_response_loop() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    let server = thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        let mut writer = BufWriter::new(stream);
-
-        let req = read_message(&mut reader).unwrap();
-        let response = json_response_for(&req, &json!({"path": req.query_utf8()}));
-        write_message(&mut writer, &response).unwrap();
-        writer.flush().unwrap();
-    });
-
-    let client = Client::connect(addr).unwrap();
-    client
-        .set_read_timeout(Some(Duration::from_millis(20)))
-        .unwrap();
-    thread::sleep(Duration::from_millis(120));
-
-    let out = client
-        .call_json_with_timeout("/after_idle", &json!({}), Duration::from_millis(300))
-        .unwrap();
-    assert_eq!(out["path"], "/after_idle");
-
-    server.join().unwrap();
-}

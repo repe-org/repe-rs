@@ -76,15 +76,6 @@ impl Client {
         Ok(Self { inner })
     }
 
-    pub fn set_read_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
-        let writer = self
-            .inner
-            .writer
-            .lock()
-            .map_err(|_| std::io::Error::other("client writer lock poisoned"))?;
-        writer.get_ref().set_read_timeout(d)
-    }
-
     pub fn set_write_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
         let writer = self
             .inner
@@ -455,9 +446,7 @@ fn spawn_response_loop(mut reader: BufReader<TcpStream>, inner: std::sync::Weak<
             let response = match read_message(&mut reader) {
                 Ok(message) => message,
                 Err(RepeError::Io(ref io_err))
-                    if io_err.kind() == ErrorKind::TimedOut
-                        || io_err.kind() == ErrorKind::WouldBlock
-                        || io_err.kind() == ErrorKind::Interrupted =>
+                    if io_err.kind() == ErrorKind::Interrupted =>
                 {
                     continue;
                 }
