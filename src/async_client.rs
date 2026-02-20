@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Instant;
 use tokio::io::AsyncWriteExt;
 use tokio::io::{BufReader, BufWriter};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -21,9 +20,6 @@ use tokio::time::{Duration, timeout};
 
 type PendingSender = oneshot::Sender<Result<Message, RepeError>>;
 type PendingRequests = HashMap<u64, PendingSender>;
-type TimedOutRequests = HashMap<u64, Instant>;
-
-const TIMED_OUT_REQUEST_TOMBSTONE_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct AsyncClient {
@@ -33,7 +29,6 @@ pub struct AsyncClient {
 struct AsyncClientInner {
     writer: Mutex<BufWriter<OwnedWriteHalf>>,
     pending: Mutex<PendingRequests>,
-    timed_out: Mutex<TimedOutRequests>,
     next_id: AtomicU64,
     shutdown: StdMutex<Option<oneshot::Sender<()>>>,
 }
@@ -53,10 +48,7 @@ enum PendingDispatch {
         sender: PendingSender,
         response: Message,
     },
-    LateTimedOut {
-        got_id: u64,
-    },
-    Unknown {
+    Unrecognized {
         got_id: u64,
     },
 }
@@ -70,7 +62,6 @@ impl AsyncClient {
         let inner = Arc::new(AsyncClientInner {
             writer: Mutex::new(BufWriter::new(write_half)),
             pending: Mutex::new(HashMap::new()),
-            timed_out: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             shutdown: StdMutex::new(Some(shutdown_tx)),
         });
@@ -308,7 +299,6 @@ impl AsyncClient {
                     return Err(response_channel_closed_error(id));
                 }
                 Err(_) => {
-                    self.mark_timed_out_request(id).await;
                     self.remove_pending(id).await;
                     return Err(request_timeout_error(id, duration));
                 }
@@ -336,12 +326,6 @@ impl AsyncClient {
     async fn remove_pending(&self, id: u64) {
         let mut pending = self.inner.pending.lock().await;
         pending.remove(&id);
-    }
-
-    async fn mark_timed_out_request(&self, id: u64) {
-        let mut timed_out = self.inner.timed_out.lock().await;
-        prune_timed_out_requests(&mut timed_out);
-        timed_out.insert(id, Instant::now() + TIMED_OUT_REQUEST_TOMBSTONE_TTL);
     }
 
     fn validate_response(expected_id: u64, resp: Message) -> Result<Message, RepeError> {
@@ -431,12 +415,8 @@ fn spawn_response_loop(
 
                 if let Some(sender) = matched_sender {
                     PendingDispatch::Matched { sender, response }
-                } else if take_timed_out_tombstone(&inner_ref, response_id).await {
-                    PendingDispatch::LateTimedOut {
-                        got_id: response_id,
-                    }
                 } else {
-                    PendingDispatch::Unknown {
+                    PendingDispatch::Unrecognized {
                         got_id: response_id,
                     }
                 }
@@ -446,15 +426,8 @@ fn spawn_response_loop(
                 PendingDispatch::Matched { sender, response } => {
                     let _ = sender.send(Ok(response));
                 }
-                PendingDispatch::LateTimedOut { got_id } => {
-                    eprintln!("[repe] dropping late response for timed-out request id {got_id}");
-                }
-                PendingDispatch::Unknown { got_id } => {
-                    eprintln!(
-                        "[repe] protocol violation: received response for unknown request id {got_id}"
-                    );
-                    fail_all_pending(&inner, unknown_response_id_error(got_id)).await;
-                    break;
+                PendingDispatch::Unrecognized { got_id } => {
+                    eprintln!("[repe] dropping response for unrecognized request id {got_id}");
                 }
             }
         }
@@ -516,24 +489,6 @@ fn clone_fatal_error_for_waiter(err: &RepeError, request_id: u64) -> RepeError {
             message: message.clone(),
         },
     }
-}
-
-async fn take_timed_out_tombstone(inner: &AsyncClientInner, request_id: u64) -> bool {
-    let mut timed_out = inner.timed_out.lock().await;
-    prune_timed_out_requests(&mut timed_out);
-    timed_out.remove(&request_id).is_some()
-}
-
-fn prune_timed_out_requests(timed_out: &mut TimedOutRequests) {
-    let now = Instant::now();
-    timed_out.retain(|_, expires_at| *expires_at > now);
-}
-
-fn unknown_response_id_error(request_id: u64) -> RepeError {
-    RepeError::Io(std::io::Error::new(
-        ErrorKind::InvalidData,
-        format!("received response for unknown request id {request_id}"),
-    ))
 }
 
 fn request_timeout_error(request_id: u64, timeout: Duration) -> RepeError {

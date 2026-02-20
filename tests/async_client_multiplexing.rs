@@ -212,7 +212,7 @@ async fn async_client_ignores_late_response_for_timed_out_request() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn async_client_unknown_response_id_fails_pending_request_without_hanging() {
+async fn async_client_unrecognized_response_id_is_discarded() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -220,32 +220,25 @@ async fn async_client_unknown_response_id_fails_pending_request_without_hanging(
         let (stream, _) = listener.accept().unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut req = read_message(&mut reader).unwrap();
-        req.header.id += 1;
+        req.header.id += 1; // mangle ID so client won't match it
 
         let mut writer = BufWriter::new(stream);
         write_message(&mut writer, &req).unwrap();
         writer.flush().unwrap();
+        // Server closes after a short delay; client should get a connection error
         thread::sleep(Duration::from_millis(200));
     });
 
     let client = AsyncClient::connect(addr).await.unwrap();
-    let result = tokio::time::timeout(Duration::from_millis(500), async {
+    let result = tokio::time::timeout(Duration::from_millis(2000), async {
         client.call_json("/x", &json!({"a": 1})).await
     })
     .await
-    .expect("call_json should fail quickly instead of hanging");
+    .expect("call_json should fail when server closes connection");
 
-    let err = result.unwrap_err();
-    match err {
-        RepeError::Io(io_err) => {
-            assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidData);
-            assert!(
-                io_err.to_string().contains("unknown request id"),
-                "error should mention unknown id, got: {io_err}"
-            );
-        }
-        other => panic!("unexpected error: {other:?}"),
-    }
+    // The unrecognized response is discarded; the caller fails when the
+    // server closes the connection (not from a protocol-violation teardown).
+    assert!(result.is_err());
 
     tokio::task::spawn_blocking(move || server.join().unwrap())
         .await

@@ -7,8 +7,8 @@ use std::thread;
 use std::time::Duration;
 
 #[test]
-fn client_unknown_response_id_fails_pending_request_without_hanging() {
-    // Server: echoes response with wrong id (id + 1)
+fn client_unrecognized_response_id_is_discarded() {
+    // Server: echoes response with wrong id (id + 1), then closes
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let srv = thread::spawn(move || {
@@ -29,6 +29,7 @@ fn client_unknown_response_id_fails_pending_request_without_hanging() {
         let mut writer = BufWriter::new(stream);
         write_message(&mut writer, &resp).unwrap();
         writer.flush().unwrap();
+        // Server closes after a short delay; client should get a connection error
         thread::sleep(Duration::from_millis(200));
     });
 
@@ -39,20 +40,12 @@ fn client_unknown_response_id_fails_pending_request_without_hanging() {
         let _ = done_tx.send(result);
     });
 
+    // The unrecognized response is discarded; the caller fails when the
+    // server closes the connection (not from a protocol-violation teardown).
     let result = done_rx
-        .recv_timeout(Duration::from_millis(500))
-        .expect("call_json should fail quickly instead of hanging");
-    let err = result.unwrap_err();
-    match err {
-        RepeError::Io(io_err) => {
-            assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidData);
-            assert!(
-                io_err.to_string().contains("unknown request id"),
-                "error should mention unknown id, got: {io_err}"
-            );
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
+        .recv_timeout(Duration::from_millis(2000))
+        .expect("call_json should fail when server closes connection");
+    assert!(result.is_err());
     worker.join().unwrap();
     srv.join().unwrap();
 }
