@@ -445,9 +445,7 @@ fn spawn_response_loop(mut reader: BufReader<TcpStream>, inner: std::sync::Weak<
         loop {
             let response = match read_message(&mut reader) {
                 Ok(message) => message,
-                Err(RepeError::Io(ref io_err))
-                    if io_err.kind() == ErrorKind::Interrupted =>
-                {
+                Err(RepeError::Io(ref io_err)) if io_err.kind() == ErrorKind::Interrupted => {
                     continue;
                 }
                 Err(err) => {

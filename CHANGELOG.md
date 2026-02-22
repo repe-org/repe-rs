@@ -12,6 +12,7 @@
 - Hardened unknown-response-ID handling:
   - unknown response IDs are now logged and dropped by default
   - late responses for timed-out requests are also dropped without tearing down the connection
+- Made `AsyncClient` request tracking cancellation-safe so dropped call futures do not leak entries in the pending-request map.
 - Preserved structured fatal response-loop errors when failing pending requests instead of flattening everything to `Io(ConnectionAborted)`.
 - Bounded sync `Client::batch_json` worker threads to avoid unbounded OS thread creation on large batches.
 

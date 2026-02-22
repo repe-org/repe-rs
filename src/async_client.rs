@@ -28,7 +28,7 @@ pub struct AsyncClient {
 
 struct AsyncClientInner {
     writer: Mutex<BufWriter<OwnedWriteHalf>>,
-    pending: Mutex<PendingRequests>,
+    pending: StdMutex<PendingRequests>,
     next_id: AtomicU64,
     shutdown: StdMutex<Option<oneshot::Sender<()>>>,
 }
@@ -53,6 +53,42 @@ enum PendingDispatch {
     },
 }
 
+struct PendingRequestGuard {
+    inner: Arc<AsyncClientInner>,
+    request_id: u64,
+    disarmed: bool,
+}
+
+impl PendingRequestGuard {
+    fn register(inner: &Arc<AsyncClientInner>, request_id: u64, sender: PendingSender) -> Self {
+        {
+            let mut pending = lock_pending_map(&inner.pending);
+            pending.insert(request_id, sender);
+        }
+
+        Self {
+            inner: Arc::clone(inner),
+            request_id,
+            disarmed: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for PendingRequestGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+
+        let mut pending = lock_pending_map(&self.inner.pending);
+        pending.remove(&self.request_id);
+    }
+}
+
 impl AsyncClient {
     pub async fn connect<A: ToSocketAddrs>(addr: A) -> std::io::Result<Self> {
         let stream = TcpStream::connect(addr).await?;
@@ -61,7 +97,7 @@ impl AsyncClient {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let inner = Arc::new(AsyncClientInner {
             writer: Mutex::new(BufWriter::new(write_half)),
-            pending: Mutex::new(HashMap::new()),
+            pending: StdMutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             shutdown: StdMutex::new(Some(shutdown_tx)),
         });
@@ -281,38 +317,26 @@ impl AsyncClient {
         let msg = body_fn(builder)?.build();
 
         let (sender, receiver) = oneshot::channel();
-        {
-            let mut pending = self.inner.pending.lock().await;
-            pending.insert(id, sender);
-        }
+        let mut pending_guard = PendingRequestGuard::register(&self.inner, id, sender);
 
         if let Err(err) = self.write_request(&msg).await {
-            self.remove_pending(id).await;
             return Err(err);
         }
 
         let received = match timeout_duration {
             Some(duration) => match timeout(duration, receiver).await {
                 Ok(Ok(value)) => value,
-                Ok(Err(_)) => {
-                    self.remove_pending(id).await;
-                    return Err(response_channel_closed_error(id));
-                }
-                Err(_) => {
-                    self.remove_pending(id).await;
-                    return Err(request_timeout_error(id, duration));
-                }
+                Ok(Err(_)) => return Err(response_channel_closed_error(id)),
+                Err(_) => return Err(request_timeout_error(id, duration)),
             },
             None => match receiver.await {
                 Ok(value) => value,
-                Err(_) => {
-                    self.remove_pending(id).await;
-                    return Err(response_channel_closed_error(id));
-                }
+                Err(_) => return Err(response_channel_closed_error(id)),
             },
         };
 
         let resp = received?;
+        pending_guard.disarm();
         Self::validate_response(id, resp)
     }
 
@@ -321,11 +345,6 @@ impl AsyncClient {
         write_message_async(&mut *writer, msg).await?;
         writer.flush().await?;
         Ok(())
-    }
-
-    async fn remove_pending(&self, id: u64) {
-        let mut pending = self.inner.pending.lock().await;
-        pending.remove(&id);
     }
 
     fn validate_response(expected_id: u64, resp: Message) -> Result<Message, RepeError> {
@@ -409,7 +428,7 @@ fn spawn_response_loop(
                 };
                 let response_id = response.header.id;
                 let matched_sender = {
-                    let mut pending = inner_ref.pending.lock().await;
+                    let mut pending = lock_pending_map(&inner_ref.pending);
                     pending.remove(&response_id)
                 };
 
@@ -445,7 +464,7 @@ async fn fail_all_pending(inner: &std::sync::Weak<AsyncClientInner>, err: RepeEr
     }
 
     let waiters = {
-        let mut pending = inner_ref.pending.lock().await;
+        let mut pending = lock_pending_map(&inner_ref.pending);
         pending.drain().collect::<Vec<_>>()
     };
 
@@ -514,4 +533,99 @@ fn batch_worker_join_error(err: JoinError) -> RepeError {
 
 fn batch_worker_missing_result_error() -> RepeError {
     RepeError::Io(std::io::Error::other("batch worker missing result"))
+}
+
+fn lock_pending_map(
+    pending: &StdMutex<PendingRequests>,
+) -> std::sync::MutexGuard<'_, PendingRequests> {
+    match pending.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::{read_message, write_message};
+    use serde_json::json;
+    use std::io::{BufReader, BufWriter, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+
+    fn json_response_for(req: &Message) -> Message {
+        Message::builder()
+            .id(req.header.id)
+            .query_bytes(req.query.clone())
+            .query_format(
+                QueryFormat::try_from(req.header.query_format).unwrap_or(QueryFormat::RawBinary),
+            )
+            .body_json(&json!({"path": req.query_utf8()}))
+            .expect("json body")
+            .build()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_call_cleans_pending_entry() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (first_seen_tx, first_seen_rx) = mpsc::channel();
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = BufWriter::new(stream);
+
+            let _first = read_message(&mut reader).unwrap();
+            first_seen_tx
+                .send(())
+                .expect("signal that first request arrived");
+
+            let second = read_message(&mut reader).unwrap();
+            let response = json_response_for(&second);
+            write_message(&mut writer, &response).unwrap();
+            writer.flush().unwrap();
+        });
+
+        let client = AsyncClient::connect(addr).await.unwrap();
+
+        let cancelled_client = client.clone();
+        let cancelled_call = tokio::spawn(async move {
+            cancelled_client
+                .call_json("/cancelled", &json!({"n": 1}))
+                .await
+        });
+
+        tokio::task::spawn_blocking(move || {
+            first_seen_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("server should observe the first request");
+        })
+        .await
+        .unwrap();
+
+        cancelled_call.abort();
+        let join_err = cancelled_call.await.unwrap_err();
+        assert!(join_err.is_cancelled());
+
+        let pending_count = {
+            let pending = lock_pending_map(&client.inner.pending);
+            pending.len()
+        };
+        assert_eq!(
+            pending_count, 0,
+            "cancelled calls must not leak pending entries"
+        );
+
+        let out = client
+            .call_json_with_timeout("/ok", &json!({"n": 2}), Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(out["path"], "/ok");
+
+        tokio::task::spawn_blocking(move || server.join().unwrap())
+            .await
+            .unwrap();
+    }
 }
