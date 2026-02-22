@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+
+## [0.4.2] - 2026-02-22
 - Added multiplexed request handling to `Client` and `AsyncClient` so multiple in-flight calls can share a single connection and still match responses by request ID.
 - Added per-request timeout helpers on both clients:
   - `call_json_with_timeout`
