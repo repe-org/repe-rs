@@ -319,9 +319,7 @@ impl AsyncClient {
         let (sender, receiver) = oneshot::channel();
         let mut pending_guard = PendingRequestGuard::register(&self.inner, id, sender);
 
-        if let Err(err) = self.write_request(&msg).await {
-            return Err(err);
-        }
+        self.write_request(&msg).await?;
 
         let received = match timeout_duration {
             Some(duration) => match timeout(duration, receiver).await {
