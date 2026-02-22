@@ -183,7 +183,7 @@ mod tests {
             let _ = handle_connection(stream, router_clone, None, None).await;
         });
 
-        let mut client = AsyncClient::connect(addr).await.unwrap();
+        let client = AsyncClient::connect(addr).await.unwrap();
         let out = client
             .call_json("/mul", &serde_json::json!({"a": 6, "b": 7}))
             .await

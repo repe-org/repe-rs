@@ -2,11 +2,13 @@ use repe::*;
 use serde::{Deserialize, Serialize};
 use std::io::{BufReader, BufWriter, Write};
 use std::net::TcpListener;
+use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 #[test]
-fn client_detects_id_mismatch() {
-    // Server: echoes response with wrong id (id + 1)
+fn client_unrecognized_response_id_is_discarded() {
+    // Server: echoes response with wrong id (id + 1), then closes
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let srv = thread::spawn(move || {
@@ -27,17 +29,61 @@ fn client_detects_id_mismatch() {
         let mut writer = BufWriter::new(stream);
         write_message(&mut writer, &resp).unwrap();
         writer.flush().unwrap();
+        // Server closes after a short delay; client should get a connection error
+        thread::sleep(Duration::from_millis(200));
     });
 
-    let mut client = client::Client::connect(addr).unwrap();
+    let client = client::Client::connect(addr).unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let result = client.call_json("/x", &serde_json::json!({"a": 1}));
+        let _ = done_tx.send(result);
+    });
+
+    // The unrecognized response is discarded; the caller fails when the
+    // server closes the connection (not from a protocol-violation teardown).
+    let result = done_rx
+        .recv_timeout(Duration::from_millis(2000))
+        .expect("call_json should fail when server closes connection");
+    assert!(result.is_err());
+    worker.join().unwrap();
+    srv.join().unwrap();
+}
+
+#[test]
+fn client_preserves_structured_fatal_response_loop_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv = thread::spawn(move || {
+        let (stream, _addr) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let req = read_message(&mut reader).unwrap();
+
+        let mut resp = Message::builder()
+            .id(req.header.id)
+            .query_bytes(req.query.clone())
+            .query_format(QueryFormat::try_from(req.header.query_format).unwrap())
+            .error_code(ErrorCode::Ok)
+            .body_json(&serde_json::json!({"ok": true}))
+            .unwrap()
+            .build();
+        resp.header.spec = 0;
+
+        let mut writer = BufWriter::new(stream);
+        write_message(&mut writer, &resp).unwrap();
+        writer.flush().unwrap();
+    });
+
+    let client = client::Client::connect(addr).unwrap();
     let err = client
-        .call_json("/x", &serde_json::json!({"a":1}))
+        .call_json("/fatal", &serde_json::json!({"a": 1}))
         .unwrap_err();
     match err {
-        RepeError::ResponseIdMismatch { .. } => {}
+        RepeError::InvalidSpec(0) => {}
         other => panic!("unexpected: {other:?}"),
     }
-    let _ = srv.join();
+
+    srv.join().unwrap();
 }
 
 #[test]
@@ -77,7 +123,7 @@ fn client_notify_sets_flag_and_does_not_wait_for_response() {
         // No response sent back; ensure the client was a pure notify for every request.
     });
 
-    let mut client = client::Client::connect(addr).unwrap();
+    let client = client::Client::connect(addr).unwrap();
     client
         .notify_json("/notify", &serde_json::json!({"ok": true}))
         .unwrap();

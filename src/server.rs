@@ -1074,7 +1074,7 @@ mod tests {
         });
 
         // Use the public Client API
-        let mut client = crate::client::Client::connect(addr).unwrap();
+        let client = crate::client::Client::connect(addr).unwrap();
         let out = client
             .call_json("/add", &serde_json::json!({"a": 3, "b": 4}))
             .unwrap();
@@ -1254,7 +1254,7 @@ mod tests {
             )
         });
 
-        let mut client = crate::client::Client::connect(addr).unwrap();
+        let client = crate::client::Client::connect(addr).unwrap();
         let err = client
             .call_json("/nope", &serde_json::json!({}))
             .unwrap_err();
@@ -1409,7 +1409,7 @@ mod tests {
             )
         });
 
-        let mut client = crate::client::Client::connect(addr).unwrap();
+        let client = crate::client::Client::connect(addr).unwrap();
         // Provide invalid JSON for NeedsI32 (string instead of number)
         let err = client
             .call_json("/typed", &serde_json::json!({"a": "not-a-number"}))

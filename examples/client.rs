@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = Client::connect("127.0.0.1:8081")?;
+    let client = Client::connect("127.0.0.1:8081")?;
 
     let pong = client.call_json("/ping", &json!({}))?;
     println!("/ping => {}", pong);

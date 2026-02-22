@@ -1,7 +1,20 @@
 # Changelog
 
 ## [Unreleased]
-- _Nothing yet._
+- Added multiplexed request handling to `Client` and `AsyncClient` so multiple in-flight calls can share a single connection and still match responses by request ID.
+- Added per-request timeout helpers on both clients:
+  - `call_json_with_timeout`
+  - `call_typed_json_with_timeout`
+  - `call_typed_beve_with_timeout`
+- Added JSON batch helpers on both clients:
+  - `batch_json`
+  - `batch_json_with_timeout`
+- Hardened unknown-response-ID handling:
+  - unknown response IDs are now logged and dropped by default
+  - late responses for timed-out requests are also dropped without tearing down the connection
+- Made `AsyncClient` request tracking cancellation-safe so dropped call futures do not leak entries in the pending-request map.
+- Preserved structured fatal response-loop errors when failing pending requests instead of flattening everything to `Io(ConnectionAborted)`.
+- Bounded sync `Client::batch_json` worker threads to avoid unbounded OS thread creation on large batches.
 
 ## [0.4.0] - 2025-10-24
 - Router middleware hooks (`with_middleware` / `register_middleware`) let servers centralize auth, logging, or validation without manually wrapping each handler.
