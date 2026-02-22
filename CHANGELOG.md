@@ -10,8 +10,8 @@
   - `batch_json`
   - `batch_json_with_timeout`
 - Hardened unknown-response-ID handling:
-  - late responses for recently timed-out requests are dropped
-  - truly unknown response IDs are treated as protocol violations that fail pending requests
+  - unknown response IDs are now logged and dropped by default
+  - late responses for timed-out requests are also dropped without tearing down the connection
 - Preserved structured fatal response-loop errors when failing pending requests instead of flattening everything to `Io(ConnectionAborted)`.
 - Bounded sync `Client::batch_json` worker threads to avoid unbounded OS thread creation on large batches.
 

@@ -228,7 +228,7 @@ struct AddResp {
     sum: i64,
 }
 
-let mut client = Client::connect("127.0.0.1:8081")?;
+let client = Client::connect("127.0.0.1:8081")?;
 let pong = client.call_json("/ping", &json!({}))?;
 assert_eq!(pong["pong"], true);
 
@@ -274,7 +274,8 @@ Error handling
   - Missing routes → `MethodNotFound` with the requested path in the message.
   - Application failures from handlers → return `(ErrorCode, String)` to control both fields.
 - Clients surface mismatched protocol versions as `RepeError::VersionMismatch`.
-- Responses with unknown request IDs are treated as protocol violations unless they match a recently timed-out request ID (late response), in which case they are dropped.
+- Responses with unknown request IDs are logged and dropped by default (including late responses for timed-out requests).
+- For bounded latency, prefer `call_*_with_timeout` APIs so a dropped response ID cannot leave a call waiting indefinitely.
 
 Async usage (minimal end‑to‑end)
 
@@ -301,7 +302,7 @@ struct AddResp {
     sum: i64,
 }
 
-let mut client = AsyncClient::connect(addr).await.unwrap();
+let client = AsyncClient::connect(addr).await.unwrap();
 let pong = client.call_json("/ping", &json!({})).await.unwrap();
 assert_eq!(pong["pong"], true);
 
