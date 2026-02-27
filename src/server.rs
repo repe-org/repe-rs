@@ -2,6 +2,7 @@ use crate::constants::{BodyFormat, ErrorCode, QueryFormat, REPE_VERSION};
 use crate::error::RepeError;
 use crate::io::{read_message, write_message};
 use crate::message::{Message, create_error_response_like, create_response};
+use crate::registry::Registry;
 use crate::structs::RepeStruct;
 use beve::from_slice as beve_from_slice;
 use serde::Serialize;
@@ -209,6 +210,10 @@ trait StructRouterEntry: Send + Sync {
     fn handler_for(&self, path: &str) -> Option<Arc<dyn HandlerErased>>;
 }
 
+trait RegistryRouterEntry: Send + Sync {
+    fn handler_for(&self, path: &str) -> Option<Arc<dyn HandlerErased>>;
+}
+
 #[derive(Debug)]
 pub enum LockError {
     Poisoned(String),
@@ -321,6 +326,7 @@ impl<T: ?Sized + Send + Sync> Lockable<T> for parking_lot::RwLock<T> {
 pub struct Router {
     inner: Arc<HashMap<String, Arc<dyn HandlerErased>>>,
     structs: Arc<Vec<Arc<dyn StructRouterEntry>>>,
+    registries: Arc<Vec<Arc<dyn RegistryRouterEntry>>>,
     middlewares: Arc<Vec<Arc<dyn Middleware>>>,
 }
 
@@ -329,6 +335,7 @@ impl Router {
         Self {
             inner: Arc::new(HashMap::new()),
             structs: Arc::new(Vec::new()),
+            registries: Arc::new(Vec::new()),
             middlewares: Arc::new(Vec::new()),
         }
     }
@@ -459,9 +466,39 @@ impl Router {
         shared
     }
 
+    /// Register a dynamic [`Registry`] under `path_prefix`.
+    ///
+    /// The prefix can be empty to serve the registry at the root path. Requests under the
+    /// prefix are mapped to registry JSON pointers by stripping the prefix.
+    pub fn with_registry(mut self, path_prefix: &str, registry: Arc<Registry>) -> Self {
+        self.register_registry(path_prefix, registry);
+        self
+    }
+
+    /// Register a dynamic [`Registry`] in-place and return the shared handle.
+    pub fn register_registry(
+        &mut self,
+        path_prefix: &str,
+        registry: Arc<Registry>,
+    ) -> Arc<Registry> {
+        let mut entries = (*self.registries).clone();
+        entries.push(Arc::new(RegisteredRegistry::new(
+            path_prefix,
+            Arc::clone(&registry),
+        )));
+        self.registries = Arc::new(entries);
+        registry
+    }
+
     pub fn get(&self, path: &str) -> Option<Arc<dyn HandlerErased>> {
         let handler = if let Some(handler) = self.inner.get(path) {
             Some(handler.clone())
+        } else if let Some(handler) = self
+            .registries
+            .iter()
+            .find_map(|entry| entry.handler_for(path))
+        {
+            Some(handler)
         } else {
             self.structs
                 .iter()
@@ -496,6 +533,80 @@ where
     root: String,
     shared: Arc<L>,
     phantom: std::marker::PhantomData<T>,
+}
+
+struct RegisteredRegistry {
+    prefix: String,
+    registry: Arc<Registry>,
+}
+
+impl RegisteredRegistry {
+    fn new(prefix: &str, registry: Arc<Registry>) -> Self {
+        let mut normalized = if prefix.is_empty() || prefix == "/" {
+            String::new()
+        } else if prefix.starts_with('/') {
+            prefix.to_string()
+        } else {
+            format!("/{}", prefix)
+        };
+        if normalized.len() > 1 {
+            normalized = normalized.trim_end_matches('/').to_string();
+        }
+        Self {
+            prefix: normalized,
+            registry,
+        }
+    }
+
+    fn pointer_for<'a>(&self, path: &'a str) -> Option<&'a str> {
+        if self.prefix.is_empty() {
+            return if path.is_empty() {
+                Some("/")
+            } else {
+                Some(path)
+            };
+        }
+
+        if path == self.prefix {
+            return Some("/");
+        }
+
+        let rest = path.strip_prefix(&self.prefix)?;
+        if rest.starts_with('/') {
+            Some(rest)
+        } else {
+            None
+        }
+    }
+}
+
+impl RegistryRouterEntry for RegisteredRegistry {
+    fn handler_for(&self, path: &str) -> Option<Arc<dyn HandlerErased>> {
+        let pointer = self.pointer_for(path)?.to_string();
+        Some(Arc::new(RegistryRequestHandler {
+            registry: Arc::clone(&self.registry),
+            pointer,
+        }))
+    }
+}
+
+struct RegistryRequestHandler {
+    registry: Arc<Registry>,
+    pointer: String,
+}
+
+impl HandlerErased for RegistryRequestHandler {
+    fn handle(&self, req: &Message) -> Result<Message, RepeError> {
+        let body = match Registry::decode_body(req) {
+            Ok(value) => value,
+            Err(err) => return Ok(create_error_response_like(req, err.code(), err.to_string())),
+        };
+
+        match self.registry.dispatch(&self.pointer, body) {
+            Ok(value) => create_response(req, value, BodyFormat::Json),
+            Err(err) => Ok(create_error_response_like(req, err.code(), err.to_string())),
+        }
+    }
 }
 
 impl<T, L> RegisteredStruct<T, L>

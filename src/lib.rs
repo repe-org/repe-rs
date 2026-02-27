@@ -13,6 +13,7 @@ pub mod header;
 pub mod io;
 pub mod json_pointer;
 pub mod message;
+pub mod registry;
 pub mod server;
 pub mod structs;
 
@@ -33,6 +34,7 @@ pub use header::Header;
 pub use io::{read_message, write_message};
 pub use json_pointer::{evaluate as eval_json_pointer, parse as parse_json_pointer};
 pub use message::Message;
+pub use registry::{Registry, RegistryCallable, RegistryError};
 pub use server::{
     IntoTypedResponse, JsonTypedHandler, LockError, Lockable, Middleware, Next, Router, Server,
     TypedResponse,

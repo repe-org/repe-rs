@@ -11,6 +11,7 @@ This crate provides:
 - Message encode/decode to/from bytes and I/O helpers for streams
 - JSON body helpers using `serde`/`serde_json`
 - BEVE binary body helpers via the [`beve`](https://crates.io/crates/beve) crate
+- Dynamic registry routing with JSON Pointer semantics
 - Error codes and formats aligned with the spec
 
 Installation
@@ -71,6 +72,8 @@ Examples
 - `examples/json_roundtrip.rs` – construct/serialize/parse a JSON message.
 - `examples/server.rs` – run a JSON-pointer server (TCP).
 - `examples/client.rs` – call the server routes.
+- `examples/registry_server.rs` – serve a dynamic registry under a path prefix.
+- `examples/registry_roundtrip.rs` – local registry READ/WRITE/CALL roundtrip.
 - `examples/async_server.rs` – tokio-based async server.
 - `examples/async_client.rs` – tokio-based async client.
 
@@ -208,6 +211,37 @@ Router handles `Arc<L>` for any lock implementing `repe::Lockable<T>`, so you ca
 `parking-lot` feature to use `parking_lot::Mutex`/`RwLock` without extra wrapper types.
 ```
 
+Registry (Dynamic Routing)
+
+- Mount a `Registry` on any path prefix with `Router::with_registry("/api/v1", registry)`.
+- Registry request semantics:
+  - Empty body => READ value.
+  - Non-empty body + function target => CALL function.
+  - Non-empty body + non-function target => WRITE value.
+- See [docs/registry.md](docs/registry.md) for full behavior, format decoding details, and client examples.
+
+```rust
+use repe::{ErrorCode, Registry, Router, Server};
+use serde_json::{Value, json};
+use std::sync::Arc;
+
+let registry = Arc::new(Registry::new());
+registry.register_value("/counter", json!(0))?;
+registry.register_function("/add", |params| {
+    let Some(Value::Object(map)) = params else {
+        return Err((ErrorCode::InvalidBody, "expected object body".into()));
+    };
+    let a = map.get("a").and_then(Value::as_i64).unwrap_or(0);
+    let b = map.get("b").and_then(Value::as_i64).unwrap_or(0);
+    Ok(json!({"result": a + b}))
+})?;
+
+let router = Router::new().with_registry("/api/v1", Arc::clone(&registry));
+let server = Server::new(router);
+let listener = server.listen("127.0.0.1:8082")?;
+server.serve(listener)?;
+```
+
 Client
 
 - Connect and call JSON-pointer routes with JSON bodies:
@@ -245,6 +279,13 @@ Typed helpers work for BEVE payloads too:
 let beve_sum: AddResp = client.call_typed_beve("/add", &AddReq { a: 4, b: 5 })?;
 assert_eq!(beve_sum.sum, 9);
 ```
+
+Registry-oriented client helpers:
+
+- Empty-body READs: `registry_read("/api/v1/counter")` or `call_message(...)`
+- Typed READs: `registry_read_typed::<_, MyType>(...)`
+- JSON WRITE/CALL helpers: `registry_write_json(...)` and `registry_call_json(...)`
+- Custom wire formats: `call_with_formats(...)` and `notify_with_formats(...)`
 
 Multiplexed calls, timeouts, and batching
 
@@ -325,6 +366,8 @@ Running the examples
 ```
 cargo run --example server
 cargo run --example client
+cargo run --example registry_server
+cargo run --example registry_roundtrip
 cargo run --example async_server
 cargo run --example async_client
 ```

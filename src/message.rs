@@ -264,6 +264,20 @@ mod tests {
         let err = msg.beve_body::<serde_json::Value>().unwrap_err();
         matches!(err, RepeError::Beve(_));
     }
+
+    #[test]
+    fn builder_format_code_methods_set_explicit_codes() {
+        let msg = Message::builder()
+            .id(9)
+            .query_str("/raw")
+            .query_format_code(0x7777)
+            .body_bytes(vec![1, 2, 3])
+            .body_format_code(0x8888)
+            .build();
+
+        assert_eq!(msg.header.query_format, 0x7777);
+        assert_eq!(msg.header.body_format, 0x8888);
+    }
 }
 
 #[derive(Default)]
@@ -294,8 +308,16 @@ impl MessageBuilder {
         self.query_format = u16::from(f);
         self
     }
+    pub fn query_format_code(mut self, format_code: u16) -> Self {
+        self.query_format = format_code;
+        self
+    }
     pub fn body_format(mut self, f: BodyFormat) -> Self {
         self.body_format = u16::from(f);
+        self
+    }
+    pub fn body_format_code(mut self, format_code: u16) -> Self {
+        self.body_format = format_code;
         self
     }
     pub fn query_bytes(mut self, q: impl Into<Vec<u8>>) -> Self {
