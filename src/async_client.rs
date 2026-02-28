@@ -174,6 +174,127 @@ impl AsyncClient {
             .await
     }
 
+    /// Send a JSON-pointer request with an empty body and return the full response message.
+    ///
+    /// This is useful for protocols that use empty-body semantics (for example, registry READs).
+    pub async fn call_message<P: AsRef<str>>(&self, path: P) -> Result<Message, RepeError> {
+        self.call_message_with_formats_and_timeout(
+            path,
+            QueryFormat::JsonPointer as u16,
+            None,
+            BodyFormat::RawBinary as u16,
+            None,
+        )
+        .await
+    }
+
+    /// Send a JSON-pointer request with an empty body, failing if no response arrives before
+    /// `timeout_duration`.
+    pub async fn call_message_with_timeout<P: AsRef<str>>(
+        &self,
+        path: P,
+        timeout_duration: Duration,
+    ) -> Result<Message, RepeError> {
+        self.call_message_with_formats_and_timeout(
+            path,
+            QueryFormat::JsonPointer as u16,
+            None,
+            BodyFormat::RawBinary as u16,
+            Some(timeout_duration),
+        )
+        .await
+    }
+
+    /// Low-level call API that allows custom query/body format codes and optional raw body bytes.
+    ///
+    /// If `body` is `None`, the request body is empty (`body_length = 0`).
+    pub async fn call_with_formats<P: AsRef<str>>(
+        &self,
+        path: P,
+        query_format: u16,
+        body: Option<&[u8]>,
+        body_format: u16,
+    ) -> Result<Message, RepeError> {
+        self.call_message_with_formats_and_timeout(path, query_format, body, body_format, None)
+            .await
+    }
+
+    /// Timeout variant of [`AsyncClient::call_with_formats`].
+    pub async fn call_with_formats_and_timeout<P: AsRef<str>>(
+        &self,
+        path: P,
+        query_format: u16,
+        body: Option<&[u8]>,
+        body_format: u16,
+        timeout_duration: Duration,
+    ) -> Result<Message, RepeError> {
+        self.call_message_with_formats_and_timeout(
+            path,
+            query_format,
+            body,
+            body_format,
+            Some(timeout_duration),
+        )
+        .await
+    }
+
+    /// Registry helper: send an empty-body request and decode the JSON response.
+    pub async fn registry_read<P: AsRef<str>>(&self, path: P) -> Result<Value, RepeError> {
+        let resp = self.call_message(path).await?;
+        resp.json_body::<Value>()
+    }
+
+    /// Registry helper: send an empty-body request and deserialize the JSON response as `R`.
+    pub async fn registry_read_typed<P: AsRef<str>, R: DeserializeOwned>(
+        &self,
+        path: P,
+    ) -> Result<R, RepeError> {
+        let resp = self.call_message(path).await?;
+        resp.json_body::<R>()
+    }
+
+    /// Timeout variant of [`AsyncClient::registry_read`].
+    pub async fn registry_read_with_timeout<P: AsRef<str>>(
+        &self,
+        path: P,
+        timeout_duration: Duration,
+    ) -> Result<Value, RepeError> {
+        let resp = self
+            .call_message_with_timeout(path, timeout_duration)
+            .await?;
+        resp.json_body::<Value>()
+    }
+
+    /// Timeout variant of [`AsyncClient::registry_read_typed`].
+    pub async fn registry_read_typed_with_timeout<P: AsRef<str>, R: DeserializeOwned>(
+        &self,
+        path: P,
+        timeout_duration: Duration,
+    ) -> Result<R, RepeError> {
+        let resp = self
+            .call_message_with_timeout(path, timeout_duration)
+            .await?;
+        resp.json_body::<R>()
+    }
+
+    /// Registry helper: send a JSON body (WRITE semantics for non-function targets).
+    pub async fn registry_write_json<P: AsRef<str>, T: Serialize>(
+        &self,
+        path: P,
+        body: &T,
+    ) -> Result<Value, RepeError> {
+        self.call_json(path, body).await
+    }
+
+    /// Registry helper: send a JSON body (CALL semantics for function targets).
+    pub async fn registry_call_json<P: AsRef<str>, T: Serialize>(
+        &self,
+        path: P,
+        body: &T,
+    ) -> Result<Value, RepeError> {
+        self.call_json(path, body).await
+    }
+
     pub async fn notify_json<P: AsRef<str>, T: Serialize>(
         &self,
         path: P,
@@ -198,6 +319,20 @@ impl AsyncClient {
         body: &T,
     ) -> Result<(), RepeError> {
         self.notify_with_body(path, |builder| builder.body_beve(body))
+            .await
+    }
+
+    /// Low-level notify API that allows custom query/body format codes and optional raw body bytes.
+    ///
+    /// If `body` is `None`, the notify request is sent with an empty body.
+    pub async fn notify_with_formats<P: AsRef<str>>(
+        &self,
+        path: P,
+        query_format: u16,
+        body: Option<&[u8]>,
+        body_format: u16,
+    ) -> Result<(), RepeError> {
+        self.notify_with_message_formats(path, query_format, body, body_format)
             .await
     }
 
@@ -262,7 +397,12 @@ impl AsyncClient {
         timeout_duration: Option<Duration>,
     ) -> Result<Value, RepeError> {
         let resp = self
-            .call_with_body_and_timeout(path, timeout_duration, |builder| builder.body_json(body))
+            .call_with_body_and_timeout(
+                path,
+                QueryFormat::JsonPointer as u16,
+                timeout_duration,
+                |builder| builder.body_json(body),
+            )
             .await?;
         resp.json_body::<Value>()
     }
@@ -278,7 +418,12 @@ impl AsyncClient {
         timeout_duration: Option<Duration>,
     ) -> Result<R, RepeError> {
         let resp = self
-            .call_with_body_and_timeout(path, timeout_duration, |builder| builder.body_json(body))
+            .call_with_body_and_timeout(
+                path,
+                QueryFormat::JsonPointer as u16,
+                timeout_duration,
+                |builder| builder.body_json(body),
+            )
             .await?;
         Self::decode_typed_response(&resp)
     }
@@ -294,7 +439,12 @@ impl AsyncClient {
         timeout_duration: Option<Duration>,
     ) -> Result<R, RepeError> {
         let resp = self
-            .call_with_body_and_timeout(path, timeout_duration, |builder| builder.body_beve(body))
+            .call_with_body_and_timeout(
+                path,
+                QueryFormat::JsonPointer as u16,
+                timeout_duration,
+                |builder| builder.body_beve(body),
+            )
             .await?;
         Self::decode_typed_response(&resp)
     }
@@ -302,6 +452,7 @@ impl AsyncClient {
     async fn call_with_body_and_timeout<P, F>(
         &self,
         path: P,
+        query_format: u16,
         timeout_duration: Option<Duration>,
         body_fn: F,
     ) -> Result<Message, RepeError>
@@ -313,7 +464,7 @@ impl AsyncClient {
         let builder = Message::builder()
             .id(id)
             .query_str(path.as_ref())
-            .query_format(QueryFormat::JsonPointer);
+            .query_format_code(query_format);
         let msg = body_fn(builder)?.build();
 
         let (sender, receiver) = oneshot::channel();
@@ -387,14 +538,69 @@ impl AsyncClient {
         P: AsRef<str>,
         F: FnOnce(MessageBuilder) -> Result<MessageBuilder, RepeError>,
     {
+        self.notify_with_builder(path, QueryFormat::JsonPointer as u16, body_fn)
+            .await
+    }
+
+    async fn notify_with_builder<P, F>(
+        &self,
+        path: P,
+        query_format: u16,
+        body_fn: F,
+    ) -> Result<(), RepeError>
+    where
+        P: AsRef<str>,
+        F: FnOnce(MessageBuilder) -> Result<MessageBuilder, RepeError>,
+    {
         let id = self.next_request_id();
         let builder = Message::builder()
             .id(id)
             .notify(true)
             .query_str(path.as_ref())
-            .query_format(QueryFormat::JsonPointer);
+            .query_format_code(query_format);
         let msg = body_fn(builder)?.build();
         self.write_request(&msg).await
+    }
+
+    async fn call_message_with_formats_and_timeout<P: AsRef<str>>(
+        &self,
+        path: P,
+        query_format: u16,
+        body: Option<&[u8]>,
+        body_format: u16,
+        timeout_duration: Option<Duration>,
+    ) -> Result<Message, RepeError> {
+        self.call_with_body_and_timeout(path, query_format, timeout_duration, |builder| {
+            let builder = if let Some(bytes) = body {
+                builder
+                    .body_bytes(bytes.to_vec())
+                    .body_format_code(body_format)
+            } else {
+                builder.body_format_code(body_format)
+            };
+            Ok(builder)
+        })
+        .await
+    }
+
+    async fn notify_with_message_formats<P: AsRef<str>>(
+        &self,
+        path: P,
+        query_format: u16,
+        body: Option<&[u8]>,
+        body_format: u16,
+    ) -> Result<(), RepeError> {
+        self.notify_with_builder(path, query_format, |builder| {
+            let builder = if let Some(bytes) = body {
+                builder
+                    .body_bytes(bytes.to_vec())
+                    .body_format_code(body_format)
+            } else {
+                builder.body_format_code(body_format)
+            };
+            Ok(builder)
+        })
+        .await
     }
 }
 
