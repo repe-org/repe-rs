@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [1.0.0] - 2026-03-05
 - Added multi-node fleet APIs:
   - `Fleet` for synchronous TCP request/response fanout
   - `AsyncFleet` for asynchronous tokio-based TCP fanout
