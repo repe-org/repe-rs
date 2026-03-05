@@ -256,6 +256,9 @@ impl UniUdpFleet {
             .collect()
     }
 
+    /// Returns nodes that contain all provided tags.
+    ///
+    /// Passing an empty `tags` slice matches all nodes.
     pub fn filter_nodes<T: AsRef<str>>(&self, tags: &[T]) -> Vec<UniUdpNode> {
         let tag_set: HashSet<String> = tags.iter().map(|tag| tag.as_ref().to_string()).collect();
         read_nodes(&self.nodes)
@@ -296,6 +299,9 @@ impl UniUdpFleet {
         }
     }
 
+    /// Sends notify-style UDP messages to nodes matching all provided tags.
+    ///
+    /// Passing an empty `tags` slice matches all nodes.
     pub fn send_notify<T: AsRef<str>>(
         &self,
         method: &str,
@@ -305,6 +311,9 @@ impl UniUdpFleet {
         self.send_with_selection(method, params, tags, true)
     }
 
+    /// Sends request-style UDP messages to nodes matching all provided tags.
+    ///
+    /// Passing an empty `tags` slice matches all nodes.
     pub fn send_request<T: AsRef<str>>(
         &self,
         method: &str,
@@ -314,6 +323,7 @@ impl UniUdpFleet {
         self.send_with_selection(method, params, tags, false)
     }
 
+    /// Sends notify-style UDP messages to all nodes.
     pub fn notify_all(&self, method: &str, params: Option<&Value>) -> HashMap<String, SendResult> {
         self.send_notify(method, params, &[] as &[&str])
     }

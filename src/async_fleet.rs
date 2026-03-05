@@ -135,6 +135,9 @@ impl AsyncFleet {
         out
     }
 
+    /// Returns nodes that contain all provided tags.
+    ///
+    /// Passing an empty `tags` slice matches all nodes.
     pub async fn filter_nodes<T: AsRef<str>>(&self, tags: &[T]) -> Vec<Node> {
         let tag_set: HashSet<String> = tags.iter().map(|tag| tag.as_ref().to_string()).collect();
         self.nodes
@@ -275,6 +278,9 @@ impl AsyncFleet {
             .await)
     }
 
+    /// Broadcasts to nodes matching all provided tags.
+    ///
+    /// Passing an empty `tags` slice matches all nodes.
     pub async fn broadcast_json<T: AsRef<str>>(
         &self,
         method: &str,
@@ -304,6 +310,9 @@ impl AsyncFleet {
         results
     }
 
+    /// Broadcasts and reduces over nodes matching all provided tags.
+    ///
+    /// Passing an empty `tags` slice matches all nodes.
     pub async fn map_reduce_json<T: AsRef<str>, R, F>(
         &self,
         method: &str,

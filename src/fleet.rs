@@ -349,6 +349,9 @@ impl Fleet {
             .collect()
     }
 
+    /// Returns nodes that contain all provided tags.
+    ///
+    /// Passing an empty `tags` slice matches all nodes.
     pub fn filter_nodes<T: AsRef<str>>(&self, tags: &[T]) -> Vec<Node> {
         let tag_set: HashSet<String> = tags.iter().map(|tag| tag.as_ref().to_string()).collect();
         read_nodes(&self.nodes)
@@ -476,6 +479,9 @@ impl Fleet {
         Ok(self.call_message_with_retry(node, method.to_string()))
     }
 
+    /// Broadcasts to nodes matching all provided tags.
+    ///
+    /// Passing an empty `tags` slice matches all nodes.
     pub fn broadcast_json<T: AsRef<str>>(
         &self,
         method: &str,
@@ -505,6 +511,9 @@ impl Fleet {
         results
     }
 
+    /// Broadcasts and reduces over nodes matching all provided tags.
+    ///
+    /// Passing an empty `tags` slice matches all nodes.
     pub fn map_reduce_json<T: AsRef<str>, R, F>(
         &self,
         method: &str,

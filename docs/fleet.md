@@ -130,7 +130,7 @@ for (name, result) in results {
 
 ## Notes
 
-- Tag filters match nodes that contain all specified tags.
+- Tag filters match nodes that contain all specified tags. An empty tag list matches all nodes.
 - Fleet methods snapshot target nodes before fanout, so in-flight broadcasts are isolated from concurrent add/remove operations.
 - Retry behavior is applied to TCP fleet calls (`call_json`, `call_message`, `broadcast_json`) for transport/I/O failures only (not well-formed server error responses).
 - `UniUdpClient` is backed by the `uniudp` crate. UDP fanout now uses UniUDP framing/reliability features (chunking, redundancy, and optional RS FEC).
