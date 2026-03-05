@@ -1,6 +1,4 @@
 use crate::client::Client;
-#[cfg(feature = "fleet-udp")]
-use crate::constants::{BodyFormat, QueryFormat};
 use crate::error::RepeError;
 use crate::message::Message;
 use serde_json::Value;
@@ -794,39 +792,3 @@ fn write_nodes(
         Err(poisoned) => poisoned.into_inner(),
     }
 }
-
-#[cfg(feature = "fleet-udp")]
-pub(crate) fn build_message_for_udp(
-    id: u64,
-    method: &str,
-    params: Option<&Value>,
-    query_format: u16,
-    body_format: u16,
-    notify: bool,
-) -> Result<Message, RepeError> {
-    let builder = Message::builder()
-        .id(id)
-        .notify(notify)
-        .query_str(method)
-        .query_format_code(query_format);
-
-    let builder = if let Some(value) = params {
-        match BodyFormat::try_from(body_format) {
-            Ok(BodyFormat::Json) => builder.body_json(value)?,
-            Ok(BodyFormat::Beve) => builder.body_beve(value)?,
-            Ok(BodyFormat::Utf8) => builder.body_utf8(&value.to_string()),
-            Ok(BodyFormat::RawBinary) | Err(_) => builder
-                .body_bytes(serde_json::to_vec(value).map_err(RepeError::from)?)
-                .body_format_code(body_format),
-        }
-    } else {
-        builder.body_format_code(body_format)
-    };
-
-    Ok(builder.build())
-}
-
-#[cfg(feature = "fleet-udp")]
-pub(crate) const DEFAULT_QUERY_FORMAT_CODE: u16 = QueryFormat::JsonPointer as u16;
-#[cfg(feature = "fleet-udp")]
-pub(crate) const DEFAULT_BODY_FORMAT_CODE: u16 = BodyFormat::Json as u16;

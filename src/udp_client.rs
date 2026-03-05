@@ -1,5 +1,6 @@
+use crate::constants::{BodyFormat, QueryFormat};
 use crate::error::RepeError;
-use crate::fleet::{DEFAULT_BODY_FORMAT_CODE, DEFAULT_QUERY_FORMAT_CODE, build_message_for_udp};
+use crate::message::Message;
 use serde_json::Value;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -7,6 +8,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use uniudp::fec::FecMode;
 use uniudp::options::{SendIdentityOverrides, SendOptions};
 use uniudp::sender::{SendFailure, SendRequest, Sender};
+
+const DEFAULT_QUERY_FORMAT_CODE: u16 = QueryFormat::JsonPointer as u16;
+const DEFAULT_BODY_FORMAT_CODE: u16 = BodyFormat::Json as u16;
 
 #[derive(Clone)]
 pub struct UniUdpClient {
@@ -178,6 +182,36 @@ impl UniUdpClient {
 
         options
     }
+}
+
+fn build_message_for_udp(
+    id: u64,
+    method: &str,
+    params: Option<&Value>,
+    query_format: u16,
+    body_format: u16,
+    notify: bool,
+) -> Result<Message, RepeError> {
+    let builder = Message::builder()
+        .id(id)
+        .notify(notify)
+        .query_str(method)
+        .query_format_code(query_format);
+
+    let builder = if let Some(value) = params {
+        match BodyFormat::try_from(body_format) {
+            Ok(BodyFormat::Json) => builder.body_json(value)?,
+            Ok(BodyFormat::Beve) => builder.body_beve(value)?,
+            Ok(BodyFormat::Utf8) => builder.body_utf8(&value.to_string()),
+            Ok(BodyFormat::RawBinary) | Err(_) => builder
+                .body_bytes(serde_json::to_vec(value).map_err(RepeError::from)?)
+                .body_format_code(body_format),
+        }
+    } else {
+        builder.body_format_code(body_format)
+    };
+
+    Ok(builder.build())
 }
 
 fn resolve_destination<A: ToSocketAddrs>(target: A) -> Result<SocketAddr, RepeError> {
