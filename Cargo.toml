@@ -18,8 +18,6 @@ include = [
     "examples/**",
     "tests/**",
 ]
-exclude = ["Cargo.toml.orig"]
-
 [features]
 default = []
 parking-lot = ["dep:parking_lot"]
