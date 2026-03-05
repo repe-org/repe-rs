@@ -287,10 +287,7 @@ impl Fleet {
         configs: Vec<NodeConfig>,
         options: FleetOptions,
     ) -> Result<Self, FleetError> {
-        validate_timeout(options.default_timeout)?;
-        if options.retry_policy.max_attempts < 1 {
-            return Err(FleetError::InvalidRetryAttempts);
-        }
+        validate_fleet_options(&options)?;
 
         let mut names = HashSet::new();
         let mut nodes = HashMap::new();
@@ -719,12 +716,20 @@ fn validate_timeout(timeout: Duration) -> Result<(), FleetError> {
     Ok(())
 }
 
-fn validate_node_config(config: &NodeConfig) -> Result<(), FleetError> {
+pub(crate) fn validate_node_config(config: &NodeConfig) -> Result<(), FleetError> {
     validate_host(&config.host)?;
     validate_port(config.port)?;
     validate_timeout(config.timeout)?;
     if config.name.is_empty() {
         return Err(FleetError::EmptyNodeName);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_fleet_options(options: &FleetOptions) -> Result<(), FleetError> {
+    validate_timeout(options.default_timeout)?;
+    if options.retry_policy.max_attempts < 1 {
+        return Err(FleetError::InvalidRetryAttempts);
     }
     Ok(())
 }

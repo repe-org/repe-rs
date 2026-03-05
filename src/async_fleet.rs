@@ -2,7 +2,7 @@ use crate::async_client::AsyncClient;
 use crate::error::RepeError;
 use crate::fleet::{
     ConnectSummary, DisconnectSummary, FleetError, FleetOptions, HealthStatus, Node, NodeConfig,
-    ReconnectSummary, RemoteResult,
+    ReconnectSummary, RemoteResult, validate_fleet_options, validate_node_config,
 };
 use crate::message::Message;
 use serde_json::Value;
@@ -71,29 +71,13 @@ impl AsyncFleet {
         configs: Vec<NodeConfig>,
         options: FleetOptions,
     ) -> Result<Self, FleetError> {
-        if options.default_timeout.is_zero() {
-            return Err(FleetError::InvalidTimeout);
-        }
-        if options.retry_policy.max_attempts < 1 {
-            return Err(FleetError::InvalidRetryAttempts);
-        }
+        validate_fleet_options(&options)?;
 
         let mut names = HashSet::new();
         let mut nodes = HashMap::new();
 
         for config in configs {
-            if config.host.is_empty() {
-                return Err(FleetError::EmptyHost);
-            }
-            if config.name.is_empty() {
-                return Err(FleetError::EmptyNodeName);
-            }
-            if config.port == 0 {
-                return Err(FleetError::InvalidPort(config.port));
-            }
-            if config.timeout.is_zero() {
-                return Err(FleetError::InvalidTimeout);
-            }
+            validate_node_config(&config)?;
             if !names.insert(config.name.clone()) {
                 return Err(FleetError::DuplicateNodeName(config.name));
             }
@@ -163,18 +147,7 @@ impl AsyncFleet {
     }
 
     pub async fn add_node(&self, config: NodeConfig) -> Result<(), FleetError> {
-        if config.host.is_empty() {
-            return Err(FleetError::EmptyHost);
-        }
-        if config.name.is_empty() {
-            return Err(FleetError::EmptyNodeName);
-        }
-        if config.port == 0 {
-            return Err(FleetError::InvalidPort(config.port));
-        }
-        if config.timeout.is_zero() {
-            return Err(FleetError::InvalidTimeout);
-        }
+        validate_node_config(&config)?;
 
         let mut nodes = self.nodes.write().await;
         if nodes.contains_key(&config.name) {
