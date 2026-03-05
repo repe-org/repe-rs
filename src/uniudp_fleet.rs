@@ -4,7 +4,6 @@ use serde_json::Value;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::sync::{Arc, RwLock};
-use std::thread;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,22 +352,10 @@ impl UniUdpFleet {
         notify: bool,
     ) -> HashMap<String, SendResult> {
         let target_nodes = self.snapshot_target_nodes(tags);
-        let mut handles = Vec::with_capacity(target_nodes.len());
-
-        for node in target_nodes {
-            let method = method.to_string();
-            let params = params.cloned();
-            handles.push(thread::spawn(move || {
-                let result = send_to_node(node, method, params, notify);
-                (result.node.clone(), result)
-            }));
-        }
-
         let mut results = HashMap::new();
-        for handle in handles {
-            if let Ok((name, result)) = handle.join() {
-                results.insert(name, result);
-            }
+        for node in target_nodes {
+            let result = send_to_node(node, method.to_string(), params.cloned(), notify);
+            results.insert(result.node.clone(), result);
         }
 
         results
