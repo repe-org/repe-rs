@@ -121,6 +121,71 @@ Async (tokio)
 - Use `AsyncServer` and `AsyncClient` for asynchronous operation with tokio.
 - See `examples/async_server.rs` and `examples/async_client.rs`.
 
+Fleet (Multi-Node Control)
+
+- Use `Fleet` / `AsyncFleet` to manage multiple TCP REPE servers as one logical unit.
+- Use `UniUdpFleet` for fire-and-forget UDP fanout.
+- TCP retry policy retries transport/I/O failures only; application-level server errors are returned without retry.
+- See [docs/fleet.md](docs/fleet.md) for complete API details.
+
+```rust
+use repe::{Fleet, FleetOptions, NodeConfig, RetryPolicy};
+use serde_json::json;
+use std::time::Duration;
+
+let fleet = Fleet::with_options(
+    vec![
+        NodeConfig::new("127.0.0.1", 8081)?.with_name("node-1")?.with_tags(["compute"]),
+        NodeConfig::new("127.0.0.1", 8082)?.with_name("node-2")?.with_tags(["compute", "primary"]),
+    ],
+    FleetOptions {
+        default_timeout: Duration::from_secs(2),
+        retry_policy: RetryPolicy { max_attempts: 3, delay: Duration::from_millis(100) },
+    },
+)?;
+
+let _ = fleet.connect_all();
+let status = fleet.broadcast_json("/status", None, &[] as &[&str]);
+let total = fleet.map_reduce_json("/compute", Some(&json!({"value": 10})), &["compute"], |results| {
+    results
+        .into_iter()
+        .filter_map(|r| r.value.and_then(|v| v["result"].as_i64()))
+        .sum::<i64>()
+});
+println!("total={total}, nodes={}", status.len());
+```
+
+```rust
+use repe::{AsyncFleet, FleetOptions, NodeConfig, RetryPolicy};
+use serde_json::json;
+use std::time::Duration;
+
+let fleet = AsyncFleet::with_options(
+    vec![NodeConfig::new("127.0.0.1", 8081)?.with_name("node-1")?],
+    FleetOptions {
+        default_timeout: Duration::from_secs(2),
+        retry_policy: RetryPolicy { max_attempts: 3, delay: Duration::from_millis(100) },
+    },
+)?;
+
+let _ = fleet.connect_all().await;
+let res = fleet.call_json("node-1", "/status", Some(&json!({}))).await?;
+assert!(res.succeeded());
+```
+
+```rust
+use repe::{UniUdpFleet, UniUdpNodeConfig};
+use serde_json::json;
+
+let fleet = UniUdpFleet::new(vec![
+    UniUdpNodeConfig::new("127.0.0.1", 5001)?.with_name("edge-a")?.with_tags(["edge"]),
+    UniUdpNodeConfig::new("127.0.0.1", 5002)?.with_name("edge-b")?.with_tags(["edge"]),
+])?;
+
+let sent = fleet.send_notify("/heartbeat", Some(&json!({"source": "controller"})), &["edge"]);
+assert!(sent.values().all(|result| result.succeeded()));
+```
+
 Server
 
 - Build a router and serve TCP:

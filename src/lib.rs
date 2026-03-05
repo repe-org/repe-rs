@@ -4,11 +4,13 @@
 //! Spec reference: <https://github.com/beve-org/beve>
 
 pub mod async_client;
+pub mod async_fleet;
 pub mod async_io;
 pub mod async_server;
 pub mod client;
 pub mod constants;
 pub mod error;
+pub mod fleet;
 pub mod header;
 pub mod io;
 pub mod json_pointer;
@@ -16,6 +18,8 @@ pub mod message;
 pub mod registry;
 pub mod server;
 pub mod structs;
+pub mod udp_client;
+pub mod uniudp_fleet;
 
 #[doc(hidden)]
 pub mod derive {
@@ -26,10 +30,15 @@ pub mod derive {
 pub use repe_derive::RepeStruct;
 
 pub use async_client::AsyncClient;
+pub use async_fleet::AsyncFleet;
 pub use async_server::AsyncServer;
 pub use client::Client;
 pub use constants::{BodyFormat, ErrorCode, HEADER_SIZE, QueryFormat, REPE_SPEC, REPE_VERSION};
 pub use error::RepeError;
+pub use fleet::{
+    ConnectSummary, DisconnectSummary, Fleet, FleetError, FleetOptions, HealthStatus, Node,
+    NodeConfig, ReconnectSummary, RemoteResult, RetryPolicy,
+};
 pub use header::Header;
 pub use io::{read_message, write_message};
 pub use json_pointer::{evaluate as eval_json_pointer, parse as parse_json_pointer};
@@ -40,3 +49,5 @@ pub use server::{
     TypedResponse,
 };
 pub use structs::{RepeStruct, StructError};
+pub use udp_client::UniUdpClient;
+pub use uniudp_fleet::{SendResult, UniUdpFleet, UniUdpNode, UniUdpNodeConfig};

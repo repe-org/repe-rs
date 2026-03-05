@@ -1,6 +1,29 @@
 # Changelog
 
 ## [Unreleased]
+- Added multi-node fleet APIs:
+  - `Fleet` for synchronous TCP request/response fanout
+  - `AsyncFleet` for asynchronous tokio-based TCP fanout
+  - `UniUdpFleet` for unidirectional UDP fanout
+- Added shared fleet types and configuration:
+  - `NodeConfig`, `FleetOptions`, `RetryPolicy`
+  - `RemoteResult`, `HealthStatus`
+  - connect/disconnect/reconnect summary types
+- Added fleet operations:
+  - connection lifecycle (`connect_all`, `disconnect_all`, `reconnect_disconnected`)
+  - single-node calls (`call_json`, `call_message`)
+  - tag-filtered broadcast (`broadcast_json`) and reduction (`map_reduce_json`)
+  - per-node health checks (`health_check`)
+- Updated TCP fleet retry policy to retry only transport/I/O failures and stop retrying on application-level server errors.
+- Added UDP foundations:
+  - `UniUdpClient` with notify/request send APIs and per-message IDs, backed by the `uniudp` crate
+  - UDP node config with redundancy/chunk/FEC fields
+  - UniUDP default RS profile now uses `fec_group_size=4` with `parity_shards=2`
+- Added integration tests for:
+  - sync fleet behavior (`tests/fleet_tests.rs`)
+  - async fleet behavior (`tests/async_fleet_tests.rs`)
+  - UDP fleet behavior (`tests/uniudp_fleet_tests.rs`)
+- Added fleet documentation (`docs/fleet.md`) and README examples.
 
 ## [0.4.2] - 2026-02-22
 - Added multiplexed request handling to `Client` and `AsyncClient` so multiple in-flight calls can share a single connection and still match responses by request ID.
