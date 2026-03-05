@@ -154,7 +154,6 @@ impl UniUdpClient {
             .send_with_socket(socket, request)
             .map_err(send_failure_to_repe_error)?;
 
-        debug_assert_eq!(sent_key.message_id, repe_id);
         if sent_key.message_id != repe_id {
             return Err(RepeError::Io(std::io::Error::other(
                 "uniudp returned a mismatched message id",
