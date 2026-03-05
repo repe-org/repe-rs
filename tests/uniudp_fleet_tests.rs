@@ -1,3 +1,5 @@
+#![cfg(feature = "fleet-udp")]
+
 use repe::{FleetError, Message, UniUdpFleet, UniUdpNodeConfig};
 use serde_json::json;
 use std::net::UdpSocket;

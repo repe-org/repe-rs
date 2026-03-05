@@ -4,7 +4,7 @@
 
 - `Fleet` (sync TCP request/response)
 - `AsyncFleet` (tokio TCP request/response)
-- `UniUdpFleet` (sync UDP fire-and-forget)
+- `UniUdpFleet` (sync UDP fire-and-forget; requires `fleet-udp` feature)
 
 ## TCP Fleet Types
 

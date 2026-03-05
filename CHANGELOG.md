@@ -19,6 +19,7 @@
   - `UniUdpClient` with notify/request send APIs and per-message IDs, backed by the `uniudp` crate
   - UDP node config with redundancy/chunk/FEC fields
   - UniUDP default RS profile now uses `fec_group_size=4` with `parity_shards=2`
+- Made UniUDP support opt-in behind the `fleet-udp` Cargo feature so TCP-only builds avoid UniUDP dependencies.
 - Added integration tests for:
   - sync fleet behavior (`tests/fleet_tests.rs`)
   - async fleet behavior (`tests/async_fleet_tests.rs`)

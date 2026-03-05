@@ -124,7 +124,7 @@ Async (tokio)
 Fleet (Multi-Node Control)
 
 - Use `Fleet` / `AsyncFleet` to manage multiple TCP REPE servers as one logical unit.
-- Use `UniUdpFleet` for fire-and-forget UDP fanout.
+- Use `UniUdpFleet` for fire-and-forget UDP fanout (enable with `--features fleet-udp`).
 - TCP retry policy retries transport/I/O failures only; application-level server errors are returned without retry.
 - See [docs/fleet.md](docs/fleet.md) for complete API details.
 

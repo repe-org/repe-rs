@@ -1,4 +1,5 @@
 use crate::client::Client;
+#[cfg(feature = "fleet-udp")]
 use crate::constants::{BodyFormat, QueryFormat};
 use crate::error::RepeError;
 use crate::message::Message;
@@ -788,6 +789,7 @@ fn write_nodes(
     }
 }
 
+#[cfg(feature = "fleet-udp")]
 pub(crate) fn build_message_for_udp(
     id: u64,
     method: &str,
@@ -818,5 +820,7 @@ pub(crate) fn build_message_for_udp(
     Ok(builder.build())
 }
 
+#[cfg(feature = "fleet-udp")]
 pub(crate) const DEFAULT_QUERY_FORMAT_CODE: u16 = QueryFormat::JsonPointer as u16;
+#[cfg(feature = "fleet-udp")]
 pub(crate) const DEFAULT_BODY_FORMAT_CODE: u16 = BodyFormat::Json as u16;

@@ -18,7 +18,9 @@ pub mod message;
 pub mod registry;
 pub mod server;
 pub mod structs;
+#[cfg(feature = "fleet-udp")]
 pub mod udp_client;
+#[cfg(feature = "fleet-udp")]
 pub mod uniudp_fleet;
 
 #[doc(hidden)]
@@ -49,5 +51,7 @@ pub use server::{
     TypedResponse,
 };
 pub use structs::{RepeStruct, StructError};
+#[cfg(feature = "fleet-udp")]
 pub use udp_client::UniUdpClient;
+#[cfg(feature = "fleet-udp")]
 pub use uniudp_fleet::{SendResult, UniUdpFleet, UniUdpNode, UniUdpNodeConfig};
