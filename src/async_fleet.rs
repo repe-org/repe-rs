@@ -37,14 +37,6 @@ impl AsyncNodeState {
             timeout: self.config.timeout,
         }
     }
-
-    fn timeout_or(&self, fallback: std::time::Duration) -> std::time::Duration {
-        if self.config.timeout.is_zero() {
-            fallback
-        } else {
-            self.config.timeout
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -409,7 +401,7 @@ impl AsyncFleet {
         let mut last_error = None;
 
         for attempt in 0..self.options.retry_policy.max_attempts {
-            let timeout = state.timeout_or(self.options.default_timeout);
+            let timeout = state.config.timeout;
             let call = async {
                 let client = ensure_connected(&state).await?;
                 if let Some(ref value) = params {
@@ -463,7 +455,7 @@ impl AsyncFleet {
         let mut last_error = None;
 
         for attempt in 0..self.options.retry_policy.max_attempts {
-            let timeout = state.timeout_or(self.options.default_timeout);
+            let timeout = state.config.timeout;
             let call = async {
                 let client = ensure_connected(&state).await?;
                 client.call_message_with_timeout(&method, timeout).await

@@ -253,14 +253,6 @@ impl NodeState {
             timeout: self.config.timeout,
         }
     }
-
-    fn timeout_or(&self, fallback: Duration) -> Duration {
-        if self.config.timeout.is_zero() {
-            fallback
-        } else {
-            self.config.timeout
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -603,7 +595,7 @@ impl Fleet {
         let mut last_error = None;
 
         for attempt in 0..self.options.retry_policy.max_attempts {
-            let timeout = node.timeout_or(self.options.default_timeout);
+            let timeout = node.config.timeout;
             let call = (|| {
                 let client = ensure_connected(&node)?;
                 if let Some(ref value) = params {
@@ -656,7 +648,7 @@ impl Fleet {
         let mut last_error = None;
 
         for attempt in 0..self.options.retry_policy.max_attempts {
-            let timeout = node.timeout_or(self.options.default_timeout);
+            let timeout = node.config.timeout;
             let call = (|| {
                 let client = ensure_connected(&node)?;
                 client.call_message_with_timeout(&method, timeout)
