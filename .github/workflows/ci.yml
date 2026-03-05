@@ -43,6 +43,8 @@ jobs:
 
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
