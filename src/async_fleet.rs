@@ -6,7 +6,7 @@ use crate::fleet::{
 };
 use crate::message::Message;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
@@ -15,14 +15,14 @@ const DEFAULT_HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 
 struct AsyncNodeState {
     config: NodeConfig,
-    tags: HashSet<String>,
+    tags: BTreeSet<String>,
     client: Mutex<Option<AsyncClient>>,
 }
 
 impl AsyncNodeState {
     fn new(config: NodeConfig) -> Self {
         Self {
-            tags: config.tags.iter().cloned().collect(),
+            tags: config.tags.clone(),
             config,
             client: Mutex::new(None),
         }
@@ -33,7 +33,7 @@ impl AsyncNodeState {
             name: self.config.name.clone(),
             host: self.config.host.clone(),
             port: self.config.port,
-            tags: self.tags.iter().cloned().collect(),
+            tags: self.tags.clone(),
             timeout: self.config.timeout,
         }
     }
@@ -131,7 +131,7 @@ impl AsyncFleet {
     ///
     /// Passing an empty `tags` slice matches all nodes.
     pub async fn filter_nodes<T: AsRef<str>>(&self, tags: &[T]) -> Vec<Node> {
-        let tag_set: HashSet<String> = tags.iter().map(|tag| tag.as_ref().to_string()).collect();
+        let tag_set: BTreeSet<String> = tags.iter().map(|tag| tag.as_ref().to_string()).collect();
         self.nodes
             .read()
             .await
@@ -372,7 +372,7 @@ impl AsyncFleet {
     }
 
     async fn snapshot_target_nodes<T: AsRef<str>>(&self, tags: &[T]) -> Vec<Arc<AsyncNodeState>> {
-        let tag_set: HashSet<String> = tags.iter().map(|tag| tag.as_ref().to_string()).collect();
+        let tag_set: BTreeSet<String> = tags.iter().map(|tag| tag.as_ref().to_string()).collect();
         self.nodes
             .read()
             .await

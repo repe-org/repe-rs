@@ -45,7 +45,7 @@ pub struct NodeConfig {
     pub name: String,
     pub host: String,
     pub port: u16,
-    pub tags: Vec<String>,
+    pub tags: BTreeSet<String>,
     pub timeout: Duration,
 }
 
@@ -59,7 +59,7 @@ impl NodeConfig {
             name: host.clone(),
             host,
             port,
-            tags: Vec::new(),
+            tags: BTreeSet::new(),
             timeout: DEFAULT_TIMEOUT,
         })
     }
@@ -229,14 +229,14 @@ pub struct ReconnectSummary {
 
 struct NodeState {
     config: NodeConfig,
-    tags: HashSet<String>,
+    tags: BTreeSet<String>,
     client: Mutex<Option<Client>>,
 }
 
 impl NodeState {
     fn new(config: NodeConfig) -> Self {
         Self {
-            tags: config.tags.iter().cloned().collect(),
+            tags: config.tags.clone(),
             config,
             client: Mutex::new(None),
         }
@@ -247,7 +247,7 @@ impl NodeState {
             name: self.config.name.clone(),
             host: self.config.host.clone(),
             port: self.config.port,
-            tags: self.tags.iter().cloned().collect(),
+            tags: self.tags.clone(),
             timeout: self.config.timeout,
         }
     }
@@ -343,7 +343,7 @@ impl Fleet {
     ///
     /// Passing an empty `tags` slice matches all nodes.
     pub fn filter_nodes<T: AsRef<str>>(&self, tags: &[T]) -> Vec<Node> {
-        let tag_set: HashSet<String> = tags.iter().map(|tag| tag.as_ref().to_string()).collect();
+        let tag_set: BTreeSet<String> = tags.iter().map(|tag| tag.as_ref().to_string()).collect();
         read_nodes(&self.nodes)
             .values()
             .filter(|node| tag_set.is_subset(&node.tags))
@@ -568,7 +568,7 @@ impl Fleet {
     }
 
     fn snapshot_target_nodes<T: AsRef<str>>(&self, tags: &[T]) -> Vec<Arc<NodeState>> {
-        let tag_set: HashSet<String> = tags.iter().map(|tag| tag.as_ref().to_string()).collect();
+        let tag_set: BTreeSet<String> = tags.iter().map(|tag| tag.as_ref().to_string()).collect();
         read_nodes(&self.nodes)
             .values()
             .filter(|node| tag_set.is_subset(&node.tags))

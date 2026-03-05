@@ -11,7 +11,7 @@ pub struct UniUdpNodeConfig {
     pub name: String,
     pub host: String,
     pub port: u16,
-    pub tags: Vec<String>,
+    pub tags: BTreeSet<String>,
     pub redundancy: usize,
     pub chunk_size: usize,
     pub fec_group_size: usize,
@@ -32,7 +32,7 @@ impl UniUdpNodeConfig {
             name: host.clone(),
             host,
             port,
-            tags: Vec::new(),
+            tags: BTreeSet::new(),
             redundancy: 1,
             chunk_size: 1024,
             fec_group_size: 4,
@@ -158,7 +158,7 @@ impl Display for SendResult {
 
 struct UniUdpNodeState {
     config: UniUdpNodeConfig,
-    tags: HashSet<String>,
+    tags: BTreeSet<String>,
     client: UniUdpClient,
 }
 
@@ -173,7 +173,7 @@ impl UniUdpNodeState {
         )?;
 
         Ok(Self {
-            tags: config.tags.iter().cloned().collect(),
+            tags: config.tags.clone(),
             config,
             client,
         })
@@ -184,7 +184,7 @@ impl UniUdpNodeState {
             name: self.config.name.clone(),
             host: self.config.host.clone(),
             port: self.config.port,
-            tags: self.tags.iter().cloned().collect(),
+            tags: self.tags.clone(),
             redundancy: self.config.redundancy,
             chunk_size: self.config.chunk_size,
             fec_group_size: self.config.fec_group_size,
@@ -259,7 +259,7 @@ impl UniUdpFleet {
     ///
     /// Passing an empty `tags` slice matches all nodes.
     pub fn filter_nodes<T: AsRef<str>>(&self, tags: &[T]) -> Vec<UniUdpNode> {
-        let tag_set: HashSet<String> = tags.iter().map(|tag| tag.as_ref().to_string()).collect();
+        let tag_set: BTreeSet<String> = tags.iter().map(|tag| tag.as_ref().to_string()).collect();
         read_nodes(&self.nodes)
             .values()
             .filter(|node| tag_set.is_subset(&node.tags))
@@ -362,7 +362,7 @@ impl UniUdpFleet {
     }
 
     fn snapshot_target_nodes<T: AsRef<str>>(&self, tags: &[T]) -> Vec<Arc<UniUdpNodeState>> {
-        let tag_set: HashSet<String> = tags.iter().map(|tag| tag.as_ref().to_string()).collect();
+        let tag_set: BTreeSet<String> = tags.iter().map(|tag| tag.as_ref().to_string()).collect();
         read_nodes(&self.nodes)
             .values()
             .filter(|node| tag_set.is_subset(&node.tags))
