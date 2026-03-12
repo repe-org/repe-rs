@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 use repe::{eval_json_pointer, parse_json_pointer};
 use serde_json::json;
 

@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 use repe::{AsyncClient, BodyFormat, Message, QueryFormat, read_message, write_message};
 use serde::Deserialize;
 use serde_json::{Value, json};

@@ -1,24 +1,32 @@
-use crate::constants::{BodyFormat, ErrorCode, QueryFormat, REPE_VERSION};
+use crate::constants::{BodyFormat, ErrorCode};
 use crate::error::RepeError;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::io::{read_message, write_message};
 use crate::message::{Message, create_error_response_like, create_response};
 use crate::registry::Registry;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::server_request::route_request;
 use crate::structs::RepeStruct;
 use beve::from_slice as beve_from_slice;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::Write;
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::{BufReader, BufWriter};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::Ordering;
+#[cfg(not(target_arch = "wasm32"))]
+use std::{
+    net::{TcpListener, TcpStream, ToSocketAddrs},
+    sync::atomic::AtomicBool,
+    thread,
+    time::Duration,
 };
-use std::thread;
-use std::time::Duration;
 
 pub trait HandlerErased: Send + Sync {
     fn handle(&self, req: &Message) -> Result<Message, RepeError>;
@@ -276,6 +284,7 @@ impl<T: ?Sized + Send + Sync> Lockable<T> for std::sync::RwLock<T> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl<T: ?Sized + Send> Lockable<T> for tokio::sync::Mutex<T> {
     type Guard<'a>
         = tokio::sync::MutexGuard<'a, T>
@@ -287,6 +296,7 @@ impl<T: ?Sized + Send> Lockable<T> for tokio::sync::Mutex<T> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl<T: ?Sized + Send + Sync> Lockable<T> for tokio::sync::RwLock<T> {
     type Guard<'a>
         = tokio::sync::RwLockWriteGuard<'a, T>
@@ -791,6 +801,7 @@ impl<H: JsonTypedHandler> HandlerErased for JsonTypedAdapter<H> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub struct Server {
     router: Router,
     read_timeout: Option<Duration>,
@@ -799,6 +810,7 @@ pub struct Server {
     tcp_nodelay: bool,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Server {
     pub fn new(router: Router) -> Self {
         Self {
@@ -862,6 +874,7 @@ impl Server {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn handle_connection(
     stream: TcpStream,
     router: Router,
@@ -881,62 +894,7 @@ fn handle_connection(
             Err(RepeError::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e),
         };
-        let notify = req.header.notify == 1;
-        if req.header.version != REPE_VERSION {
-            if !notify {
-                let resp = create_error_response_like(
-                    &req,
-                    ErrorCode::VersionMismatch,
-                    format!("Unsupported REPE version {}", req.header.version),
-                );
-                write_message(&mut writer, &resp)?;
-                writer.flush()?;
-            }
-            continue;
-        }
-        let qf = QueryFormat::try_from(req.header.query_format).unwrap_or(QueryFormat::RawBinary);
-        let path = match qf {
-            QueryFormat::JsonPointer => match req.query_str() {
-                Ok(s) => s,
-                Err(_) => {
-                    if !notify {
-                        let resp = create_error_response_like(
-                            &req,
-                            ErrorCode::InvalidQuery,
-                            "Query must be valid UTF-8",
-                        );
-                        write_message(&mut writer, &resp)?;
-                        writer.flush()?;
-                    }
-                    continue;
-                }
-            },
-            QueryFormat::RawBinary => {
-                if !notify {
-                    let resp = create_error_response_like(
-                        &req,
-                        ErrorCode::InvalidQuery,
-                        "Raw binary queries are not supported by this server",
-                    );
-                    write_message(&mut writer, &resp)?;
-                    writer.flush()?;
-                }
-                continue;
-            }
-        };
-        let resp = match router.get(path) {
-            Some(handler) => match handler.handle(&req) {
-                Ok(m) => m,
-                Err(e) => create_error_response_like(&req, e.to_error_code(), e.to_string()),
-            },
-            None => create_error_response_like(
-                &req,
-                ErrorCode::MethodNotFound,
-                format!("Method not found: {path}"),
-            ),
-        };
-
-        if !notify {
+        if let Some(resp) = route_request(&router, &req) {
             write_message(&mut writer, &resp)?;
             writer.flush()?;
         }
@@ -944,12 +902,13 @@ fn handle_connection(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    use crate::{QueryFormat, REPE_VERSION};
     use serde::{Deserialize, Serialize};
     use std::io::Read;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     #[test]
     fn middleware_runs_for_registered_handlers() {

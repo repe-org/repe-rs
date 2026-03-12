@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 use repe::{BodyFormat, ErrorCode, Message, QueryFormat, Registry, Router};
 use serde_json::{Value, json};
 use std::sync::Arc;

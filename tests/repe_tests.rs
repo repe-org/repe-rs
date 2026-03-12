@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 use repe::message::{create_error_message, create_error_response_like, create_response};
 use repe::*;
 

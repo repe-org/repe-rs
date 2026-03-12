@@ -60,6 +60,18 @@ impl Message {
         Self::new(header, query, body)
     }
 
+    pub fn from_slice_exact(buf: &[u8]) -> Result<Self, RepeError> {
+        let message = Self::from_slice(buf)?;
+        let expected = HEADER_SIZE + message.query.len() + message.body.len();
+        if buf.len() != expected {
+            return Err(RepeError::LengthMismatch {
+                expected: expected as u64,
+                got: buf.len() as u64,
+            });
+        }
+        Ok(message)
+    }
+
     pub fn is_error(&self) -> bool {
         self.header.ec != ErrorCode::Ok as u32
     }
@@ -173,6 +185,26 @@ mod tests {
             RepeError::BufferTooSmall { need, have } => {
                 assert_eq!(need, full_len);
                 assert_eq!(have, full_len - 1);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn message_from_slice_exact_rejects_trailing_bytes() {
+        let msg = Message::builder()
+            .id(11)
+            .query_str("/a")
+            .query_format(QueryFormat::JsonPointer)
+            .body_utf8("payload")
+            .build();
+        let mut bytes = msg.to_vec();
+        bytes.extend_from_slice(&[0xAA, 0xBB]);
+
+        match Message::from_slice_exact(&bytes).unwrap_err() {
+            RepeError::LengthMismatch { expected, got } => {
+                assert_eq!(expected, msg.to_vec().len() as u64);
+                assert_eq!(got, bytes.len() as u64);
             }
             other => panic!("unexpected error: {other:?}"),
         }
