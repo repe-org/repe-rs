@@ -2,6 +2,6 @@
 /reference
 target/
 PR_DESCRIPTION.md
-docs/pr-description.md
-docs/feature-expansion-plan.md
+dev/pr-description.md
+dev/feature-expansion-plan.md
 PR.md
