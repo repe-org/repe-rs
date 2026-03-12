@@ -6,7 +6,9 @@ use crate::server_request::route_request;
 use futures_util::{SinkExt, StreamExt};
 use std::io::ErrorKind;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
-use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::handshake::server::{
+    Callback, ErrorResponse, Request, Response,
+};
 use tokio_tungstenite::tungstenite::{self, Message as WsMessage, http::StatusCode};
 use tokio_tungstenite::{WebSocketStream, accept_hdr_async};
 
@@ -93,14 +95,12 @@ async fn accept_repe_websocket(
     stream: TcpStream,
     expected_path: &str,
 ) -> Result<WebSocketStream<TcpStream>, RepeError> {
-    let expected = expected_path.to_owned();
-    accept_hdr_async(stream, move |request: &Request, response: Response| {
-        if request.uri().path() == expected {
-            Ok(response)
-        } else {
-            Err(path_not_found_response(request))
-        }
-    })
+    accept_hdr_async(
+        stream,
+        WebSocketPathValidator {
+            expected: expected_path.to_owned(),
+        },
+    )
     .await
     .map_err(websocket_transport_error)
 }
@@ -190,6 +190,25 @@ fn websocket_invalid_data_error(message: &str) -> RepeError {
     RepeError::Io(std::io::Error::new(ErrorKind::InvalidData, message))
 }
 
+struct WebSocketPathValidator {
+    expected: String,
+}
+
+impl Callback for WebSocketPathValidator {
+    #[allow(clippy::result_large_err)]
+    fn on_request(
+        self,
+        request: &Request,
+        response: Response,
+    ) -> Result<Response, ErrorResponse> {
+        if request.uri().path() == self.expected {
+            Ok(response)
+        } else {
+            Err(path_not_found_response(request))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,7 +247,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn websocket_proxy_forwards_raw_messages() {
-        let upstream_router = Router::new().with_json("/echo", |value| Ok(value));
+        let upstream_router = Router::new().with_json("/echo", Ok);
         let upstream_listener = crate::async_server::AsyncServer::listen(("127.0.0.1", 0))
             .await
             .unwrap();
