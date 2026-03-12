@@ -30,11 +30,7 @@ impl WebSocketServer {
         self.serve_listener(listener, path).await
     }
 
-    pub async fn serve_listener(
-        self,
-        listener: TcpListener,
-        path: &str,
-    ) -> std::io::Result<()> {
+    pub async fn serve_listener(self, listener: TcpListener, path: &str) -> std::io::Result<()> {
         let expected_path = normalize_path(path);
 
         loop {
@@ -176,12 +172,9 @@ fn path_not_found_response(request: &Request) -> ErrorResponse {
 fn websocket_transport_error(err: tungstenite::Error) -> RepeError {
     match err {
         tungstenite::Error::Io(io_err) => RepeError::Io(io_err),
-        tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => {
-            RepeError::Io(std::io::Error::new(
-                ErrorKind::ConnectionAborted,
-                "websocket connection closed",
-            ))
-        }
+        tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => RepeError::Io(
+            std::io::Error::new(ErrorKind::ConnectionAborted, "websocket connection closed"),
+        ),
         other => RepeError::Io(std::io::Error::other(other.to_string())),
     }
 }
@@ -196,11 +189,7 @@ struct WebSocketPathValidator {
 
 impl Callback for WebSocketPathValidator {
     #[allow(clippy::result_large_err)]
-    fn on_request(
-        self,
-        request: &Request,
-        response: Response,
-    ) -> Result<Response, ErrorResponse> {
+    fn on_request(self, request: &Request, response: Response) -> Result<Response, ErrorResponse> {
         if request.uri().path() == self.expected {
             Ok(response)
         } else {

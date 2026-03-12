@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use std::io::Write;
 #[cfg(not(target_arch = "wasm32"))]
 use std::io::{BufReader, BufWriter};
-use std::sync::Mutex;
 use std::sync::Arc;
+use std::sync::Mutex;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::Ordering;
 #[cfg(not(target_arch = "wasm32"))]

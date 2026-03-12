@@ -21,8 +21,7 @@ type PendingSender = oneshot::Sender<Result<Message, RepeError>>;
 type PendingRequests = HashMap<u64, PendingSender>;
 type WsWriter =
     futures_util::stream::SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>;
-type WsReader =
-    futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
+type WsReader = futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 
 #[derive(Clone)]
 pub struct WebSocketClient {
@@ -638,7 +637,9 @@ fn spawn_response_loop(mut reader: WsReader, inner: std::sync::Weak<WebSocketCli
                     let _ = sender.send(Ok(response));
                 }
                 PendingDispatch::Unrecognized { got_id } => {
-                    eprintln!("[repe] dropping websocket response for unrecognized request id {got_id}");
+                    eprintln!(
+                        "[repe] dropping websocket response for unrecognized request id {got_id}"
+                    );
                 }
             }
         }
@@ -656,10 +657,7 @@ fn decode_websocket_frame(frame: WsMessage) -> Result<Option<Message>, RepeError
     }
 }
 
-async fn fail_all_pending(
-    inner: &std::sync::Weak<WebSocketClientInner>,
-    err: RepeError,
-) {
+async fn fail_all_pending(inner: &std::sync::Weak<WebSocketClientInner>, err: RepeError) {
     let Some(inner_ref) = inner.upgrade() else {
         return;
     };
@@ -761,12 +759,9 @@ fn websocket_connect_error(err: tungstenite::Error) -> std::io::Error {
 fn websocket_transport_error(err: tungstenite::Error) -> RepeError {
     match err {
         tungstenite::Error::Io(io_err) => RepeError::Io(io_err),
-        tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => {
-            RepeError::Io(std::io::Error::new(
-                ErrorKind::ConnectionAborted,
-                "websocket connection closed",
-            ))
-        }
+        tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => RepeError::Io(
+            std::io::Error::new(ErrorKind::ConnectionAborted, "websocket connection closed"),
+        ),
         other => RepeError::Io(std::io::Error::other(other.to_string())),
     }
 }
