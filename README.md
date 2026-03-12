@@ -13,6 +13,8 @@ This crate provides:
 - BEVE binary body helpers via the [`beve`](https://crates.io/crates/beve) crate
 - Dynamic registry routing with JSON Pointer semantics
 - Error codes and formats aligned with the spec
+- Optional native WebSocket transport (`websocket` feature)
+- Optional browser WebSocket transport for wasm (`websocket-wasm` feature)
 
 Installation
 
@@ -20,7 +22,7 @@ Add to your `Cargo.toml`:
 
 ```
 [dependencies]
-repe = "0.1"
+repe = "1.1"
 ```
 
 > Tip: run `cargo add repe` to automatically pull the latest compatible release.
@@ -80,8 +82,33 @@ Examples
 Notes
 
 - BEVE helpers encode/decode via serde, so your existing request/response types continue to work.
-- The header `reserved` field is currently ignored (per spec receivers must not reject non-zero values).
+- The header `reserved` field is validated and must be zero.
 - The header length is validated to be `48 + query_length + body_length`.
+
+Feature flags
+
+- `websocket` - native `WebSocketClient`, `WebSocketServer`, and `proxy_connection`
+- `websocket-wasm` - browser `WasmClient` on `wasm32-unknown-unknown`
+- `fleet-udp` - UDP fanout support via `UniUdpFleet`
+- `parking-lot` - `Lockable` support for `parking_lot::Mutex` / `RwLock`
+
+WebSocket transport
+
+- Each REPE message maps to exactly one WebSocket binary message.
+- WebSocket decoding enforces exact message length within each bounded binary frame.
+
+```rust
+use repe::WebSocketClient;
+use serde_json::json;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = WebSocketClient::connect("ws://127.0.0.1:8081/repe").await?;
+    let pong = client.call_json("/ping", &json!({})).await?;
+    assert_eq!(pong["pong"], true);
+    Ok(())
+}
+```
 
 JSON Pointer Routing and Typed Handlers
 

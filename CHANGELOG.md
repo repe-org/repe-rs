@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.1.0] - 2026-03-12
+- Added WebSocket transport support:
+  - `WebSocketClient` for native async WebSocket RPC
+  - `WebSocketServer` for native WebSocket serving
+  - `WasmClient` for browser-based WebSocket RPC on `wasm32-unknown-unknown`
+- Added `proxy_connection` support for forwarding full REPE `Message` values to an upstream `AsyncClient`.
+- Added `Message::from_slice_exact` and enforced exact bounded-message length validation for WebSocket binary frames.
+- Refactored server request validation/routing into shared helpers so TCP sync, TCP async, and WebSocket servers use the same request handling path.
+- Refactored crate exports and target-specific dependencies so shared protocol types compile on both native and `wasm32`, while native TCP transports remain gated off the wasm target.
+- Gated native integration tests to `not(target_arch = "wasm32")` so wasm-target builds do not try to compile native TCP/fleet test binaries.
+
 ## [1.0.0] - 2026-03-05
 - Added multi-node fleet APIs:
   - `Fleet` for synchronous TCP request/response fanout
