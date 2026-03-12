@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 use repe::{Client, Message, QueryFormat, RepeError, read_message, write_message};
 use serde_json::{Value, json};
 use std::io::{BufReader, BufWriter, Write};

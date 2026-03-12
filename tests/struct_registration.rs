@@ -1,3 +1,4 @@
+#![cfg(not(target_arch = "wasm32"))]
 #![allow(unreachable_code)]
 
 use repe::constants::{ErrorCode, QueryFormat};

@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 use repe::*;
 use serde::{Deserialize, Serialize};
 use std::io::{BufReader, BufWriter, Write};

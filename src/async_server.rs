@@ -1,8 +1,8 @@
 use crate::async_io::{read_message_async, write_message_async};
-use crate::constants::{ErrorCode, QueryFormat, REPE_VERSION};
 use crate::error::RepeError;
-use crate::message::{Message, create_error_response_like};
+use crate::message::Message;
 use crate::server::Router;
+use crate::server_request::route_request;
 use tokio::io::AsyncWriteExt;
 use tokio::io::{BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
@@ -69,84 +69,7 @@ async fn handle_connection(
             read_message_async(&mut reader).await?
         };
 
-        let notify = req.header.notify == 1;
-        if req.header.version != REPE_VERSION {
-            if !notify {
-                let resp = create_error_response_like(
-                    &req,
-                    ErrorCode::VersionMismatch,
-                    format!("Unsupported REPE version {}", req.header.version),
-                );
-                if let Some(dur) = write_timeout {
-                    timeout(dur, write_message_async(&mut writer, &resp))
-                        .await
-                        .ok();
-                    timeout(dur, writer.flush()).await.ok();
-                } else {
-                    write_message_async(&mut writer, &resp).await?;
-                    writer.flush().await?;
-                }
-            }
-            continue;
-        }
-        let qf = QueryFormat::try_from(req.header.query_format).unwrap_or(QueryFormat::RawBinary);
-        let path = match qf {
-            QueryFormat::JsonPointer => match req.query_str() {
-                Ok(s) => s,
-                Err(_) => {
-                    if !notify {
-                        let resp = create_error_response_like(
-                            &req,
-                            ErrorCode::InvalidQuery,
-                            "Query must be valid UTF-8",
-                        );
-                        if let Some(dur) = write_timeout {
-                            timeout(dur, write_message_async(&mut writer, &resp))
-                                .await
-                                .ok();
-                            timeout(dur, writer.flush()).await.ok();
-                        } else {
-                            write_message_async(&mut writer, &resp).await?;
-                            writer.flush().await?;
-                        }
-                    }
-                    continue;
-                }
-            },
-            QueryFormat::RawBinary => {
-                if !notify {
-                    let resp = create_error_response_like(
-                        &req,
-                        ErrorCode::InvalidQuery,
-                        "Raw binary queries are not supported by this server",
-                    );
-                    if let Some(dur) = write_timeout {
-                        timeout(dur, write_message_async(&mut writer, &resp))
-                            .await
-                            .ok();
-                        timeout(dur, writer.flush()).await.ok();
-                    } else {
-                        write_message_async(&mut writer, &resp).await?;
-                        writer.flush().await?;
-                    }
-                }
-                continue;
-            }
-        };
-
-        let resp = match router.get(path) {
-            Some(handler) => match handler.handle(&req) {
-                Ok(m) => m,
-                Err(e) => create_error_response_like(&req, e.to_error_code(), e.to_string()),
-            },
-            None => create_error_response_like(
-                &req,
-                ErrorCode::MethodNotFound,
-                format!("Method not found: {path}"),
-            ),
-        };
-
-        if !notify {
+        if let Some(resp) = route_request(&router, &req) {
             if let Some(dur) = write_timeout {
                 timeout(dur, write_message_async(&mut writer, &resp))
                     .await

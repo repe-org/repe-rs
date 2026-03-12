@@ -1,4 +1,4 @@
-#![cfg(feature = "fleet-udp")]
+#![cfg(all(not(target_arch = "wasm32"), feature = "fleet-udp"))]
 
 use repe::{FleetError, Message, UniUdpFleet, UniUdpNodeConfig};
 use serde_json::json;

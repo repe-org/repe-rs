@@ -1,72 +1,57 @@
-use crate::async_io::{read_message_async, write_message_async};
 use crate::constants::{BodyFormat, ErrorCode, QueryFormat, REPE_VERSION};
 use crate::error::RepeError;
 use crate::message::{Message, MessageBuilder};
 use beve::from_slice as beve_from_slice;
+use futures_channel::oneshot;
+use futures_util::future::{Either, join_all, select};
+use js_sys::{ArrayBuffer, Uint8Array};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::ErrorKind;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
-use tokio::io::AsyncWriteExt;
-use tokio::io::{BufReader, BufWriter};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{TcpStream, ToSocketAddrs};
-use tokio::sync::{Mutex, oneshot};
-use tokio::task::JoinError;
-use tokio::time::{Duration, timeout};
+use std::pin::Pin;
+use std::rc::{Rc, Weak};
+use std::task::{Context, Poll};
+use std::time::Duration;
+use wasm_bindgen::JsCast;
+use wasm_bindgen::JsValue;
+use wasm_bindgen::closure::Closure;
+use web_sys::{BinaryType, CloseEvent, Event, MessageEvent, WebSocket};
 
 type PendingSender = oneshot::Sender<Result<Message, RepeError>>;
 type PendingRequests = HashMap<u64, PendingSender>;
 
 #[derive(Clone)]
-pub struct AsyncClient {
-    inner: Arc<AsyncClientInner>,
+pub struct WasmClient {
+    inner: Rc<WasmClientInner>,
 }
 
-struct AsyncClientInner {
-    writer: Mutex<BufWriter<OwnedWriteHalf>>,
-    pending: StdMutex<PendingRequests>,
-    next_id: AtomicU64,
-    shutdown: StdMutex<Option<oneshot::Sender<()>>>,
-}
-
-impl Drop for AsyncClientInner {
-    fn drop(&mut self) {
-        if let Ok(mut tx) = self.shutdown.lock() {
-            if let Some(sender) = tx.take() {
-                let _ = sender.send(());
-            }
-        }
-    }
-}
-
-enum PendingDispatch {
-    Matched {
-        sender: PendingSender,
-        response: Message,
-    },
-    Unrecognized {
-        got_id: u64,
-    },
+struct WasmClientInner {
+    ws: WebSocket,
+    pending: RefCell<PendingRequests>,
+    next_id: Cell<u64>,
+    onmessage: Closure<dyn FnMut(MessageEvent)>,
+    onerror: Closure<dyn FnMut(Event)>,
+    onclose: Closure<dyn FnMut(CloseEvent)>,
 }
 
 struct PendingRequestGuard {
-    inner: Arc<AsyncClientInner>,
+    inner: Rc<WasmClientInner>,
     request_id: u64,
     disarmed: bool,
 }
 
 impl PendingRequestGuard {
     fn register(
-        inner: &Arc<AsyncClientInner>,
+        inner: &Rc<WasmClientInner>,
         request_id: u64,
         sender: PendingSender,
     ) -> Result<Self, RepeError> {
         {
-            let mut pending = lock_pending_map(&inner.pending);
+            let mut pending = inner.pending.borrow_mut();
             if pending.contains_key(&request_id) {
                 return Err(duplicate_request_id_error(request_id));
             }
@@ -74,7 +59,7 @@ impl PendingRequestGuard {
         }
 
         Ok(Self {
-            inner: Arc::clone(inner),
+            inner: Rc::clone(inner),
             request_id,
             disarmed: false,
         })
@@ -91,35 +76,69 @@ impl Drop for PendingRequestGuard {
             return;
         }
 
-        let mut pending = lock_pending_map(&self.inner.pending);
-        pending.remove(&self.request_id);
+        self.inner.pending.borrow_mut().remove(&self.request_id);
     }
 }
 
-impl AsyncClient {
-    pub async fn connect<A: ToSocketAddrs>(addr: A) -> std::io::Result<Self> {
-        let stream = TcpStream::connect(addr).await?;
-        stream.set_nodelay(true)?;
-        let (read_half, write_half) = stream.into_split();
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let inner = Arc::new(AsyncClientInner {
-            writer: Mutex::new(BufWriter::new(write_half)),
-            pending: StdMutex::new(HashMap::new()),
-            next_id: AtomicU64::new(1),
-            shutdown: StdMutex::new(Some(shutdown_tx)),
-        });
+impl Drop for WasmClientInner {
+    fn drop(&mut self) {
+        self.ws.set_onmessage(None);
+        self.ws.set_onerror(None);
+        self.ws.set_onclose(None);
+        let _ = self.ws.close();
 
-        spawn_response_loop(
-            BufReader::new(read_half),
-            Arc::downgrade(&inner),
-            shutdown_rx,
-        );
+        let err = websocket_closed_error();
+        for (request_id, sender) in self.pending.get_mut().drain() {
+            let _ = sender.send(Err(clone_fatal_error_for_waiter(&err, request_id)));
+        }
+    }
+}
+
+impl WasmClient {
+    pub async fn connect(url: &str) -> Result<Self, RepeError> {
+        let ws = WebSocket::new(url).map_err(js_to_io_error)?;
+        ws.set_binary_type(BinaryType::Arraybuffer);
+
+        let (open_tx, open_rx) = oneshot::channel::<Result<(), RepeError>>();
+        let open_tx = Rc::new(RefCell::new(Some(open_tx)));
+
+        let open_signal = Rc::clone(&open_tx);
+        let onopen = Closure::wrap(Box::new(move |_event: Event| {
+            if let Some(sender) = open_signal.borrow_mut().take() {
+                let _ = sender.send(Ok(()));
+            }
+        }) as Box<dyn FnMut(Event)>);
+        ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
+
+        let error_signal = Rc::clone(&open_tx);
+        let onerror = Closure::wrap(Box::new(move |_event: Event| {
+            if let Some(sender) = error_signal.borrow_mut().take() {
+                let _ = sender.send(Err(websocket_event_error("websocket connection failed")));
+            }
+        }) as Box<dyn FnMut(Event)>);
+        ws.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+
+        let connect_result = match open_rx.await {
+            Ok(result) => result,
+            Err(_) => Err(websocket_event_error("websocket open channel closed")),
+        };
+
+        ws.set_onopen(None);
+        ws.set_onerror(None);
+        connect_result?;
+
+        let inner = Rc::new_cyclic(|weak| WasmClientInner::new(ws.clone(), weak.clone()));
+        inner
+            .ws
+            .set_onmessage(Some(inner.onmessage.as_ref().unchecked_ref()));
+        inner
+            .ws
+            .set_onerror(Some(inner.onerror.as_ref().unchecked_ref()));
+        inner
+            .ws
+            .set_onclose(Some(inner.onclose.as_ref().unchecked_ref()));
 
         Ok(Self { inner })
-    }
-
-    fn next_request_id(&self) -> u64 {
-        self.inner.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
     pub async fn call_json<P: AsRef<str>, T: Serialize>(
@@ -130,7 +149,6 @@ impl AsyncClient {
         self.call_json_with_optional_timeout(path, body, None).await
     }
 
-    /// Send a JSON request and fail if no response arrives before `timeout_duration`.
     pub async fn call_json_with_timeout<P: AsRef<str>, T: Serialize>(
         &self,
         path: P,
@@ -150,7 +168,6 @@ impl AsyncClient {
             .await
     }
 
-    /// Send a typed JSON request and fail if no response arrives before `timeout_duration`.
     pub async fn call_typed_json_with_timeout<P: AsRef<str>, T: Serialize, R: DeserializeOwned>(
         &self,
         path: P,
@@ -170,7 +187,6 @@ impl AsyncClient {
             .await
     }
 
-    /// Send a typed BEVE request and fail if no response arrives before `timeout_duration`.
     pub async fn call_typed_beve_with_timeout<P: AsRef<str>, T: Serialize, R: DeserializeOwned>(
         &self,
         path: P,
@@ -181,9 +197,6 @@ impl AsyncClient {
             .await
     }
 
-    /// Send a JSON-pointer request with an empty body and return the full response message.
-    ///
-    /// This is useful for protocols that use empty-body semantics (for example, registry READs).
     pub async fn call_message<P: AsRef<str>>(&self, path: P) -> Result<Message, RepeError> {
         self.call_message_with_formats_and_timeout(
             path,
@@ -195,8 +208,6 @@ impl AsyncClient {
         .await
     }
 
-    /// Send a JSON-pointer request with an empty body, failing if no response arrives before
-    /// `timeout_duration`.
     pub async fn call_message_with_timeout<P: AsRef<str>>(
         &self,
         path: P,
@@ -212,9 +223,6 @@ impl AsyncClient {
         .await
     }
 
-    /// Low-level call API that allows custom query/body format codes and optional raw body bytes.
-    ///
-    /// If `body` is `None`, the request body is empty (`body_length = 0`).
     pub async fn call_with_formats<P: AsRef<str>>(
         &self,
         path: P,
@@ -226,7 +234,6 @@ impl AsyncClient {
             .await
     }
 
-    /// Timeout variant of [`AsyncClient::call_with_formats`].
     pub async fn call_with_formats_and_timeout<P: AsRef<str>>(
         &self,
         path: P,
@@ -245,13 +252,11 @@ impl AsyncClient {
         .await
     }
 
-    /// Registry helper: send an empty-body request and decode the JSON response.
     pub async fn registry_read<P: AsRef<str>>(&self, path: P) -> Result<Value, RepeError> {
         let resp = self.call_message(path).await?;
         resp.json_body::<Value>()
     }
 
-    /// Registry helper: send an empty-body request and deserialize the JSON response as `R`.
     pub async fn registry_read_typed<P: AsRef<str>, R: DeserializeOwned>(
         &self,
         path: P,
@@ -260,7 +265,6 @@ impl AsyncClient {
         resp.json_body::<R>()
     }
 
-    /// Timeout variant of [`AsyncClient::registry_read`].
     pub async fn registry_read_with_timeout<P: AsRef<str>>(
         &self,
         path: P,
@@ -272,7 +276,6 @@ impl AsyncClient {
         resp.json_body::<Value>()
     }
 
-    /// Timeout variant of [`AsyncClient::registry_read_typed`].
     pub async fn registry_read_typed_with_timeout<P: AsRef<str>, R: DeserializeOwned>(
         &self,
         path: P,
@@ -284,7 +287,6 @@ impl AsyncClient {
         resp.json_body::<R>()
     }
 
-    /// Registry helper: send a JSON body (WRITE semantics for non-function targets).
     pub async fn registry_write_json<P: AsRef<str>, T: Serialize>(
         &self,
         path: P,
@@ -293,7 +295,6 @@ impl AsyncClient {
         self.call_json(path, body).await
     }
 
-    /// Registry helper: send a JSON body (CALL semantics for function targets).
     pub async fn registry_call_json<P: AsRef<str>, T: Serialize>(
         &self,
         path: P,
@@ -329,9 +330,6 @@ impl AsyncClient {
             .await
     }
 
-    /// Low-level notify API that allows custom query/body format codes and optional raw body bytes.
-    ///
-    /// If `body` is `None`, the notify request is sent with an empty body.
     pub async fn notify_with_formats<P: AsRef<str>>(
         &self,
         path: P,
@@ -343,26 +341,6 @@ impl AsyncClient {
             .await
     }
 
-    /// Forward a prebuilt REPE message over this connection.
-    ///
-    /// This preserves the original query/body bytes, ids, notify flag, format codes, and upstream
-    /// error responses. If `msg` is a notify request, no response is awaited and `Ok(None)` is
-    /// returned.
-    pub async fn forward_message(&self, msg: &Message) -> Result<Option<Message>, RepeError> {
-        self.forward_message_with_optional_timeout(msg, None).await
-    }
-
-    /// Timeout variant of [`AsyncClient::forward_message`].
-    pub async fn forward_message_with_timeout(
-        &self,
-        msg: &Message,
-        timeout_duration: Duration,
-    ) -> Result<Option<Message>, RepeError> {
-        self.forward_message_with_optional_timeout(msg, Some(timeout_duration))
-            .await
-    }
-
-    /// Execute JSON calls in parallel over this single connection and keep request order.
     pub async fn batch_json(
         &self,
         requests: Vec<(String, Value)>,
@@ -370,7 +348,6 @@ impl AsyncClient {
         self.batch_json_inner(requests, None).await
     }
 
-    /// Execute JSON calls in parallel with a per-request timeout.
     pub async fn batch_json_with_timeout(
         &self,
         requests: Vec<(String, Value)>,
@@ -385,35 +362,28 @@ impl AsyncClient {
         requests: Vec<(String, Value)>,
         timeout_duration: Option<Duration>,
     ) -> Vec<Result<Value, RepeError>> {
-        let mut workers = Vec::with_capacity(requests.len());
-
-        for (index, (path, body)) in requests.into_iter().enumerate() {
+        join_all(requests.into_iter().map(|(path, body)| {
             let client = self.clone();
-            workers.push((
-                index,
-                tokio::spawn(async move {
-                    client
-                        .call_json_with_optional_timeout(path, &body, timeout_duration)
-                        .await
-                }),
-            ));
-        }
+            async move {
+                client
+                    .call_json_with_optional_timeout(path, &body, timeout_duration)
+                    .await
+            }
+        }))
+        .await
+    }
 
-        let mut out: Vec<Option<Result<Value, RepeError>>> = std::iter::repeat_with(|| None)
-            .take(workers.len())
-            .collect();
+    fn next_request_id(&self) -> u64 {
+        let id = self.inner.next_id.get();
+        self.inner.next_id.set(id + 1);
+        id
+    }
 
-        for (index, worker) in workers {
-            let result = match worker.await {
-                Ok(value) => value,
-                Err(err) => Err(batch_worker_join_error(err)),
-            };
-            out[index] = Some(result);
-        }
-
-        out.into_iter()
-            .map(|entry| entry.unwrap_or_else(|| Err(batch_worker_missing_result_error())))
-            .collect()
+    fn write_request(&self, msg: &Message) -> Result<(), RepeError> {
+        self.inner
+            .ws
+            .send_with_u8_array(&msg.to_vec())
+            .map_err(js_to_io_error)
     }
 
     async fn call_json_with_optional_timeout<P: AsRef<str>, T: Serialize>(
@@ -496,30 +466,30 @@ impl AsyncClient {
         let (sender, receiver) = oneshot::channel();
         let mut pending_guard = PendingRequestGuard::register(&self.inner, id, sender)?;
 
-        self.write_request(&msg).await?;
+        self.write_request(&msg)?;
 
         let received = match timeout_duration {
-            Some(duration) => match timeout(duration, receiver).await {
-                Ok(Ok(value)) => value,
-                Ok(Err(_)) => return Err(response_channel_closed_error(id)),
-                Err(_) => return Err(request_timeout_error(id, duration)),
-            },
+            Some(duration) => {
+                let timeout_future = JsTimeout::new(duration)?;
+                futures_util::pin_mut!(receiver);
+                futures_util::pin_mut!(timeout_future);
+                match select(receiver, timeout_future).await {
+                    Either::Left((value, _)) => match value {
+                        Ok(value) => value,
+                        Err(_) => return Err(response_channel_closed_error(id)),
+                    },
+                    Either::Right(((), _)) => return Err(request_timeout_error(id, duration)),
+                }
+            }
             None => match receiver.await {
                 Ok(value) => value,
                 Err(_) => return Err(response_channel_closed_error(id)),
             },
         };
 
-        let resp = received?;
+        let response = received?;
         pending_guard.disarm();
-        Self::validate_response(id, resp)
-    }
-
-    async fn write_request(&self, msg: &Message) -> Result<(), RepeError> {
-        let mut writer = self.inner.writer.lock().await;
-        write_message_async(&mut *writer, msg).await?;
-        writer.flush().await?;
-        Ok(())
+        Self::validate_response(id, response)
     }
 
     fn validate_response(expected_id: u64, resp: Message) -> Result<Message, RepeError> {
@@ -550,7 +520,7 @@ impl AsyncClient {
             Ok(BodyFormat::Beve) => beve_from_slice(&resp.body).map_err(RepeError::from),
             Ok(BodyFormat::RawBinary) => {
                 let io_err = std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
+                    ErrorKind::InvalidData,
                     "response body is neither JSON nor BEVE",
                 );
                 Err(RepeError::Json(serde_json::Error::io(io_err)))
@@ -585,7 +555,7 @@ impl AsyncClient {
             .query_str(path.as_ref())
             .query_format_code(query_format);
         let msg = body_fn(builder)?.build();
-        self.write_request(&msg).await
+        self.write_request(&msg)
     }
 
     async fn call_message_with_formats_and_timeout<P: AsRef<str>>(
@@ -628,122 +598,190 @@ impl AsyncClient {
         })
         .await
     }
+}
 
-    async fn forward_message_with_optional_timeout(
-        &self,
-        msg: &Message,
-        timeout_duration: Option<Duration>,
-    ) -> Result<Option<Message>, RepeError> {
-        if msg.header.notify == 1 {
-            self.write_request(msg).await?;
-            return Ok(None);
-        }
-
-        let request_id = msg.header.id;
-        let (sender, receiver) = oneshot::channel();
-        let mut pending_guard = PendingRequestGuard::register(&self.inner, request_id, sender)?;
-
-        self.write_request(msg).await?;
-
-        let received = match timeout_duration {
-            Some(duration) => match timeout(duration, receiver).await {
-                Ok(Ok(value)) => value,
-                Ok(Err(_)) => return Err(response_channel_closed_error(request_id)),
-                Err(_) => return Err(request_timeout_error(request_id, duration)),
-            },
-            None => match receiver.await {
-                Ok(value) => value,
-                Err(_) => return Err(response_channel_closed_error(request_id)),
-            },
+impl WasmClientInner {
+    fn new(ws: WebSocket, weak: Weak<WasmClientInner>) -> Self {
+        let onmessage = {
+            let weak = weak.clone();
+            Closure::wrap(Box::new(move |event: MessageEvent| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.handle_message(event);
+                }
+            }) as Box<dyn FnMut(MessageEvent)>)
         };
 
-        let response = received?;
-        pending_guard.disarm();
-        if response.header.version != REPE_VERSION {
-            return Err(RepeError::VersionMismatch(response.header.version));
-        }
-        if response.header.id != request_id {
-            return Err(RepeError::ResponseIdMismatch {
-                expected: request_id,
-                got: response.header.id,
-            });
-        }
+        let onerror = {
+            let weak = weak.clone();
+            Closure::wrap(Box::new(move |_event: Event| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.fail_all_pending(websocket_event_error("websocket error"));
+                }
+            }) as Box<dyn FnMut(Event)>)
+        };
 
-        Ok(Some(response))
+        let onclose = {
+            Closure::wrap(Box::new(move |_event: CloseEvent| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.fail_all_pending(websocket_closed_error());
+                }
+            }) as Box<dyn FnMut(CloseEvent)>)
+        };
+
+        Self {
+            ws,
+            pending: RefCell::new(HashMap::new()),
+            next_id: Cell::new(1),
+            onmessage,
+            onerror,
+            onclose,
+        }
     }
-}
 
-fn spawn_response_loop(
-    mut reader: BufReader<OwnedReadHalf>,
-    inner: std::sync::Weak<AsyncClientInner>,
-    mut shutdown_rx: oneshot::Receiver<()>,
-) {
-    tokio::spawn(async move {
-        loop {
-            let response = tokio::select! {
-                _ = &mut shutdown_rx => {
-                    break;
-                }
-                read = read_message_async(&mut reader) => {
-                    match read {
-                        Ok(message) => message,
-                        Err(err) => {
-                            fail_all_pending(&inner, err).await;
-                            break;
-                        }
-                    }
-                }
-            };
+    fn handle_message(&self, event: MessageEvent) {
+        let response = match decode_message_event(event) {
+            Ok(message) => message,
+            Err(err) => {
+                self.fail_all_pending(err);
+                return;
+            }
+        };
 
-            let dispatch = {
-                let Some(inner_ref) = inner.upgrade() else {
-                    break;
-                };
-                let response_id = response.header.id;
-                let matched_sender = {
-                    let mut pending = lock_pending_map(&inner_ref.pending);
-                    pending.remove(&response_id)
-                };
-
-                if let Some(sender) = matched_sender {
-                    PendingDispatch::Matched { sender, response }
-                } else {
-                    PendingDispatch::Unrecognized {
-                        got_id: response_id,
-                    }
-                }
-            };
-
-            match dispatch {
-                PendingDispatch::Matched { sender, response } => {
-                    let _ = sender.send(Ok(response));
-                }
-                PendingDispatch::Unrecognized { got_id } => {
-                    eprintln!("[repe] dropping response for unrecognized request id {got_id}");
-                }
+        let sender = self.pending.borrow_mut().remove(&response.header.id);
+        match sender {
+            Some(sender) => {
+                let _ = sender.send(Ok(response));
+            }
+            None => {
+                eprintln!(
+                    "[repe] dropping websocket response for unrecognized request id {}",
+                    response.header.id
+                );
             }
         }
-    });
+    }
+
+    fn fail_all_pending(&self, err: RepeError) {
+        let waiters = self.pending.borrow_mut().drain().collect::<Vec<_>>();
+        for (request_id, sender) in waiters {
+            let _ = sender.send(Err(clone_fatal_error_for_waiter(&err, request_id)));
+        }
+    }
 }
 
-async fn fail_all_pending(inner: &std::sync::Weak<AsyncClientInner>, err: RepeError) {
-    let Some(inner_ref) = inner.upgrade() else {
-        return;
-    };
+fn decode_message_event(event: MessageEvent) -> Result<Message, RepeError> {
+    let data = event.data();
+    let buffer = data
+        .dyn_into::<ArrayBuffer>()
+        .map_err(|_| websocket_invalid_data_error("websocket transport requires ArrayBuffer"))?;
+    let payload = Uint8Array::new(&buffer).to_vec();
+    Message::from_slice_exact(&payload)
+}
 
-    {
-        let mut writer = inner_ref.writer.lock().await;
-        let _ = writer.shutdown().await;
+struct JsTimeout {
+    receiver: oneshot::Receiver<()>,
+    handle: Option<i32>,
+    callback: Option<Closure<dyn FnMut()>>,
+}
+
+impl JsTimeout {
+    fn new(duration: Duration) -> Result<Self, RepeError> {
+        let window =
+            web_sys::window().ok_or_else(|| websocket_event_error("window is not available"))?;
+        let (sender, receiver) = oneshot::channel();
+        let sender = Rc::new(RefCell::new(Some(sender)));
+        let callback_sender = Rc::clone(&sender);
+        let callback = Closure::wrap(Box::new(move || {
+            if let Some(sender) = callback_sender.borrow_mut().take() {
+                let _ = sender.send(());
+            }
+        }) as Box<dyn FnMut()>);
+
+        let handle = window
+            .set_timeout_with_callback_and_timeout_and_arguments_0(
+                callback.as_ref().unchecked_ref(),
+                duration.as_millis().min(i32::MAX as u128) as i32,
+            )
+            .map_err(js_to_io_error)?;
+
+        Ok(Self {
+            receiver,
+            handle: Some(handle),
+            callback: Some(callback),
+        })
     }
 
-    let waiters = {
-        let mut pending = lock_pending_map(&inner_ref.pending);
-        pending.drain().collect::<Vec<_>>()
-    };
-
-    for (request_id, sender) in waiters {
-        let _ = sender.send(Err(clone_fatal_error_for_waiter(&err, request_id)));
+    fn clear(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            if let Some(window) = web_sys::window() {
+                window.clear_timeout_with_handle(handle);
+            }
+        }
+        self.callback.take();
     }
+}
+
+impl Future for JsTimeout {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.receiver).poll(cx) {
+            Poll::Ready(_) => {
+                self.clear();
+                Poll::Ready(())
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for JsTimeout {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+fn request_timeout_error(request_id: u64, timeout: Duration) -> RepeError {
+    RepeError::Io(std::io::Error::new(
+        ErrorKind::TimedOut,
+        format!(
+            "request {request_id} timed out after {}ms",
+            timeout.as_millis()
+        ),
+    ))
+}
+
+fn response_channel_closed_error(request_id: u64) -> RepeError {
+    RepeError::Io(std::io::Error::new(
+        ErrorKind::ConnectionAborted,
+        format!("response channel closed for request {request_id}"),
+    ))
+}
+
+fn duplicate_request_id_error(request_id: u64) -> RepeError {
+    RepeError::Io(std::io::Error::new(
+        ErrorKind::AlreadyExists,
+        format!("request id {request_id} is already pending"),
+    ))
+}
+
+fn websocket_closed_error() -> RepeError {
+    RepeError::Io(std::io::Error::new(
+        ErrorKind::ConnectionAborted,
+        "websocket connection closed",
+    ))
+}
+
+fn websocket_event_error(message: &str) -> RepeError {
+    RepeError::Io(std::io::Error::other(message))
+}
+
+fn websocket_invalid_data_error(message: &str) -> RepeError {
+    RepeError::Io(std::io::Error::new(ErrorKind::InvalidData, message))
+}
+
+fn js_to_io_error(value: JsValue) -> RepeError {
+    RepeError::Io(std::io::Error::other(format!("{value:?}")))
 }
 
 fn clone_fatal_error_for_waiter(err: &RepeError, request_id: u64) -> RepeError {
@@ -780,132 +818,5 @@ fn clone_fatal_error_for_waiter(err: &RepeError, request_id: u64) -> RepeError {
             code: *code,
             message: message.clone(),
         },
-    }
-}
-
-fn request_timeout_error(request_id: u64, timeout: Duration) -> RepeError {
-    RepeError::Io(std::io::Error::new(
-        ErrorKind::TimedOut,
-        format!(
-            "request {request_id} timed out after {}ms",
-            timeout.as_millis()
-        ),
-    ))
-}
-
-fn response_channel_closed_error(request_id: u64) -> RepeError {
-    RepeError::Io(std::io::Error::new(
-        ErrorKind::ConnectionAborted,
-        format!("response channel closed for request {request_id}"),
-    ))
-}
-
-fn duplicate_request_id_error(request_id: u64) -> RepeError {
-    RepeError::Io(std::io::Error::new(
-        ErrorKind::AlreadyExists,
-        format!("request id {request_id} is already pending"),
-    ))
-}
-
-fn batch_worker_join_error(err: JoinError) -> RepeError {
-    RepeError::Io(std::io::Error::other(format!("batch worker failed: {err}")))
-}
-
-fn batch_worker_missing_result_error() -> RepeError {
-    RepeError::Io(std::io::Error::other("batch worker missing result"))
-}
-
-fn lock_pending_map(
-    pending: &StdMutex<PendingRequests>,
-) -> std::sync::MutexGuard<'_, PendingRequests> {
-    match pending.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::io::{read_message, write_message};
-    use serde_json::json;
-    use std::io::{BufReader, BufWriter, Write};
-    use std::net::TcpListener;
-    use std::sync::mpsc;
-    use std::thread;
-
-    fn json_response_for(req: &Message) -> Message {
-        Message::builder()
-            .id(req.header.id)
-            .query_bytes(req.query.clone())
-            .query_format(
-                QueryFormat::try_from(req.header.query_format).unwrap_or(QueryFormat::RawBinary),
-            )
-            .body_json(&json!({"path": req.query_utf8()}))
-            .expect("json body")
-            .build()
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelled_call_cleans_pending_entry() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (first_seen_tx, first_seen_rx) = mpsc::channel();
-
-        let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut writer = BufWriter::new(stream);
-
-            let _first = read_message(&mut reader).unwrap();
-            first_seen_tx
-                .send(())
-                .expect("signal that first request arrived");
-
-            let second = read_message(&mut reader).unwrap();
-            let response = json_response_for(&second);
-            write_message(&mut writer, &response).unwrap();
-            writer.flush().unwrap();
-        });
-
-        let client = AsyncClient::connect(addr).await.unwrap();
-
-        let cancelled_client = client.clone();
-        let cancelled_call = tokio::spawn(async move {
-            cancelled_client
-                .call_json("/cancelled", &json!({"n": 1}))
-                .await
-        });
-
-        tokio::task::spawn_blocking(move || {
-            first_seen_rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("server should observe the first request");
-        })
-        .await
-        .unwrap();
-
-        cancelled_call.abort();
-        let join_err = cancelled_call.await.unwrap_err();
-        assert!(join_err.is_cancelled());
-
-        let pending_count = {
-            let pending = lock_pending_map(&client.inner.pending);
-            pending.len()
-        };
-        assert_eq!(
-            pending_count, 0,
-            "cancelled calls must not leak pending entries"
-        );
-
-        let out = client
-            .call_json_with_timeout("/ok", &json!({"n": 2}), Duration::from_secs(1))
-            .await
-            .unwrap();
-        assert_eq!(out["path"], "/ok");
-
-        tokio::task::spawn_blocking(move || server.join().unwrap())
-            .await
-            .unwrap();
     }
 }
