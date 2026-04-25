@@ -1,5 +1,6 @@
 use crate::constants::{BodyFormat, ErrorCode};
 use crate::message::Message;
+use crate::peer::CallContext;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -47,16 +48,60 @@ impl RegistryError {
     }
 }
 
+/// A function or object that the registry dispatches to.
+///
+/// Handlers receive a [`CallContext`] alongside the request body so that
+/// peer-aware handlers can push notify messages back to the calling peer.
+/// Handlers that don't care about the context can register a plain
+/// `Fn(Option<Value>) -> Result<Value, ...>` closure: the blanket impl
+/// below ignores the context for them.
+///
+/// To register a closure that *does* want the context, wrap it with
+/// [`WithContext`]:
+///
+/// ```ignore
+/// registry.register_function("/run", WithContext(|ctx, params| {
+///     if let Some(peer) = ctx.peer() {
+///         peer.send_notify("/progress", NotifyBody::Json(b"{}".to_vec())).ok();
+///     }
+///     Ok(serde_json::json!({"status": "ok"}))
+/// }))?;
+/// ```
 pub trait RegistryCallable: Send + Sync {
-    fn call(&self, params: Option<Value>) -> Result<Value, (ErrorCode, String)>;
+    fn call(&self, ctx: &CallContext, params: Option<Value>) -> Result<Value, (ErrorCode, String)>;
 }
 
 impl<F> RegistryCallable for F
 where
     F: Fn(Option<Value>) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static,
 {
-    fn call(&self, params: Option<Value>) -> Result<Value, (ErrorCode, String)> {
+    fn call(
+        &self,
+        _ctx: &CallContext,
+        params: Option<Value>,
+    ) -> Result<Value, (ErrorCode, String)> {
         (self)(params)
+    }
+}
+
+/// Newtype wrapper that adapts an `Fn(&CallContext, Option<Value>) -> ...`
+/// closure into a [`RegistryCallable`].
+///
+/// Rust's coherence rules forbid two blanket impls on different `Fn`
+/// signatures for the same trait, so context-aware closures need a marker.
+/// `WithContext` is that marker; pass it to
+/// [`Registry::register_function`] like any other handler.
+pub struct WithContext<F>(pub F);
+
+impl<F> RegistryCallable for WithContext<F>
+where
+    F: Fn(&CallContext, Option<Value>) -> Result<Value, (ErrorCode, String)>
+        + Send
+        + Sync
+        + 'static,
+{
+    fn call(&self, ctx: &CallContext, params: Option<Value>) -> Result<Value, (ErrorCode, String)> {
+        (self.0)(ctx, params)
     }
 }
 
@@ -176,7 +221,32 @@ impl Registry {
         resolve_ref(&state.root, &segments).cloned()
     }
 
+    /// Dispatch a request to a registered value or function.
+    ///
+    /// Equivalent to [`Registry::dispatch_with_ctx`] with a
+    /// [`CallContext::detached`] context. Use this for direct in-process
+    /// dispatches where there's no calling peer (tests, batch fixups,
+    /// etc.). Servers that want to surface a [`PeerHandle`] to handlers
+    /// should call `dispatch_with_ctx` instead.
     pub fn dispatch(&self, pointer: &str, body: Option<Value>) -> Result<Value, RegistryError> {
+        let ctx = CallContext::detached(pointer);
+        self.dispatch_with_ctx(pointer, body, &ctx)
+    }
+
+    /// Dispatch a request to a registered value or function, threading
+    /// `ctx` through to any registered [`RegistryCallable`].
+    ///
+    /// Reads (`body == None`) and writes (`body == Some(...)` against a
+    /// non-function target) ignore the context; only function calls use
+    /// it. The pointer used for routing is the `pointer` argument; the
+    /// context's `method()` is informational and may differ (e.g. a
+    /// router that strips a path prefix before dispatching).
+    pub fn dispatch_with_ctx(
+        &self,
+        pointer: &str,
+        body: Option<Value>,
+        ctx: &CallContext,
+    ) -> Result<Value, RegistryError> {
         let segments = parse_pointer(pointer)?;
         if body.is_none() {
             let state = self.read_state();
@@ -197,7 +267,7 @@ impl Registry {
         };
         if let Some(f) = function {
             return f
-                .call(Some(payload))
+                .call(ctx, Some(payload))
                 .map_err(|(code, message)| RegistryError::Execution { code, message });
         }
 
@@ -565,6 +635,75 @@ mod tests {
             .dispatch("/add", Some(json!({"a": 2, "b": 3})))
             .expect("call");
         assert_eq!(call_result, Value::from(5));
+    }
+
+    #[test]
+    fn dispatch_with_ctx_threads_peer_to_callable() {
+        use crate::peer::{NotifyBody, PeerHandle, PeerId, PeerSendError, PeerSink};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct CapturingSink {
+            captured: Mutex<Vec<String>>,
+        }
+        impl PeerSink for CapturingSink {
+            fn send_notify(&self, method: &str, _body: NotifyBody) -> Result<(), PeerSendError> {
+                self.captured.lock().unwrap().push(method.to_string());
+                Ok(())
+            }
+        }
+
+        let sink = Arc::new(CapturingSink::default());
+        let peer = PeerHandle::new(PeerId(7), sink.clone());
+
+        let observed_peer = Arc::new(Mutex::new(None::<PeerId>));
+        let observed_peer_clone = Arc::clone(&observed_peer);
+        let registry = Registry::new();
+        registry
+            .register_function(
+                "/run",
+                WithContext(move |ctx: &CallContext, _params| {
+                    if let Some(p) = ctx.peer() {
+                        *observed_peer_clone.lock().unwrap() = Some(p.peer_id());
+                        p.send_notify("/progress", NotifyBody::Json(b"{}".to_vec()))
+                            .ok();
+                    }
+                    Ok(Value::from("ok"))
+                }),
+            )
+            .expect("register WithContext function");
+
+        let ctx = CallContext::new("/run", &peer);
+        let result = registry
+            .dispatch_with_ctx("/run", Some(json!({})), &ctx)
+            .expect("dispatch");
+        assert_eq!(result, Value::from("ok"));
+        assert_eq!(*observed_peer.lock().unwrap(), Some(PeerId(7)));
+        assert_eq!(sink.captured.lock().unwrap().as_slice(), &["/progress"]);
+    }
+
+    #[test]
+    fn dispatch_default_context_is_detached() {
+        let registry = Registry::new();
+        let observed = Arc::new(std::sync::Mutex::new(false));
+        let observed_clone = Arc::clone(&observed);
+        registry
+            .register_function(
+                "/probe",
+                WithContext(move |ctx: &CallContext, _params| {
+                    *observed_clone.lock().unwrap() = ctx.peer().is_none();
+                    Ok(Value::from("ok"))
+                }),
+            )
+            .expect("register");
+
+        registry
+            .dispatch("/probe", Some(json!({})))
+            .expect("dispatch");
+        assert!(
+            *observed.lock().unwrap(),
+            "dispatch must use a detached context"
+        );
     }
 
     #[test]

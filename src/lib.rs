@@ -22,6 +22,7 @@ pub mod header;
 pub mod io;
 pub mod json_pointer;
 pub mod message;
+pub mod peer;
 pub mod registry;
 pub mod server;
 #[cfg(not(target_arch = "wasm32"))]
@@ -66,7 +67,8 @@ pub use header::Header;
 pub use io::{read_message, write_message, write_message_streaming};
 pub use json_pointer::{evaluate as eval_json_pointer, parse as parse_json_pointer};
 pub use message::{Message, MessageView};
-pub use registry::{Registry, RegistryCallable, RegistryError};
+pub use peer::{CallContext, NotifyBody, PeerHandle, PeerId, PeerSendError, PeerSink};
+pub use registry::{Registry, RegistryCallable, RegistryError, WithContext};
 #[cfg(not(target_arch = "wasm32"))]
 pub use server::Server;
 pub use server::{
