@@ -31,12 +31,15 @@
 //!    can find it.
 //! 3. The producer thread, for each chunk:
 //!    * [`wait_for_credit`] for `chunk_len` bytes,
-//!    * encode the body and call [`push_replay`],
+//!    * encode the body and call [`push_replay`] with the logical
+//!      `data_len` of the chunk and the wire body,
 //!    * read the current [`peer`] and call `peer.send_notify(...)`,
 //!    * on `Ok` call [`record_sent(new_offset)`],
 //!    * on `Err(PeerSendError::Disconnected)` call
-//!      [`wait_for_reconnect`], take the pending resume, and
-//!      re-emit ring chunks through the new peer.
+//!      [`wait_for_reconnect`]; on
+//!      [`ReconnectOutcome::ResumeReady`] re-emit ring chunks
+//!      starting at the returned `resume_at_offset` through the new
+//!      peer.
 //! 4. Inbound ACK handlers call [`record_ack`]; cancel calls
 //!    [`cancel`]; resume calls [`request_resume`].
 //! 5. At each file (or whatever your chunked unit is) boundary, call
@@ -128,8 +131,8 @@ struct TransferControlInner {
 }
 
 /// Resume request published by the inbound resume handler and
-/// consumed by the producer thread on its next disconnect (or via an
-/// explicit [`TransferControl::take_pending_resume`]).
+/// consumed by the producer thread on its next call to
+/// [`TransferControl::wait_for_reconnect`].
 ///
 /// The new peer is *not* carried here: [`TransferControl::request_resume`]
 /// installs it directly into the control's peer slot, and the
@@ -151,12 +154,21 @@ struct ReplayRing {
     capacity_bytes: u64,
 }
 
-/// One entry in the replay ring. `body_bytes` is the exact wire body
-/// the producer pushed onto the peer (whatever encoding it used);
-/// replay is a straight resend, not a re-encode.
+/// One entry in the replay ring.
+///
+/// * `offset` and `data_len` are in the embedder's *logical* byte
+///   domain (whatever monotonic counter the producer uses for ACKs and
+///   for `last_received_offset` on resume). Successive chunks satisfy
+///   `next.offset == prev.offset + prev.data_len`.
+/// * `body_bytes` is the exact wire body the producer pushed onto the
+///   peer (whatever encoding it used); replay is a straight resend,
+///   not a re-encode. Its length may exceed `data_len` because it can
+///   include framing/envelope overhead, and that's why the ring tracks
+///   the two separately.
 #[derive(Clone)]
 pub struct RingChunk {
     pub offset: u64,
+    pub data_len: u64,
     pub last: bool,
     pub body_bytes: Arc<Vec<u8>>,
 }
@@ -170,31 +182,32 @@ impl ReplayRing {
         }
     }
 
-    fn push(&mut self, offset: u64, last: bool, body_bytes: Vec<u8>) {
-        // Defense in depth: chunks must arrive at strictly
-        // increasing offsets so `replay_from(offset)` returns each
-        // chunk at most once. The producer's offset comes from its
-        // own monotonic counter, so a violation here means a coding
-        // mistake (e.g. a replay path accidentally re-pushed during
-        // re-emit). We can't assert non-overlap (`offset >= back +
-        // back.len`) because `body_bytes` is the wire body, which
-        // may include envelope bytes that aren't counted in
-        // `offset`; strict monotonicity is what matters for the
-        // replay invariant.
+    fn push(&mut self, offset: u64, data_len: u64, last: bool, body_bytes: Vec<u8>) {
+        // Successive chunks must abut in the logical-offset domain.
+        // The ring's invariant for `replay_from(o)` and `covers(o)`
+        // is that the chunks form a contiguous run, so a gap or an
+        // overlap here means a coding mistake (the producer's offset
+        // counter drifted from the data it actually pushed).
         debug_assert!(
-            self.chunks.back().is_none_or(|c| offset > c.offset),
-            "ReplayRing::push: non-monotonic offset {offset} (last was {:?})",
-            self.chunks.back().map(|c| c.offset),
+            self.chunks
+                .back()
+                .is_none_or(|c| offset == c.offset + c.data_len),
+            "ReplayRing::push: non-contiguous offset {offset} (last ended at {:?})",
+            self.chunks.back().map(|c| c.offset + c.data_len),
         );
-        let len = body_bytes.len() as u64;
+        let wire_len = body_bytes.len() as u64;
         // Single oversized chunk: keep it as the sole entry rather
         // than spinning forever evicting the only thing we have.
         self.chunks.push_back(RingChunk {
             offset,
+            data_len,
             last,
             body_bytes: Arc::new(body_bytes),
         });
-        self.bytes_held = self.bytes_held.saturating_add(len);
+        // bytes_held is the wire-byte resource we're bounding (what
+        // a re-emit would actually push back over the socket), so it
+        // tracks body_bytes.len(), not data_len.
+        self.bytes_held = self.bytes_held.saturating_add(wire_len);
         while self.bytes_held > self.capacity_bytes && self.chunks.len() > 1 {
             if let Some(front) = self.chunks.pop_front() {
                 self.bytes_held = self
@@ -210,9 +223,7 @@ impl ReplayRing {
     }
 
     fn highest_end_offset(&self) -> Option<u64> {
-        self.chunks
-            .back()
-            .map(|c| c.offset + c.body_bytes.len() as u64)
+        self.chunks.back().map(|c| c.offset + c.data_len)
     }
 
     /// True if `offset` is at or after a stored chunk boundary AND
@@ -275,10 +286,10 @@ impl std::error::Error for CreditError {}
 /// expired.
 #[derive(Debug)]
 pub enum ReconnectOutcome {
-    /// A resume request arrived. Call
-    /// [`TransferControl::take_pending_resume`] to consume the new
-    /// peer and the requested offset.
-    ResumeReady,
+    /// A resume request arrived. The carried [`PendingResume`] is
+    /// already consumed from the control's internal slot; the new
+    /// peer is installed and observable via [`TransferControl::peer`].
+    ResumeReady(PendingResume),
     /// Cancel arrived (sticky). The reason mirrors
     /// [`CreditError::Cancelled`].
     Cancelled(String),
@@ -361,9 +372,16 @@ impl TransferControl {
     /// Push one wire body into the replay ring. The producer calls
     /// this *before* sending so a `Disconnected` error doesn't leave
     /// the ring missing the failed body.
-    pub fn push_replay(&self, offset: u64, last: bool, body_bytes: Vec<u8>) {
+    ///
+    /// `offset` and `data_len` are in the embedder's logical-offset
+    /// domain (the same domain ACKs use). `body_bytes` is the
+    /// actual wire payload, which may be longer than `data_len` if
+    /// the encoding adds envelope overhead. The ring's eviction
+    /// budget is in wire bytes; trailing-edge resume math is in
+    /// logical bytes.
+    pub fn push_replay(&self, offset: u64, data_len: u64, last: bool, body_bytes: Vec<u8>) {
         let mut g = self.inner.lock().expect("TransferControl mutex poisoned");
-        g.replay.push(offset, last, body_bytes);
+        g.replay.push(offset, data_len, last, body_bytes);
     }
 
     /// Snapshot the ring chunks at or after `offset`. Returns owned
@@ -424,6 +442,11 @@ impl TransferControl {
     /// Park until a resume request, cancel, or `timeout`. The
     /// producer calls this once `peer.send_notify(...)` returns
     /// [`crate::PeerSendError::Disconnected`].
+    ///
+    /// On [`ReconnectOutcome::ResumeReady`] the staged
+    /// [`PendingResume`] is consumed from the control's internal
+    /// slot and returned to the caller, so a second concurrent
+    /// `request_resume` cannot race ahead of the producer.
     pub fn wait_for_reconnect(&self, timeout: Duration) -> ReconnectOutcome {
         let deadline = Instant::now() + timeout;
         let mut g = self.inner.lock().expect("TransferControl mutex poisoned");
@@ -431,8 +454,8 @@ impl TransferControl {
             if let Some(reason) = g.cancelled.clone() {
                 return ReconnectOutcome::Cancelled(reason);
             }
-            if g.pending_resume.is_some() {
-                return ReconnectOutcome::ResumeReady;
+            if let Some(pending) = g.pending_resume.take() {
+                return ReconnectOutcome::ResumeReady(pending);
             }
             let now = Instant::now();
             if now >= deadline {
@@ -444,17 +467,6 @@ impl TransferControl {
                 .expect("TransferControl mutex poisoned");
             g = gg;
         }
-    }
-
-    /// Consume the pending resume request, if any. The producer
-    /// calls this once [`Self::wait_for_reconnect`] returns
-    /// [`ReconnectOutcome::ResumeReady`].
-    pub fn take_pending_resume(&self) -> Option<PendingResume> {
-        self.inner
-            .lock()
-            .expect("TransferControl mutex poisoned")
-            .pending_resume
-            .take()
     }
 
     /// Block until enough credit is available to send `chunk_len`
@@ -853,12 +865,12 @@ mod tests {
     #[test]
     fn replay_ring_evicts_oldest_when_full() {
         let mut ring = ReplayRing::new(100);
-        ring.push(0, false, vec![0u8; 40]);
-        ring.push(40, false, vec![0u8; 40]);
+        ring.push(0, 40, false, vec![0u8; 40]);
+        ring.push(40, 40, false, vec![0u8; 40]);
         assert_eq!(ring.bytes_held, 80);
         assert_eq!(ring.chunks.len(), 2);
 
-        ring.push(80, false, vec![0u8; 40]);
+        ring.push(80, 40, false, vec![0u8; 40]);
         assert_eq!(ring.bytes_held, 80);
         assert_eq!(ring.chunks.len(), 2);
         assert_eq!(ring.chunks.front().unwrap().offset, 40);
@@ -868,7 +880,7 @@ mod tests {
     #[test]
     fn replay_ring_keeps_single_oversized_chunk() {
         let mut ring = ReplayRing::new(50);
-        ring.push(0, false, vec![0u8; 200]);
+        ring.push(0, 200, false, vec![0u8; 200]);
         assert_eq!(ring.chunks.len(), 1);
         assert_eq!(ring.bytes_held, 200);
     }
@@ -879,8 +891,8 @@ mod tests {
         assert!(ring.covers(0));
         assert!(!ring.covers(8));
 
-        ring.push(0, false, vec![0u8; 16]);
-        ring.push(16, false, vec![0u8; 16]);
+        ring.push(0, 16, false, vec![0u8; 16]);
+        ring.push(16, 16, false, vec![0u8; 16]);
         assert!(ring.covers(0));
         assert!(ring.covers(16));
         assert!(!ring.covers(8));
@@ -890,11 +902,25 @@ mod tests {
     }
 
     #[test]
+    fn replay_ring_covers_trailing_edge_when_wire_bytes_exceed_data_len() {
+        // Repro for the bug fixed in v2.3: with body_bytes longer
+        // than data_len (envelope overhead), the trailing-edge match
+        // must use data_len, not body_bytes.len().
+        let mut ring = ReplayRing::new(1024);
+        ring.push(0, 16, false, vec![0u8; 24]); // 8 bytes envelope
+        ring.push(16, 16, true, vec![0u8; 24]);
+        // Receiver fully caught up at offset 32 (= 16 + 16) should
+        // be covered, even though wire length sums to 48.
+        assert!(ring.covers(32));
+        assert!(!ring.covers(48));
+    }
+
+    #[test]
     fn replay_chunks_from_returns_tail() {
         let mut ring = ReplayRing::new(1024);
-        ring.push(0, false, vec![0xAA; 16]);
-        ring.push(16, false, vec![0xBB; 16]);
-        ring.push(32, true, vec![0xCC; 16]);
+        ring.push(0, 16, false, vec![0xAA; 16]);
+        ring.push(16, 16, false, vec![0xBB; 16]);
+        ring.push(32, 16, true, vec![0xCC; 16]);
 
         let from_16 = ring.replay_from(16);
         assert_eq!(from_16.len(), 2);
@@ -908,7 +934,7 @@ mod tests {
         let ctl = TransferControl::with_replay_capacity(1024, 1024);
         ctl.set_peer(dummy_peer(1));
         ctl.advance_to_file(2);
-        ctl.push_replay(0, false, vec![0u8; 16]);
+        ctl.push_replay(0, 16, false, vec![0u8; 16]);
 
         let new_peer = dummy_peer(2);
         let err = ctl.request_resume(new_peer, 5, 0).unwrap_err();
@@ -925,9 +951,9 @@ mod tests {
     fn request_resume_validates_offset_in_ring() {
         let ctl = TransferControl::with_replay_capacity(1024, 64);
         ctl.set_peer(dummy_peer(1));
-        ctl.push_replay(0, false, vec![0u8; 32]);
-        ctl.push_replay(32, false, vec![0u8; 32]);
-        ctl.push_replay(64, false, vec![0u8; 32]);
+        ctl.push_replay(0, 32, false, vec![0u8; 32]);
+        ctl.push_replay(32, 32, false, vec![0u8; 32]);
+        ctl.push_replay(64, 32, false, vec![0u8; 32]);
         // Ring capacity = 64; first chunk (offset 0) was evicted.
         let new_peer = dummy_peer(2);
         let err = ctl.request_resume(new_peer, 0, 0).unwrap_err();
@@ -938,7 +964,7 @@ mod tests {
     fn request_resume_signals_writer_via_condvar() {
         let ctl = TransferControl::new(1024);
         ctl.set_peer(dummy_peer(1));
-        ctl.push_replay(0, false, vec![0u8; 16]);
+        ctl.push_replay(0, 16, false, vec![0u8; 16]);
 
         let writer_ctl = Arc::clone(&ctl);
         let waiter =
@@ -949,13 +975,11 @@ mod tests {
         ctl.request_resume(new_peer, 0, 0).unwrap();
 
         match waiter.join().unwrap() {
-            ReconnectOutcome::ResumeReady => {}
+            ReconnectOutcome::ResumeReady(pending) => {
+                assert_eq!(pending.resume_at_offset, 0);
+            }
             other => panic!("expected ResumeReady, got {other:?}"),
         }
-
-        let pending = ctl.take_pending_resume().expect("resume staged");
-        assert_eq!(pending.resume_at_offset, 0);
-        assert!(ctl.take_pending_resume().is_none());
     }
 
     #[test]
@@ -983,7 +1007,7 @@ mod tests {
     fn advance_to_file_clears_replay_ring() {
         let ctl = TransferControl::with_replay_capacity(1024, 1024);
         ctl.set_peer(dummy_peer(1));
-        ctl.push_replay(0, false, vec![0u8; 32]);
+        ctl.push_replay(0, 32, false, vec![0u8; 32]);
         let before = ctl.replay_chunks_from(0);
         assert_eq!(before.len(), 1);
         ctl.advance_to_file(1);
