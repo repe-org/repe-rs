@@ -1,5 +1,20 @@
 # Changelog
 
+## [2.2.0] - 2026-04-25
+
+### Added
+- `repe::stream` module: backpressure-controlled streaming over REPE notifies, for protocols that push large payloads (multi-GB blobs, log streams, paginated query results) from the server to a peer and need flow control beyond what the bare notify primitive provides.
+  - `TransferControl`: per-transfer state machine. ACK-driven window credit (`wait_for_credit` / `record_sent` / `record_ack`), sticky cancel signal, replay ring, peer slot, idle timestamps.
+  - `TransferRegistry<K>`: typed table of in-flight transfers; the embedder picks the key type (typically a transfer-id newtype). Inbound ACK / cancel / resume handlers look the control up by key.
+  - Replay ring + reconnect: `push_replay`, `replay_chunks_from`, `request_resume`, `wait_for_reconnect`, `take_pending_resume`. The producer parks on `wait_for_reconnect` after a `PeerSendError::Disconnected`; an inbound resume handler calls `request_resume(new_peer, file_index, last_received_offset)` to swap in the new peer and unpark, after which the producer replays the ring tail.
+  - `spawn_watchdog<K>(registry, idle_timeout)`: background thread that scans the registry and force-cancels transfers whose last chunk and last ACK are both older than `idle_timeout`.
+  - `RingChunk` carries `body_bytes: Arc<Vec<u8>>` (the exact wire body); replay is a straight resend, not a re-encode.
+- The wire shape of the protocol (`transfer_begin`, `file_chunk`, ACK / cancel / resume bodies) is up to the embedder; this module deals only in offsets, ACKs, and opaque body bytes.
+
+### Notes
+- The watchdog thread holds a `Weak<TransferRegistry<K>>`, not an `Arc`. Dropping the embedder's last strong reference terminates the thread on its next tick (clamped to `[1 s, 5 s]`). For a process-wide singleton this just means the thread lives for the process; embedders that build short-lived registries (per-test, per-tenant) get clean teardown for free.
+- Defaults (`DEFAULT_WINDOW_BYTES`, `DEFAULT_BACKPRESSURE_TIMEOUT`, `DEFAULT_IDLE_TIMEOUT`, `DEFAULT_REPLAY_RING_BYTES`, `DEFAULT_RECONNECT_TIMEOUT`) are tuned for LAN-class links pushing multi-GB files. Lower the window on slow links; raise the reconnect timeout for clients with long roaming windows.
+
 ## [2.1.0] - 2026-04-25
 
 ### Added
