@@ -2,6 +2,7 @@ use crate::constants::{BodyFormat, ErrorCode, HEADER_SIZE, QueryFormat};
 use crate::error::RepeError;
 use crate::header::Header;
 use beve::{Error as BeveError, from_slice as beve_from_slice, to_vec as beve_to_vec};
+use std::io::{self, Write};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
@@ -39,6 +40,28 @@ impl Message {
             out.extend_from_slice(&self.body);
         }
         out
+    }
+
+    /// Wire size of the serialized message: `HEADER_SIZE + query.len() + body.len()`.
+    /// O(1); does not serialize.
+    pub fn serialized_len(&self) -> usize {
+        HEADER_SIZE + self.query.len() + self.body.len()
+    }
+
+    /// Write the message to `w` without allocating an intermediate frame buffer.
+    ///
+    /// Equivalent to `w.write_all(&self.to_vec())` byte-for-byte, but emits the
+    /// header, query, and body in three writes instead of building a single
+    /// owned `Vec<u8>`. Useful when the body is large (e.g. multi-MiB chunks).
+    pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        w.write_all(&self.header.encode())?;
+        if !self.query.is_empty() {
+            w.write_all(&self.query)?;
+        }
+        if !self.body.is_empty() {
+            w.write_all(&self.body)?;
+        }
+        Ok(())
     }
 
     pub fn from_slice(buf: &[u8]) -> Result<Self, RepeError> {
@@ -120,6 +143,53 @@ impl Message {
                 Err(RepeError::from(BeveError::msg("body_format is not BEVE")))
             }
         }
+    }
+}
+
+/// Borrowing view over a serialized REPE message.
+///
+/// Unlike [`Message::from_slice`], which copies the query and body out of the
+/// caller's buffer, `MessageView` keeps both as borrowed slices of the input.
+/// Useful when a large body (e.g. a multi-MiB chunk) will be deserialized with
+/// `serde_bytes::Bytes<'a>` so the bulk payload stays borrowed end-to-end.
+///
+/// The `header` is decoded by value because it's only 48 bytes and downstream
+/// code typically wants the parsed fields rather than the raw header bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageView<'a> {
+    pub header: Header,
+    pub query: &'a [u8],
+    pub body: &'a [u8],
+}
+
+impl<'a> MessageView<'a> {
+    /// Parse a `MessageView` from `buf`. The returned view borrows from `buf`;
+    /// no copies are made.
+    pub fn from_slice(buf: &'a [u8]) -> Result<Self, RepeError> {
+        if buf.len() < HEADER_SIZE {
+            return Err(RepeError::InvalidHeaderLength(buf.len()));
+        }
+        let header = Header::decode(&buf[..HEADER_SIZE])?;
+        let expected = HEADER_SIZE + header.query_length as usize + header.body_length as usize;
+        if buf.len() < expected {
+            return Err(RepeError::BufferTooSmall {
+                need: expected,
+                have: buf.len(),
+            });
+        }
+        let q_start = HEADER_SIZE;
+        let q_end = q_start + header.query_length as usize;
+        let b_end = q_end + header.body_length as usize;
+        Ok(Self {
+            header,
+            query: &buf[q_start..q_end],
+            body: &buf[q_end..b_end],
+        })
+    }
+
+    /// View the query as a `&str`. Errors if the query is not valid UTF-8.
+    pub fn query_str(&self) -> Result<&'a str, std::str::Utf8Error> {
+        std::str::from_utf8(self.query)
     }
 }
 
@@ -282,6 +352,80 @@ mod tests {
                 y: "ok".into()
             }
         );
+    }
+
+    #[test]
+    fn message_view_from_slice_borrows() {
+        let msg = Message::builder()
+            .id(7)
+            .query_str("/echo")
+            .query_format(QueryFormat::JsonPointer)
+            .body_bytes(vec![1u8, 2, 3, 4])
+            .body_format(BodyFormat::RawBinary)
+            .build();
+        let bytes = msg.to_vec();
+
+        let view = MessageView::from_slice(&bytes).unwrap();
+        assert_eq!(view.header, msg.header);
+        assert_eq!(view.query, msg.query.as_slice());
+        assert_eq!(view.body, msg.body.as_slice());
+
+        // Verify the slices point inside `bytes`, not into a fresh allocation.
+        let bytes_start = bytes.as_ptr() as usize;
+        let bytes_end = bytes_start + bytes.len();
+        let q_addr = view.query.as_ptr() as usize;
+        let b_addr = view.body.as_ptr() as usize;
+        assert!(q_addr >= bytes_start && q_addr <= bytes_end);
+        assert!(b_addr >= bytes_start && b_addr <= bytes_end);
+
+        assert_eq!(view.query_str().unwrap(), "/echo");
+    }
+
+    #[test]
+    fn message_view_truncated_returns_buffer_too_small() {
+        let msg = Message::builder()
+            .id(1)
+            .query_str("/x")
+            .query_format(QueryFormat::JsonPointer)
+            .body_utf8("payload")
+            .build();
+        let mut bytes = msg.to_vec();
+        let full_len = bytes.len();
+        bytes.truncate(bytes.len() - 1);
+        match MessageView::from_slice(&bytes).unwrap_err() {
+            RepeError::BufferTooSmall { need, have } => {
+                assert_eq!(need, full_len);
+                assert_eq!(have, full_len - 1);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_to_matches_to_vec() {
+        let msg = Message::builder()
+            .id(42)
+            .query_str("/collect/file_chunk")
+            .query_format(QueryFormat::JsonPointer)
+            .body_bytes(vec![0xDEu8; 1024])
+            .body_format(BodyFormat::Beve)
+            .build();
+
+        let expected = msg.to_vec();
+        let mut got = Vec::new();
+        msg.write_to(&mut got).expect("write_to");
+        assert_eq!(got, expected);
+        assert_eq!(msg.serialized_len(), expected.len());
+    }
+
+    #[test]
+    fn write_to_handles_empty_query_and_body() {
+        let msg = Message::builder().id(1).build();
+        let expected = msg.to_vec();
+        let mut got = Vec::new();
+        msg.write_to(&mut got).expect("write_to");
+        assert_eq!(got, expected);
+        assert_eq!(msg.serialized_len(), expected.len());
     }
 
     #[test]

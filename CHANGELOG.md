@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+- Added streaming and zero-copy `Message` I/O for large bodies:
+  - `Message::write_to<W: Write>` and `Message::serialized_len` emit/size a message without allocating an intermediate frame `Vec<u8>`.
+  - `write_message_streaming(w, header, query, body_len, body_writer)` lets the body be produced by a closure (pairs with `beve::to_writer_streaming` for direct BEVE-into-writer encoding of multi-MiB bodies).
+  - `MessageView<'a>` borrows the query and body slices out of a caller-supplied buffer instead of copying like `Message::from_slice`. Useful with `serde_bytes::Bytes<'a>` so a chunk payload stays borrowed end-to-end.
+
 ## [1.1.0] - 2026-03-12
 - Added WebSocket transport support:
   - `WebSocketClient` for native async WebSocket RPC

@@ -69,6 +69,43 @@ let val: serde_json::Value = parsed.beve_body()?;
 assert_eq!(val["ping"], true);
 ```
 
+Streaming and zero-copy I/O
+
+For large bodies (e.g. multi-MiB binary chunks), `Message::to_vec` /
+`Message::from_slice` add a full-body memcpy you may not want. The streaming
+APIs below let the body flow directly between the wire and a user-supplied
+encoder/decoder.
+
+```rust
+use repe::{write_message_streaming, BodyFormat, Header, QueryFormat};
+use std::io::Write;
+
+// Send: BEVE-encode a body straight into the writer with no intermediate Vec.
+let mut header = Header::new();
+header.id = 99;
+header.query_format = QueryFormat::JsonPointer as u16;
+header.body_format = BodyFormat::Beve as u16;
+let body_len = beve_chunk_size(&chunk); // computed up front
+
+write_message_streaming(&mut socket, header, b"/collect/file_chunk", body_len, |w| {
+    beve::to_writer_streaming(w, &chunk).map_err(std::io::Error::other)
+})?;
+```
+
+```rust
+use repe::MessageView;
+
+// Receive: borrow into the WS frame buffer instead of copying out of it.
+let view = MessageView::from_slice(&frame_bytes)?;
+let path = view.query_str()?;
+// view.body is &[u8] pointing inside frame_bytes; pair with serde_bytes::Bytes<'a>
+// on a Deserialize struct to keep the chunk payload borrowed end-to-end.
+```
+
+`Message::write_to` and `Message::serialized_len` are the owned-`Message`
+counterparts: emit a `Message` to a `Write` without going through `to_vec`,
+or query its wire size in `O(1)`.
+
 Examples
 
 - `examples/json_roundtrip.rs` – construct/serialize/parse a JSON message.

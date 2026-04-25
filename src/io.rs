@@ -31,6 +31,44 @@ pub fn write_message<W: Write>(w: &mut W, msg: &Message) -> Result<(), RepeError
     Ok(())
 }
 
+/// Emit a REPE message whose body is produced by `body_writer` rather than
+/// owned by a `Message` value.
+///
+/// The caller supplies the wire body length (`body_len`) up front; this lets
+/// the header be written before the body and avoids buffering the body into
+/// a `Vec<u8>` first. `header.query_length`, `header.body_length`, and
+/// `header.length` are overwritten to reflect `query.len()` and `body_len`,
+/// so the caller does not need to set them before calling this function.
+///
+/// The `body_writer` closure must emit exactly `body_len` bytes; failing to
+/// do so produces an unframed message on the wire and the receiving side will
+/// either block (short body) or misinterpret subsequent frames (long body).
+///
+/// Pairs with `beve::to_writer_streaming` so that a large binary body can be
+/// BEVE-encoded directly into the caller-supplied writer with zero
+/// intermediate `Vec<u8>`.
+pub fn write_message_streaming<W, F>(
+    w: &mut W,
+    mut header: Header,
+    query: &[u8],
+    body_len: u64,
+    body_writer: F,
+) -> Result<(), RepeError>
+where
+    W: Write,
+    F: FnOnce(&mut W) -> std::io::Result<()>,
+{
+    header.query_length = query.len() as u64;
+    header.body_length = body_len;
+    header.length = (HEADER_SIZE as u64) + header.query_length + body_len;
+    w.write_all(&header.encode())?;
+    if !query.is_empty() {
+        w.write_all(query)?;
+    }
+    body_writer(w)?;
+    Ok(())
+}
+
 fn read_exact<R: Read>(r: &mut R, mut buf: &mut [u8]) -> Result<(), RepeError> {
     while !buf.is_empty() {
         let n = r.read(buf)?;
@@ -76,6 +114,47 @@ mod tests {
         assert_eq!(parsed.header.body_format, BodyFormat::Json as u16);
         let v: serde_json::Value = parsed.json_body().unwrap();
         assert_eq!(v["x"], 1);
+    }
+
+    #[test]
+    fn write_message_streaming_matches_write_message() {
+        let body_bytes = vec![0xABu8; 4096];
+        let reference = Message::builder()
+            .id(99)
+            .query_str("/collect/file_chunk")
+            .query_format(QueryFormat::JsonPointer)
+            .body_bytes(body_bytes.clone())
+            .body_format(BodyFormat::Beve)
+            .build();
+
+        let mut expected = Vec::new();
+        write_message(&mut expected, &reference).unwrap();
+
+        let mut header = Header::new();
+        header.id = 99;
+        header.query_format = QueryFormat::JsonPointer as u16;
+        header.body_format = BodyFormat::Beve as u16;
+        let query = b"/collect/file_chunk";
+
+        let mut got = Vec::new();
+        write_message_streaming(&mut got, header, query, body_bytes.len() as u64, |w| {
+            w.write_all(&body_bytes)
+        })
+        .unwrap();
+
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn write_message_streaming_with_empty_query_and_body() {
+        let header = Header::new();
+        let mut got = Vec::new();
+        write_message_streaming(&mut got, header, &[], 0, |_| Ok(())).unwrap();
+
+        let parsed = Message::from_slice(&got).unwrap();
+        assert_eq!(parsed.header.length, HEADER_SIZE as u64);
+        assert!(parsed.query.is_empty());
+        assert!(parsed.body.is_empty());
     }
 
     #[test]
