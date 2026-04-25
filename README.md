@@ -195,6 +195,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+Receiving server-pushed notifies
+
+`WebSocketClient::subscribe_notifies()` returns a tokio mpsc receiver
+that yields every inbound `Message` whose `notify` header flag is set.
+The response loop checks the notify flag *before* the request/response
+correlation map, so server-pushed notifies never collide with an
+in-flight request that happens to share the same id.
+
+At most one subscriber may be active at a time. If a live subscription
+already exists, `subscribe_notifies` returns `Err(AlreadySubscribed)`
+without disturbing the existing receiver; this matters because
+`WebSocketClient` is `Clone`, and the loud-replace contract keeps two
+holders of the same client from silently stealing each other's
+subscription. Call `unsubscribe_notifies()` first to take over. A
+stale slot whose receiver was already dropped does not block a new
+subscription; in that case `subscribe_notifies` silently installs the
+new sender.
+
+Notifies that arrive while no subscriber is registered are silently
+dropped (logging every drop would avalanche under high-rate notifies
+like server-pushed binary chunks).
+
+The channel is unbounded. The transport read loop pushes every
+inbound notify into the channel without backpressure, so a slow or
+stalled consumer plus a high-rate producer will grow the buffer until
+the process OOMs. Application-level backpressure (e.g. ACK windows in
+a chunk protocol) is the right fix; the consumer must drain the
+receiver promptly. The API deliberately does not offer a bounded
+variant: dropping notifies on overflow corrupts chunk streams, and
+blocking the read loop on overflow stalls the request/response
+correlation path that shares the same socket.
+
+The receiver yields raw `Message` values; decode the body using
+`Message::json_body::<T>()`, `beve::from_slice(&msg.body)`, or
+`MessageView::from_slice(&frame_bytes)` as appropriate for the wire
+`body_format`.
+
+```rust
+use repe::WebSocketClient;
+use serde_json::Value;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = WebSocketClient::connect("ws://127.0.0.1:8081/repe").await?;
+    let mut notifies = client.subscribe_notifies()?;
+    tokio::spawn(async move {
+        while let Some(msg) = notifies.recv().await {
+            let path = msg.query_str().unwrap_or("");
+            let body: Value = msg.json_body().unwrap_or(Value::Null);
+            println!("notify {path}: {body}");
+        }
+    });
+    let _ = client.call_json("/start", &serde_json::json!({})).await?;
+    Ok(())
+}
+```
+
 JSON Pointer Routing and Typed Handlers
 
 - Router keys are JSON Pointer paths (e.g., `/ping`, `/echo`, `/status`). Raw-binary queries are rejected with an explicit `Invalid query` error.

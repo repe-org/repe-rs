@@ -83,6 +83,6 @@ pub use uniudp_fleet::{SendResult, UniUdpFleet, UniUdpNode, UniUdpNodeConfig};
 #[cfg(all(feature = "websocket-wasm", target_arch = "wasm32"))]
 pub use wasm_client::WasmClient;
 #[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]
-pub use websocket_client::WebSocketClient;
+pub use websocket_client::{AlreadySubscribed, WebSocketClient};
 #[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]
 pub use websocket_server::{WebSocketServer, proxy_connection};
