@@ -292,10 +292,7 @@ pub enum ReconnectOutcome {
 pub enum ResumeRejection {
     /// Resume was for a file other than the one the producer is
     /// currently emitting.
-    WrongFileIndex {
-        requested: u32,
-        current: u32,
-    },
+    WrongFileIndex { requested: u32, current: u32 },
     /// Requested offset is outside the replay ring.
     OutOfWindow,
     /// Transfer is already cancelled; can't be resumed.
@@ -469,11 +466,7 @@ impl TransferControl {
     /// you ever add a second concurrent producer, move
     /// [`Self::record_sent`] accounting under the same lock as the
     /// wait.
-    pub fn wait_for_credit(
-        &self,
-        chunk_len: u64,
-        deadline: Instant,
-    ) -> Result<(), CreditError> {
+    pub fn wait_for_credit(&self, chunk_len: u64, deadline: Instant) -> Result<(), CreditError> {
         let mut guard = self.inner.lock().expect("TransferControl mutex poisoned");
         loop {
             if let Some(reason) = guard.cancelled.clone() {
@@ -948,7 +941,8 @@ mod tests {
         ctl.push_replay(0, false, vec![0u8; 16]);
 
         let writer_ctl = Arc::clone(&ctl);
-        let waiter = std::thread::spawn(move || writer_ctl.wait_for_reconnect(Duration::from_secs(2)));
+        let waiter =
+            std::thread::spawn(move || writer_ctl.wait_for_reconnect(Duration::from_secs(2)));
 
         std::thread::sleep(Duration::from_millis(40));
         let new_peer = dummy_peer(2);

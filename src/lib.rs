@@ -26,9 +26,9 @@ pub mod peer;
 pub mod registry;
 pub mod server;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod stream;
-#[cfg(not(target_arch = "wasm32"))]
 mod server_request;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod stream;
 pub mod structs;
 #[cfg(all(feature = "fleet-udp", not(target_arch = "wasm32")))]
 pub mod udp_client;
@@ -80,8 +80,8 @@ pub use server::{
 #[cfg(not(target_arch = "wasm32"))]
 pub use stream::{
     CreditError, DEFAULT_BACKPRESSURE_TIMEOUT, DEFAULT_IDLE_TIMEOUT, DEFAULT_RECONNECT_TIMEOUT,
-    DEFAULT_REPLAY_RING_BYTES, DEFAULT_WINDOW_BYTES, PendingResume, ReconnectOutcome, RingChunk,
-    ResumeRejection, TransferControl, TransferRegistry, spawn_watchdog,
+    DEFAULT_REPLAY_RING_BYTES, DEFAULT_WINDOW_BYTES, PendingResume, ReconnectOutcome,
+    ResumeRejection, RingChunk, TransferControl, TransferRegistry, spawn_watchdog,
 };
 pub use structs::{RepeStruct, StructError};
 #[cfg(all(feature = "fleet-udp", not(target_arch = "wasm32")))]
