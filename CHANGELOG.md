@@ -1,15 +1,20 @@
 # Changelog
 
-## [Unreleased]
+## [2.0.0] - 2026-04-25
+
+### Breaking changes
+- `RegistryCallable::call` now takes `&CallContext` in addition to `Option<Value>`. Plain `Fn(Option<Value>) -> Result<...>` closures keep compiling unchanged via the existing blanket impl, but anyone implementing `RegistryCallable` directly via a struct must update their `fn call` signature.
+
+### Added
 - Added streaming and zero-copy `Message` I/O for large bodies:
   - `Message::write_to<W: Write>` and `Message::serialized_len` emit/size a message without allocating an intermediate frame `Vec<u8>`.
   - `write_message_streaming(w, header, query, body_len, body_writer)` lets the body be produced by a closure (pairs with `beve::to_writer_streaming` for direct BEVE-into-writer encoding of multi-MiB bodies).
   - `MessageView<'a>` borrows the query and body slices out of a caller-supplied buffer instead of copying like `Message::from_slice`. Useful with `serde_bytes::Bytes<'a>` so a chunk payload stays borrowed end-to-end.
-- Added peer-aware handler routing types so handlers can push notify messages back to the calling peer:
+- Peer-aware handler routing types so handlers can push notify messages back to the calling peer:
   - `PeerSink` trait that embedders implement against their per-connection outbound mechanism.
   - `PeerHandle` (cloneable wrapper over `Arc<dyn PeerSink>` plus a `PeerId`), `NotifyBody` (variant tagged with the wire `BodyFormat`), and `PeerSendError`.
   - `CallContext<'a>` carries the optional `PeerHandle` and the dispatched method through to handlers.
-  - `RegistryCallable::call` now takes `&CallContext` in addition to `Option<Value>`. Plain `Fn(Option<Value>) -> Result<...>` closures keep compiling unchanged via the existing blanket impl; closures that want the context wrap in the new `WithContext` adapter.
+  - `WithContext` adapter for registering closures that want the `&CallContext`.
   - `Registry::dispatch_with_ctx` mirrors `Registry::dispatch` but threads the `CallContext` to the registered callable. `dispatch` becomes a thin wrapper that supplies a `CallContext::detached` context.
   - Built-in TCP/WebSocket servers do not yet construct `PeerHandle`s themselves; embedders that need peer routing wire their own `PeerSink` and call `dispatch_with_ctx`.
 

@@ -106,6 +106,54 @@ let path = view.query_str()?;
 counterparts: emit a `Message` to a `Write` without going through `to_vec`,
 or query its wire size in `O(1)`.
 
+Peer-aware handlers
+
+When a handler needs to push more than one message back to the calling
+client (e.g. server-pushed file chunks after a single `/run_collection`
+call), it needs a typed handle to that specific connection. `PeerSink` /
+`PeerHandle` / `CallContext` provide that handle; `Registry::dispatch_with_ctx`
+threads it through to handlers.
+
+Repe-rs's built-in TCP/WebSocket servers do not yet construct `PeerHandle`s
+themselves. Embedders that want peer routing wire their own `PeerSink`
+(typically a bounded channel drained by a writer task) against their
+server's outbound side.
+
+```rust
+use repe::{
+    CallContext, NotifyBody, PeerHandle, PeerId, PeerSendError, PeerSink,
+    Registry, WithContext,
+};
+use serde_json::{json, Value};
+use std::sync::Arc;
+
+// Implement PeerSink against your server's outbound mechanism.
+struct OutboundChannel(/* tx: mpsc::Sender<...> */);
+impl PeerSink for OutboundChannel {
+    fn send_notify(&self, _method: &str, _body: NotifyBody) -> Result<(), PeerSendError> {
+        // push a notify Message onto the peer's outbound queue.
+        Ok(())
+    }
+}
+
+// Register a context-aware handler. WithContext is the marker that opts
+// into the &CallContext parameter; plain Fn(Option<Value>) -> Result<...>
+// closures keep working unchanged.
+let registry = Registry::new();
+registry.register_function("/run", WithContext(|ctx: &CallContext, _params| {
+    if let Some(peer) = ctx.peer() {
+        peer.send_notify("/progress", NotifyBody::Json(b"{\"step\":1}".to_vec())).ok();
+    }
+    Ok::<_, (repe::ErrorCode, String)>(json!({"status": "ok"}))
+})).unwrap();
+
+// At dispatch time, build a CallContext for the calling peer and invoke
+// dispatch_with_ctx. Plain dispatch() supplies CallContext::detached.
+let peer = PeerHandle::new(PeerId(1), Arc::new(OutboundChannel(/* ... */)));
+let ctx = CallContext::new("/run", &peer);
+let _ = registry.dispatch_with_ctx("/run", Some(json!({})), &ctx);
+```
+
 Examples
 
 - `examples/json_roundtrip.rs` – construct/serialize/parse a JSON message.
