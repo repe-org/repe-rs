@@ -122,7 +122,7 @@ struct MethodMaybeBody {
     body: Option<String>,
 }
 
-/// Pre-process argv to support the inferred-mode shortcut from the C++ tool:
+/// Pre-process argv to support the inferred-mode shortcut:
 /// `repe /path` -> `repe get /path` and `repe /path '<json>'` -> `repe set /path '<json>'`.
 /// We rewrite only when the first non-flag positional starts with `/`, so existing
 /// subcommand invocations are untouched. A literal `--` is the user explicitly
@@ -292,7 +292,9 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Command::Set(MethodWithBody { method, body }) => {
             let body_text = resolve_body(body.as_deref(), cli.body_file.as_deref())?
                 .ok_or_else(|| CliError::Usage("`set` requires a body".into()))?;
-            // Mirrors the C++ tool: set suppresses the response body on success.
+            // `set` suppresses the response body on success: a successful write
+            // doesn't have anything interesting to print, and silence makes the
+            // command pleasant to use in scripts.
             let _ = transport
                 .send(
                     &method,
