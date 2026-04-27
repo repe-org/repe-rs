@@ -11,13 +11,13 @@ readme = "README.md"
 keywords = ["rpc", "protocol", "repe", "json"]
 categories = ["network-programming", "encoding"]
 include = [
-    "Cargo.toml",
-    "README.md",
-    "LICENSE",
-    "docs/**",
-    "src/**",
-    "examples/**",
-    "tests/**",
+    "/Cargo.toml",
+    "/README.md",
+    "/LICENSE",
+    "/docs/**",
+    "/src/**",
+    "/examples/**",
+    "/tests/**",
 ]
 [features]
 default = []
