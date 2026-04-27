@@ -3,6 +3,7 @@
 Rust implementation of the [REPE RPC protocol](https://github.com/repe-org/REPE) with JSON and BEVE body support.
 
 [![crates.io](https://img.shields.io/crates/v/repe.svg)](https://crates.io/crates/repe)
+[![docs](https://img.shields.io/badge/docs-repe--rs-blue?logo=readthedocs&logoColor=white)](https://repe-org.github.io/repe-rs/)
 
 ## Features
 
@@ -10,11 +11,11 @@ Rust implementation of the [REPE RPC protocol](https://github.com/repe-org/REPE)
 - Streaming and zero-copy I/O (`MessageView`, `write_message_streaming`) for large bodies.
 - JSON bodies via `serde_json`; BEVE bodies via the [`beve`](https://crates.io/crates/beve) crate.
 - Sync and async (tokio) clients and servers, with multiplexed in-flight requests, per-call timeouts, batching, and notify support.
-- Dynamic [`Registry`](https://github.com/repe-org/repe-rs/blob/main/docs/registry.md) routing with JSON Pointer semantics.
-- [`Fleet`](https://github.com/repe-org/repe-rs/blob/main/docs/fleet.md) APIs for multi-node TCP and UDP fanout.
-- Optional [WebSocket transport](https://github.com/repe-org/repe-rs/blob/main/docs/websocket.md), including a wasm browser client and server-pushed notify subscriptions.
-- Optional [`stream`](https://github.com/repe-org/repe-rs/blob/main/docs/streaming.md) module for backpressure-controlled bulk transfers with reconnect-resume.
-- Optional [`repe` CLI](https://github.com/repe-org/repe-rs/blob/main/docs/cli.md) for talking to any REPE server over TCP or WebSocket.
+- Dynamic [`Registry`](https://repe-org.github.io/repe-rs/registry/) routing with JSON Pointer semantics.
+- [`Fleet`](https://repe-org.github.io/repe-rs/fleet/) APIs for multi-node TCP and UDP fanout.
+- Optional [WebSocket transport](https://repe-org.github.io/repe-rs/websocket/), including a wasm browser client and server-pushed notify subscriptions.
+- Optional [`stream`](https://repe-org.github.io/repe-rs/streaming/) module for backpressure-controlled bulk transfers with reconnect-resume.
+- Optional [`repe` CLI](https://repe-org.github.io/repe-rs/cli/) for talking to any REPE server over TCP or WebSocket.
 
 ## Installation
 
@@ -73,7 +74,7 @@ assert_eq!(pong["pong"], true);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-The async (`tokio`) variant uses `AsyncServer` and `AsyncClient` and exposes the same shape. See [docs/server.md](https://github.com/repe-org/repe-rs/blob/main/docs/server.md) for routers, typed handlers, middleware, struct registration, and peer-aware handlers, and [docs/client.md](https://github.com/repe-org/repe-rs/blob/main/docs/client.md) for the full client surface (typed and BEVE helpers, multiplexing, timeouts, batches, notifies, error handling).
+The async (`tokio`) variant uses `AsyncServer` and `AsyncClient` and exposes the same shape. See the [Server guide](https://repe-org.github.io/repe-rs/server/) for routers, typed handlers, middleware, struct registration, and peer-aware handlers, and the [Client guide](https://repe-org.github.io/repe-rs/client/) for the full client surface (typed and BEVE helpers, multiplexing, timeouts, batches, notifies, error handling).
 
 ## Feature Flags
 
@@ -87,14 +88,16 @@ The async (`tokio`) variant uses `AsyncServer` and `AsyncClient` and exposes the
 
 ## Documentation
 
-- [Server, routers, and handlers](https://github.com/repe-org/repe-rs/blob/main/docs/server.md)
-- [Client APIs](https://github.com/repe-org/repe-rs/blob/main/docs/client.md)
-- [Registry (dynamic routing)](https://github.com/repe-org/repe-rs/blob/main/docs/registry.md)
-- [Fleet (multi-node control)](https://github.com/repe-org/repe-rs/blob/main/docs/fleet.md)
-- [WebSocket transport](https://github.com/repe-org/repe-rs/blob/main/docs/websocket.md)
-- [Streaming with backpressure](https://github.com/repe-org/repe-rs/blob/main/docs/streaming.md)
-- [Command-line client](https://github.com/repe-org/repe-rs/blob/main/docs/cli.md)
-- [Wire format and JSON Pointer helpers](https://github.com/repe-org/repe-rs/blob/main/docs/protocol.md)
+Full documentation is hosted at **[repe-org.github.io/repe-rs](https://repe-org.github.io/repe-rs/)**.
+
+- [Server, routers, and handlers](https://repe-org.github.io/repe-rs/server/)
+- [Client APIs](https://repe-org.github.io/repe-rs/client/)
+- [Registry (dynamic routing)](https://repe-org.github.io/repe-rs/registry/)
+- [Fleet (multi-node control)](https://repe-org.github.io/repe-rs/fleet/)
+- [WebSocket transport](https://repe-org.github.io/repe-rs/websocket/)
+- [Streaming with backpressure](https://repe-org.github.io/repe-rs/streaming/)
+- [Command-line client](https://repe-org.github.io/repe-rs/cli/)
+- [Wire format and JSON Pointer helpers](https://repe-org.github.io/repe-rs/protocol/)
 
 ## Examples
 
