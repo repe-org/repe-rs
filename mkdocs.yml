@@ -1,0 +1,77 @@
+site_name: repe-rs
+site_description: Rust implementation of the REPE RPC protocol with JSON and BEVE body support.
+site_url: https://repe-org.github.io/repe-rs/
+repo_url: https://github.com/repe-org/repe-rs
+repo_name: repe-org/repe-rs
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.top
+    - navigation.sections
+    - navigation.indexes
+    - content.code.copy
+    - content.code.annotate
+    - content.action.edit
+    - search.suggest
+    - search.highlight
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to light mode
+  icon:
+    repo: fontawesome/brands/github
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+
+plugins:
+  - search
+
+nav:
+  - Overview: index.md
+  - Wire Format: protocol.md
+  - Server: server.md
+  - Client: client.md
+  - Registry: registry.md
+  - Fleet: fleet.md
+  - WebSocket Transport: websocket.md
+  - Streaming: streaming.md
+  - Command-Line Client: cli.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/repe-org/repe-rs
+    - icon: fontawesome/brands/rust
+      link: https://crates.io/crates/repe

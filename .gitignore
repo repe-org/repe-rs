@@ -5,3 +5,7 @@ PR_DESCRIPTION.md
 dev/pr-description.md
 dev/feature-expansion-plan.md
 PR.md
+
+# MkDocs build output and local virtualenv
+/site/
+/.mkdocs-venv/
