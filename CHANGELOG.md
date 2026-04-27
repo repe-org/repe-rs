@@ -1,5 +1,25 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- `cli` feature and `repe` binary: command-line client for REPE servers. Auto-detects transport from `--url` (`ws://` / `wss://` use the WebSocket transport, anything else uses TCP, with a default port of 5099). Supports `get` / `set` / `call` / `notify` subcommands, plus an inferred mode (`repe /path` reads, `repe /path '<json>'` writes). Install with `cargo install repe --features cli`.
+- CLI body sources: pass `-` as the positional body to read from stdin, or `--body-file PATH` to read from a file. The two sources are mutually exclusive with each other and with a literal positional body.
+- CLI response decoding handles all body formats: JSON and BEVE responses are pretty-printed (or compacted with `--raw`), UTF-8 bodies are surfaced as JSON strings (or printed verbatim under `--raw`, so `repe --raw get /motd` behaves like a plain text fetch), and unparseable raw-binary responses are surfaced as a clear RPC error rather than an opaque decode failure.
+- `REPE_URL` environment variable as a default for `--url`, so repeated invocations against the same server can drop the flag. An explicit `--url` always overrides the env var.
+- `repe completions <shell>` subcommand emits a clap-derived completion script for `bash`, `zsh`, `fish`, `elvish`, or `powershell`. Runs locally with no server or runtime.
+- `tests/cli.rs` end-to-end coverage of the binary against an in-process registry-backed `AsyncServer` and `WebSocketServer`, exercising every subcommand, raw output, stdin/`--body-file` body sources, the body-source conflict rule, both error-exit paths, `--timeout` enforcement, BEVE response decoding, `REPE_URL` precedence, and the completions subcommand.
+
+### Fixed
+- Bare bracketed IPv6 literals in `--url` (`[::1]`) now have the default port `:5099` appended, matching the IPv4 hostname behavior. Previously they were left untouched and produced invalid socket addresses.
+- `--` is now an explicit opt-out from inferred mode: `repe -- /foo` no longer rewrites to `repe -- get /foo` (which clap would then misparse), it leaves argv untouched.
+- `--timeout` is now honored by `notify`. The flag was previously declared global but had no plumbing through to `Transport::notify`, so `repe --timeout 1 notify /x '{}'` silently ignored the bound.
+- `--timeout` rejects negative and non-finite values (NaN, `+/-inf`) with a clear usage error instead of silently clamping to zero (which then fired immediately).
+- `--body-file` is rejected for `get` before the connect attempt, so misconfigured invocations against an unreachable server surface the usage error instead of the connect failure.
+
+### Notes
+- CLI bodies are validated as syntactically-valid JSON client-side before the request is sent. Semantic validation (does this value match the schema for `/foo`?) remains the server's responsibility.
+
 ## [2.2.0] - 2026-04-25
 
 ### Added
