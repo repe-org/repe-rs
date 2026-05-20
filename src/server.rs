@@ -3,6 +3,7 @@ use crate::error::RepeError;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::io::{read_message, write_message};
 use crate::message::{Message, create_error_response_like, create_response};
+use crate::peer::CallContext;
 use crate::registry::Registry;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::server_request::route_request;
@@ -30,11 +31,28 @@ use std::{
 
 pub trait HandlerErased: Send + Sync {
     fn handle(&self, req: &Message) -> Result<Message, RepeError>;
+
+    /// Context-aware dispatch. Default implementation ignores the
+    /// context and delegates to [`handle`](Self::handle), so existing
+    /// implementors compile unchanged.
+    ///
+    /// Override this for handlers that need the calling peer (e.g.
+    /// push notifies to the originator during request handling) or
+    /// the dispatched method. The built-in
+    /// `WebSocketServer` invokes this method per request with a
+    /// [`CallContext`] carrying the peer; the TCP servers invoke
+    /// `handle` directly, so context-aware handlers also need to
+    /// behave correctly when no peer is available (see
+    /// [`CallContext::detached`]).
+    fn handle_with_ctx(&self, req: &Message, _ctx: &CallContext) -> Result<Message, RepeError> {
+        self.handle(req)
+    }
 }
 
 pub struct Next<'a> {
     middlewares: &'a [Arc<dyn Middleware>],
     handler: &'a dyn HandlerErased,
+    ctx: Option<&'a CallContext<'a>>,
 }
 
 impl<'a> Next<'a> {
@@ -42,15 +60,44 @@ impl<'a> Next<'a> {
         Self {
             middlewares,
             handler,
+            ctx: None,
+        }
+    }
+
+    fn with_ctx(
+        middlewares: &'a [Arc<dyn Middleware>],
+        handler: &'a dyn HandlerErased,
+        ctx: &'a CallContext<'a>,
+    ) -> Self {
+        Self {
+            middlewares,
+            handler,
+            ctx: Some(ctx),
         }
     }
 
     /// Continue to the next middleware (or final handler if this was the last middleware).
+    ///
+    /// If a [`CallContext`] was attached upstream (via
+    /// `WebSocketServer`'s peer-aware dispatch path), it is threaded
+    /// through to the leaf handler automatically. Middleware authors
+    /// do not need to be aware of the context to forward it; calling
+    /// `next.run(req)` preserves whatever the caller provided.
     pub fn run(self, req: &Message) -> Result<Message, RepeError> {
         if let Some((first, rest)) = self.middlewares.split_first() {
-            first.handle(req, Next::new(rest, self.handler))
+            first.handle(
+                req,
+                Next {
+                    middlewares: rest,
+                    handler: self.handler,
+                    ctx: self.ctx,
+                },
+            )
         } else {
-            self.handler.handle(req)
+            match self.ctx {
+                Some(ctx) => self.handler.handle_with_ctx(req, ctx),
+                None => self.handler.handle(req),
+            }
         }
     }
 }
@@ -77,6 +124,26 @@ impl HandlerErased for MiddlewarePipeline {
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
         Next::new(self.middlewares.as_ref(), self.handler.as_ref()).run(req)
     }
+
+    fn handle_with_ctx(&self, req: &Message, ctx: &CallContext) -> Result<Message, RepeError> {
+        Next::with_ctx(self.middlewares.as_ref(), self.handler.as_ref(), ctx).run(req)
+    }
+}
+
+fn decode_json_param(req: &Message) -> Result<Result<Value, Message>, RepeError> {
+    let value: Value = match BodyFormat::try_from(req.header.body_format) {
+        Ok(BodyFormat::Json) => serde_json::from_slice(&req.body)?,
+        Ok(BodyFormat::Utf8) => serde_json::from_str(&req.body_utf8()).map_err(RepeError::from)?,
+        Ok(BodyFormat::Beve) => beve_from_slice(&req.body)?,
+        _ => {
+            return Ok(Err(create_error_response_like(
+                req,
+                ErrorCode::InvalidBody,
+                "Expected JSON body",
+            )));
+        }
+    };
+    Ok(Ok(value))
 }
 
 struct JsonHandler<F>(F)
@@ -88,21 +155,37 @@ where
     F: Fn(Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static,
 {
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
-        let param: Value = match BodyFormat::try_from(req.header.body_format) {
-            Ok(BodyFormat::Json) => serde_json::from_slice(&req.body)?,
-            Ok(BodyFormat::Utf8) => {
-                serde_json::from_str(&req.body_utf8()).map_err(RepeError::from)?
-            }
-            Ok(BodyFormat::Beve) => beve_from_slice(&req.body)?,
-            _ => {
-                return Ok(create_error_response_like(
-                    req,
-                    ErrorCode::InvalidBody,
-                    "Expected JSON body",
-                ));
-            }
+        let param = match decode_json_param(req)? {
+            Ok(v) => v,
+            Err(err) => return Ok(err),
         };
         match (self.0)(param) {
+            Ok(value) => create_response(req, value, BodyFormat::Json),
+            Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
+        }
+    }
+}
+
+struct JsonHandlerCtx<F>(F)
+where
+    F: Fn(&CallContext, Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static;
+
+impl<F> HandlerErased for JsonHandlerCtx<F>
+where
+    F: Fn(&CallContext, Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static,
+{
+    fn handle(&self, req: &Message) -> Result<Message, RepeError> {
+        let path = req.query_str().unwrap_or("");
+        let ctx = CallContext::detached(path);
+        self.handle_with_ctx(req, &ctx)
+    }
+
+    fn handle_with_ctx(&self, req: &Message, ctx: &CallContext) -> Result<Message, RepeError> {
+        let param = match decode_json_param(req)? {
+            Ok(v) => v,
+            Err(err) => return Ok(err),
+        };
+        match (self.0)(ctx, param) {
             Ok(value) => create_response(req, value, BodyFormat::Json),
             Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
         }
@@ -177,6 +260,25 @@ where
     }
 }
 
+fn decode_typed_param<T>(req: &Message) -> Result<Result<T, Message>, RepeError>
+where
+    T: DeserializeOwned,
+{
+    let value: T = match BodyFormat::try_from(req.header.body_format) {
+        Ok(BodyFormat::Json) => serde_json::from_slice(&req.body)?,
+        Ok(BodyFormat::Utf8) => serde_json::from_str(&req.body_utf8()).map_err(RepeError::from)?,
+        Ok(BodyFormat::Beve) => beve_from_slice(&req.body)?,
+        _ => {
+            return Ok(Err(create_error_response_like(
+                req,
+                ErrorCode::InvalidBody,
+                "Expected JSON body",
+            )));
+        }
+    };
+    Ok(Ok(value))
+}
+
 struct TypedHandler<T, R, F>(F, std::marker::PhantomData<(T, R)>)
 where
     T: DeserializeOwned + Send + Sync + 'static,
@@ -190,21 +292,70 @@ where
     F: TypedHandlerFn<T, R>,
 {
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
-        let t: T = match BodyFormat::try_from(req.header.body_format) {
-            Ok(BodyFormat::Json) => serde_json::from_slice(&req.body)?,
-            Ok(BodyFormat::Utf8) => {
-                serde_json::from_str(&req.body_utf8()).map_err(RepeError::from)?
-            }
-            Ok(BodyFormat::Beve) => beve_from_slice(&req.body)?,
-            _ => {
-                return Ok(create_error_response_like(
-                    req,
-                    ErrorCode::InvalidBody,
-                    "Expected JSON body",
-                ));
-            }
+        let t: T = match decode_typed_param(req)? {
+            Ok(v) => v,
+            Err(err) => return Ok(err),
         };
         match self.0.call(t) {
+            Ok(r) => {
+                let (value, format) = r.into_typed_response();
+                create_response(req, value, format)
+            }
+            Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
+        }
+    }
+}
+
+/// Trait shape mirroring [`TypedHandlerFn`] for context-aware typed
+/// handlers. Implemented by closures of the form
+/// `Fn(&CallContext, T) -> Result<R, (ErrorCode, String)>`.
+pub trait TypedHandlerFnCtx<T, R>: Send + Sync + 'static
+where
+    T: DeserializeOwned + Send + Sync + 'static,
+    R: Serialize + Send + Sync + 'static,
+{
+    type Response: IntoTypedResponse<R>;
+    fn call(&self, ctx: &CallContext, input: T) -> Result<Self::Response, (ErrorCode, String)>;
+}
+
+impl<T, R, S, F> TypedHandlerFnCtx<T, R> for F
+where
+    T: DeserializeOwned + Send + Sync + 'static,
+    R: Serialize + Send + Sync + 'static,
+    S: IntoTypedResponse<R>,
+    F: Fn(&CallContext, T) -> Result<S, (ErrorCode, String)> + Send + Sync + 'static,
+{
+    type Response = S;
+
+    fn call(&self, ctx: &CallContext, input: T) -> Result<Self::Response, (ErrorCode, String)> {
+        (self)(ctx, input)
+    }
+}
+
+struct TypedHandlerCtx<T, R, F>(F, std::marker::PhantomData<(T, R)>)
+where
+    T: DeserializeOwned + Send + Sync + 'static,
+    R: Serialize + Send + Sync + 'static,
+    F: TypedHandlerFnCtx<T, R>;
+
+impl<T, R, F> HandlerErased for TypedHandlerCtx<T, R, F>
+where
+    T: DeserializeOwned + Send + Sync + 'static,
+    R: Serialize + Send + Sync + 'static,
+    F: TypedHandlerFnCtx<T, R>,
+{
+    fn handle(&self, req: &Message) -> Result<Message, RepeError> {
+        let path = req.query_str().unwrap_or("");
+        let ctx = CallContext::detached(path);
+        self.handle_with_ctx(req, &ctx)
+    }
+
+    fn handle_with_ctx(&self, req: &Message, ctx: &CallContext) -> Result<Message, RepeError> {
+        let t: T = match decode_typed_param(req)? {
+            Ok(v) => v,
+            Err(err) => return Ok(err),
+        };
+        match self.0.call(ctx, t) {
             Ok(r) => {
                 let (value, format) = r.into_typed_response();
                 create_response(req, value, format)
@@ -405,6 +556,68 @@ impl Router {
         map.insert(
             path.to_string(),
             Arc::new(TypedHandler::<T, R, F>(f, std::marker::PhantomData))
+                as Arc<dyn HandlerErased>,
+        );
+        self.inner = Arc::new(map);
+        self
+    }
+
+    /// Context-aware JSON handler. Same shape as [`with_json`] but the
+    /// closure also receives a [`CallContext`] carrying the calling
+    /// peer (when one is available) and the dispatched method.
+    ///
+    /// Typical use: push a notify back to the calling peer during
+    /// request handling, e.g. progress updates while a long-running
+    /// call is in flight.
+    ///
+    /// ```ignore
+    /// use repe::server::Router;
+    /// use repe::NotifyBody;
+    ///
+    /// let router = Router::new().with_json_ctx("/start", |ctx, params| {
+    ///     if let Some(peer) = ctx.peer() {
+    ///         let _ = peer.send_notify(
+    ///             "/progress",
+    ///             NotifyBody::Json(serde_json::to_vec(&serde_json::json!({
+    ///                 "stage": "begin"
+    ///             })).unwrap()),
+    ///         );
+    ///     }
+    ///     Ok(serde_json::json!({ "started": true }))
+    /// });
+    /// ```
+    ///
+    /// When dispatched without a peer (TCP transports, direct
+    /// in-process calls), `ctx.peer()` returns `None`.
+    ///
+    /// [`with_json`]: Self::with_json
+    pub fn with_json_ctx<F>(mut self, path: &str, handler: F) -> Self
+    where
+        F: Fn(&CallContext, Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static,
+    {
+        let mut map = self.inner.as_ref().clone();
+        map.insert(
+            path.to_string(),
+            Arc::new(JsonHandlerCtx(handler)) as Arc<dyn HandlerErased>,
+        );
+        self.inner = Arc::new(map);
+        self
+    }
+
+    /// Context-aware typed handler. Same shape as [`with_typed`] but
+    /// the closure also receives a [`CallContext`].
+    ///
+    /// [`with_typed`]: Self::with_typed
+    pub fn with_typed_ctx<T, R, F>(mut self, path: &str, f: F) -> Self
+    where
+        T: DeserializeOwned + Send + Sync + 'static,
+        R: Serialize + Send + Sync + 'static,
+        F: TypedHandlerFnCtx<T, R>,
+    {
+        let mut map = self.inner.as_ref().clone();
+        map.insert(
+            path.to_string(),
+            Arc::new(TypedHandlerCtx::<T, R, F>(f, std::marker::PhantomData))
                 as Arc<dyn HandlerErased>,
         );
         self.inner = Arc::new(map);
@@ -613,6 +826,18 @@ impl HandlerErased for RegistryRequestHandler {
         };
 
         match self.registry.dispatch(&self.pointer, body) {
+            Ok(value) => create_response(req, value, BodyFormat::Json),
+            Err(err) => Ok(create_error_response_like(req, err.code(), err.to_string())),
+        }
+    }
+
+    fn handle_with_ctx(&self, req: &Message, ctx: &CallContext) -> Result<Message, RepeError> {
+        let body = match Registry::decode_body(req) {
+            Ok(value) => value,
+            Err(err) => return Ok(create_error_response_like(req, err.code(), err.to_string())),
+        };
+
+        match self.registry.dispatch_with_ctx(&self.pointer, body, ctx) {
             Ok(value) => create_response(req, value, BodyFormat::Json),
             Err(err) => Ok(create_error_response_like(req, err.code(), err.to_string())),
         }
