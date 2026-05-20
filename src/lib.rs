@@ -69,7 +69,9 @@ pub use header::Header;
 pub use io::{read_message, write_message, write_message_streaming};
 pub use json_pointer::{evaluate as eval_json_pointer, parse as parse_json_pointer};
 pub use message::{Message, MessageView};
-pub use peer::{CallContext, NotifyBody, PeerHandle, PeerId, PeerSendError, PeerSink};
+pub use peer::{
+    CallContext, NotifyBody, PeerHandle, PeerId, PeerRegistry, PeerSendError, PeerSink,
+};
 pub use registry::{Registry, RegistryCallable, RegistryError, WithContext};
 #[cfg(not(target_arch = "wasm32"))]
 pub use server::Server;

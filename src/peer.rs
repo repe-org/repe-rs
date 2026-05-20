@@ -22,7 +22,11 @@
 //! with a populated [`CallContext`].
 
 use crate::constants::BodyFormat;
-use std::sync::Arc;
+use crate::error::RepeError;
+use serde::Serialize;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// Server-assigned identifier for a connected peer.
 ///
@@ -119,6 +123,16 @@ pub trait PeerSink: Send + Sync {
     /// bounded channel that returns [`PeerSendError::Full`] when saturated
     /// is the recommended shape; embedders that prefer to block until the
     /// channel has capacity may do so.
+    ///
+    /// **Query format is currently fixed at `QueryFormat::JsonPointer`.**
+    /// The built-in [`WebSocketServer`](crate::websocket_server::WebSocketServer)
+    /// sink and the present trait shape both assume `method` is a JSON
+    /// pointer; pushing notifies that should advertise a different
+    /// query format (custom binary protocols, embedder-defined codes)
+    /// requires building the [`Message`](crate::Message) by hand and
+    /// writing it through a parallel mechanism. A future revision will
+    /// thread a `QueryFormat` through this signature; for now the
+    /// limitation is by design, not an oversight.
     fn send_notify(&self, method: &str, body: NotifyBody) -> Result<(), PeerSendError>;
 
     /// Returns `true` if the peer's transport is still open.
@@ -209,10 +223,235 @@ impl<'a> CallContext<'a> {
     }
 }
 
+/// Live set of peers attached to one server instance.
+///
+/// Inserted on accept, removed on close. Cheap to clone (`Arc` inside)
+/// so background tasks can hold a handle for broadcasting. The registry
+/// is transport-agnostic: anything that produces [`PeerHandle`]s can
+/// feed it, not just the built-in `WebSocketServer`.
+///
+/// Typical wiring:
+///
+/// ```ignore
+/// let peers = PeerRegistry::new();
+/// let server = WebSocketServer::new(router).with_peer_registry(peers.clone());
+///
+/// let publisher = peers.clone();
+/// tokio::spawn(async move {
+///     publisher.broadcast_notify_json("/state/changed", &snapshot);
+/// });
+/// ```
+#[derive(Clone)]
+pub struct PeerRegistry {
+    inner: Arc<Mutex<HashMap<PeerId, PeerHandle>>>,
+    next_id: Arc<AtomicU64>,
+}
+
+impl Default for PeerRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PeerRegistry {
+    /// Build an empty registry.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Mint a fresh, monotonically increasing [`PeerId`] from this
+    /// registry's id counter.
+    ///
+    /// Embedders that build their own [`PeerHandle`]s (rather than
+    /// going through `WebSocketServer::with_peer_registry`) can call
+    /// this to keep ids unique across every server feeding the
+    /// registry. `WebSocketServer::with_peer_registry` adopts this
+    /// counter internally, so two servers sharing one registry never
+    /// mint colliding ids.
+    pub fn next_peer_id(&self) -> PeerId {
+        let value = self.next_id.fetch_add(1, Ordering::Relaxed);
+        debug_assert!(
+            value != PeerId::DETACHED.0,
+            "PeerRegistry id counter collided with PeerId::DETACHED sentinel \
+             (this requires ~2^64 connections; debug-only tripwire, not a contract)"
+        );
+        PeerId(value)
+    }
+
+    /// Internal counter handle shared with `WebSocketServer` so that
+    /// all servers wired to one registry mint unique ids.
+    pub(crate) fn id_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.next_id)
+    }
+
+    /// Current number of connected peers.
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// `true` if no peers are connected.
+    pub fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    /// Snapshot of currently-connected peer handles.
+    ///
+    /// The registry lock is held only long enough to clone the values
+    /// into the returned `Vec`; callers can iterate freely without
+    /// blocking inserts or removals.
+    pub fn peers(&self) -> Vec<PeerHandle> {
+        self.lock().values().cloned().collect()
+    }
+
+    /// Look up a peer by id. Returns `None` if the peer has
+    /// disconnected.
+    pub fn get(&self, id: PeerId) -> Option<PeerHandle> {
+        self.lock().get(&id).cloned()
+    }
+
+    /// Insert a peer.
+    ///
+    /// Callers are responsible for ensuring `PeerId`s are unique
+    /// within one registry. `WebSocketServer::with_peer_registry`
+    /// already does this for you (it adopts the registry's id
+    /// counter); embedders rolling their own pipeline should mint ids
+    /// via [`PeerRegistry::next_peer_id`]. Overwriting an existing
+    /// entry trips a `debug_assert!` so the silent-corruption mode
+    /// (two servers minting `PeerId(0)` against a shared registry)
+    /// fires loudly in tests.
+    pub fn insert(&self, peer: PeerHandle) {
+        let prev = self.lock().insert(peer.peer_id(), peer);
+        debug_assert!(
+            prev.is_none(),
+            "PeerRegistry::insert overwrote an existing peer; \
+             two PeerHandles minted the same PeerId. If you wired multiple \
+             WebSocketServers to one PeerRegistry without using with_peer_registry, \
+             share PeerRegistry::next_peer_id across them."
+        );
+    }
+
+    /// Remove a peer. Returns the removed handle if it was present.
+    pub fn remove(&self, id: PeerId) -> Option<PeerHandle> {
+        self.lock().remove(&id)
+    }
+
+    /// Broadcast a JSON-bodied notify to every connected peer.
+    ///
+    /// The body is encoded once on the caller's task; the encoded
+    /// bytes are cloned into each peer's outbound channel. Returns a
+    /// per-peer result map so callers can surface backpressure
+    /// ([`PeerSendError::Full`]) or prune dead peers
+    /// ([`PeerSendError::Disconnected`]). The registry's lock is held
+    /// only long enough to snapshot the peer map; per-peer sends run
+    /// outside the lock, so a slow peer cannot stall delivery to the
+    /// others.
+    pub fn broadcast_notify_json<P, T>(
+        &self,
+        path: P,
+        body: &T,
+    ) -> Result<HashMap<PeerId, Result<(), PeerSendError>>, RepeError>
+    where
+        P: AsRef<str>,
+        T: Serialize + ?Sized,
+    {
+        let encoded = serde_json::to_vec(body)?;
+        Ok(self.broadcast_each(path.as_ref(), |_peer| NotifyBody::Json(encoded.clone())))
+    }
+
+    /// BEVE-bodied broadcast. See [`broadcast_notify_json`] for
+    /// semantics.
+    ///
+    /// [`broadcast_notify_json`]: PeerRegistry::broadcast_notify_json
+    pub fn broadcast_notify_beve<P, T>(
+        &self,
+        path: P,
+        body: &T,
+    ) -> Result<HashMap<PeerId, Result<(), PeerSendError>>, RepeError>
+    where
+        P: AsRef<str>,
+        T: Serialize,
+    {
+        let encoded = beve::to_vec(body)?;
+        Ok(self.broadcast_each(path.as_ref(), |_peer| NotifyBody::Beve(encoded.clone())))
+    }
+
+    /// UTF-8-bodied broadcast. Plain text is advertised with
+    /// [`BodyFormat::Utf8`].
+    pub fn broadcast_notify_utf8<P, S>(
+        &self,
+        path: P,
+        text: S,
+    ) -> HashMap<PeerId, Result<(), PeerSendError>>
+    where
+        P: AsRef<str>,
+        S: AsRef<str>,
+    {
+        let text = text.as_ref().to_owned();
+        self.broadcast_each(path.as_ref(), |_peer| NotifyBody::Utf8(text.clone()))
+    }
+
+    /// Raw-body broadcast. The caller supplies the body bytes and the
+    /// [`BodyFormat`] tag the wire should advertise.
+    pub fn broadcast_notify_raw<P>(
+        &self,
+        path: P,
+        body_format: BodyFormat,
+        body: &[u8],
+    ) -> HashMap<PeerId, Result<(), PeerSendError>>
+    where
+        P: AsRef<str>,
+    {
+        let bytes = body.to_vec();
+        self.broadcast_each(path.as_ref(), move |_peer| {
+            NotifyBody::Raw(bytes.clone(), body_format)
+        })
+    }
+
+    fn broadcast_each<F>(
+        &self,
+        path: &str,
+        mut body_for: F,
+    ) -> HashMap<PeerId, Result<(), PeerSendError>>
+    where
+        F: FnMut(&PeerHandle) -> NotifyBody,
+    {
+        let snapshot = self.peers();
+        let mut out = HashMap::with_capacity(snapshot.len());
+        for peer in snapshot {
+            let body = body_for(&peer);
+            let result = peer.send_notify(path, body);
+            out.insert(peer.peer_id(), result);
+        }
+        out
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PeerId, PeerHandle>> {
+        // Recover from poison: the map's invariants (an `Arc`-keyed
+        // `HashMap<PeerId, PeerHandle>` with no cross-entry coupling)
+        // cannot be left inconsistent by any single insert/remove, so
+        // honoring the poison would block the registry forever on the
+        // strength of an unrelated panic in some other code path.
+        match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
+impl std::fmt::Debug for PeerRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerRegistry")
+            .field("len", &self.len())
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     #[derive(Default)]
     struct CapturingSink {
@@ -268,7 +507,7 @@ mod tests {
         let err = peer
             .send_notify("/z", NotifyBody::Json(b"{}".to_vec()))
             .unwrap_err();
-        matches!(err, PeerSendError::Disconnected);
+        assert!(matches!(err, PeerSendError::Disconnected));
         assert!(!peer.is_connected());
     }
 
