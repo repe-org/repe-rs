@@ -44,11 +44,7 @@ pub trait HandlerErased: Send + Sync {
     /// `handle` directly, so context-aware handlers also need to
     /// behave correctly when no peer is available (see
     /// [`CallContext::detached`]).
-    fn handle_with_ctx(
-        &self,
-        req: &Message,
-        _ctx: &CallContext,
-    ) -> Result<Message, RepeError> {
+    fn handle_with_ctx(&self, req: &Message, _ctx: &CallContext) -> Result<Message, RepeError> {
         self.handle(req)
     }
 }
@@ -129,11 +125,7 @@ impl HandlerErased for MiddlewarePipeline {
         Next::new(self.middlewares.as_ref(), self.handler.as_ref()).run(req)
     }
 
-    fn handle_with_ctx(
-        &self,
-        req: &Message,
-        ctx: &CallContext,
-    ) -> Result<Message, RepeError> {
+    fn handle_with_ctx(&self, req: &Message, ctx: &CallContext) -> Result<Message, RepeError> {
         Next::with_ctx(self.middlewares.as_ref(), self.handler.as_ref(), ctx).run(req)
     }
 }
@@ -188,11 +180,7 @@ where
         self.handle_with_ctx(req, &ctx)
     }
 
-    fn handle_with_ctx(
-        &self,
-        req: &Message,
-        ctx: &CallContext,
-    ) -> Result<Message, RepeError> {
+    fn handle_with_ctx(&self, req: &Message, ctx: &CallContext) -> Result<Message, RepeError> {
         let param = match decode_json_param(req)? {
             Ok(v) => v,
             Err(err) => return Ok(err),
@@ -362,11 +350,7 @@ where
         self.handle_with_ctx(req, &ctx)
     }
 
-    fn handle_with_ctx(
-        &self,
-        req: &Message,
-        ctx: &CallContext,
-    ) -> Result<Message, RepeError> {
+    fn handle_with_ctx(&self, req: &Message, ctx: &CallContext) -> Result<Message, RepeError> {
         let t: T = match decode_typed_param(req)? {
             Ok(v) => v,
             Err(err) => return Ok(err),
@@ -609,10 +593,7 @@ impl Router {
     /// [`with_json`]: Self::with_json
     pub fn with_json_ctx<F>(mut self, path: &str, handler: F) -> Self
     where
-        F: Fn(&CallContext, Value) -> Result<Value, (ErrorCode, String)>
-            + Send
-            + Sync
-            + 'static,
+        F: Fn(&CallContext, Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static,
     {
         let mut map = self.inner.as_ref().clone();
         map.insert(
@@ -850,11 +831,7 @@ impl HandlerErased for RegistryRequestHandler {
         }
     }
 
-    fn handle_with_ctx(
-        &self,
-        req: &Message,
-        ctx: &CallContext,
-    ) -> Result<Message, RepeError> {
+    fn handle_with_ctx(&self, req: &Message, ctx: &CallContext) -> Result<Message, RepeError> {
         let body = match Registry::decode_body(req) {
             Ok(value) => value,
             Err(err) => return Ok(create_error_response_like(req, err.code(), err.to_string())),

@@ -2,7 +2,9 @@ use crate::async_client::AsyncClient;
 use crate::constants::QueryFormat;
 use crate::error::RepeError;
 use crate::message::Message;
-use crate::peer::{CallContext, NotifyBody, PeerHandle, PeerId, PeerRegistry, PeerSendError, PeerSink};
+use crate::peer::{
+    CallContext, NotifyBody, PeerHandle, PeerId, PeerRegistry, PeerSendError, PeerSink,
+};
 use crate::server::Router;
 use crate::server_request::route_request_with_ctx;
 use futures_util::stream::{SplitSink, SplitStream};
@@ -627,10 +629,7 @@ mod tests {
 
         // Round-trip a request so we know the peer is registered by
         // the time the broadcast runs.
-        let _ = client
-            .call_json("/ping", &json!({}))
-            .await
-            .unwrap();
+        let _ = client.call_json("/ping", &json!({})).await.unwrap();
 
         assert_eq!(peers.len(), 1);
         let results = peers
@@ -988,9 +987,7 @@ mod tests {
             if let Some(peer) = ctx.peer() {
                 let _ = peer.send_notify(
                     "/progress",
-                    NotifyBody::Json(
-                        serde_json::to_vec(&json!({ "stage": "running" })).unwrap(),
-                    ),
+                    NotifyBody::Json(serde_json::to_vec(&json!({ "stage": "running" })).unwrap()),
                 );
             }
             Ok(json!({ "done": true }))
@@ -1154,8 +1151,7 @@ mod tests {
         // Both peers must be present with distinct ids.
         assert_eq!(peers.len(), 2);
         let snapshot = peers.peers();
-        let ids: std::collections::HashSet<_> =
-            snapshot.iter().map(|p| p.peer_id().0).collect();
+        let ids: std::collections::HashSet<_> = snapshot.iter().map(|p| p.peer_id().0).collect();
         assert_eq!(ids.len(), 2, "shared registry minted colliding PeerIds");
 
         drop(c1);
