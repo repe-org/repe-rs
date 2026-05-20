@@ -126,6 +126,42 @@ Each accepted connection allocates a bounded `tokio::sync::mpsc` channel for out
 
 When the channel is full, `PeerHandle::send_notify` (and thus `broadcast_notify_*`) returns `PeerSendError::Full` for that peer; other peers are unaffected. A slow consumer cannot stall delivery to the broadcast set. The embedder chooses the policy: retry on the next tick, prune the peer, or escalate.
 
+### In-Handler Notifies
+
+Request handlers can also push notifies back to the calling peer mid-request. Register a handler via `Router::with_json_ctx` (or `with_typed_ctx`) and the closure receives a `CallContext` carrying the `PeerHandle`:
+
+```rust
+use repe::server::Router;
+use repe::websocket_server::WebSocketServer;
+use repe::NotifyBody;
+use serde_json::json;
+
+let router = Router::new().with_json_ctx("/run", |ctx, _params| {
+    if let Some(peer) = ctx.peer() {
+        let _ = peer.send_notify(
+            "/progress",
+            NotifyBody::Json(serde_json::to_vec(&json!({ "stage": "begin" })).unwrap()),
+        );
+        // ... do work ...
+        let _ = peer.send_notify(
+            "/progress",
+            NotifyBody::Json(serde_json::to_vec(&json!({ "stage": "end" })).unwrap()),
+        );
+    }
+    Ok(json!({ "ok": true }))
+});
+
+let server = WebSocketServer::new(router);
+```
+
+Registry-backed handlers reach the same `CallContext`: wrap a closure with `repe::registry::WithContext` before registering it. `WebSocketServer` automatically calls `Registry::dispatch_with_ctx` so the registered callable receives the peer.
+
+Middleware does not need to be aware of `CallContext` to forward it. `Next::run(req)` threads whatever the upstream caller attached, so existing middleware composes transparently with new context-aware handlers. Handlers registered via `with_json` / `with_typed` (the legacy non-`_ctx` variants) keep working unchanged; they simply do not receive the context.
+
+Calls dispatched through the TCP transports (`Client`, `AsyncClient`, `Server`, `AsyncServer`) do not carry a peer today; `ctx.peer()` returns `None` for those. Context-aware handlers should treat `None` as the no-push case rather than relying on the peer always being present.
+
 ### Compatibility
 
 The push path is strictly opt-in. Existing `WebSocketServer::new(router).serve(addr, path)` callers see no behavior change, no new error variants, and no protocol changes. Notify frames are the same shape they have always been (`Message::builder().notify(true)`).
+
+Adding `handle_with_ctx` to `HandlerErased` is source-compatible because the trait provides a default implementation that delegates to `handle`. Existing implementors of `HandlerErased` (embedder custom handler types) compile unchanged.

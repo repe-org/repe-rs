@@ -7,14 +7,18 @@
 - `WebSocketServer::with_peer_registry(registry)`: attach a `PeerRegistry` so accepted peers are inserted on connect and removed on disconnect. The disconnect cleanup runs from a `Drop` guard so it fires on every exit path (clean close, transport error, handler panic).
 - `WebSocketServer::on_peer_connect(f)` / `on_peer_disconnect(f)`: lower-level lifecycle hooks. Both compose: every registered closure fires in registration order, so `with_peer_registry` can coexist with logging or metrics callbacks. The connect hook runs synchronously before the reader/writer tasks start, so a notify queued from inside it is guaranteed to reach the wire before any response.
 - `WebSocketServer::with_outbound_capacity(n)`: per-connection outbound channel capacity (default `DEFAULT_OUTBOUND_CAPACITY = 256`). A full channel returns `PeerSendError::Full` from `PeerHandle::send_notify`; the embedder picks the retry/prune policy.
+- `Router::with_json_ctx` and `Router::with_typed_ctx`: register handlers that take a `&CallContext` alongside the body. Inside the handler, `ctx.peer()` is the calling `PeerHandle` (when the request came in over a transport that produces peers; `WebSocketServer` does), so handlers can push notifies back to the originator mid-request (progress updates, streaming chunks, server-initiated state mirroring).
+- `HandlerErased::handle_with_ctx(&self, req, ctx)`: new trait method threading the `CallContext` to the leaf handler. Defaults to ignoring the context and calling `handle`, so existing implementors (embedder custom handlers) compile unchanged.
+- `TypedHandlerFnCtx` in `repe::server`: trait shape mirroring `TypedHandlerFn` for `Fn(&CallContext, T) -> Result<R, ...>` closures.
+- `route_request_with_ctx` (crate-internal): peer-threaded dispatch path used by `WebSocketServer`. TCP-backed servers continue to use the existing context-free `route_request`.
 
 ### Changed
 - `WebSocketServer::handle_connection` is now a reader/writer task pair coordinated by a bounded `tokio::sync::mpsc` channel. The writer task is the sole point that touches the outbound `SplitSink`, so any code path that holds a `PeerHandle` can push notifies onto the wire alongside in-flight responses. Existing request-response servers see no behavior change.
+- `WebSocketServer` now dispatches each request through `HandlerErased::handle_with_ctx` with a `CallContext` carrying the calling peer. Handlers registered via `with_json` / `with_typed` are unaffected (they inherit the default `handle_with_ctx` that drops the context). TCP servers continue to dispatch via the existing context-free path.
 
 ### Notes
 - The push path is strictly opt-in. `WebSocketServer::new(router).serve(...)` callers compile and run unchanged. No protocol changes: notify frames are the same shape they have always been.
 - Broadcast cost: one encode plus one `Vec<u8>` clone per peer. Sharing a single `Arc<[u8]>` across peers for very large broadcast bodies is left as future work.
-- In-handler notifies (handlers reaching the calling peer's `PeerHandle`) are still out of scope. Surfacing the peer to handlers requires a router/handler signature change; `Registry::dispatch_with_ctx` already threads `CallContext` for the registry-backed path.
 
 ## [2.4.0] - 2026-04-27
 

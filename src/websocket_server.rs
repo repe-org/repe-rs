@@ -2,9 +2,9 @@ use crate::async_client::AsyncClient;
 use crate::constants::QueryFormat;
 use crate::error::RepeError;
 use crate::message::Message;
-use crate::peer::{NotifyBody, PeerHandle, PeerId, PeerRegistry, PeerSendError, PeerSink};
+use crate::peer::{CallContext, NotifyBody, PeerHandle, PeerId, PeerRegistry, PeerSendError, PeerSink};
 use crate::server::Router;
-use crate::server_request::route_request;
+use crate::server_request::route_request_with_ctx;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use std::io::ErrorKind;
@@ -263,9 +263,12 @@ async fn handle_connection_with_config(
         for hook in config.on_connect.iter() {
             hook(peer.clone());
         }
-        drop(peer); // Local clone no longer needed; hooks own theirs.
 
-        reader_task(ws_reader, &config.router, outbound_tx).await
+        // Keep `peer` in the reader scope; it is threaded into each
+        // request's `CallContext` so handlers can push notifies back
+        // to the originator (via `Router::with_json_ctx` /
+        // `with_typed_ctx` or a registry-backed `RegistryCallable`).
+        reader_task(ws_reader, &config.router, outbound_tx, peer).await
         // _guard drops here (on every exit path, including unwind),
         // firing disconnect hooks. Any registry entry holding a
         // PeerHandle clone (and thus a sender clone) is released,
@@ -290,6 +293,7 @@ async fn reader_task(
     mut ws_reader: SplitStream<WebSocketStream<TcpStream>>,
     router: &Router,
     outbound_tx: mpsc::Sender<Message>,
+    peer: PeerHandle,
 ) -> Result<(), RepeError> {
     loop {
         let frame = match ws_reader.next().await {
@@ -304,7 +308,15 @@ async fn reader_task(
             FrameAction::Close => break,
         };
 
-        if let Some(response) = route_request(router, &request) {
+        // Build a CallContext threading the calling peer to handlers.
+        // Handlers registered via `Router::with_json_ctx` /
+        // `with_typed_ctx` (or registry-backed callables that take a
+        // `CallContext`) can reach `ctx.peer()` and push notifies back
+        // through this connection's outbound channel during request
+        // handling.
+        let path = request.query_str().unwrap_or("");
+        let ctx = CallContext::new(path, &peer);
+        if let Some(response) = route_request_with_ctx(router, &request, &ctx) {
             if outbound_tx.send(response).await.is_err() {
                 // Writer task exited (likely wire error); abandon
                 // reader. The disconnect guard will still fire when
@@ -313,6 +325,9 @@ async fn reader_task(
             }
         }
     }
+    // `peer` drops here, releasing this connection's sender clone of
+    // the outbound channel and helping the writer drain.
+    drop(peer);
     Ok(())
 }
 
@@ -961,6 +976,152 @@ mod tests {
             peers.is_empty(),
             "panicking connect hook leaked peer in registry"
         );
+        server_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_pushes_notify_to_calling_peer_via_with_json_ctx() {
+        // A handler registered via with_json_ctx pushes a progress
+        // notify back to the calling peer mid-request. Both the
+        // notify and the response must arrive on the same connection.
+        let router = Router::new().with_json_ctx("/work", |ctx, _params| {
+            if let Some(peer) = ctx.peer() {
+                let _ = peer.send_notify(
+                    "/progress",
+                    NotifyBody::Json(
+                        serde_json::to_vec(&json!({ "stage": "running" })).unwrap(),
+                    ),
+                );
+            }
+            Ok(json!({ "done": true }))
+        });
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = WebSocketServer::new(router);
+        let server_task = serve_one(listener, "/repe", server).await;
+
+        let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
+            .await
+            .unwrap();
+        let mut notifies = client.subscribe_notifies().expect("subscribe");
+
+        let resp = client.call_json("/work", &json!({})).await.unwrap();
+        assert_eq!(resp, json!({ "done": true }));
+
+        let pushed = tokio::time::timeout(Duration::from_secs(2), notifies.recv())
+            .await
+            .expect("progress notify did not arrive")
+            .expect("channel closed");
+        assert!(pushed.header.notify != 0);
+        assert_eq!(pushed.query_str().unwrap(), "/progress");
+        let body: serde_json::Value = pushed.json_body().unwrap();
+        assert_eq!(body, json!({ "stage": "running" }));
+
+        drop(client);
+        server_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctx_handler_sees_no_peer_under_legacy_handle() {
+        // When a context-aware handler is invoked via the legacy
+        // HandlerErased::handle path (no peer threaded), ctx.peer()
+        // is None. This guards the TCP-transport / direct-dispatch
+        // fallback shape so a ctx-aware handler does not panic when
+        // there is no peer.
+        let router = Router::new().with_json_ctx("/probe", |ctx, _params| {
+            Ok(json!({ "has_peer": ctx.peer().is_some() }))
+        });
+        let handler = router.get("/probe").expect("handler exists");
+
+        let req = Message::builder()
+            .id(1)
+            .query_str("/probe")
+            .query_format(QueryFormat::JsonPointer)
+            .body_json(&json!({}))
+            .unwrap()
+            .build();
+        let resp = handler.handle(&req).unwrap();
+        let body: serde_json::Value = resp.json_body().unwrap();
+        assert_eq!(body, json!({ "has_peer": false }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn registry_callable_receives_peer_via_with_context() {
+        // A Registry-backed handler wrapped in `WithContext` must see
+        // the calling peer when the request comes in over the
+        // WebSocket transport.
+        use crate::Registry;
+        use crate::registry::WithContext;
+
+        let registry = Arc::new(Registry::new());
+        registry
+            .register_function(
+                "/work",
+                WithContext(|ctx: &CallContext, _params| {
+                    if let Some(peer) = ctx.peer() {
+                        let _ = peer.send_notify(
+                            "/progress",
+                            NotifyBody::Json(
+                                serde_json::to_vec(&json!({ "stage": "registry" })).unwrap(),
+                            ),
+                        );
+                    }
+                    Ok(json!({ "done": true }))
+                }),
+            )
+            .unwrap();
+
+        let router = Router::new().with_registry("", Arc::clone(&registry));
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = WebSocketServer::new(router);
+        let server_task = serve_one(listener, "/repe", server).await;
+
+        let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
+            .await
+            .unwrap();
+        let mut notifies = client.subscribe_notifies().expect("subscribe");
+
+        let resp = client.call_json("/work", &json!({})).await.unwrap();
+        assert_eq!(resp, json!({ "done": true }));
+
+        let pushed = tokio::time::timeout(Duration::from_secs(2), notifies.recv())
+            .await
+            .expect("registry handler did not push a notify")
+            .expect("channel closed");
+        assert_eq!(pushed.query_str().unwrap(), "/progress");
+
+        drop(client);
+        server_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn middleware_preserves_ctx_across_pipeline() {
+        // Middleware that calls next.run(req) without knowing about
+        // CallContext must still thread ctx to the leaf handler.
+        // This is what lets existing middleware compose with new
+        // context-aware handlers.
+        use crate::server::Next;
+        let router = Router::new()
+            .with_middleware(|req: &Message, next: Next<'_>| next.run(req))
+            .with_json_ctx("/work", |ctx, _params| {
+                Ok(json!({ "has_peer": ctx.peer().is_some() }))
+            });
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = WebSocketServer::new(router);
+        let server_task = serve_one(listener, "/repe", server).await;
+
+        let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
+            .await
+            .unwrap();
+        let resp = client.call_json("/work", &json!({})).await.unwrap();
+        assert_eq!(resp, json!({ "has_peer": true }));
+
+        drop(client);
         server_task.abort();
     }
 
