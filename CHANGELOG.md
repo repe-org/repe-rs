@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-05-20
+
 ### Added
 - `PeerRegistry`: cloneable live set of connected peers, with `broadcast_notify_json` / `broadcast_notify_beve` / `broadcast_notify_utf8` / `broadcast_notify_raw` helpers. Each broadcast encodes (or copies, for the pre-encoded variants) the body once on the caller's task and returns a `HashMap<PeerId, Result<(), PeerSendError>>` so callers can prune dead peers (`PeerSendError::Disconnected`) or surface backpressure (`PeerSendError::Full`). Owns its own `PeerId` allocator (`PeerRegistry::next_peer_id`), so two `WebSocketServer`s sharing one registry never mint colliding ids.
 - `WebSocketServer::with_peer_registry(registry)`: attach a `PeerRegistry` so accepted peers are inserted on connect and removed on disconnect. The disconnect cleanup runs from a `Drop` guard so it fires on every exit path (clean close, transport error, handler panic).
