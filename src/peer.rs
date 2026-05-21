@@ -283,6 +283,7 @@ impl PeerRegistry {
 
     /// Internal counter handle shared with `WebSocketServer` so that
     /// all servers wired to one registry mint unique ids.
+    #[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]
     pub(crate) fn id_counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.next_id)
     }
