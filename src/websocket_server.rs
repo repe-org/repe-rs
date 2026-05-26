@@ -9,6 +9,7 @@ use crate::server::{Execution, HandlerErased, Router};
 use crate::server_request::{Resolution, dispatch, resolve};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
+use std::future::Future;
 use std::io::ErrorKind;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -163,7 +164,54 @@ impl WebSocketServer {
         self.serve_listener(listener, path).await
     }
 
+    /// Bind `addr` and serve REPE WebSocket connections until
+    /// `shutdown` resolves, then stop accepting and return `Ok(())`.
+    ///
+    /// For embedders that run the server in-process and need a clean
+    /// stop without tearing down the runtime. `shutdown` is any future:
+    /// a [`tokio::sync::oneshot`] receiver, a `Notify`, a timer.
+    ///
+    /// Already-accepted connections are **not** awaited — each runs on
+    /// its own detached task and continues until its peer disconnects
+    /// or it errors; this call returns as soon as the accept loop
+    /// stops. Track connection lifetimes yourself (e.g. via a
+    /// [`PeerRegistry`]) if you need to drain them before exiting.
+    ///
+    /// Equivalent to [`serve`](Self::serve) when `shutdown` never
+    /// resolves.
+    pub async fn serve_with_shutdown<A: ToSocketAddrs>(
+        self,
+        addr: A,
+        path: &str,
+        shutdown: impl Future<Output = ()>,
+    ) -> std::io::Result<()> {
+        let listener = Self::listen(addr).await?;
+        self.serve_listener_with_shutdown(listener, path, shutdown)
+            .await
+    }
+
+    /// Serve an already-bound listener until the listener errors or the
+    /// task is dropped. For a clean stop, use
+    /// [`serve_listener_with_shutdown`](Self::serve_listener_with_shutdown).
     pub async fn serve_listener(self, listener: TcpListener, path: &str) -> std::io::Result<()> {
+        self.serve_listener_with_shutdown(listener, path, std::future::pending::<()>())
+            .await
+    }
+
+    /// Like [`serve_with_shutdown`](Self::serve_with_shutdown) but takes
+    /// an already-bound [`TcpListener`] instead of an address, mirroring
+    /// the [`serve`](Self::serve) / [`serve_listener`](Self::serve_listener)
+    /// pair. This is the single accept loop the other `serve*` entry
+    /// points delegate to; see
+    /// [`serve_with_shutdown`](Self::serve_with_shutdown) for the
+    /// shutdown semantics (already-accepted connections are not
+    /// awaited).
+    pub async fn serve_listener_with_shutdown(
+        self,
+        listener: TcpListener,
+        path: &str,
+        shutdown: impl Future<Output = ()>,
+    ) -> std::io::Result<()> {
         let expected_path = normalize_path(path);
         let config = Arc::new(ConnectionConfig {
             router: self.router,
@@ -174,23 +222,32 @@ impl WebSocketServer {
             on_disconnect: Arc::new(self.on_disconnect),
         });
 
+        tokio::pin!(shutdown);
         loop {
-            let (stream, _addr) = listener.accept().await?;
-            let expected_path = expected_path.clone();
-            let config = Arc::clone(&config);
-            tokio::spawn(async move {
-                match accept_repe_websocket(stream, &expected_path).await {
-                    Ok(ws_stream) => {
-                        if let Err(err) = handle_connection_with_config(ws_stream, config).await {
-                            eprintln!("[repe] websocket connection error: {err}");
+            tokio::select! {
+                // `TcpListener::accept` is cancel-safe, so losing this
+                // branch to `shutdown` cannot drop an accepted stream.
+                accepted = listener.accept() => {
+                    let (stream, _addr) = accepted?;
+                    let expected_path = expected_path.clone();
+                    let config = Arc::clone(&config);
+                    tokio::spawn(async move {
+                        match accept_repe_websocket(stream, &expected_path).await {
+                            Ok(ws_stream) => {
+                                if let Err(err) = handle_connection_with_config(ws_stream, config).await {
+                                    eprintln!("[repe] websocket connection error: {err}");
+                                }
+                            }
+                            Err(err) => {
+                                eprintln!("[repe] websocket handshake error: {err}");
+                            }
                         }
-                    }
-                    Err(err) => {
-                        eprintln!("[repe] websocket handshake error: {err}");
-                    }
+                    });
                 }
-            });
+                _ = &mut shutdown => break,
+            }
         }
+        Ok(())
     }
 }
 
@@ -678,6 +735,59 @@ mod tests {
 
         drop(client);
         server_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn serve_with_shutdown_stops_accepting_and_returns() {
+        // Feature 3: a client round-trips before shutdown; firing the
+        // shutdown future makes the serve loop return Ok(()) and the
+        // listener is dropped, so a subsequent connect no longer
+        // succeeds. Driven through serve_listener_with_shutdown (the
+        // single accept loop) with a pre-bound listener to avoid a
+        // port-reuse race.
+        let router = Router::new().with_json("/ping", |_| Ok(json!({ "ok": true })));
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server = WebSocketServer::new(router);
+        let serve = tokio::spawn(async move {
+            server
+                .serve_listener_with_shutdown(listener, "/repe", async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
+            .await
+            .unwrap();
+        let resp = client.call_json("/ping", &json!({})).await.unwrap();
+        assert_eq!(resp, json!({ "ok": true }));
+
+        // Fire shutdown; the serve future must return Ok(()).
+        shutdown_tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .expect("serve future did not return after shutdown")
+            .expect("serve task panicked");
+        assert!(result.is_ok(), "serve returned an error: {result:?}");
+
+        // The listener was dropped when serve returned, so a fresh
+        // connect attempt does not yield a working client (it errors
+        // or times out).
+        let after = tokio::time::timeout(
+            Duration::from_secs(2),
+            WebSocketClient::connect(&format!("ws://{addr}/repe")),
+        )
+        .await;
+        assert!(
+            matches!(after, Ok(Err(_)) | Err(_)),
+            "connect unexpectedly succeeded after shutdown"
+        );
+
+        drop(client);
     }
 
     #[tokio::test(flavor = "current_thread")]
