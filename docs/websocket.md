@@ -156,7 +156,7 @@ let server = WebSocketServer::new(router);
 
 Registry-backed handlers reach the same `CallContext`: wrap a closure with `repe::registry::WithContext` before registering it. `WebSocketServer` automatically calls `Registry::dispatch_with_ctx` so the registered callable receives the peer.
 
-Middleware does not need to be aware of `CallContext` to forward it. `Next::run(req)` threads whatever the upstream caller attached, so existing middleware composes transparently with new context-aware handlers. Handlers registered via `with_json` / `with_typed` (the legacy non-`_ctx` variants) keep working unchanged; they simply do not receive the context.
+Middleware does not need to be aware of `CallContext` to forward it. `Next::run(req)` threads whatever the upstream caller attached, so existing middleware composes transparently with new context-aware handlers. Handlers registered via `with_json` / `with_typed` (the legacy non-`_ctx` variants) keep working unchanged; they simply do not receive the context. A cross-cutting middleware that *does* want the calling peer can read it through `next.ctx()` (or the `next.peer()` shortcut); both return `None` on peer-less transports.
 
 Calls dispatched through the TCP transports (`Client`, `AsyncClient`, `Server`, `AsyncServer`) do not carry a peer today; `ctx.peer()` returns `None` for those. Context-aware handlers should treat `None` as the no-push case rather than relying on the peer always being present.
 
@@ -216,3 +216,58 @@ When a client disconnects, the connection's reader and writer tasks stop, but an
 ### One producer per transfer
 
 Removing per-connection serialization also removes an implicit safety net. Inline, a second `/begin` for the same transfer id cannot start until the first returns; off-reader, two `begin` frames spawn two producers against one `TransferControl`, violating its single-producer assumption and racing the registry entry (the second `begin` overwrites it while both producers run). The concurrency cap bounds the *count* of off-reader tasks, not duplicate registration, so a `begin`-style handler **must reject (or de-duplicate) a transfer id that is already registered** — check `TransferRegistry::get` before `register` and return an application error if it is already present.
+
+### Deferred: a first-class stream source
+
+The wiring above — install a `TransferControl`, spawn the producer off the reader, and route inbound ack/cancel/resume through your own handlers — is deliberately left to the embedder. A higher-level `WebSocketServer` stream-source surface that owns all of it (you would supply only the byte source and the chunk method names, and `begin`/ack/cancel/resume would be handled internally) is **deferred** until a second distinct windowed-transfer consumer of the built-in server exists, so the trait is designed against more than one transfer shape rather than over-fit to one. When it is built it should be *pull-based* (the server asks the source for the next chunk only when the credit window has room) and expose a seek so replay/resume can re-emit from an arbitrary offset. Until then, off-reader dispatch plus the [`repe::stream`](streaming.md) API fully cover a single consumer.
+
+## Graceful Shutdown
+
+`serve` and `serve_listener` run until the listener errors or the task is dropped. To stop accepting cleanly without tearing down the runtime, use `serve_with_shutdown` (which binds an address) or `serve_listener_with_shutdown` (which takes an already-bound listener); both `select!` between accepting connections and a shutdown future and return `Ok(())` once it resolves.
+
+```rust
+use repe::websocket_server::WebSocketServer;
+use tokio::sync::oneshot;
+
+let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+let server = WebSocketServer::new(router);
+let handle = tokio::spawn(async move {
+    server
+        .serve_with_shutdown("0.0.0.0:8081", "/repe", async {
+            let _ = shutdown_rx.await;
+        })
+        .await
+});
+
+// ... later, to stop accepting new connections:
+let _ = shutdown_tx.send(());
+let _ = handle.await;
+```
+
+Already-accepted connections are **not** awaited: each runs on its own detached task and continues until its peer disconnects or it errors, and the call returns as soon as the accept loop stops. Track connection lifetimes yourself (e.g. via a [`PeerRegistry`](#peerregistry)) if you need to drain them before exiting.
+
+## One-Port Co-Hosting
+
+To share a single TCP port between the REPE WebSocket endpoint and your own HTTP routes, drive connections yourself instead of using the built-in accept loop. `WebSocketServer::into_shared()` consumes the builder into a cheap, cloneable `SharedWebSocketServer` — the per-connection configuration is built once, each clone is an `Arc` clone, and the handle is `Send + Sync + 'static`. Then, for each accepted stream, peek the upgrade request and route it: `WebSocketServer::accept(stream, path)` performs the REPE handshake (validating `path`), and `SharedWebSocketServer::serve_connection(ws)` runs that connection's reader/writer loop. Connect/disconnect hooks and any attached `PeerRegistry` fire exactly as under `serve`.
+
+```rust
+use repe::websocket_server::WebSocketServer;
+
+let shared = WebSocketServer::new(router).into_shared();
+let listener = tokio::net::TcpListener::bind("0.0.0.0:8081").await?;
+loop {
+    let (stream, _addr) = listener.accept().await?;
+    let shared = shared.clone();
+    tokio::spawn(async move {
+        if looks_like_websocket_upgrade(&stream) {     // your own header peek
+            if let Ok(ws) = WebSocketServer::accept(stream, "/repe").await {
+                let _ = shared.serve_connection(ws).await;
+            }
+        } else {
+            serve_http(stream).await;                  // your own HTTP handler
+        }
+    });
+}
+```
+
+The built-in `serve` / `serve_listener` loop is itself implemented on top of `into_shared` + `accept` + `serve_connection`, so a co-hosted connection behaves identically to one accepted by the built-in loop.
