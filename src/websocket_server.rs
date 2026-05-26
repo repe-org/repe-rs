@@ -1258,6 +1258,51 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn middleware_reads_calling_peer_via_next_ctx() {
+        // Feature 5: a middleware that is not itself context-aware can
+        // still reach the calling peer through `next.ctx()` /
+        // `next.peer()`. Driven over the WebSocket server so a real
+        // peer is attached.
+        use crate::server::Next;
+        use std::sync::atomic::AtomicBool;
+
+        let saw_peer = Arc::new(AtomicBool::new(false));
+        let saw_peer_mw = Arc::clone(&saw_peer);
+        let router = Router::new()
+            .with_middleware(move |req: &Message, next: Next<'_>| {
+                // `peer()` is sugar for `ctx().and_then(|c| c.peer())`;
+                // the two must agree.
+                assert_eq!(
+                    next.peer().is_some(),
+                    next.ctx().and_then(|c| c.peer()).is_some()
+                );
+                if next.peer().is_some() {
+                    saw_peer_mw.store(true, Ordering::SeqCst);
+                }
+                next.run(req)
+            })
+            .with_json("/ping", |_| Ok(json!({ "ok": true })));
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = WebSocketServer::new(router);
+        let server_task = serve_one(listener, "/repe", server).await;
+
+        let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
+            .await
+            .unwrap();
+        let resp = client.call_json("/ping", &json!({})).await.unwrap();
+        assert_eq!(resp, json!({ "ok": true }));
+        assert!(
+            saw_peer.load(Ordering::SeqCst),
+            "middleware did not observe the calling peer via next.ctx()/next.peer()"
+        );
+
+        drop(client);
+        server_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn shared_registry_across_two_servers_mints_unique_ids() {
         let router_a = Router::new().with_json("/ping", |_| Ok(json!({ "ok": true })));
         let router_b = Router::new().with_json("/ping", |_| Ok(json!({ "ok": true })));

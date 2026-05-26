@@ -3,7 +3,7 @@ use crate::error::RepeError;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::io::{read_message, write_message};
 use crate::message::{Message, create_error_response_like, create_response};
-use crate::peer::CallContext;
+use crate::peer::{CallContext, PeerHandle};
 use crate::registry::Registry;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::server_request::route_request;
@@ -120,6 +120,26 @@ impl<'a> Next<'a> {
                 None => self.handler.handle(req),
             }
         }
+    }
+
+    /// The [`CallContext`] threaded into this pipeline, if any.
+    ///
+    /// `WebSocketServer`'s peer-aware dispatch attaches a context
+    /// carrying the calling peer; the TCP transports and direct
+    /// in-process dispatch do not, so this returns `None` there.
+    /// Lets a cross-cutting middleware read the calling peer (via
+    /// [`ctx.peer()`](CallContext::peer)) or the dispatched method
+    /// without being a context-aware leaf handler itself.
+    pub fn ctx(&self) -> Option<&CallContext<'a>> {
+        self.ctx
+    }
+
+    /// The calling peer, if one was attached upstream. Sugar for
+    /// [`ctx()`](Self::ctx)`.and_then(|c| c.peer())`. Returns `None`
+    /// for dispatch paths without a peer (TCP transports, direct
+    /// calls).
+    pub fn peer(&self) -> Option<&PeerHandle> {
+        self.ctx.and_then(|c| c.peer())
     }
 }
 
