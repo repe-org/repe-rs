@@ -46,7 +46,7 @@ pub mod derive {
     pub use repe_derive::RepeStruct;
 }
 
-/// Derive macro to generate [`structs::RepeStruct`](crate::structs::RepeStruct) implementations.
+/// Derive macro to generate [`structs::RepeStruct`] implementations.
 pub use repe_derive::RepeStruct;
 
 #[cfg(not(target_arch = "wasm32"))]

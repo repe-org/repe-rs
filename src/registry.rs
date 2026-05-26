@@ -226,8 +226,8 @@ impl Registry {
     /// Equivalent to [`Registry::dispatch_with_ctx`] with a
     /// [`CallContext::detached`] context. Use this for direct in-process
     /// dispatches where there's no calling peer (tests, batch fixups,
-    /// etc.). Servers that want to surface a [`PeerHandle`] to handlers
-    /// should call `dispatch_with_ctx` instead.
+    /// etc.). Servers that want to surface a [`PeerHandle`](crate::PeerHandle)
+    /// to handlers should call `dispatch_with_ctx` instead.
     pub fn dispatch(&self, pointer: &str, body: Option<Value>) -> Result<Value, RegistryError> {
         let ctx = CallContext::detached(pointer);
         self.dispatch_with_ctx(pointer, body, &ctx)
