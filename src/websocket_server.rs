@@ -1,12 +1,12 @@
 use crate::async_client::AsyncClient;
-use crate::constants::QueryFormat;
+use crate::constants::{ErrorCode, QueryFormat};
 use crate::error::RepeError;
-use crate::message::Message;
+use crate::message::{Message, create_error_response_like};
 use crate::peer::{
     CallContext, NotifyBody, PeerHandle, PeerId, PeerRegistry, PeerSendError, PeerSink,
 };
-use crate::server::Router;
-use crate::server_request::route_request_with_ctx;
+use crate::server::{Execution, HandlerErased, Router};
+use crate::server_request::{Resolution, dispatch, resolve};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use std::io::ErrorKind;
@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::oneshot;
+use tokio::sync::{Semaphore, oneshot};
 use tokio::time::Duration;
 use tokio_tungstenite::tungstenite::handshake::server::{
     Callback, ErrorResponse, Request, Response,
@@ -36,6 +36,12 @@ type DisconnectHook = Arc<dyn Fn(PeerId) + Send + Sync>;
 /// [`WebSocketServer::with_outbound_capacity`].
 pub const DEFAULT_OUTBOUND_CAPACITY: usize = 256;
 
+/// Default cap on concurrently-running off-reader handlers (registered
+/// via `Router::with_*_blocking`) per connection. Bounds how many
+/// blocking-pool threads one connection can occupy at once. Override
+/// with [`WebSocketServer::with_offreader_limit`]; `0` removes the cap.
+pub const DEFAULT_OFFREADER_LIMIT: usize = 16;
+
 /// Upper bound on how long the writer task spends draining queued
 /// messages after the connection's reader has exited. A slow or
 /// unresponsive peer (where TCP has not yet errored) cannot pin the
@@ -45,6 +51,7 @@ const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct WebSocketServer {
     router: Router,
     outbound_capacity: usize,
+    offreader_limit: Option<usize>,
     peer_id_counter: Arc<AtomicU64>,
     on_connect: Vec<ConnectHook>,
     on_disconnect: Vec<DisconnectHook>,
@@ -55,6 +62,7 @@ impl WebSocketServer {
         Self {
             router,
             outbound_capacity: DEFAULT_OUTBOUND_CAPACITY,
+            offreader_limit: Some(DEFAULT_OFFREADER_LIMIT),
             peer_id_counter: Arc::new(AtomicU64::new(0)),
             on_connect: Vec::new(),
             on_disconnect: Vec::new(),
@@ -79,6 +87,23 @@ impl WebSocketServer {
             "WebSocketServer outbound capacity must be >= 1"
         );
         self.outbound_capacity = capacity;
+        self
+    }
+
+    /// Cap on concurrently-running off-reader handlers (those registered
+    /// via `Router::with_json_blocking` and friends) per connection.
+    /// Defaults to [`DEFAULT_OFFREADER_LIMIT`].
+    ///
+    /// When the cap is reached, a further off-reader request gets an
+    /// error response (`ErrorCode::ApplicationErrorBase`) and the client
+    /// should retry; the request is never queued and the reader is never
+    /// blocked waiting for a slot — blocking it would stall the very
+    /// frames (ACKs, cancels) that in-flight transfers need to finish
+    /// and free a slot. Pass `0` to remove the cap (unbounded), which
+    /// matches a hand-rolled `spawn_blocking` and is only sensible if you
+    /// have sized the runtime's blocking pool accordingly.
+    pub fn with_offreader_limit(mut self, limit: usize) -> Self {
+        self.offreader_limit = (limit > 0).then_some(limit);
         self
     }
 
@@ -143,6 +168,7 @@ impl WebSocketServer {
         let config = Arc::new(ConnectionConfig {
             router: self.router,
             outbound_capacity: self.outbound_capacity,
+            offreader_limit: self.offreader_limit,
             peer_id_counter: self.peer_id_counter,
             on_connect: Arc::new(self.on_connect),
             on_disconnect: Arc::new(self.on_disconnect),
@@ -171,6 +197,7 @@ impl WebSocketServer {
 struct ConnectionConfig {
     router: Router,
     outbound_capacity: usize,
+    offreader_limit: Option<usize>,
     peer_id_counter: Arc<AtomicU64>,
     on_connect: Arc<Vec<ConnectHook>>,
     on_disconnect: Arc<Vec<DisconnectHook>>,
@@ -242,6 +269,10 @@ async fn handle_connection_with_config(
     });
     let peer = PeerHandle::new(peer_id, sink);
 
+    // Per-connection cap on concurrent off-reader handlers. `None`
+    // (set via `with_offreader_limit(0)`) means unbounded.
+    let offreader_sem = config.offreader_limit.map(|n| Arc::new(Semaphore::new(n)));
+
     // Build the disconnect guard *before* invoking connect hooks. If a
     // later connect hook panics after an earlier one (e.g. the
     // registry-insert hook) has already side-effected, unwinding still
@@ -270,7 +301,7 @@ async fn handle_connection_with_config(
         // request's `CallContext` so handlers can push notifies back
         // to the originator (via `Router::with_json_ctx` /
         // `with_typed_ctx` or a registry-backed `RegistryCallable`).
-        reader_task(ws_reader, &config.router, outbound_tx, peer).await
+        reader_task(ws_reader, &config.router, outbound_tx, peer, offreader_sem).await
         // _guard drops here (on every exit path, including unwind),
         // firing disconnect hooks. Any registry entry holding a
         // PeerHandle clone (and thus a sender clone) is released,
@@ -296,6 +327,7 @@ async fn reader_task(
     router: &Router,
     outbound_tx: mpsc::Sender<Message>,
     peer: PeerHandle,
+    offreader_sem: Option<Arc<Semaphore>>,
 ) -> Result<(), RepeError> {
     loop {
         let frame = match ws_reader.next().await {
@@ -310,27 +342,128 @@ async fn reader_task(
             FrameAction::Close => break,
         };
 
-        // Build a CallContext threading the calling peer to handlers.
-        // Handlers registered via `Router::with_json_ctx` /
-        // `with_typed_ctx` (or registry-backed callables that take a
-        // `CallContext`) can reach `ctx.peer()` and push notifies back
-        // through this connection's outbound channel during request
-        // handling.
-        let path = request.query_str().unwrap_or("");
-        let ctx = CallContext::new(path, &peer);
-        if let Some(response) = route_request_with_ctx(router, &request, &ctx) {
-            if outbound_tx.send(response).await.is_err() {
-                // Writer task exited (likely wire error); abandon
-                // reader. The disconnect guard will still fire when
-                // we return.
-                break;
+        // Resolve the route (version/query validation + handler lookup)
+        // here, on the reader, so the early error responses and the
+        // execution mode are computed identically for the inline and
+        // off-reader paths; only where dispatch runs differs.
+        match resolve(router, &request) {
+            Resolution::Respond(maybe_response) => {
+                if let Some(response) = maybe_response {
+                    if outbound_tx.send(response).await.is_err() {
+                        break;
+                    }
+                }
             }
+            Resolution::Dispatch { handler, notify } => match handler.execution() {
+                Execution::Inline => {
+                    // Thread the calling peer to handlers so
+                    // `with_json_ctx` / `with_typed_ctx` (and
+                    // registry-backed callables) can push notifies back
+                    // through this connection during request handling.
+                    let path = request.query_str().unwrap_or("");
+                    let ctx = CallContext::new(path, &peer);
+                    if let Some(response) = dispatch(handler.as_ref(), &request, &ctx, notify) {
+                        if outbound_tx.send(response).await.is_err() {
+                            // Writer task exited (likely wire error);
+                            // abandon reader. The disconnect guard still
+                            // fires when we return.
+                            break;
+                        }
+                    }
+                }
+                Execution::OffReader => {
+                    if !spawn_off_reader(
+                        &offreader_sem,
+                        handler,
+                        request,
+                        notify,
+                        &peer,
+                        &outbound_tx,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                }
+            },
         }
     }
     // `peer` drops here, releasing this connection's sender clone of
     // the outbound channel and helping the writer drain.
     drop(peer);
     Ok(())
+}
+
+/// Dispatch an off-reader handler on a blocking thread so the reader
+/// keeps decoding inbound frames while it runs or parks.
+///
+/// Acquires a per-connection permit first. If the cap is saturated it
+/// rejects (non-notify) or drops (notify) the request rather than
+/// blocking the reader — blocking here would stall the ACK/cancel
+/// frames in-flight handlers need to finish and free a slot, the very
+/// deadlock off-reader dispatch exists to avoid. A handler panic is
+/// caught and mapped to an error response so it cannot tear down the
+/// connection, which an off-reader handler shares with other concurrent
+/// transfers.
+///
+/// Returns `false` if the outbound channel is closed (the caller should
+/// stop reading), `true` otherwise.
+async fn spawn_off_reader(
+    offreader_sem: &Option<Arc<Semaphore>>,
+    handler: Arc<dyn HandlerErased>,
+    request: Message,
+    notify: bool,
+    peer: &PeerHandle,
+    outbound_tx: &mpsc::Sender<Message>,
+) -> bool {
+    let permit = match offreader_sem {
+        Some(sem) => match Arc::clone(sem).try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                if notify {
+                    // No response to reject a notify with; drop it.
+                    return true;
+                }
+                let response = create_error_response_like(
+                    &request,
+                    ErrorCode::ApplicationErrorBase,
+                    "off-reader dispatch limit reached; retry",
+                );
+                return outbound_tx.send(response).await.is_ok();
+            }
+        },
+        None => None,
+    };
+
+    let peer = peer.clone();
+    let outbound_tx = outbound_tx.clone();
+    tokio::task::spawn_blocking(move || {
+        // Hold the permit for the whole handler run; dropped on return
+        // (including the panic path), which is what lets the idle
+        // watchdog reclaim a wedged slot once it cancels the transfer.
+        let _permit = permit;
+        let path = request.query_str().unwrap_or("");
+        let ctx = CallContext::new(path, &peer);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dispatch(handler.as_ref(), &request, &ctx, notify)
+        }));
+        let response = match outcome {
+            Ok(maybe_response) => maybe_response,
+            Err(_) => (!notify).then(|| {
+                create_error_response_like(
+                    &request,
+                    ErrorCode::ApplicationErrorBase,
+                    "handler panicked",
+                )
+            }),
+        };
+        if let Some(response) = response {
+            // Best-effort: the writer may already be gone if the
+            // connection closed while this handler ran.
+            let _ = outbound_tx.blocking_send(response);
+        }
+    });
+    true
 }
 
 async fn writer_task(
@@ -509,6 +642,7 @@ mod tests {
         let config = Arc::new(ConnectionConfig {
             router,
             outbound_capacity: DEFAULT_OUTBOUND_CAPACITY,
+            offreader_limit: Some(DEFAULT_OFFREADER_LIMIT),
             peer_id_counter: Arc::new(AtomicU64::new(0)),
             on_connect: Arc::new(Vec::new()),
             on_disconnect: Arc::new(Vec::new()),
@@ -592,6 +726,7 @@ mod tests {
         let config = Arc::new(ConnectionConfig {
             router: server.router,
             outbound_capacity: server.outbound_capacity,
+            offreader_limit: server.offreader_limit,
             peer_id_counter: server.peer_id_counter,
             on_connect: Arc::new(server.on_connect),
             on_disconnect: Arc::new(server.on_disconnect),
@@ -1158,5 +1293,175 @@ mod tests {
         drop(c2);
         ta.abort();
         tb.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn off_reader_handler_does_not_block_the_reader() {
+        use std::sync::Condvar;
+        // `/wait` is off-reader and parks on a condvar until `/signal`
+        // (an inline handler on the *same* connection) opens the gate.
+        // If the off-reader handler ran on the reader task, `/signal`
+        // could never be decoded and this would deadlock.
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let gate_wait = Arc::clone(&gate);
+        let gate_signal = Arc::clone(&gate);
+
+        let router = Router::new()
+            .with_json_blocking("/wait", move |_| {
+                let (lock, cv) = &*gate_wait;
+                let mut ready = lock.lock().unwrap();
+                while !*ready {
+                    ready = cv.wait(ready).unwrap();
+                }
+                Ok(json!({ "woke": true }))
+            })
+            .with_json("/signal", move |_| {
+                let (lock, cv) = &*gate_signal;
+                *lock.lock().unwrap() = true;
+                cv.notify_all();
+                Ok(json!({ "signaled": true }))
+            });
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = WebSocketServer::new(router);
+        let server_task = serve_one(listener, "/repe", server).await;
+
+        let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
+            .await
+            .unwrap();
+        let waiter = client.clone();
+        let wait_call = tokio::spawn(async move { waiter.call_json("/wait", &json!({})).await });
+
+        // Give `/wait` time to reach the server and park.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // If the reader were blocked inside `/wait`, this would time out.
+        let signaled = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.call_json("/signal", &json!({})),
+        )
+        .await
+        .expect("/signal timed out: off-reader handler blocked the reader")
+        .unwrap();
+        assert_eq!(signaled["signaled"], true);
+
+        let woke = tokio::time::timeout(Duration::from_secs(2), wait_call)
+            .await
+            .expect("/wait timed out")
+            .unwrap()
+            .unwrap();
+        assert_eq!(woke["woke"], true);
+
+        drop(client);
+        server_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn off_reader_handler_panic_returns_error_and_keeps_connection() {
+        // A panicking off-reader handler is caught and mapped to an
+        // error response (not swallowed into a client hang), and it must
+        // not take the connection down.
+        let router = Router::new()
+            .with_json_blocking(
+                "/boom",
+                |_| -> Result<serde_json::Value, (ErrorCode, String)> {
+                    panic!("handler exploded");
+                },
+            )
+            .with_json("/ping", |_| Ok(json!({ "pong": true })));
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = WebSocketServer::new(router);
+        let server_task = serve_one(listener, "/repe", server).await;
+
+        let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
+            .await
+            .unwrap();
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.call_json("/boom", &json!({})),
+        )
+        .await
+        .expect("/boom timed out: panic produced no response")
+        .unwrap_err();
+        match err {
+            RepeError::ServerError { code, .. } => {
+                assert_eq!(code, ErrorCode::ApplicationErrorBase)
+            }
+            other => panic!("expected ServerError, got {other:?}"),
+        }
+
+        // The connection is still alive afterward.
+        let pong = client.call_json("/ping", &json!({})).await.unwrap();
+        assert_eq!(pong["pong"], true);
+
+        drop(client);
+        server_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn off_reader_limit_rejects_when_saturated() {
+        use std::sync::Condvar;
+        // Cap of 1: the first `/hold` takes the only slot and parks; a
+        // second `/hold` on the same connection must be rejected (not
+        // queued, and without blocking the reader).
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let gate_hold = Arc::clone(&gate);
+
+        let router = Router::new().with_json_blocking("/hold", move |_| {
+            let (lock, cv) = &*gate_hold;
+            let mut ready = lock.lock().unwrap();
+            while !*ready {
+                ready = cv.wait(ready).unwrap();
+            }
+            Ok(json!({ "released": true }))
+        });
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = WebSocketServer::new(router).with_offreader_limit(1);
+        let server_task = serve_one(listener, "/repe", server).await;
+
+        let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
+            .await
+            .unwrap();
+        let holder = client.clone();
+        let first = tokio::spawn(async move { holder.call_json("/hold", &json!({})).await });
+
+        // Let the first `/hold` take the slot and park.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let rejected = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.call_json("/hold", &json!({})),
+        )
+        .await
+        .expect("second /hold timed out instead of being rejected")
+        .unwrap_err();
+        match rejected {
+            RepeError::ServerError { code, .. } => {
+                assert_eq!(code, ErrorCode::ApplicationErrorBase)
+            }
+            other => panic!("expected saturation ServerError, got {other:?}"),
+        }
+
+        // Release the first `/hold`; it completes and frees the slot.
+        {
+            let (lock, cv) = &*gate;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        let released = tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .expect("first /hold timed out")
+            .unwrap()
+            .unwrap();
+        assert_eq!(released["released"], true);
+
+        drop(client);
+        server_task.abort();
     }
 }

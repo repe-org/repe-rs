@@ -76,7 +76,7 @@ pub use registry::{Registry, RegistryCallable, RegistryError, WithContext};
 #[cfg(not(target_arch = "wasm32"))]
 pub use server::Server;
 pub use server::{
-    IntoTypedResponse, JsonTypedHandler, LockError, Lockable, Middleware, Next, Router,
+    Execution, IntoTypedResponse, JsonTypedHandler, LockError, Lockable, Middleware, Next, Router,
     TypedResponse,
 };
 #[cfg(not(target_arch = "wasm32"))]

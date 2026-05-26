@@ -29,6 +29,19 @@ use std::{
     time::Duration,
 };
 
+/// Where the server should run a handler, returned by
+/// [`HandlerErased::execution`]. Only the WebSocket server consults it;
+/// the TCP servers always run inline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Execution {
+    /// Run on the connection's reader task, one request at a time.
+    Inline,
+    /// Run on a blocking thread so the reader stays free to decode
+    /// further inbound frames (ACKs, cancels) while the handler runs
+    /// or parks. Set by the `Router::with_*_blocking` constructors.
+    OffReader,
+}
+
 pub trait HandlerErased: Send + Sync {
     fn handle(&self, req: &Message) -> Result<Message, RepeError>;
 
@@ -46,6 +59,14 @@ pub trait HandlerErased: Send + Sync {
     /// [`CallContext::detached`]).
     fn handle_with_ctx(&self, req: &Message, _ctx: &CallContext) -> Result<Message, RepeError> {
         self.handle(req)
+    }
+
+    /// Where this handler should be dispatched. Defaults to
+    /// [`Execution::Inline`]. The `Router::with_*_blocking` constructors
+    /// return a wrapper whose `execution` is [`Execution::OffReader`];
+    /// only the WebSocket server checks it.
+    fn execution(&self) -> Execution {
+        Execution::Inline
     }
 }
 
@@ -127,6 +148,33 @@ impl HandlerErased for MiddlewarePipeline {
 
     fn handle_with_ctx(&self, req: &Message, ctx: &CallContext) -> Result<Message, RepeError> {
         Next::with_ctx(self.middlewares.as_ref(), self.handler.as_ref(), ctx).run(req)
+    }
+
+    fn execution(&self) -> Execution {
+        // Forward to the wrapped handler so a middleware-wrapped
+        // off-reader path stays off-reader. Without this, registering
+        // any middleware would silently downgrade every `_blocking`
+        // handler to inline and reintroduce the streaming deadlock.
+        self.handler.execution()
+    }
+}
+
+/// Wraps any handler so it dispatches off the reader task
+/// ([`Execution::OffReader`]); delegates `handle` / `handle_with_ctx`
+/// unchanged. Built by the `Router::with_*_blocking` constructors.
+struct OffReaderHandler<H>(H);
+
+impl<H: HandlerErased> HandlerErased for OffReaderHandler<H> {
+    fn handle(&self, req: &Message) -> Result<Message, RepeError> {
+        self.0.handle(req)
+    }
+
+    fn handle_with_ctx(&self, req: &Message, ctx: &CallContext) -> Result<Message, RepeError> {
+        self.0.handle_with_ctx(req, ctx)
+    }
+
+    fn execution(&self) -> Execution {
+        Execution::OffReader
     }
 }
 
@@ -619,6 +667,82 @@ impl Router {
             path.to_string(),
             Arc::new(TypedHandlerCtx::<T, R, F>(f, std::marker::PhantomData))
                 as Arc<dyn HandlerErased>,
+        );
+        self.inner = Arc::new(map);
+        self
+    }
+
+    /// Off-reader variant of [`with_json`](Self::with_json): on the
+    /// WebSocket server the handler runs on a blocking thread (see
+    /// [`Execution::OffReader`]) so the reader stays free to decode
+    /// further inbound frames while it runs or parks. Use for handlers
+    /// that block — e.g. a `repe::stream` producer waiting on
+    /// `wait_for_credit`. On the TCP servers it behaves exactly like
+    /// [`with_json`](Self::with_json).
+    pub fn with_json_blocking(
+        mut self,
+        path: &str,
+        handler: impl Fn(Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static,
+    ) -> Self {
+        let mut map = self.inner.as_ref().clone();
+        map.insert(
+            path.to_string(),
+            Arc::new(OffReaderHandler(JsonHandler(handler))) as Arc<dyn HandlerErased>,
+        );
+        self.inner = Arc::new(map);
+        self
+    }
+
+    /// Off-reader variant of [`with_json_ctx`](Self::with_json_ctx).
+    /// See [`with_json_blocking`](Self::with_json_blocking).
+    pub fn with_json_ctx_blocking<F>(mut self, path: &str, handler: F) -> Self
+    where
+        F: Fn(&CallContext, Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static,
+    {
+        let mut map = self.inner.as_ref().clone();
+        map.insert(
+            path.to_string(),
+            Arc::new(OffReaderHandler(JsonHandlerCtx(handler))) as Arc<dyn HandlerErased>,
+        );
+        self.inner = Arc::new(map);
+        self
+    }
+
+    /// Off-reader variant of [`with_typed`](Self::with_typed).
+    /// See [`with_json_blocking`](Self::with_json_blocking).
+    pub fn with_typed_blocking<T, R, F>(mut self, path: &str, f: F) -> Self
+    where
+        T: DeserializeOwned + Send + Sync + 'static,
+        R: Serialize + Send + Sync + 'static,
+        F: TypedHandlerFn<T, R>,
+    {
+        let mut map = self.inner.as_ref().clone();
+        map.insert(
+            path.to_string(),
+            Arc::new(OffReaderHandler(TypedHandler::<T, R, F>(
+                f,
+                std::marker::PhantomData,
+            ))) as Arc<dyn HandlerErased>,
+        );
+        self.inner = Arc::new(map);
+        self
+    }
+
+    /// Off-reader variant of [`with_typed_ctx`](Self::with_typed_ctx).
+    /// See [`with_json_blocking`](Self::with_json_blocking).
+    pub fn with_typed_ctx_blocking<T, R, F>(mut self, path: &str, f: F) -> Self
+    where
+        T: DeserializeOwned + Send + Sync + 'static,
+        R: Serialize + Send + Sync + 'static,
+        F: TypedHandlerFnCtx<T, R>,
+    {
+        let mut map = self.inner.as_ref().clone();
+        map.insert(
+            path.to_string(),
+            Arc::new(OffReaderHandler(TypedHandlerCtx::<T, R, F>(
+                f,
+                std::marker::PhantomData,
+            ))) as Arc<dyn HandlerErased>,
         );
         self.inner = Arc::new(map);
         self
@@ -1795,5 +1919,56 @@ mod tests {
         running.store(false, Ordering::SeqCst);
         drop(stream);
         srv.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn plain_constructors_default_to_inline_execution() {
+        let router = Router::new().with_json("/x", |_| Ok(serde_json::json!({})));
+        assert_eq!(router.get("/x").unwrap().execution(), Execution::Inline);
+    }
+
+    #[test]
+    fn blocking_constructors_mark_off_reader_execution() {
+        #[derive(Deserialize)]
+        struct In {
+            n: i64,
+        }
+        // Named fns sidestep the higher-ranked-lifetime closure inference
+        // quirk on the `&CallContext` parameter (it affects
+        // `with_typed_ctx` too; it is not specific to the blocking
+        // variant).
+        fn typed(inp: In) -> Result<serde_json::Value, (ErrorCode, String)> {
+            Ok(serde_json::json!({ "n": inp.n }))
+        }
+        fn typed_ctx(
+            _ctx: &CallContext,
+            inp: In,
+        ) -> Result<serde_json::Value, (ErrorCode, String)> {
+            Ok(serde_json::json!({ "n": inp.n }))
+        }
+        let router = Router::new()
+            .with_json_blocking("/j", |_| Ok(serde_json::json!({})))
+            .with_json_ctx_blocking("/jc", |_ctx, _v| Ok(serde_json::json!({})))
+            .with_typed_blocking::<In, serde_json::Value, _>("/t", typed)
+            .with_typed_ctx_blocking::<In, serde_json::Value, _>("/tc", typed_ctx);
+        for path in ["/j", "/jc", "/t", "/tc"] {
+            assert_eq!(
+                router.get(path).unwrap().execution(),
+                Execution::OffReader,
+                "{path} should be off-reader"
+            );
+        }
+    }
+
+    #[test]
+    fn middleware_preserves_off_reader_execution() {
+        // Guards MiddlewarePipeline::execution() forwarding: a
+        // registered middleware must not silently downgrade an
+        // off-reader handler back to inline (which would reintroduce
+        // the streaming deadlock).
+        let router = Router::new()
+            .with_middleware(|req: &Message, next: Next<'_>| next.run(req))
+            .with_json_blocking("/x", |_| Ok(serde_json::json!({})));
+        assert_eq!(router.get("/x").unwrap().execution(), Execution::OffReader);
     }
 }
