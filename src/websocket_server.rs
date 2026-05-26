@@ -569,13 +569,22 @@ async fn spawn_off_reader(
         }));
         let response = match outcome {
             Ok(maybe_response) => maybe_response,
-            Err(_) => (!notify).then(|| {
-                create_error_response_like(
-                    &request,
-                    ErrorCode::ApplicationErrorBase,
-                    "handler panicked",
-                )
-            }),
+            Err(_) => {
+                // The default panic hook has already printed the panic;
+                // add a repe-level line so the failure is attributable
+                // here too -- especially for a notify, which has no
+                // response to carry the error back to the client. The
+                // connection is deliberately kept alive (it is shared
+                // with other concurrent off-reader transfers).
+                eprintln!("[repe] off-reader handler panicked for {path}; connection kept alive");
+                (!notify).then(|| {
+                    create_error_response_like(
+                        &request,
+                        ErrorCode::ApplicationErrorBase,
+                        "handler panicked",
+                    )
+                })
+            }
         };
         if let Some(response) = response {
             // Best-effort: the writer may already be gone if the

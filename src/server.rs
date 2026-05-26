@@ -33,6 +33,7 @@ use std::{
 /// [`HandlerErased::execution`]. Only the WebSocket server consults it;
 /// the TCP servers always run inline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive] // dispatch hint, not a wire spec; may gain modes (e.g. async off-reader)
 pub enum Execution {
     /// Run on the connection's reader task, one request at a time.
     Inline,
@@ -1990,5 +1991,39 @@ mod tests {
             .with_middleware(|req: &Message, next: Next<'_>| next.run(req))
             .with_json_blocking("/x", |_| Ok(serde_json::json!({})));
         assert_eq!(router.get("/x").unwrap().execution(), Execution::OffReader);
+    }
+
+    #[test]
+    fn blocking_route_behaves_like_inline_over_tcp() {
+        // The _blocking constructors are WebSocket-only: the TCP server
+        // never consults Execution, so a with_json_blocking route
+        // round-trips exactly like with_json. Both TCP servers share the
+        // route_request -> resolve/dispatch path; this exercises the
+        // sync Server end to end.
+        let router = Router::new().with_json_blocking("/echo", Ok);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router_clone = router.clone();
+        let srv = thread::spawn(move || {
+            let (stream, _addr) = listener.accept().unwrap();
+            handle_connection(
+                stream,
+                router_clone,
+                Arc::new(AtomicBool::new(true)),
+                None,
+                None,
+                true,
+            )
+        });
+
+        let client = crate::client::Client::connect(addr).unwrap();
+        let out = client
+            .call_json("/echo", &serde_json::json!({ "n": 7 }))
+            .unwrap();
+        assert_eq!(out, serde_json::json!({ "n": 7 }));
+
+        drop(client);
+        let _ = srv.join().unwrap();
     }
 }
