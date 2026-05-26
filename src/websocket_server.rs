@@ -244,9 +244,9 @@ impl WebSocketServer {
     }
 
     /// Consume this builder into a cheap, cloneable
-    /// [`SharedWebSocketServer`]. The [`ConnectionConfig`] (router,
-    /// hooks, capacities) is built exactly once here; each clone of the
-    /// returned handle is an `Arc` clone.
+    /// [`SharedWebSocketServer`]. The per-connection configuration
+    /// (router, hooks, capacities) is built exactly once here; each
+    /// clone of the returned handle is an `Arc` clone.
     ///
     /// Use with [`accept`](Self::accept) and
     /// [`SharedWebSocketServer::serve_connection`] to serve connections
