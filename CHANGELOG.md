@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-05-26
+
+### Added
+- Off-reader handler dispatch: `Router::with_json_blocking`, `with_json_ctx_blocking`, `with_typed_blocking`, and `with_typed_ctx_blocking`. On `WebSocketServer` a `_blocking` route runs on a `tokio::task::spawn_blocking` thread so the connection's reader stays free to decode further inbound frames (ACKs, cancels, resumes) while the handler runs or parks. This is the prerequisite for driving a `repe::stream` producer directly from a request handler: the producer parks in `wait_for_credit` waiting on ACKs that arrive as inbound frames the same reader must decode, so an inline handler would deadlock at the first full window. The TCP `Server` / `AsyncServer` ignore the tag and always run inline (they have no peer and no push primitive).
+- `Execution` enum (re-exported at the crate root) and `HandlerErased::execution()`, returned by the trait to tell `WebSocketServer` where to dispatch. Defaults to `Execution::Inline`, so existing handlers and custom `HandlerErased` implementors are unaffected; the `_blocking` constructors return `Execution::OffReader`.
+- `WebSocketServer::with_offreader_limit(n)` and `DEFAULT_OFFREADER_LIMIT` (16): per-connection cap on concurrently running off-reader handlers. When the cap is reached a further off-reader request gets an immediate error response (the client retries) rather than blocking the reader — blocking it would stall the very ACK/cancel frames in-flight transfers need to free a slot. Pass `0` to remove the cap.
+- Graceful shutdown: `WebSocketServer::serve_with_shutdown(addr, path, shutdown)` and `serve_listener_with_shutdown(listener, path, shutdown)` stop accepting once the `shutdown` future resolves and return `Ok(())`. Already-accepted connections run on their own detached tasks and are not awaited; track them via a `PeerRegistry` if you need to drain them.
+- One-port co-hosting: `WebSocketServer::into_shared()` returns a cheap, cloneable `SharedWebSocketServer` (re-exported at the crate root). Pair `WebSocketServer::accept(stream, path)` (the REPE handshake) with `SharedWebSocketServer::serve_connection(ws)` to serve connections the embedder accepts itself — e.g. share one TCP port between REPE WebSocket upgrades and the embedder's own HTTP routes. Connect/disconnect hooks and any attached `PeerRegistry` fire exactly as under `serve`.
+- `Next::ctx()` and `Next::peer()`: let a cross-cutting middleware read the calling `CallContext` / `PeerHandle` that `WebSocketServer` threads through the pipeline, without the middleware being a context-aware leaf handler itself. Both return `None` on peer-less transports (TCP, direct in-process dispatch).
+
+### Changed
+- `WebSocketServer`'s reader now resolves each request (version/query validation + handler lookup) and then dispatches it inline or off-reader based on `HandlerErased::execution()`. Validation and error-response synthesis are computed once on the reader and are identical on both paths; only where the handler body runs differs. Request/response servers with no `_blocking` routes see no behavior change.
+- `MiddlewarePipeline` forwards `execution()` to the wrapped handler, so registering middleware no longer downgrades a `_blocking` route back to inline.
+- The `serve` / `serve_listener` / `serve_with_shutdown` / `serve_listener_with_shutdown` entry points are unified onto a single accept loop built from the public `into_shared` + `accept` + `serve_connection` primitives.
+
+### Notes
+- Off-reader dispatch is strictly opt-in; inline remains the default and keeps strict per-connection, request-at-a-time ordering. Off-reader handlers run concurrently with subsequent inline handlers and with each other, so their responses interleave on the wire — correlate responses to requests by the REPE message id (as clients already do), not by arrival order.
+- A producer parked off-reader holds a process-wide `spawn_blocking` thread (tokio's default pool is 512) until its `wait_for_credit` deadline, an idle-watchdog cancel, or an `on_peer_disconnect`-driven `TransferControl::cancel`. The hold is bounded, not indefinite, but embedders expecting many concurrent streaming connections should size the runtime's `max_blocking_threads` accordingly. See `docs/websocket.md`.
+- Both the saturation rejection and a caught handler panic surface as `ErrorCode::ApplicationErrorBase`. REPE defines no protocol-level "unavailable" / "internal" code today, so a client cannot tell these apart from an ordinary application error by code alone. Treat this as a known protocol gap.
+- A first-class `WebSocketServer` stream-source surface (owning begin/ack/cancel/resume internally) is deferred until a second distinct windowed-transfer consumer exists, so the trait is designed against more than one shape. Until then, off-reader dispatch plus the `repe::stream` API cover the single-consumer case.
+
+## [2.5.1] - 2026-05-20
+
+### Changed
+- Gate `PeerRegistry::id_counter` behind the `websocket` feature so default-feature builds don't warn that the method is dead code; it is only consumed by the feature-gated `websocket_server`. No API or behavior change for `websocket`-enabled builds.
+
 ## [2.5.0] - 2026-05-20
 
 ### Added
