@@ -165,3 +165,50 @@ Calls dispatched through the TCP transports (`Client`, `AsyncClient`, `Server`, 
 The push path is strictly opt-in. Existing `WebSocketServer::new(router).serve(addr, path)` callers see no behavior change, no new error variants, and no protocol changes. Notify frames are the same shape they have always been (`Message::builder().notify(true)`).
 
 Adding `handle_with_ctx` to `HandlerErased` is source-compatible because the trait provides a default implementation that delegates to `handle`. Existing implementors of `HandlerErased` (embedder custom handler types) compile unchanged.
+
+## Off-Reader Handler Dispatch (`_blocking`)
+
+By default every handler runs **inline** on the connection's reader task: the reader decodes a frame, runs the handler to completion, then decodes the next frame. That keeps strict per-connection, request-at-a-time ordering, but it means a handler that **blocks or parks** also stalls the reader — no further inbound frames on that connection are decoded until it returns. On a `current_thread` runtime it stalls the whole server.
+
+That is fatal for a [`repe::stream`](streaming.md) producer. The producer parks in `wait_for_credit` until the receiver ACKs, and those ACKs arrive as inbound frames the *same* reader must decode. Drive the producer from an inline handler and the reader is parked inside it, the ACKs are never read, the credit window never reopens, and the transfer deadlocks at the first full window.
+
+The `_blocking` constructors opt a route out of inline dispatch:
+
+```rust
+use repe::server::Router;
+
+let router = Router::new()
+    .with_json("/status", |_| Ok(serde_json::json!({ "ok": true })))  // inline, as usual
+    .with_json_blocking("/download/begin", |_params| { /* may block / park */ Ok(serde_json::json!({})) })
+    .with_json_ctx_blocking("/export", |ctx, _params| { /* ctx.peer() + may park */ Ok(serde_json::json!({})) })
+    .with_typed_blocking::<Req, Resp, _>("/report", |req| { /* ... */ })
+    .with_typed_ctx_blocking::<Req, Resp, _>("/stream", |ctx, req| { /* ... */ });
+```
+
+On the WebSocket server an off-reader handler runs on a blocking thread (`tokio::task::spawn_blocking`); the reader keeps decoding inbound frames (ACKs, cancels, resumes) while it runs or parks. The handler's response, if any, flows back through the same writer task on completion. The `_blocking` suffix describes the callee — it runs on the blocking pool and may park, exactly as in `tokio::task::spawn_blocking` — and never means "blocks the reader." The TCP `Server` / `AsyncServer` ignore the off-reader tag and always run inline (they have no peer and no push primitive).
+
+Reach for `_blocking` when a handler **blocks or parks**: a `repe::stream` producer, a synchronous read of a large blob, a blocking database call. Leave fast request/response handlers inline.
+
+### Ordering
+
+Inline handlers keep strict per-connection, request-at-a-time order. Off-reader handlers run **concurrently** with subsequent inline handlers and with each other, so their responses interleave on the wire. Clients correlate responses to requests by the REPE message id (as they already do); do not assume per-connection serialization for off-reader routes. This is the same concurrency you would get by hand-rolling a worker thread, made first-class and opt-in.
+
+### Concurrency cap and saturation
+
+Off-reader dispatch is capped per connection by `with_offreader_limit(n)` (default `DEFAULT_OFFREADER_LIMIT`, 16). A permit is acquired before the handler is spawned and held for its whole life, so the count reflects actually-running handlers and a finished, panicked, or cancelled handler frees its slot on exit.
+
+```rust
+use repe::websocket_server::WebSocketServer;
+
+let server = WebSocketServer::new(router).with_offreader_limit(32);  // 0 removes the cap
+```
+
+When the cap is reached the reader does **not** block waiting for a slot — that would stall the very ACK/cancel frames in-flight transfers need to finish and free a slot, recreating the deadlock. Instead a further off-reader request gets an immediate error response and the reader keeps reading; the client should retry. A handler **panic** is caught and likewise mapped to an error response, so the connection — which it shares with other concurrent transfers — survives rather than being torn down.
+
+Both the saturation rejection and the caught panic surface as `ErrorCode::ApplicationErrorBase`: REPE defines no protocol-level "unavailable" or "internal error" code today, so a client cannot tell these apart from an ordinary application error by code alone. Treat this as a known protocol gap.
+
+`with_offreader_limit` bounds **per-connection fairness, not the global blocking pool.** `spawn_blocking` draws from tokio's process-wide blocking pool (512 threads by default), and a producer parked in `wait_for_credit` holds its thread for the whole transfer. Embedders expecting many concurrent streaming connections should raise the runtime's `max_blocking_threads` or use a dedicated runtime. The idle watchdog (`spawn_watchdog`, see [streaming.md](streaming.md)) reclaims both the blocking-pool thread and the permit from a transfer that goes silent.
+
+### One producer per transfer
+
+Removing per-connection serialization also removes an implicit safety net. Inline, a second `/begin` for the same transfer id cannot start until the first returns; off-reader, two `begin` frames spawn two producers against one `TransferControl`, violating its single-producer assumption and racing the registry entry (the second `begin` overwrites it while both producers run). The concurrency cap bounds the *count* of off-reader tasks, not duplicate registration, so a `begin`-style handler **must reject (or de-duplicate) a transfer id that is already registered** — check `TransferRegistry::get` before `register` and return an application error if it is already present.

@@ -1714,4 +1714,127 @@ mod tests {
         drop(client);
         server_task.abort();
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn off_reader_drives_windowed_stream_to_completion() {
+        // Feature 1 end-to-end: a `with_json_ctx_blocking` /begin
+        // handler drives a real repe::stream producer (wait_for_credit
+        // -> peer.send_notify -> record_sent); inbound ACKs route
+        // through an inline /ack handler that calls record_ack; and a
+        // multi-window transfer completes over the WebSocket transport
+        // with the client draining notifies. Because /begin runs off
+        // the reader, the reader stays free to decode the ACK frames the
+        // producer parks waiting on -- the deadlock this whole feature
+        // exists to remove. The window holds only 4 chunks of a
+        // 16-chunk transfer, so it fills and is released repeatedly;
+        // the transfer can only complete if credit release works.
+        use crate::stream::{TransferControl, TransferRegistry};
+        use std::time::Instant;
+
+        const WINDOW: u64 = 1024;
+        const CHUNK: u64 = 256;
+        const NUM_CHUNKS: u64 = 16; // 4096 bytes total; window = 4 chunks
+
+        #[derive(Hash, Eq, PartialEq, Copy, Clone)]
+        struct TransferId(u64);
+
+        let registry: Arc<TransferRegistry<TransferId>> = Arc::new(TransferRegistry::new());
+        let registry_begin = Arc::clone(&registry);
+        let registry_ack = Arc::clone(&registry);
+
+        let router = Router::new()
+            .with_json_ctx_blocking("/begin", move |ctx, _params| {
+                let peer = ctx.peer().expect("websocket peer present").clone();
+                let control = TransferControl::new(WINDOW);
+                control.set_peer(peer);
+                registry_begin.register(TransferId(1), Arc::clone(&control));
+
+                let mut offset: u64 = 0;
+                for seq in 0..NUM_CHUNKS {
+                    let last = seq + 1 == NUM_CHUNKS;
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    control
+                        .wait_for_credit(CHUNK, deadline)
+                        .map_err(|e| (ErrorCode::ApplicationErrorBase, e.to_string()))?;
+                    let through = offset + CHUNK;
+                    let body =
+                        serde_json::to_vec(&json!({ "through": through, "last": last })).unwrap();
+                    let peer = control.peer().expect("peer installed");
+                    peer.send_notify("/chunk", NotifyBody::Json(body))
+                        .map_err(|e| {
+                            (ErrorCode::ApplicationErrorBase, format!("send failed: {e}"))
+                        })?;
+                    control.record_sent(through);
+                    offset = through;
+                }
+                registry_begin.unregister(TransferId(1));
+                Ok(json!({ "sent": NUM_CHUNKS, "bytes": offset }))
+            })
+            .with_json("/ack", move |params| {
+                let file_index = params["file_index"].as_u64().unwrap_or(0) as u32;
+                let through = params["through"].as_u64().unwrap_or(0);
+                if let Some(control) = registry_ack.get(TransferId(1)) {
+                    control.record_ack(file_index, through);
+                }
+                Ok(json!({ "ok": true }))
+            });
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = WebSocketServer::new(router);
+        let server_task = serve_one(listener, "/repe", server).await;
+
+        let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
+            .await
+            .unwrap();
+        let mut notifies = client.subscribe_notifies().expect("subscribe");
+
+        // /begin runs the whole transfer and only responds when done, so
+        // drive it concurrently while we drain chunk notifies and ACK.
+        let begin_client = client.clone();
+        let begin = tokio::spawn(async move { begin_client.call_json("/begin", &json!({})).await });
+
+        let mut count: u64 = 0;
+        let mut last_through: u64 = 0;
+        loop {
+            let chunk = tokio::time::timeout(Duration::from_secs(10), notifies.recv())
+                .await
+                .expect("chunk notify did not arrive (producer likely starved for credit)")
+                .expect("notify channel closed");
+            assert_eq!(chunk.query_str().unwrap(), "/chunk");
+            let body: serde_json::Value = chunk.json_body().unwrap();
+            let through = body["through"].as_u64().unwrap();
+            let last = body["last"].as_bool().unwrap();
+            // Chunks arrive in order, each advancing by exactly CHUNK.
+            assert_eq!(through, last_through + CHUNK);
+            last_through = through;
+            count += 1;
+            // ACK everything received so far; record_ack releases credit
+            // so a producer parked in wait_for_credit resumes.
+            client
+                .call_json("/ack", &json!({ "file_index": 0, "through": through }))
+                .await
+                .unwrap();
+            if last {
+                break;
+            }
+        }
+        assert_eq!(count, NUM_CHUNKS);
+        assert_eq!(last_through, NUM_CHUNKS * CHUNK);
+
+        let begin_resp = tokio::time::timeout(Duration::from_secs(10), begin)
+            .await
+            .expect("/begin did not complete")
+            .expect("/begin task panicked")
+            .expect("/begin returned an error");
+        assert_eq!(begin_resp["sent"].as_u64(), Some(NUM_CHUNKS));
+        assert_eq!(begin_resp["bytes"].as_u64(), Some(NUM_CHUNKS * CHUNK));
+        assert!(
+            registry.is_empty(),
+            "transfer should be unregistered after completion"
+        );
+
+        drop(client);
+        server_task.abort();
+    }
 }
