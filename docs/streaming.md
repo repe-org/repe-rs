@@ -32,16 +32,22 @@ let chunk_len: u64 = 4 * 1024 * 1024;
 let body: Vec<u8> = body_for_chunk(chunk_offset);
 
 control.wait_for_credit(chunk_len, Instant::now() + Duration::from_secs(30))?;
-control.push_replay(chunk_offset, false, body.clone());
+// push_replay records the chunk in the replay ring *before* the send, so a
+// Disconnected error can't leave the ring missing it. `chunk_len` is the
+// logical (ACK-domain) length; `body` is the wire payload, which may be longer.
+control.push_replay(chunk_offset, chunk_len, false, body.clone());
 let p = control.peer().expect("peer installed");
 match p.send_notify("/file_chunk", NotifyBody::Beve(body)) {
     Ok(()) => control.record_sent(chunk_offset + chunk_len),
     Err(PeerSendError::Disconnected) => match control.wait_for_reconnect(Duration::from_secs(30)) {
-        ReconnectOutcome::ResumeReady => {
-            let resume = control.take_pending_resume().unwrap();
-            // request_resume installed the new peer into the slot;
-            // read it back via control.peer() and replay every
-            // ring chunk at offset >= resume.resume_at_offset.
+        ReconnectOutcome::ResumeReady(resume) => {
+            // request_resume already swapped the new peer into the slot and
+            // consumed the staged request. Re-emit the ring tail from the
+            // receiver's last-received offset, then continue producing.
+            let p = control.peer().expect("peer installed by request_resume");
+            for chunk in control.replay_chunks_from(resume.resume_at_offset) {
+                let _ = p.send_notify("/file_chunk", NotifyBody::Beve(chunk.body_bytes.to_vec()));
+            }
         }
         ReconnectOutcome::Cancelled(_) | ReconnectOutcome::Timeout => { /* abort */ }
     },

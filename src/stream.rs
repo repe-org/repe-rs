@@ -19,8 +19,10 @@
 //!
 //! The protocol itself (the wire shape of `transfer_begin` /
 //! `file_chunk` / `transfer_ack` / etc.) is up to you: this module
-//! deals only in offsets, ACKs, and opaque body bytes. See the
-//! soul-rs `WsSink` for one concrete embedding.
+//! deals only in offsets, ACKs, and opaque body bytes. The concrete
+//! embedding -- how each chunk reaches the wire -- lives in your
+//! transport's sink; a [`PeerHandle`] from the built-in
+//! `WebSocketServer` is one such sink.
 //!
 //! ## Lifecycle
 //!
