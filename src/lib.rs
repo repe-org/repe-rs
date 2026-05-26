@@ -76,7 +76,7 @@ pub use registry::{Registry, RegistryCallable, RegistryError, WithContext};
 #[cfg(not(target_arch = "wasm32"))]
 pub use server::Server;
 pub use server::{
-    IntoTypedResponse, JsonTypedHandler, LockError, Lockable, Middleware, Next, Router,
+    Execution, IntoTypedResponse, JsonTypedHandler, LockError, Lockable, Middleware, Next, Router,
     TypedResponse,
 };
 #[cfg(not(target_arch = "wasm32"))]
@@ -95,4 +95,4 @@ pub use wasm_client::WasmClient;
 #[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]
 pub use websocket_client::{AlreadySubscribed, WebSocketClient};
 #[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]
-pub use websocket_server::{WebSocketServer, proxy_connection};
+pub use websocket_server::{SharedWebSocketServer, WebSocketServer, proxy_connection};
