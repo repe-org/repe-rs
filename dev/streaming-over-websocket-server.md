@@ -1,8 +1,39 @@
 # Driving `repe::stream` from `WebSocketServer`: off-reader dispatch and related gaps
 
-## Status
+## Implementation status & handoff (read first)
 
-Proposal. Design decisions resolved (see [Resolved design decisions](#resolved-design-decisions)); not yet implemented. Written against repe 2.5.1; the feature line references still hold on `main`, but the `repe::stream` doc-drift this note originally flagged was fixed in 7c7035e / 9bd1d60 (see [Doc cleanup](#doc-cleanup-resolved-on-main)).
+This started as a design proposal. **Feature 1 is implemented**; the rest is a work order for an implementing agent. Written against repe 2.5.1.
+
+**Done.** Feature 1 (off-reader handler dispatch) landed in commit `c19f86f` on branch `streaming-over-websocket` (draft PR #13, base `main`). See [Feature 1](#feature-1-required-off-reader-handler-dispatch) for exactly what exists now.
+
+**Remaining work for this PR**, in recommended order:
+
+1. [Feature 5](#feature-5-minor-expose-callcontext-to-middleware) — `Next::ctx()` accessor. Trivial, additive, no dependencies.
+2. [Feature 3](#feature-3-graceful-shutdown) — `serve_with_shutdown`.
+3. [Feature 4](#feature-4-serve-an-already-accepted-connection-one-port-co-hosting) — `into_shared` / `accept` / `serve_connection` for one-port co-hosting.
+4. [Feature 1 follow-ups](#feature-1-follow-ups) — an end-to-end `repe::stream`-over-off-reader integration test, and a `docs/websocket.md` section for the `_blocking` constructors.
+
+**Out of scope.** [Feature 2](#feature-2-optional-future-first-class-stream-source-on-websocketserver) (`StreamSource`) stays **deferred** per [decision 5](#resolved-design-decisions); do not implement it.
+
+**Constraints (binding).**
+
+- Everything is **additive and opt-in**: existing `serve` / `with_json` / `with_typed` callers must compile and behave unchanged. **No wire-format or frame-shape changes.**
+- The [Resolved design decisions](#resolved-design-decisions) are binding; honor them.
+- **Do not add new `ErrorCode` variants.** REPE's codes are a shared cross-language spec; the missing "unavailable"/"internal" code is a known gap ([decision 3](#resolved-design-decisions)) to raise upstream, not patch here. Keep the interim `ErrorCode::ApplicationErrorBase` that Feature 1 already uses.
+- Match the surrounding code's style and comment density; put rustdoc on every new public item.
+
+**Workflow.** Work on `streaming-over-websocket`; commit each feature separately; keep PR #13 a draft until the list above is complete, then mark it ready.
+
+**Verify before each commit (all must pass):**
+
+```
+cargo test --features websocket            # lib + integration + doctests
+cargo test                                 # default features (TCP path)
+cargo clippy --features websocket --all-targets
+cargo fmt --check
+```
+
+**Note on line numbers.** References below predate the Feature 1 implementation and have shifted; locate code by the named symbols (functions, structs, fields), not by line. Current anchors are given where they matter.
 
 This note is about two subsystems that shipped independently and do not currently compose: the push-capable `WebSocketServer` (reader/writer task pair, `PeerHandle`, `PeerRegistry`) and the `repe::stream` backpressure control plane (`TransferControl`, `TransferRegistry`, replay ring, watchdog). An embedder that tries to drive a windowed transfer from inside a `WebSocketServer` request handler deadlocks. Fixing that cleanly needs one new primitive (off-reader handler dispatch); a few smaller server gaps surfaced alongside it and are folded in here.
 
@@ -50,6 +81,18 @@ The only way to use the two together today is to **not** drive the producer from
 The root cause is not where any code lives. `repe::stream` is already the right module and draws the right boundary (it deals only in offsets, ACKs, and opaque bytes). The root cause is that `WebSocketServer`'s inline reader and `repe::stream`'s "free reader feeding `record_ack`" requirement are contradictory. The fix is a way to run a handler off the reader task.
 
 ## Feature 1 (required): off-reader handler dispatch
+
+> **Status: implemented** (commit `c19f86f` on `streaming-over-websocket`). The design below is realized as:
+>
+> - `Execution` enum + `HandlerErased::execution()` (default `Inline`) in `src/server.rs`, re-exported as `repe::Execution`.
+> - `Router::with_json_blocking` / `with_json_ctx_blocking` / `with_typed_blocking` / `with_typed_ctx_blocking`, each wrapping the handler in `OffReaderHandler` (`src/server.rs`).
+> - `MiddlewarePipeline::execution()` forwards to the wrapped handler.
+> - `route_request_with_ctx` factored into `resolve` + `dispatch` (`src/server_request.rs`).
+> - `reader_task` (`src/websocket_server.rs`) resolves, checks `execution()`, then runs `dispatch` inline or via `spawn_off_reader` (same file): `spawn_blocking` + `catch_unwind`, response via `blocking_send`.
+> - `WebSocketServer::with_offreader_limit(n)` + `DEFAULT_OFFREADER_LIMIT` (16); per-connection `Semaphore`; saturation and caught panics return `ErrorCode::ApplicationErrorBase`.
+> - Tests in the `server.rs` and `websocket_server.rs` `tests` modules (execution defaults, middleware forwarding, parking, panic, saturation).
+>
+> The prose below is the original design rationale, kept as the established patterns later features must follow. Two pieces remain — see [Feature 1 follow-ups](#feature-1-follow-ups).
 
 Let a handler run on a thread separate from the connection reader, so the reader keeps decoding inbound frames (ACKs, cancels, resumes) while the handler runs. The handler's response, if any, flows back through the existing writer task on completion.
 
@@ -118,7 +161,16 @@ WebSocket server only (see [decision 2](#resolved-design-decisions)): that is wh
 
 Off-reader dispatch keeps the obvious request/response shape (`/download/begin` returns its result; the client does not have to special-case a result-bearing notify), needs no embedder-side producer plumbing, and gives exactly one correct way to combine a handler with `repe::stream`. The workaround leaves a footgun in place (drive the producer inline and it deadlocks) and re-imposes the per-embedder wiring the server exists to remove.
 
+## Feature 1 follow-ups
+
+Two pieces deferred from the initial Feature 1 commit; both are part of finishing this PR:
+
+1. **End-to-end streaming integration test.** Feature 1's tests prove the reader stays free (a parked off-reader handler does not block other requests) but stop short of a real `repe::stream` transfer. Add a test that drives a `TransferControl` producer from a `with_json_ctx_blocking` `/begin` handler (the `wait_for_credit` → `peer.send_notify` → `record_sent` loop), routes inbound ACKs through an inline `/ack` handler that calls `record_ack`, and asserts a multi-window transfer completes over the WebSocket transport with the client draining notifies. This is the scenario the whole proposal exists to enable; put it in the `websocket_server.rs` `tests` module.
+2. **`docs/websocket.md` section.** Document the `_blocking` constructors and `with_offreader_limit`: when to reach for off-reader dispatch (handlers that block or park, e.g. stream producers), the ordering caveat (off-reader responses interleave and correlate by message id), the per-connection cap and its saturation error, and the duplicate-`begin` caveat from [Ordering semantics](#ordering-semantics-must-be-documented). Rustdoc on the constructors already exists; this is the prose guide.
+
 ## Feature 2 (optional, future): first-class stream source on `WebSocketServer`
+
+> **Out of scope for this PR** — deferred per [decision 5](#resolved-design-decisions). Do not implement unless explicitly re-scoped; building it speculatively contradicts a recorded decision. Recorded below for when a second windowed-transfer consumer triggers it.
 
 Feature 1 makes a handler-driven transfer *possible* but still leaves the embedder to spawn the producer, register the `TransferControl`, and route inbound ack/cancel/resume into it through three separate handlers. It is also still possible to wire it wrong by producing inline. A higher-level surface could own all of that:
 
@@ -136,7 +188,7 @@ Recommendation: defer until a second consumer needs windowed transfer over the b
 
 ## Feature 3: graceful shutdown
 
-`serve` / `serve_listener` loop forever (`src/websocket_server.rs:151`); the only ways to stop are to drop the listener or abort the task. Add a shutdown-aware entry point:
+`serve` / `serve_listener` loop forever (the accept `loop` in `serve_listener`); the only ways to stop are to drop the listener or abort the task. Add a shutdown-aware entry point:
 
 ```rust
 pub async fn serve_with_shutdown<A: ToSocketAddrs>(
@@ -144,11 +196,21 @@ pub async fn serve_with_shutdown<A: ToSocketAddrs>(
 ) -> std::io::Result<()>;
 ```
 
-It selects between `listener.accept()` and `shutdown`; on shutdown it stops accepting and returns. The doc should state whether in-flight connection tasks are awaited or detached (simplest first cut: stop accepting, return, let connection tasks finish on their own or be dropped with the runtime). Priority: minor; useful for embedders that run the server in-process and need a clean stop without tearing down the runtime.
+It selects between `listener.accept()` and `shutdown`; on shutdown it stops accepting and returns. Priority: minor; useful for embedders that run the server in-process and need a clean stop without tearing down the runtime.
+
+**Tasks.**
+
+- Add `serve_with_shutdown` beside `serve_listener`; `tokio::select!` between `listener.accept()` and the `shutdown` future. On `shutdown`, break the accept loop and return `Ok(())`.
+- First cut: stop accepting and return; let already-spawned connection tasks finish on their own (they are detached `tokio::spawn`s today). State this explicitly in the rustdoc.
+- Refactor `serve_listener` to delegate to `serve_with_shutdown(.., std::future::pending())` so there is one accept loop, not two.
+
+**Acceptance.** After `shutdown` resolves, the future returns `Ok(())` and no new connections are accepted; existing `serve` / `serve_listener` behavior is unchanged.
+
+**Test.** Bind a listener, spawn `serve_with_shutdown` with a `oneshot`/`Notify` shutdown; confirm a client connects and round-trips before shutdown; fire shutdown; confirm the serve future returns and a subsequent connect no longer succeeds.
 
 ## Feature 4: serve an already-accepted connection (one-port co-hosting)
 
-`serve_listener` owns the accept loop, and the per-connection pieces are private (`accept_repe_websocket` at `src/websocket_server.rs:213`, `handle_connection_with_config` at `:227`). An embedder that also serves plain HTTP routes therefore cannot share one TCP port with the REPE endpoint. Expose the per-connection path:
+`serve_listener` owns the accept loop, and the per-connection pieces are private (`accept_repe_websocket` at `src/websocket_server.rs:240`, `handle_connection_with_config` at `:254`). An embedder that also serves plain HTTP routes therefore cannot share one TCP port with the REPE endpoint. Expose the per-connection path:
 
 ```rust
 impl WebSocketServer {
@@ -170,7 +232,18 @@ impl SharedWebSocketServer {   // Clone == Arc clone; Send + Sync + 'static
 
 An embedder can then peek the upgrade header on each accepted stream, route WebSocket upgrades to `accept` + `serve_connection`, and send everything else to its own HTTP handler, all on one listener.
 
-Design note: `serve` currently consumes `self` and builds `Arc<ConnectionConfig>` once, so serving many connections by reference wants that config build factored out behind a shared handle — `into_shared(self) -> SharedWebSocketServer` with `serve_connection(&self, ws)` per connection (see [decision 4](#resolved-design-decisions)). The `serve_one` test helper (`src/websocket_server.rs:586`) already uses this exact shape, so it is proven internally; `serve`/`serve_listener` should be reimplemented on top of `into_shared()` + `accept` + `serve_connection` rather than carrying a second connection path. A deeper generalization, making the connection loop generic over the WS transport (`S: AsyncRead + AsyncWrite + Unpin + Send + 'static`, as `proxy_connection` already is) so an already-upgraded socket from an HTTP framework can be passed in directly, would also serve embedders already built on such a framework, but it is a larger refactor; the accepted-`TcpStream` form above covers the peek-and-route case without it. Priority: optional, only needed for one-port co-hosting.
+Design note: `serve` currently consumes `self` and builds `Arc<ConnectionConfig>` once, so serving many connections by reference wants that config build factored out behind a shared handle — `into_shared(self) -> SharedWebSocketServer` with `serve_connection(&self, ws)` per connection (see [decision 4](#resolved-design-decisions)). The `serve_one` test helper (`src/websocket_server.rs:720`) already uses this exact shape, so it is proven internally; `serve`/`serve_listener` should be reimplemented on top of `into_shared()` + `accept` + `serve_connection` rather than carrying a second connection path. A deeper generalization, making the connection loop generic over the WS transport (`S: AsyncRead + AsyncWrite + Unpin + Send + 'static`, as `proxy_connection` already is) so an already-upgraded socket from an HTTP framework can be passed in directly, would also serve embedders already built on such a framework, but it is a larger refactor; the accepted-`TcpStream` form above covers the peek-and-route case without it. Priority: optional, only needed for one-port co-hosting.
+
+**Tasks.**
+
+- Add `WebSocketServer::into_shared(self) -> SharedWebSocketServer`, where `SharedWebSocketServer` wraps the `Arc<ConnectionConfig>` that `serve_listener` builds today (it already carries `offreader_limit`). `Clone` is an `Arc` clone; the handle is `Send + Sync + 'static`.
+- Add `WebSocketServer::accept(stream, path) -> Result<WebSocketStream<TcpStream>, RepeError>` as a thin public wrapper over the existing `accept_repe_websocket`.
+- Add `SharedWebSocketServer::serve_connection(&self, ws) -> Result<(), RepeError>` running one connection via the existing `handle_connection_with_config`.
+- Reimplement `serve_listener` on top of `into_shared()` + `accept` + `serve_connection` so there is a single connection path. `serve_one` already demonstrates the destructure-once, serve-per-connection shape.
+
+**Acceptance.** An embedder can `accept` a `TcpStream` then `serve_connection` it without the built-in accept loop; `ConnectionConfig` is built once per `into_shared`, not per connection; `with_peer_registry` connect/disconnect hooks still fire on a connection served this way.
+
+**Test.** Drive a connection through `into_shared()` + `accept` + `serve_connection` directly (mirroring `serve_one`) and round-trip a request; assert a `PeerRegistry` attached via `with_peer_registry` observes the peer.
 
 ## Feature 5 (minor): expose `CallContext` to middleware
 
@@ -183,6 +256,15 @@ impl<'a> Next<'a> {
 ```
 
 Purely additive. Priority: low, since `with_json_ctx` / `with_typed_ctx` already give handlers the peer; this is only for cross-cutting middleware that wants it.
+
+**Tasks.**
+
+- Add `pub fn ctx(&self) -> Option<&CallContext<'a>>` on `impl<'a> Next<'a>`, returning `self.ctx` (the field already exists: `Next.ctx` in `src/server.rs`).
+- Optionally add `pub fn peer(&self) -> Option<&PeerHandle>` as sugar for `self.ctx.and_then(|c| c.peer())`.
+
+**Acceptance.** A middleware can read the calling peer via `next.ctx()` (or `next.peer()`); middleware that ignores it is unaffected; `Next::run` still threads ctx to the leaf as today.
+
+**Test.** Register a middleware that records whether `next.ctx().and_then(|c| c.peer())` is `Some`, drive a request over the WebSocket server (peer present), and assert it observed the peer. The existing `middleware_preserves_ctx_across_pipeline` test is a good template.
 
 ## Backward compatibility
 
