@@ -212,15 +212,8 @@ impl WebSocketServer {
         path: &str,
         shutdown: impl Future<Output = ()>,
     ) -> std::io::Result<()> {
-        let expected_path = normalize_path(path);
-        let config = Arc::new(ConnectionConfig {
-            router: self.router,
-            outbound_capacity: self.outbound_capacity,
-            offreader_limit: self.offreader_limit,
-            peer_id_counter: self.peer_id_counter,
-            on_connect: Arc::new(self.on_connect),
-            on_disconnect: Arc::new(self.on_disconnect),
-        });
+        let path = path.to_string();
+        let shared = self.into_shared();
 
         tokio::pin!(shutdown);
         loop {
@@ -229,12 +222,12 @@ impl WebSocketServer {
                 // branch to `shutdown` cannot drop an accepted stream.
                 accepted = listener.accept() => {
                     let (stream, _addr) = accepted?;
-                    let expected_path = expected_path.clone();
-                    let config = Arc::clone(&config);
+                    let path = path.clone();
+                    let shared = shared.clone();
                     tokio::spawn(async move {
-                        match accept_repe_websocket(stream, &expected_path).await {
+                        match WebSocketServer::accept(stream, &path).await {
                             Ok(ws_stream) => {
-                                if let Err(err) = handle_connection_with_config(ws_stream, config).await {
+                                if let Err(err) = shared.serve_connection(ws_stream).await {
                                     eprintln!("[repe] websocket connection error: {err}");
                                 }
                             }
@@ -249,6 +242,47 @@ impl WebSocketServer {
         }
         Ok(())
     }
+
+    /// Consume this builder into a cheap, cloneable
+    /// [`SharedWebSocketServer`]. The [`ConnectionConfig`] (router,
+    /// hooks, capacities) is built exactly once here; each clone of the
+    /// returned handle is an `Arc` clone.
+    ///
+    /// Use with [`accept`](Self::accept) and
+    /// [`SharedWebSocketServer::serve_connection`] to serve connections
+    /// the embedder accepts itself — e.g. peek the upgrade header on
+    /// each accepted stream, route WebSocket upgrades to REPE and send
+    /// everything else to an HTTP handler, all on one TCP port. The
+    /// built-in [`serve`](Self::serve) loop is implemented on top of
+    /// exactly this.
+    pub fn into_shared(self) -> SharedWebSocketServer {
+        SharedWebSocketServer {
+            config: Arc::new(ConnectionConfig {
+                router: self.router,
+                outbound_capacity: self.outbound_capacity,
+                offreader_limit: self.offreader_limit,
+                peer_id_counter: self.peer_id_counter,
+                on_connect: Arc::new(self.on_connect),
+                on_disconnect: Arc::new(self.on_disconnect),
+            }),
+        }
+    }
+
+    /// Perform the REPE WebSocket handshake on an already-accepted
+    /// `stream`, validating that the client requested `path`. Returns
+    /// the upgraded [`WebSocketStream`] ready to hand to
+    /// [`SharedWebSocketServer::serve_connection`].
+    ///
+    /// An associated function: it needs only the path, not the
+    /// router/hooks, so it composes with any [`SharedWebSocketServer`].
+    /// `path` is normalized exactly as [`serve`](Self::serve)
+    /// normalizes it.
+    pub async fn accept(
+        stream: TcpStream,
+        path: &str,
+    ) -> Result<WebSocketStream<TcpStream>, RepeError> {
+        accept_repe_websocket(stream, &normalize_path(path)).await
+    }
 }
 
 struct ConnectionConfig {
@@ -258,6 +292,35 @@ struct ConnectionConfig {
     peer_id_counter: Arc<AtomicU64>,
     on_connect: Arc<Vec<ConnectHook>>,
     on_disconnect: Arc<Vec<DisconnectHook>>,
+}
+
+/// Cheap, cloneable handle to a [`WebSocketServer`]'s per-connection
+/// configuration, produced by [`WebSocketServer::into_shared`].
+///
+/// `into_shared` builds the connection configuration (router, hooks,
+/// capacities) exactly once; cloning a `SharedWebSocketServer` is an
+/// `Arc` clone. The handle is `Send + Sync + 'static`, so it drops
+/// straight into a per-connection
+/// `tokio::spawn(async move { shared.serve_connection(ws).await })` —
+/// the shape an embedder needs to share one TCP port between REPE
+/// WebSocket upgrades and its own HTTP routes.
+#[derive(Clone)]
+pub struct SharedWebSocketServer {
+    config: Arc<ConnectionConfig>,
+}
+
+impl SharedWebSocketServer {
+    /// Run one connection's reader/writer loop using this server's
+    /// router, hooks, and capacities. Pair with
+    /// [`WebSocketServer::accept`] to serve a stream the embedder
+    /// accepted and upgraded itself.
+    ///
+    /// Connect/disconnect hooks (and any [`PeerRegistry`] attached via
+    /// [`WebSocketServer::with_peer_registry`]) fire for connections
+    /// served this way, exactly as under [`WebSocketServer::serve`].
+    pub async fn serve_connection(&self, ws: WebSocketStream<TcpStream>) -> Result<(), RepeError> {
+        handle_connection_with_config(ws, Arc::clone(&self.config)).await
+    }
 }
 
 pub async fn proxy_connection<S>(
@@ -832,25 +895,21 @@ mod tests {
         path: &str,
         server: WebSocketServer,
     ) -> tokio::task::JoinHandle<()> {
+        // Dogfood the public one-port co-hosting surface
+        // (into_shared + accept + serve_connection) so the whole
+        // WebSocket test suite exercises it.
         let path = path.to_string();
-        let config = Arc::new(ConnectionConfig {
-            router: server.router,
-            outbound_capacity: server.outbound_capacity,
-            offreader_limit: server.offreader_limit,
-            peer_id_counter: server.peer_id_counter,
-            on_connect: Arc::new(server.on_connect),
-            on_disconnect: Arc::new(server.on_disconnect),
-        });
+        let shared = server.into_shared();
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     break;
                 };
                 let path = path.clone();
-                let config = Arc::clone(&config);
+                let shared = shared.clone();
                 tokio::spawn(async move {
-                    if let Ok(ws_stream) = accept_repe_websocket(stream, &path).await {
-                        let _ = handle_connection_with_config(ws_stream, config).await;
+                    if let Ok(ws_stream) = WebSocketServer::accept(stream, &path).await {
+                        let _ = shared.serve_connection(ws_stream).await;
                     }
                 });
             }
@@ -1448,6 +1507,42 @@ mod tests {
         drop(c2);
         ta.abort();
         tb.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn into_shared_serves_connection_and_registers_peer() {
+        // Feature 4: drive a connection through into_shared() + accept
+        // + serve_connection directly (the one-port co-hosting shape an
+        // embedder uses to share a TCP port with its own HTTP routes),
+        // round-trip a request, and assert a PeerRegistry attached via
+        // with_peer_registry observes the peer.
+        let router = Router::new().with_json("/ping", |_| Ok(json!({ "ok": true })));
+        let peers = PeerRegistry::new();
+        let server = WebSocketServer::new(router).with_peer_registry(peers.clone());
+        let shared = server.into_shared();
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let accept_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            if let Ok(ws) = WebSocketServer::accept(stream, "/repe").await {
+                let _ = shared.serve_connection(ws).await;
+            }
+        });
+
+        let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
+            .await
+            .unwrap();
+        let resp = client.call_json("/ping", &json!({})).await.unwrap();
+        assert_eq!(resp, json!({ "ok": true }));
+
+        // Connect hooks fire before traffic is processed, so by the time
+        // the /ping response is in hand the peer is already registered.
+        assert_eq!(peers.len(), 1);
+
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(5), accept_task).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
