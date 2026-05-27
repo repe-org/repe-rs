@@ -13,13 +13,25 @@ pub const HEADER_SIZE: usize = 48;
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ErrorCode {
+    /// Success. The response carries a normal result, not an error.
     Ok = 0,
+    /// The request's REPE version is not supported by this server.
     VersionMismatch = 1,
+    /// The fixed header was malformed: bad spec magic, wrong length, a
+    /// non-zero reserved field, or a length that disagrees with the body.
     InvalidHeader = 2,
+    /// The query was malformed or used a query format this server does not
+    /// accept (e.g. a raw-binary query against a JSON-pointer router).
     InvalidQuery = 3,
+    /// The body could not be interpreted for the target method (wrong
+    /// shape or type for what the handler expected).
     InvalidBody = 4,
+    /// The message could not be parsed: a framing, header-decode, or
+    /// body-decode failure below the application level.
     ParseError = 5,
+    /// No handler is registered for the requested query path.
     MethodNotFound = 6,
+    /// The request did not produce a response within the allotted time.
     Timeout = 7,
     /// The server is temporarily unable to service the request and the
     /// client should retry. Distinct from an application error: it
@@ -35,7 +47,10 @@ pub enum ErrorCode {
     /// off-reader handler panic. Also in the REPE-reserved `8..4095`
     /// range.
     InternalError = 9,
-    /// Application-specific errors start at 4096
+    /// Base of the application-defined error range. A handler returns this
+    /// (or any value at or above it) for an ordinary application-level
+    /// failure, as distinct from the protocol-level codes above and from
+    /// the `ResourceExhausted` / `InternalError` server conditions.
     ApplicationErrorBase = 4096,
 }
 

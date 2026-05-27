@@ -39,6 +39,10 @@ name = "repe"
 path = "src/bin/repe.rs"
 required-features = ["cli"]
 
+[[example]]
+name = "websocket_graceful_server"
+required-features = ["websocket"]
+
 [dependencies]
 beve = "0.1"
 serde = { version = "1", features = ["derive" ] }
