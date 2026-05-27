@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-05-27
+
 ### Added
 - Off-reader handler cancellation on `CallContext`: `CallContext::is_cancelled()` (non-blocking) and `CallContext::cancelled()` (a `Future`) report/resolve when the calling peer disconnects or the server is shutting down. A long `_blocking` handler should poll `is_cancelled()` at loop boundaries and return early to free its `spawn_blocking` thread instead of running pointless work to completion. Both degrade to a never-cancelling no-op on peer-less transports (TCP servers, in-process dispatch), mirroring `CallContext::peer()` returning `None`. Backed by a per-connection `tokio_util` `CancellationToken` cancelled from the disconnect `Drop` guard; the backing type is not exposed. Complements — does not replace — the `on_peer_disconnect` → `TransferControl::cancel` path, which remains the only thing that wakes a producer parked in `wait_for_credit`.
 - Graceful connection drain: `WebSocketServer::serve_with_graceful_drain(addr, path, shutdown, drain_timeout)` and `serve_listener_with_graceful_drain(listener, path, shutdown, drain_timeout)`. On shutdown they stop accepting, cancel in-flight off-reader handlers, await already-accepted connections (tracked in a `JoinSet`) until `drain_timeout`, then abort whatever remains. Aborting a connection tears down its writer task too, so the server-level `drain_timeout` supersedes the per-connection 5 s writer drain. The turnkey counterpart to `serve_with_shutdown`, which still returns immediately and detaches connections.
@@ -11,6 +13,7 @@
 - `examples/websocket_graceful_server.rs`: a runnable end-to-end demo of a cancellation-polling off-reader handler, an `on_error` hook, and `serve_listener_with_graceful_drain`.
 
 ### Changed
+- `ErrorCode`, `QueryFormat`, and `BodyFormat` are now `#[non_exhaustive]`, so downstream `match` expressions on these protocol enums must add a wildcard (`_`) arm. This is the one-time source-breaking change behind the major version bump; in exchange, future additions to these enums — new error codes in the reserved `8..4095` range, new query/body formats — ship as non-breaking minor releases.
 - A caught off-reader handler panic now responds with `ErrorCode::InternalError` and an off-reader saturation rejection with `ErrorCode::ResourceExhausted` (both were `ErrorCode::ApplicationErrorBase`). A client that matched `ApplicationErrorBase` to detect these two cases must update to the new codes.
 - The three WebSocket-server `eprintln!` sites (handshake error, connection error, off-reader handler panic) route through `on_error` when a hook is registered, falling back to the same stderr output otherwise.
 

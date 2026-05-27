@@ -12,6 +12,7 @@ pub const HEADER_SIZE: usize = 48;
 /// REPE high-level error codes.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub enum ErrorCode {
     /// Success. The response carries a normal result, not an error.
     Ok = 0,
@@ -84,6 +85,7 @@ impl core::convert::TryFrom<u32> for ErrorCode {
 /// Reserved Query formats (0..=4095 reserved for REPE)
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub enum QueryFormat {
     RawBinary = 0,
     JsonPointer = 1,
@@ -109,6 +111,7 @@ impl core::convert::TryFrom<u16> for QueryFormat {
 /// Reserved Body formats (0..=4095 reserved for REPE)
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub enum BodyFormat {
     RawBinary = 0,
     Beve = 1, // BEVE binary body

@@ -734,7 +734,7 @@ dependencies = [
 
 [[package]]
 name = "repe"
-version = "2.6.0"
+version = "3.0.0"
 dependencies = [
  "beve",
  "clap",
