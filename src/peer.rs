@@ -25,6 +25,8 @@ use crate::constants::BodyFormat;
 use crate::error::RepeError;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -184,6 +186,29 @@ impl std::fmt::Debug for PeerHandle {
     }
 }
 
+/// Backing source for a [`CallContext`]'s cancellation signal.
+///
+/// Crate-internal so the public surface stays small and runtime-neutral:
+/// the only signal a handler sees is [`CallContext::cancelled`] /
+/// [`CallContext::is_cancelled`], never the backing type. The built-in
+/// `WebSocketServer` implements this over a `tokio_util` `CancellationToken`
+/// that is cancelled when the peer disconnects or the server shuts down;
+/// peer-less transports never attach one, so the signal degrades to a
+/// never-cancelling no-op (mirroring [`CallContext::peer`] returning
+/// `None`).
+///
+/// Defined here, rather than alongside the WebSocket server, so this
+/// transport-agnostic module owns no runtime-specific dependency: the
+/// trait is pure `std`, and the concrete `tokio_util` implementation
+/// lives behind the `websocket` feature.
+pub(crate) trait CancelSignal: Send + Sync {
+    /// Non-blocking check: has cancellation fired?
+    fn is_cancelled(&self) -> bool;
+    /// A future that resolves once cancellation fires. Boxed to keep the
+    /// backing future type out of repe's public surface.
+    fn cancelled(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+}
+
 /// Per-call dispatch context handed to peer-aware handlers.
 ///
 /// Constructed once per inbound request by whatever code drives dispatch
@@ -191,25 +216,51 @@ impl std::fmt::Debug for PeerHandle {
 /// Handlers reach the calling peer through [`CallContext::peer`]; methods
 /// dispatched without a peer (local round-trip tests, registry batch
 /// fixups) get [`CallContext::detached`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct CallContext<'a> {
     method: &'a str,
     peer: Option<&'a PeerHandle>,
+    cancel: Option<&'a dyn CancelSignal>,
 }
 
 impl<'a> CallContext<'a> {
-    /// Build a context with a peer attached.
+    /// Build a context with a peer attached and no cancellation signal.
     pub fn new(method: &'a str, peer: &'a PeerHandle) -> Self {
         Self {
             method,
             peer: Some(peer),
+            cancel: None,
         }
     }
 
     /// Build a context with no peer attached. Handlers that try to push
     /// notifies will see `peer().is_none()` and decide what to do.
     pub fn detached(method: &'a str) -> Self {
-        Self { method, peer: None }
+        Self {
+            method,
+            peer: None,
+            cancel: None,
+        }
+    }
+
+    /// Build a context with a peer and a cancellation signal attached.
+    /// Used by the built-in `WebSocketServer` to thread the connection's
+    /// cancellation handle (fired on disconnect / shutdown) onto each
+    /// dispatch.
+    // Only the feature-gated WebSocket server constructs a cancel-bearing
+    // context (the unit tests above also exercise it); a build without the
+    // `websocket` feature has no caller, so don't warn there.
+    #[cfg_attr(not(feature = "websocket"), allow(dead_code))]
+    pub(crate) fn with_cancel(
+        method: &'a str,
+        peer: &'a PeerHandle,
+        cancel: &'a dyn CancelSignal,
+    ) -> Self {
+        Self {
+            method,
+            peer: Some(peer),
+            cancel: Some(cancel),
+        }
     }
 
     /// The query path this dispatch is targeting (e.g. `/run_collection`).
@@ -220,6 +271,56 @@ impl<'a> CallContext<'a> {
     /// The calling peer, if known.
     pub fn peer(&self) -> Option<&'a PeerHandle> {
         self.peer
+    }
+
+    /// Non-blocking check of whether this call should stop: the peer has
+    /// disconnected, or the server is shutting down.
+    ///
+    /// A long off-reader handler (one registered via
+    /// `Router::with_*_blocking`) should poll this at loop boundaries and
+    /// return early once it reads `true`, freeing its blocking-pool
+    /// thread instead of running pointless work to completion. Always
+    /// `false` on peer-less transports (TCP servers, in-process
+    /// dispatch), which never attach a cancellation signal.
+    ///
+    /// This complements, and does not replace, the
+    /// [`on_peer_disconnect`](crate::PeerRegistry) →
+    /// [`TransferControl::cancel`](crate::stream::TransferControl::cancel)
+    /// path: a producer parked in
+    /// [`wait_for_credit`](crate::stream::TransferControl::wait_for_credit)
+    /// is woken only by `cancel`, not by this signal.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_some_and(|c| c.is_cancelled())
+    }
+
+    /// Resolves when this call should stop (peer disconnected or server
+    /// shutting down). Never resolves on peer-less transports, so a
+    /// `select!` arm built on it stays dormant there rather than firing
+    /// spuriously.
+    ///
+    /// Intended for an async handler to `select!` on; a synchronous
+    /// off-reader handler should poll [`is_cancelled`](Self::is_cancelled)
+    /// at loop boundaries instead.
+    pub fn cancelled(&self) -> impl Future<Output = ()> + Send + 'a {
+        // Copy the signal reference out so the returned future is tied to
+        // `'a` (the signal's lifetime), not to the `&self` borrow.
+        let cancel = self.cancel;
+        async move {
+            match cancel {
+                Some(c) => c.cancelled().await,
+                None => std::future::pending::<()>().await,
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for CallContext<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CallContext")
+            .field("method", &self.method)
+            .field("peer", &self.peer)
+            .field("cancellable", &self.cancel.is_some())
+            .finish()
     }
 }
 
@@ -526,5 +627,50 @@ mod tests {
         let without = CallContext::detached("/m");
         assert_eq!(without.method(), "/m");
         assert!(without.peer().is_none());
+    }
+
+    struct MockSignal(bool);
+    impl CancelSignal for MockSignal {
+        fn is_cancelled(&self) -> bool {
+            self.0
+        }
+        fn cancelled(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            if self.0 {
+                Box::pin(std::future::ready(()))
+            } else {
+                Box::pin(std::future::pending())
+            }
+        }
+    }
+
+    #[test]
+    fn call_context_cancellation_reflects_signal() {
+        let sink = Arc::new(CapturingSink {
+            connected: true,
+            ..Default::default()
+        });
+        let peer = PeerHandle::new(PeerId(3), sink);
+
+        let cancelled = MockSignal(true);
+        let ctx = CallContext::with_cancel("/m", &peer, &cancelled);
+        assert!(ctx.is_cancelled());
+        assert!(ctx.peer().is_some());
+
+        let live = MockSignal(false);
+        let ctx = CallContext::with_cancel("/m", &peer, &live);
+        assert!(!ctx.is_cancelled());
+    }
+
+    #[test]
+    fn detached_and_plain_contexts_never_cancel() {
+        // Peer-less and signal-less contexts degrade to a never-cancelling
+        // no-op, mirroring `peer()` returning `None`.
+        let sink = Arc::new(CapturingSink {
+            connected: true,
+            ..Default::default()
+        });
+        let peer = PeerHandle::new(PeerId(4), sink);
+        assert!(!CallContext::detached("/m").is_cancelled());
+        assert!(!CallContext::new("/m", &peer).is_cancelled());
     }
 }

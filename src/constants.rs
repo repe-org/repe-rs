@@ -21,6 +21,20 @@ pub enum ErrorCode {
     ParseError = 5,
     MethodNotFound = 6,
     Timeout = 7,
+    /// The server is temporarily unable to service the request and the
+    /// client should retry. Distinct from an application error: it
+    /// signals transient saturation, not a failed result. The built-in
+    /// `WebSocketServer` returns this when an off-reader request is
+    /// rejected because the per-connection `with_offreader_limit` cap is
+    /// reached. Occupies the REPE-reserved `8..4095` range (between
+    /// `Timeout` and `ApplicationErrorBase`).
+    ResourceExhausted = 8,
+    /// The server hit an unexpected internal failure while handling the
+    /// request; the result is not a normal application-level outcome.
+    /// The built-in `WebSocketServer` returns this for a caught
+    /// off-reader handler panic. Also in the REPE-reserved `8..4095`
+    /// range.
+    InternalError = 9,
     /// Application-specific errors start at 4096
     ApplicationErrorBase = 4096,
 }
@@ -43,6 +57,8 @@ impl core::convert::TryFrom<u32> for ErrorCode {
             5 => ErrorCode::ParseError,
             6 => ErrorCode::MethodNotFound,
             7 => ErrorCode::Timeout,
+            8 => ErrorCode::ResourceExhausted,
+            9 => ErrorCode::InternalError,
             4096 => ErrorCode::ApplicationErrorBase,
             _ => return Err(value),
         };
