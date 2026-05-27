@@ -14,10 +14,14 @@
 //!   can reach the calling peer's [`PeerHandle`] (when the dispatch path
 //!   knows about it).
 //!
-//! Repe-rs's built-in TCP/WebSocket servers do not yet construct
-//! `PeerHandle`s themselves; they keep their existing single-task
-//! read-then-write loops. Embedders that need peer routing wire their
-//! own `PeerSink` against their server's outbound channel and call
+//! The built-in [`WebSocketServer`](crate::websocket_server::WebSocketServer)
+//! constructs a [`PeerHandle`] per connection (backed by an internal
+//! [`PeerSink`] over its outbound channel) and threads it into each request's
+//! [`CallContext`], so context-aware handlers reach the calling peer via
+//! [`CallContext::peer`] with no extra wiring. The TCP servers and direct
+//! in-process dispatch do not attach a peer: there [`CallContext::peer`]
+//! returns `None`, and an embedder that needs peer routing wires its own
+//! [`PeerSink`] against its server's outbound channel and calls
 //! [`Registry::dispatch_with_ctx`](crate::registry::Registry::dispatch_with_ctx)
 //! with a populated [`CallContext`].
 

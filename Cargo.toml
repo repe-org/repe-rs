@@ -19,6 +19,13 @@ include = [
     "/examples/**",
     "/tests/**",
 ]
+
+[package.metadata.docs.rs]
+# Build docs.rs with every feature so intra-doc links into optional,
+# feature-gated modules (e.g. the `websocket`-gated WebSocketServer)
+# resolve instead of dangling under the empty default feature set.
+all-features = true
+
 [features]
 default = []
 parking-lot = ["dep:parking_lot"]

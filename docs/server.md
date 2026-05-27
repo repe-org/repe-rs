@@ -132,7 +132,7 @@ tokio::spawn(async move { let _ = AsyncServer::new(router).serve(listener).await
 
 Handlers that need to push more than one message back to the calling client (e.g. server-pushed file chunks after a single `/run_collection` call) need a typed handle to that connection. `PeerSink` / `PeerHandle` / `CallContext` provide that handle, and `Registry::dispatch_with_ctx` threads it through to the handler.
 
-The built-in TCP and WebSocket servers do not yet construct `PeerHandle`s themselves. Embedders that want peer routing wire their own `PeerSink` (typically a bounded channel drained by a writer task) against their server's outbound side.
+The built-in WebSocket server constructs a `PeerHandle` per connection and threads it into each request's `CallContext`, so over WebSocket you write only the context-aware handler and read `ctx.peer()` — no sink or dispatch wiring of your own. The TCP servers and direct in-process dispatch do not attach a peer; there `ctx.peer()` returns `None`, and you wire your own `PeerSink` (typically a bounded channel drained by a writer task) and call `Registry::dispatch_with_ctx` with a populated `CallContext`, as in the example below.
 
 ```rust
 use repe::{
