@@ -120,6 +120,25 @@ The disconnect hook fires from a `Drop` guard, so it runs on every exit path: cl
 
 `PeerHandle::send_notify` returning `Ok(())` means the message was queued onto the outbound channel, not that it was written to the wire. During concurrent disconnect, a late-arriving send may queue successfully but be dropped when the writer task exits and the bounded receiver is released. This is intrinsic to async shutdown; treat `Ok` as best-effort delivery, not as confirmation.
 
+### Error reporting
+
+By default the server prints transport-level errors to stderr (`eprintln!`). To route them into your own `log` / `tracing` pipeline instead, register an `on_error` hook. It receives a `ConnectionError` — a typed taxonomy of the events that would otherwise hit stderr, plus the off-reader saturation rejection:
+
+```rust
+use repe::{ConnectionError, WebSocketServer};
+
+let server = WebSocketServer::new(router).on_error(|err| match err {
+    ConnectionError::Handshake(e)      => tracing::warn!(%e, "websocket handshake failed"),
+    ConnectionError::Connection(e)     => tracing::info!(%e, "connection ended"),
+    ConnectionError::HandlerPanic { method } => tracing::error!(%method, "off-reader handler panicked"),
+    ConnectionError::Saturation { method }   => tracing::debug!(%method, "off-reader limit reached"),
+});
+```
+
+Like the lifecycle hooks, `on_error` composes: every registered callback fires in registration order, on the task that detected the error (an accept task, a connection's reader, or an off-reader blocking thread), so it must not block. Registering at least one callback makes the callbacks the sole sink — the default stderr logging is suppressed. With no callback registered the server keeps its stderr behavior (and stays silent on saturation, which never logged).
+
+`Handshake` and `Connection` errors are reported only by the built-in accept loops (`serve*`); a co-hosting embedder that owns its accept loop gets the connection error as the `RepeError` returned by `serve_connection` and handles it however it likes. `HandlerPanic` and `Saturation` are reported wherever the connection runs. `ConnectionError::error_code()` returns the wire `ErrorCode` that reached the client for the panic (`InternalError`) and saturation (`ResourceExhausted`) categories, and `None` for handshake / connection failures (which sent no REPE response).
+
 ### Backpressure on the server outbound channel
 
 Each accepted connection allocates a bounded `tokio::sync::mpsc` channel for outbound messages (responses plus pushed notifies). The default capacity is `DEFAULT_OUTBOUND_CAPACITY` (256). Tune per server with `with_outbound_capacity(n)`.
@@ -205,13 +224,29 @@ let server = WebSocketServer::new(router).with_offreader_limit(32);  // 0 remove
 
 When the cap is reached the reader does **not** block waiting for a slot — that would stall the very ACK/cancel frames in-flight transfers need to finish and free a slot, recreating the deadlock. Instead a further off-reader request gets an immediate error response and the reader keeps reading; the client should retry. A handler **panic** is caught and likewise mapped to an error response, so the connection — which it shares with other concurrent transfers — survives rather than being torn down.
 
-Both the saturation rejection and the caught panic surface as `ErrorCode::ApplicationErrorBase`: REPE defines no protocol-level "unavailable" or "internal error" code today, so a client cannot tell these apart from an ordinary application error by code alone. Treat this as a known protocol gap.
+The saturation rejection and the caught panic carry **distinct** wire codes so a client can branch on them: a saturation rejection is `ErrorCode::ResourceExhausted` (retryable — back off and retry) and a caught panic is `ErrorCode::InternalError` (a real failure, not a normal result), both separate from the `ErrorCode::ApplicationErrorBase` an ordinary handler error returns. The two codes occupy the REPE-reserved `8..4095` range, so a client implementing automatic retry keys off the code alone — retry-on-busy, surface-on-error. (Both surfaced as `ApplicationErrorBase` before this distinction landed; a client that matched that code to detect saturation must update.)
 
 `with_offreader_limit` bounds **per-connection fairness, not the global blocking pool.** `spawn_blocking` draws from tokio's process-wide blocking pool (512 threads by default), and a producer parked in `wait_for_credit` holds its thread for the whole transfer. Embedders expecting many concurrent streaming connections should raise the runtime's `max_blocking_threads` or use a dedicated runtime. The idle watchdog (`spawn_watchdog`, see [streaming.md](streaming.md)) reclaims both the blocking-pool thread and the permit from a transfer that goes silent.
 
-### Teardown on disconnect
+### Cancellation on disconnect and shutdown
 
-When a client disconnects, the connection's reader and writer tasks stop, but an off-reader handler already running on a blocking thread is **not** signalled: a producer parked in `wait_for_credit` is blocked on a condvar, not on a send, so it does not observe the disconnect. It wakes on the `deadline` you passed to `wait_for_credit` (the suggested `DEFAULT_BACKPRESSURE_TIMEOUT` is 30 s) and then aborts, so a departed peer's transfer holds its blocking-pool thread and off-reader permit for at most that long even with no watchdog wired — the hold is bounded, not indefinite. To reclaim them *promptly* rather than waiting the deadline out, cancel the transfer from an `on_peer_disconnect` hook. The hook receives a `PeerId` while a `TransferRegistry` is keyed by your transfer id, so keep your own peer-to-transfer association and call `TransferControl::cancel` — which wakes the parked producer immediately — for each transfer that belonged to the departing peer.
+An off-reader handler can observe that its work has become pointless through its `CallContext`. `ctx.is_cancelled()` (non-blocking) returns `true`, and `ctx.cancelled()` (a future) resolves, once the calling peer disconnects or the server begins a [graceful drain](#draining-in-flight-connections). A long poll-loop or compute handler should check `is_cancelled()` at loop boundaries and return early, freeing its `spawn_blocking` thread and off-reader permit instead of running to completion:
+
+```rust
+let router = Router::new().with_json_ctx_blocking("/export", |ctx, _params| {
+    for chunk in chunks {
+        if ctx.is_cancelled() {
+            return Ok(serde_json::json!({ "cancelled": true }));  // peer gone / shutting down
+        }
+        // ... produce and push the chunk via ctx.peer() ...
+    }
+    Ok(serde_json::json!({ "done": true }))
+});
+```
+
+The signal is a never-cancelling no-op on peer-less transports (TCP servers, in-process dispatch), so the same handler is safe to register on a `Router` served over any transport — `is_cancelled()` simply stays `false` and `cancelled()` never resolves there.
+
+**It does not wake a `wait_for_credit` park.** A `repe::stream` producer parked in `wait_for_credit` is blocked on a `Condvar`, not polling `is_cancelled()`, so the cancellation signal cannot reach it. That park is still woken only by `TransferControl::cancel`, which you drive from an `on_peer_disconnect` hook: the hook receives a `PeerId` while a `TransferRegistry` is keyed by your transfer id, so keep your own peer-to-transfer association and call `cancel` for each transfer that belonged to the departing peer. The two paths complement each other — poll-loop and compute handlers use the cancellation signal; credit-parked producers use `cancel`. With neither wired, a parked producer still wakes on the `deadline` passed to `wait_for_credit` (suggested `DEFAULT_BACKPRESSURE_TIMEOUT`, 30 s) or when the idle watchdog fires, so a departed peer's transfer holds its blocking-pool thread and off-reader permit for at most that long — the hold is bounded, not indefinite.
 
 ### One producer per transfer
 
@@ -219,7 +254,7 @@ Removing per-connection serialization also removes an implicit safety net. Inlin
 
 ### Deferred: a first-class stream source
 
-The wiring above — install a `TransferControl`, spawn the producer off the reader, and route inbound ack/cancel/resume through your own handlers — is deliberately left to the embedder. A higher-level `WebSocketServer` stream-source surface that owns all of it (you would supply only the byte source and the chunk method names, and `begin`/ack/cancel/resume would be handled internally) is **deferred** until a second distinct windowed-transfer consumer of the built-in server exists, so the trait is designed against more than one transfer shape rather than over-fit to one. When it is built it should be *pull-based* (the server asks the source for the next chunk only when the credit window has room) and expose a seek so replay/resume can re-emit from an arbitrary offset. Until then, off-reader dispatch plus the [`repe::stream`](streaming.md) API fully cover a single consumer.
+The wiring above — install a `TransferControl`, spawn the producer off the reader, and route inbound ack/cancel/resume through your own handlers — is deliberately left to the embedder. A higher-level `WebSocketServer` stream-source surface that owns all of it (you would supply only the byte source and the chunk method names, and `begin`/ack/cancel/resume would be handled internally) is **deferred** until a second distinct windowed-transfer consumer of the built-in server exists, so the trait is designed against more than one transfer shape rather than over-fit to one. Its prerequisites — cancellation-on-disconnect ([above](#cancellation-on-disconnect-and-shutdown)) and orderly drain ([below](#draining-in-flight-connections)) — now exist, so the surface can be designed against this consumer once a second appears. When it is built it should be *pull-based* (the server asks the source for the next chunk only when the credit window has room) and expose a seek so replay/resume can re-emit from an arbitrary offset. Until then, off-reader dispatch plus the [`repe::stream`](streaming.md) API fully cover a single consumer.
 
 ## Graceful Shutdown
 
@@ -246,6 +281,25 @@ let _ = handle.await;
 
 Already-accepted connections are **not** awaited: each runs on its own detached task and continues until its peer disconnects or it errors, and the call returns as soon as the accept loop stops. Track connection lifetimes yourself (e.g. via a [`PeerRegistry`](#peerregistry)) if you need to drain them before exiting.
 
+### Draining in-flight connections
+
+`serve_with_shutdown` returns the instant the accept loop stops, so in-flight work on already-accepted connections is cut off at process exit. When connections carry multi-minute transfers, use the draining entry points instead — `serve_with_graceful_drain(addr, path, shutdown, drain_timeout)` and `serve_listener_with_graceful_drain(listener, path, shutdown, drain_timeout)`. On shutdown they stop accepting, **cancel** every in-flight off-reader handler (so handlers that poll [`ctx.is_cancelled()`](#cancellation-on-disconnect-and-shutdown) wind down promptly), then await the connection tasks for up to `drain_timeout` before aborting whatever remains.
+
+```rust
+server
+    .serve_listener_with_graceful_drain(
+        listener,
+        "/repe",
+        async { let _ = shutdown_rx.await; },
+        Duration::from_secs(10),
+    )
+    .await?;
+```
+
+The server tracks every connection it accepts in a `JoinSet`, so you do not have to. `drain_timeout` is a backstop, not the common wait: cancellation winds cooperative handlers down in milliseconds, and the timeout only bounds connections whose handlers ignore cancellation or whose peers are slow to flush. Aborting a connection at the deadline tears down its writer task too, so the server-level `drain_timeout` supersedes the per-connection 5 s writer drain. A `_blocking` handler that never polls `is_cancelled()` still holds its `spawn_blocking` thread past the deadline (a blocking thread cannot be aborted) — the abort reclaims the connection's reader/writer, not such a handler, which is one more reason to poll the signal.
+
+`examples/websocket_graceful_server.rs` is a runnable end-to-end demo of this section: a cancellation-polling off-reader handler, an `on_error` hook, and `serve_listener_with_graceful_drain` winding a connection down on shutdown. Run it with `cargo run --example websocket_graceful_server --features websocket`.
+
 ## One-Port Co-Hosting
 
 To share a single TCP port between the REPE WebSocket endpoint and your own HTTP routes, drive connections yourself instead of using the built-in accept loop. `WebSocketServer::into_shared()` consumes the builder into a cheap, cloneable `SharedWebSocketServer` — the per-connection configuration is built once, each clone is an `Arc` clone, and the handle is `Send + Sync + 'static`. Then, for each accepted stream, peek the upgrade request and route it: `WebSocketServer::accept(stream, path)` performs the REPE handshake (validating `path`), and `SharedWebSocketServer::serve_connection(ws)` runs that connection's reader/writer loop. Connect/disconnect hooks and any attached `PeerRegistry` fire exactly as under `serve`.
@@ -271,3 +325,26 @@ loop {
 ```
 
 The built-in `serve` / `serve_listener` loop is itself implemented on top of `into_shared` + `accept` + `serve_connection`, so a co-hosted connection behaves identically to one accepted by the built-in loop.
+
+### Draining a co-hosted server
+
+Because a co-hosting embedder owns its accept loop, it cannot hand its listener to `serve_listener_with_graceful_drain`. To get the cancellation half on its own terms, create one `ShutdownToken`, serve each connection with `serve_connection_with_cancel(ws, &token)` instead of `serve_connection(ws)`, and `token.cancel()` on shutdown — every connection's in-flight off-reader handlers then observe [`ctx.is_cancelled()`](#cancellation-on-disconnect-and-shutdown) at once. Track the futures in your own `JoinSet` (as you already do for one-port hosting) and drain it with whatever deadline you choose.
+
+```rust
+use repe::{ShutdownToken, WebSocketServer};
+
+let shared = WebSocketServer::new(router).into_shared();
+let shutdown = ShutdownToken::new();
+// ... in your accept loop, for each REPE upgrade:
+let (shared, shutdown) = (shared.clone(), shutdown.clone());
+conns.spawn(async move {
+    if let Ok(ws) = WebSocketServer::accept(stream, "/repe").await {
+        let _ = shared.serve_connection_with_cancel(ws, &shutdown).await;
+    }
+});
+// ... on shutdown:
+shutdown.cancel();           // wake every connection's in-flight handlers
+// then drain your own JoinSet with a deadline, aborting stragglers.
+```
+
+Plain `serve_connection(ws)` still fires each connection's cancellation signal on **disconnect**; `serve_connection_with_cancel` additionally ties it to the shared token, so cancelling the token triggers all connections at once. The `ShutdownToken` hides its backing `tokio_util` cancellation type, so you are not coupled to that crate's version.

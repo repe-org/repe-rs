@@ -59,6 +59,8 @@ impl Display for ErrorCode {
             ErrorCode::ParseError => "Parse error",
             ErrorCode::MethodNotFound => "Method not found",
             ErrorCode::Timeout => "Timeout",
+            ErrorCode::ResourceExhausted => "Resource exhausted",
+            ErrorCode::InternalError => "Internal error",
             ErrorCode::ApplicationErrorBase => "Application error",
         };
         f.write_str(s)
@@ -118,6 +120,18 @@ mod tests {
 
         for (err, expected) in cases {
             assert_eq!(err.to_error_code(), expected);
+        }
+    }
+
+    #[test]
+    fn new_error_codes_round_trip_on_the_wire() {
+        // Clients decode `header.ec` via `ErrorCode::try_from`; the new
+        // codes must survive that round-trip or they would degrade to
+        // `ParseError` on the receiving end.
+        assert_eq!(u32::from(ErrorCode::ResourceExhausted), 8);
+        assert_eq!(u32::from(ErrorCode::InternalError), 9);
+        for code in [ErrorCode::ResourceExhausted, ErrorCode::InternalError] {
+            assert_eq!(ErrorCode::try_from(u32::from(code)).unwrap(), code);
         }
     }
 }

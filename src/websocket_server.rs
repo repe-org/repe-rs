@@ -3,7 +3,8 @@ use crate::constants::{ErrorCode, QueryFormat};
 use crate::error::RepeError;
 use crate::message::{Message, create_error_response_like};
 use crate::peer::{
-    CallContext, NotifyBody, PeerHandle, PeerId, PeerRegistry, PeerSendError, PeerSink,
+    CallContext, CancelSignal, NotifyBody, PeerHandle, PeerId, PeerRegistry, PeerSendError,
+    PeerSink,
 };
 use crate::server::{Execution, HandlerErased, Router};
 use crate::server_request::{Resolution, dispatch, resolve};
@@ -11,21 +12,26 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use std::future::Future;
 use std::io::ErrorKind;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Semaphore, oneshot};
-use tokio::time::Duration;
+use tokio::task::JoinSet;
+use tokio::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::handshake::server::{
     Callback, ErrorResponse, Request, Response,
 };
 use tokio_tungstenite::tungstenite::{self, Message as WsMessage, http::StatusCode};
 use tokio_tungstenite::{WebSocketStream, accept_hdr_async};
+use tokio_util::sync::CancellationToken;
 
 type ConnectHook = Arc<dyn Fn(PeerHandle) + Send + Sync>;
 type DisconnectHook = Arc<dyn Fn(PeerId) + Send + Sync>;
+type ErrorHook = Arc<dyn Fn(&ConnectionError) + Send + Sync>;
 
 /// Default per-connection outbound channel capacity.
 ///
@@ -49,6 +55,220 @@ pub const DEFAULT_OFFREADER_LIMIT: usize = 16;
 /// connection task open past this deadline.
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// A transport-level event reported to a [`WebSocketServer::on_error`]
+/// callback.
+///
+/// These are the failures the server would otherwise print to stderr
+/// (handshake / connection I/O / a caught handler panic) plus the
+/// off-reader saturation rejection, surfaced as a typed value so an
+/// embedder can route them into its own `log` / `tracing` pipeline,
+/// filter by category, or branch on the wire [`ErrorCode`] that reached
+/// the client. With no callback registered the server falls back to its
+/// historical `eprintln!` behavior for the three logged categories and
+/// stays silent for [`Saturation`](ConnectionError::Saturation), which
+/// only ever produced a wire response.
+///
+/// The category split mirrors the wire-code split: a caught panic is an
+/// [`ErrorCode::InternalError`] and a saturation rejection is an
+/// [`ErrorCode::ResourceExhausted`] (see [`error_code`]). Handshake and
+/// connection I/O failures tore the connection down before or after any
+/// REPE response, so they carry no wire code.
+///
+/// [`error_code`]: ConnectionError::error_code
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum ConnectionError {
+    /// The WebSocket upgrade handshake failed (bad path, malformed
+    /// upgrade, I/O error during the upgrade). No connection was
+    /// established.
+    Handshake(RepeError),
+    /// An established connection ended on a transport or protocol error
+    /// (the peer vanished, a non-binary frame arrived, the socket
+    /// errored). This is the value [`SharedWebSocketServer::serve_connection`]
+    /// also returns to a co-hosting embedder.
+    Connection(RepeError),
+    /// An off-reader handler panicked. The panic was caught and mapped to
+    /// an [`ErrorCode::InternalError`] response (for a request) or
+    /// swallowed (for a notify); the connection was deliberately kept
+    /// alive because it is shared with other concurrent transfers.
+    HandlerPanic {
+        /// The query path of the handler that panicked.
+        method: String,
+    },
+    /// An off-reader request was rejected because the connection's
+    /// [`with_offreader_limit`](WebSocketServer::with_offreader_limit)
+    /// cap was reached. The client received an
+    /// [`ErrorCode::ResourceExhausted`] response and should retry.
+    Saturation {
+        /// The query path of the rejected request.
+        method: String,
+    },
+}
+
+impl ConnectionError {
+    /// The REPE error code that reached (or would reach) the client for
+    /// this event, if any. A caught panic surfaces as
+    /// [`ErrorCode::InternalError`] and a saturation rejection as
+    /// [`ErrorCode::ResourceExhausted`]; handshake and connection I/O
+    /// failures carry no wire code because no REPE response was sent.
+    pub fn error_code(&self) -> Option<ErrorCode> {
+        match self {
+            ConnectionError::HandlerPanic { .. } => Some(ErrorCode::InternalError),
+            ConnectionError::Saturation { .. } => Some(ErrorCode::ResourceExhausted),
+            ConnectionError::Handshake(_) | ConnectionError::Connection(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ConnectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectionError::Handshake(err) => write!(f, "websocket handshake error: {err}"),
+            ConnectionError::Connection(err) => write!(f, "websocket connection error: {err}"),
+            ConnectionError::HandlerPanic { method } => {
+                write!(
+                    f,
+                    "off-reader handler panicked for {method}; connection kept alive"
+                )
+            }
+            ConnectionError::Saturation { method } => {
+                write!(f, "off-reader dispatch limit reached for {method}; retry")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ConnectionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ConnectionError::Handshake(err) | ConnectionError::Connection(err) => Some(err),
+            ConnectionError::HandlerPanic { .. } | ConnectionError::Saturation { .. } => None,
+        }
+    }
+}
+
+/// An opaque, cloneable shutdown trigger for connections served under a
+/// [`SharedWebSocketServer`].
+///
+/// A one-port co-hosting embedder owns its own accept loop, so it cannot
+/// hand its listener to
+/// [`serve_listener_with_graceful_drain`](WebSocketServer::serve_listener_with_graceful_drain).
+/// Instead it creates one `ShutdownToken`, serves each connection with
+/// [`serve_connection_with_cancel`](SharedWebSocketServer::serve_connection_with_cancel),
+/// and calls [`cancel`](Self::cancel) on shutdown. Every off-reader
+/// handler then observes the wind-down through
+/// [`CallContext::is_cancelled`](crate::CallContext::is_cancelled) /
+/// [`CallContext::cancelled`](crate::CallContext::cancelled), while the
+/// embedder drains its own task set.
+///
+/// The backing `tokio_util` cancellation type is deliberately hidden so
+/// the embedder is not coupled to that crate's version; the turnkey
+/// [`serve_listener_with_graceful_drain`](WebSocketServer::serve_listener_with_graceful_drain)
+/// uses the same machinery internally.
+#[derive(Clone, Default)]
+pub struct ShutdownToken {
+    inner: CancellationToken,
+}
+
+impl ShutdownToken {
+    /// Create a fresh, un-cancelled trigger.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Signal every connection served under this token to wind down.
+    /// Idempotent: cancelling again is a no-op.
+    pub fn cancel(&self) {
+        self.inner.cancel();
+    }
+
+    /// Whether [`cancel`](Self::cancel) has fired.
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+
+    /// Resolves once [`cancel`](Self::cancel) fires, so an embedder can
+    /// `select!` on the same shutdown signal it hands to the server.
+    pub async fn cancelled(&self) {
+        self.inner.cancelled().await;
+    }
+
+    /// Mint a per-connection child token. Cancelling this token cancels
+    /// every child; a child can also be cancelled on its own (on
+    /// disconnect) without affecting the parent or siblings.
+    fn child_token(&self) -> CancellationToken {
+        self.inner.child_token()
+    }
+}
+
+impl std::fmt::Debug for ShutdownToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShutdownToken")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+
+/// [`CancelSignal`] backed by a `tokio_util` [`CancellationToken`]. One
+/// per off-reader dispatch (and one shared by the connection's inline
+/// dispatch); cheap to build since it just wraps a token clone.
+struct TokenSignal(CancellationToken);
+
+impl CancelSignal for TokenSignal {
+    fn is_cancelled(&self) -> bool {
+        self.0.is_cancelled()
+    }
+
+    fn cancelled(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(self.0.cancelled())
+    }
+}
+
+/// Awaits a spawned task, aborting it if this future is itself dropped
+/// before it completes.
+///
+/// The connection handler wraps its writer task in this so that when a
+/// server-level graceful drain aborts the connection task at its
+/// deadline, the separately-spawned writer task is torn down with it
+/// rather than left draining for up to `SHUTDOWN_DRAIN_TIMEOUT` longer.
+/// On normal completion the abort fires on an already-finished handle,
+/// which is a no-op.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl<T> Future for AbortOnDrop<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.get_mut().0).poll(cx)
+    }
+}
+
+/// Route a transport-level event to the registered [`on_error`] hooks, or
+/// fall back to the server's historical stderr behavior when none are
+/// registered.
+///
+/// [`on_error`]: WebSocketServer::on_error
+fn report_error(hooks: &[ErrorHook], err: ConnectionError) {
+    if !hooks.is_empty() {
+        for hook in hooks {
+            hook(&err);
+        }
+        return;
+    }
+    // No hooks: preserve the historical stderr behavior for the
+    // categories that logged before, and stay silent for saturation
+    // (which never logged -- it only produced a wire error response).
+    match &err {
+        ConnectionError::Saturation { .. } => {}
+        logged => eprintln!("[repe] {logged}"),
+    }
+}
+
 pub struct WebSocketServer {
     router: Router,
     outbound_capacity: usize,
@@ -56,6 +276,7 @@ pub struct WebSocketServer {
     peer_id_counter: Arc<AtomicU64>,
     on_connect: Vec<ConnectHook>,
     on_disconnect: Vec<DisconnectHook>,
+    on_error: Vec<ErrorHook>,
 }
 
 impl WebSocketServer {
@@ -67,6 +288,7 @@ impl WebSocketServer {
             peer_id_counter: Arc::new(AtomicU64::new(0)),
             on_connect: Vec::new(),
             on_disconnect: Vec::new(),
+            on_error: Vec::new(),
         }
     }
 
@@ -159,6 +381,32 @@ impl WebSocketServer {
         self
     }
 
+    /// Run `f` for each transport-level [`ConnectionError`]: a handshake
+    /// or connection I/O failure (in the built-in accept loops), a caught
+    /// off-reader handler panic, or an off-reader saturation rejection.
+    /// Lets an embedder route these into its own `log` / `tracing`
+    /// pipeline instead of the default raw `eprintln!`.
+    ///
+    /// Composes like [`on_peer_connect`](Self::on_peer_connect) /
+    /// [`on_peer_disconnect`](Self::on_peer_disconnect): every registered
+    /// callback fires in registration order. Registering at least one
+    /// callback suppresses the default stderr logging entirely — the
+    /// callbacks become the sole sink, so a callback that wants the old
+    /// behavior should print it. With no callback registered the server
+    /// keeps its historical stderr behavior (and stays silent on
+    /// saturation, which never logged).
+    ///
+    /// The callback runs synchronously on the task that detected the
+    /// error (an accept task, a connection's reader, or an off-reader
+    /// blocking thread) and must not block.
+    pub fn on_error<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&ConnectionError) + Send + Sync + 'static,
+    {
+        self.on_error.push(Arc::new(f));
+        self
+    }
+
     pub async fn serve<A: ToSocketAddrs>(self, addr: A, path: &str) -> std::io::Result<()> {
         let listener = Self::listen(addr).await?;
         self.serve_listener(listener, path).await
@@ -228,16 +476,130 @@ impl WebSocketServer {
                         match WebSocketServer::accept(stream, &path).await {
                             Ok(ws_stream) => {
                                 if let Err(err) = shared.serve_connection(ws_stream).await {
-                                    eprintln!("[repe] websocket connection error: {err}");
+                                    shared.report_error(ConnectionError::Connection(err));
                                 }
                             }
                             Err(err) => {
-                                eprintln!("[repe] websocket handshake error: {err}");
+                                shared.report_error(ConnectionError::Handshake(err));
                             }
                         }
                     });
                 }
                 _ = &mut shutdown => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// Bind `addr` and serve REPE WebSocket connections until `shutdown`
+    /// resolves, then stop accepting, signal in-flight off-reader
+    /// handlers to cancel, and await already-accepted connections for up
+    /// to `drain_timeout` before aborting whatever remains.
+    ///
+    /// The draining counterpart to
+    /// [`serve_with_shutdown`](Self::serve_with_shutdown): where that one
+    /// returns the instant the accept loop stops (connections detached),
+    /// this one tracks every connection it spawns in a `JoinSet` and
+    /// gives in-flight work a bounded window to finish. See
+    /// [`serve_listener_with_graceful_drain`](Self::serve_listener_with_graceful_drain)
+    /// for the full semantics.
+    pub async fn serve_with_graceful_drain<A: ToSocketAddrs>(
+        self,
+        addr: A,
+        path: &str,
+        shutdown: impl Future<Output = ()>,
+        drain_timeout: Duration,
+    ) -> std::io::Result<()> {
+        let listener = Self::listen(addr).await?;
+        self.serve_listener_with_graceful_drain(listener, path, shutdown, drain_timeout)
+            .await
+    }
+
+    /// Like [`serve_with_graceful_drain`](Self::serve_with_graceful_drain)
+    /// but takes an already-bound [`TcpListener`].
+    ///
+    /// When `shutdown` resolves the loop stops accepting and:
+    ///
+    /// 1. signals every accepted connection to cancel — each off-reader
+    ///    handler observes this through
+    ///    [`CallContext::is_cancelled`](crate::CallContext::is_cancelled)
+    ///    / [`CallContext::cancelled`](crate::CallContext::cancelled), and
+    ///    each connection's reader stops accepting new requests;
+    /// 2. awaits the connection tasks until `drain_timeout` elapses;
+    /// 3. aborts any still-running connection tasks (which tears down
+    ///    their writer tasks too, so this server-level deadline
+    ///    supersedes the per-connection `SHUTDOWN_DRAIN_TIMEOUT` writer
+    ///    drain).
+    ///
+    /// This is the turnkey audience's entry point: it owns the accept
+    /// loop and the `JoinSet`. A one-port co-hosting embedder that owns
+    /// its own accept loop instead pairs
+    /// [`serve_connection_with_cancel`](SharedWebSocketServer::serve_connection_with_cancel)
+    /// with its own [`ShutdownToken`] and `JoinSet`.
+    ///
+    /// A misbehaving off-reader handler that never polls its cancellation
+    /// signal still holds its blocking-pool thread past `drain_timeout`
+    /// (a blocking thread cannot be aborted); the abort tears down the
+    /// connection's reader/writer, not such a handler. Pairing the drain
+    /// with handlers that poll `is_cancelled()` is what makes the
+    /// timeout a backstop rather than the common wait.
+    pub async fn serve_listener_with_graceful_drain(
+        self,
+        listener: TcpListener,
+        path: &str,
+        shutdown: impl Future<Output = ()>,
+        drain_timeout: Duration,
+    ) -> std::io::Result<()> {
+        let path = path.to_string();
+        let shared = self.into_shared();
+        // Parent of every connection's cancellation token. Cancelled once
+        // on shutdown to wake all in-flight handlers at once.
+        let parent = ShutdownToken::new();
+        let mut conns: JoinSet<()> = JoinSet::new();
+
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, _addr) = accepted?;
+                    let path = path.clone();
+                    let shared = shared.clone();
+                    let parent = parent.clone();
+                    conns.spawn(async move {
+                        match WebSocketServer::accept(stream, &path).await {
+                            Ok(ws_stream) => {
+                                if let Err(err) =
+                                    shared.serve_connection_with_cancel(ws_stream, &parent).await
+                                {
+                                    shared.report_error(ConnectionError::Connection(err));
+                                }
+                            }
+                            Err(err) => {
+                                shared.report_error(ConnectionError::Handshake(err));
+                            }
+                        }
+                    });
+                    // Reap finished connections so the JoinSet tracks only
+                    // live ones rather than growing with every accept.
+                    while conns.try_join_next().is_some() {}
+                }
+                _ = &mut shutdown => break,
+            }
+        }
+
+        // Shutdown: wake in-flight handlers, then drain with a deadline.
+        parent.cancel();
+        let deadline = Instant::now() + drain_timeout;
+        loop {
+            match tokio::time::timeout_at(deadline, conns.join_next()).await {
+                Ok(Some(_)) => {}  // a connection drained
+                Ok(None) => break, // all connections drained
+                Err(_) => {
+                    // Deadline hit: abort the stragglers and await the
+                    // aborts (prompt, since they unwind at await points).
+                    conns.shutdown().await;
+                    break;
+                }
             }
         }
         Ok(())
@@ -264,6 +626,7 @@ impl WebSocketServer {
                 peer_id_counter: self.peer_id_counter,
                 on_connect: Arc::new(self.on_connect),
                 on_disconnect: Arc::new(self.on_disconnect),
+                on_error: Arc::new(self.on_error),
             }),
         }
     }
@@ -292,6 +655,7 @@ struct ConnectionConfig {
     peer_id_counter: Arc<AtomicU64>,
     on_connect: Arc<Vec<ConnectHook>>,
     on_disconnect: Arc<Vec<DisconnectHook>>,
+    on_error: Arc<Vec<ErrorHook>>,
 }
 
 /// Cheap, cloneable handle to a [`WebSocketServer`]'s per-connection
@@ -318,8 +682,45 @@ impl SharedWebSocketServer {
     /// Connect/disconnect hooks (and any [`PeerRegistry`] attached via
     /// [`WebSocketServer::with_peer_registry`]) fire for connections
     /// served this way, exactly as under [`WebSocketServer::serve`].
+    ///
+    /// The connection's off-reader handlers see their cancellation signal
+    /// ([`CallContext::is_cancelled`](crate::CallContext::is_cancelled) /
+    /// [`CallContext::cancelled`](crate::CallContext::cancelled)) fire on
+    /// disconnect. To also fire it on an embedder-driven shutdown, use
+    /// [`serve_connection_with_cancel`](Self::serve_connection_with_cancel).
     pub async fn serve_connection(&self, ws: WebSocketStream<TcpStream>) -> Result<(), RepeError> {
-        handle_connection_with_config(ws, Arc::clone(&self.config)).await
+        // No parent: the connection token is cancelled only when this
+        // connection's reader exits (disconnect).
+        handle_connection_with_config(ws, Arc::clone(&self.config), CancellationToken::new()).await
+    }
+
+    /// Like [`serve_connection`](Self::serve_connection), but ties this
+    /// connection's cancellation signal to a shared [`ShutdownToken`] as
+    /// well as to disconnect.
+    ///
+    /// For a one-port co-hosting embedder that owns its accept loop:
+    /// create one [`ShutdownToken`], serve each connection through this
+    /// method, and call [`ShutdownToken::cancel`] on shutdown to wake
+    /// every connection's in-flight off-reader handlers at once while you
+    /// drain your own task set. The connection's token is a child of the
+    /// shared one, so cancelling the shared token cancels every
+    /// connection, and a single connection's disconnect cancels only its
+    /// own child.
+    pub async fn serve_connection_with_cancel(
+        &self,
+        ws: WebSocketStream<TcpStream>,
+        shutdown: &ShutdownToken,
+    ) -> Result<(), RepeError> {
+        handle_connection_with_config(ws, Arc::clone(&self.config), shutdown.child_token()).await
+    }
+
+    /// Report a transport-level error through this server's
+    /// [`on_error`](WebSocketServer::on_error) hooks (or the default
+    /// stderr fallback). Used by the built-in accept loops; a co-hosting
+    /// embedder that owns its loop reports the [`RepeError`] returned by
+    /// [`serve_connection`](Self::serve_connection) however it likes.
+    pub(crate) fn report_error(&self, err: ConnectionError) {
+        report_error(&self.config.on_error, err);
     }
 }
 
@@ -374,6 +775,7 @@ async fn accept_repe_websocket(
 async fn handle_connection_with_config(
     ws_stream: WebSocketStream<TcpStream>,
     config: Arc<ConnectionConfig>,
+    conn_token: CancellationToken,
 ) -> Result<(), RepeError> {
     let (outbound_tx, outbound_rx) = mpsc::channel::<Message>(config.outbound_capacity);
 
@@ -402,12 +804,22 @@ async fn handle_connection_with_config(
     let (ws_writer, ws_reader) = ws_stream.split();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-    let writer_handle = tokio::spawn(writer_task(ws_writer, outbound_rx, shutdown_rx));
+    // Abort the writer if this connection task is itself dropped (a
+    // server-level graceful drain aborting at its deadline) so the writer
+    // cannot outlive the connection's teardown.
+    let writer_guard = AbortOnDrop(tokio::spawn(writer_task(
+        ws_writer,
+        outbound_rx,
+        shutdown_rx,
+    )));
 
     let reader_result = {
         let _guard = DisconnectGuard {
             peer_id,
             hooks: Arc::clone(&config.on_disconnect),
+            // Cancel on reader exit so off-reader handlers still running
+            // on blocking threads observe the disconnect promptly.
+            cancel: conn_token.clone(),
         };
 
         // Fire connect hooks *before* the reader/writer tasks process
@@ -417,22 +829,39 @@ async fn handle_connection_with_config(
             hook(peer.clone());
         }
 
-        // Keep `peer` in the reader scope; it is threaded into each
-        // request's `CallContext` so handlers can push notifies back
-        // to the originator (via `Router::with_json_ctx` /
-        // `with_typed_ctx` or a registry-backed `RegistryCallable`).
-        reader_task(ws_reader, &config.router, outbound_tx, peer, offreader_sem).await
+        // Bundle the per-connection dispatch state for the reader. `peer`
+        // is threaded into each request's `CallContext` so handlers can
+        // push notifies back to the originator (via `Router::with_json_ctx`
+        // / `with_typed_ctx` or a registry-backed `RegistryCallable`), and
+        // `conn_token` becomes each handler's cancellation signal.
+        let conn = ConnDispatch {
+            peer,
+            outbound_tx,
+            conn_token: conn_token.clone(),
+            on_error: Arc::clone(&config.on_error),
+        };
+
+        // Stop reading promptly when the connection token is cancelled by
+        // a parent (embedder-driven shutdown). On the normal path the
+        // reader returns on its own and this arm never fires; for a
+        // parentless connection the token is only cancelled by the guard
+        // on the way out, after the reader has already returned, so the
+        // arm stays dormant.
+        tokio::select! {
+            r = reader_task(ws_reader, &config.router, conn, offreader_sem) => r,
+            _ = conn_token.cancelled() => Ok(()),
+        }
         // _guard drops here (on every exit path, including unwind),
-        // firing disconnect hooks. Any registry entry holding a
-        // PeerHandle clone (and thus a sender clone) is released,
-        // helping the writer task drain.
+        // firing disconnect hooks and cancelling the connection token.
+        // Any registry entry holding a PeerHandle clone (and thus a
+        // sender clone) is released, helping the writer task drain.
     };
 
     // Tell the writer to drain any queued messages and exit, regardless
     // of whether sender clones still linger in user-held PeerHandles.
     let _ = shutdown_tx.send(());
 
-    let writer_result = match writer_handle.await {
+    let writer_result = match writer_guard.await {
         Ok(r) => r,
         Err(join_err) => Err(RepeError::Io(std::io::Error::other(format!(
             "websocket writer task panicked: {join_err}"
@@ -442,13 +871,26 @@ async fn handle_connection_with_config(
     reader_result.and(writer_result)
 }
 
+/// Per-connection dispatch state shared by every request on a
+/// connection: the calling peer, where to push results, the connection's
+/// cancellation token, and the error sink. Bundled so the inline and
+/// off-reader paths thread one value rather than four parallel arguments.
+struct ConnDispatch {
+    peer: PeerHandle,
+    outbound_tx: mpsc::Sender<Message>,
+    conn_token: CancellationToken,
+    on_error: Arc<Vec<ErrorHook>>,
+}
+
 async fn reader_task(
     mut ws_reader: SplitStream<WebSocketStream<TcpStream>>,
     router: &Router,
-    outbound_tx: mpsc::Sender<Message>,
-    peer: PeerHandle,
+    conn: ConnDispatch,
     offreader_sem: Option<Arc<Semaphore>>,
 ) -> Result<(), RepeError> {
+    // One signal shared by every inline dispatch on this connection; the
+    // off-reader path builds its own owned clone per spawned handler.
+    let inline_signal = TokenSignal(conn.conn_token.clone());
     loop {
         let frame = match ws_reader.next().await {
             Some(Ok(frame)) => frame,
@@ -469,21 +911,22 @@ async fn reader_task(
         match resolve(router, &request) {
             Resolution::Respond(maybe_response) => {
                 if let Some(response) = maybe_response {
-                    if outbound_tx.send(response).await.is_err() {
+                    if conn.outbound_tx.send(response).await.is_err() {
                         break;
                     }
                 }
             }
             Resolution::Dispatch { handler, notify } => match handler.execution() {
                 Execution::Inline => {
-                    // Thread the calling peer to handlers so
-                    // `with_json_ctx` / `with_typed_ctx` (and
-                    // registry-backed callables) can push notifies back
-                    // through this connection during request handling.
+                    // Thread the calling peer and the connection's
+                    // cancellation signal to handlers so `with_json_ctx` /
+                    // `with_typed_ctx` (and registry-backed callables) can
+                    // push notifies back through this connection during
+                    // request handling and observe disconnect/shutdown.
                     let path = request.query_str().unwrap_or("");
-                    let ctx = CallContext::new(path, &peer);
+                    let ctx = CallContext::with_cancel(path, &conn.peer, &inline_signal);
                     if let Some(response) = dispatch(handler.as_ref(), &request, &ctx, notify) {
-                        if outbound_tx.send(response).await.is_err() {
+                        if conn.outbound_tx.send(response).await.is_err() {
                             // Writer task exited (likely wire error);
                             // abandon reader. The disconnect guard still
                             // fires when we return.
@@ -492,25 +935,16 @@ async fn reader_task(
                     }
                 }
                 Execution::OffReader => {
-                    if !spawn_off_reader(
-                        &offreader_sem,
-                        handler,
-                        request,
-                        notify,
-                        &peer,
-                        &outbound_tx,
-                    )
-                    .await
-                    {
+                    if !spawn_off_reader(&offreader_sem, &conn, handler, request, notify).await {
                         break;
                     }
                 }
             },
         }
     }
-    // `peer` drops here, releasing this connection's sender clone of
-    // the outbound channel and helping the writer drain.
-    drop(peer);
+    // `conn` drops here, releasing this connection's peer and sender
+    // clone of the outbound channel and helping the writer drain.
+    drop(conn);
     Ok(())
 }
 
@@ -530,40 +964,47 @@ async fn reader_task(
 /// stop reading), `true` otherwise.
 async fn spawn_off_reader(
     offreader_sem: &Option<Arc<Semaphore>>,
+    conn: &ConnDispatch,
     handler: Arc<dyn HandlerErased>,
     request: Message,
     notify: bool,
-    peer: &PeerHandle,
-    outbound_tx: &mpsc::Sender<Message>,
 ) -> bool {
     let permit = match offreader_sem {
         Some(sem) => match Arc::clone(sem).try_acquire_owned() {
             Ok(permit) => Some(permit),
             Err(_) => {
+                let method = request.query_str().unwrap_or("").to_string();
+                report_error(&conn.on_error, ConnectionError::Saturation { method });
                 if notify {
                     // No response to reject a notify with; drop it.
                     return true;
                 }
                 let response = create_error_response_like(
                     &request,
-                    ErrorCode::ApplicationErrorBase,
+                    ErrorCode::ResourceExhausted,
                     "off-reader dispatch limit reached; retry",
                 );
-                return outbound_tx.send(response).await.is_ok();
+                return conn.outbound_tx.send(response).await.is_ok();
             }
         },
         None => None,
     };
 
-    let peer = peer.clone();
-    let outbound_tx = outbound_tx.clone();
+    let peer = conn.peer.clone();
+    let outbound_tx = conn.outbound_tx.clone();
+    // Owned clone of the connection token so the off-reader handler's
+    // `CallContext` can borrow a signal from its own blocking-thread
+    // stack rather than the reader task's.
+    let cancel_token = conn.conn_token.clone();
+    let on_error = Arc::clone(&conn.on_error);
     tokio::task::spawn_blocking(move || {
         // Hold the permit for the whole handler run; dropped on return
         // (including the panic path), which is what lets the idle
         // watchdog reclaim a wedged slot once it cancels the transfer.
         let _permit = permit;
         let path = request.query_str().unwrap_or("");
-        let ctx = CallContext::new(path, &peer);
+        let cancel_signal = TokenSignal(cancel_token);
+        let ctx = CallContext::with_cancel(path, &peer, &cancel_signal);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             dispatch(handler.as_ref(), &request, &ctx, notify)
         }));
@@ -571,16 +1012,21 @@ async fn spawn_off_reader(
             Ok(maybe_response) => maybe_response,
             Err(_) => {
                 // The default panic hook has already printed the panic;
-                // add a repe-level line so the failure is attributable
+                // report a repe-level event so the failure is attributable
                 // here too -- especially for a notify, which has no
                 // response to carry the error back to the client. The
                 // connection is deliberately kept alive (it is shared
                 // with other concurrent off-reader transfers).
-                eprintln!("[repe] off-reader handler panicked for {path}; connection kept alive");
+                report_error(
+                    &on_error,
+                    ConnectionError::HandlerPanic {
+                        method: path.to_string(),
+                    },
+                );
                 (!notify).then(|| {
                     create_error_response_like(
                         &request,
-                        ErrorCode::ApplicationErrorBase,
+                        ErrorCode::InternalError,
                         "handler panicked",
                     )
                 })
@@ -679,10 +1125,16 @@ impl PeerSink for WsPeerSink {
 struct DisconnectGuard {
     peer_id: PeerId,
     hooks: Arc<Vec<DisconnectHook>>,
+    cancel: CancellationToken,
 }
 
 impl Drop for DisconnectGuard {
     fn drop(&mut self) {
+        // Cancel before firing hooks so an off-reader handler polling
+        // `ctx.is_cancelled()` observes the disconnect as early as
+        // possible. This is a no-op when the token was already cancelled
+        // by a parent (shutdown).
+        self.cancel.cancel();
         for hook in self.hooks.iter() {
             hook(self.peer_id);
         }
@@ -775,8 +1227,9 @@ mod tests {
             peer_id_counter: Arc::new(AtomicU64::new(0)),
             on_connect: Arc::new(Vec::new()),
             on_disconnect: Arc::new(Vec::new()),
+            on_error: Arc::new(Vec::new()),
         });
-        handle_connection_with_config(ws_stream, config).await
+        handle_connection_with_config(ws_stream, config, CancellationToken::new()).await
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1648,7 +2101,7 @@ mod tests {
         .unwrap_err();
         match err {
             RepeError::ServerError { code, .. } => {
-                assert_eq!(code, ErrorCode::ApplicationErrorBase)
+                assert_eq!(code, ErrorCode::InternalError)
             }
             other => panic!("expected ServerError, got {other:?}"),
         }
@@ -1702,7 +2155,7 @@ mod tests {
         .unwrap_err();
         match rejected {
             RepeError::ServerError { code, .. } => {
-                assert_eq!(code, ErrorCode::ApplicationErrorBase)
+                assert_eq!(code, ErrorCode::ResourceExhausted)
             }
             other => panic!("expected saturation ServerError, got {other:?}"),
         }
@@ -1845,5 +2298,457 @@ mod tests {
 
         drop(client);
         server_task.abort();
+    }
+
+    // ---- Request 1: cancellation signal on CallContext -------------
+
+    fn dummy_peer() -> PeerHandle {
+        struct Dummy;
+        impl PeerSink for Dummy {
+            fn send_notify(&self, _: &str, _: NotifyBody) -> Result<(), PeerSendError> {
+                Ok(())
+            }
+        }
+        PeerHandle::new(PeerId(99), Arc::new(Dummy))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn call_context_cancelled_future_resolves_when_token_cancels() {
+        // Drive CallContext::cancelled() against a real token-backed
+        // signal: before cancel it must not resolve; after cancel it
+        // resolves and is_cancelled() flips.
+        let token = CancellationToken::new();
+        let signal = TokenSignal(token.clone());
+        let peer = dummy_peer();
+        let ctx = CallContext::with_cancel("/m", &peer, &signal);
+
+        assert!(!ctx.is_cancelled());
+        let early = tokio::time::timeout(Duration::from_millis(50), ctx.cancelled()).await;
+        assert!(early.is_err(), "cancelled() resolved before cancel");
+
+        token.cancel();
+        assert!(ctx.is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), ctx.cancelled())
+            .await
+            .expect("cancelled() did not resolve after token cancel");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn detached_context_cancelled_never_resolves() {
+        // The peer-less, signal-less context degrades to a
+        // never-cancelling no-op so a select! arm built on it stays
+        // dormant rather than firing spuriously.
+        let ctx = CallContext::detached("/m");
+        assert!(!ctx.is_cancelled());
+        let r = tokio::time::timeout(Duration::from_millis(50), ctx.cancelled()).await;
+        assert!(r.is_err(), "detached cancelled() must never resolve");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn off_reader_handler_observes_cancellation_on_disconnect() {
+        use std::sync::atomic::AtomicBool;
+        // A sync off-reader handler polls ctx.is_cancelled() at loop
+        // boundaries (the documented pattern). When the client
+        // disconnects, the DisconnectGuard cancels the connection token
+        // and the handler observes it and winds down.
+        let observed = Arc::new(AtomicBool::new(false));
+        let observed_h = Arc::clone(&observed);
+
+        let router = Router::new().with_json_ctx_blocking("/run", move |ctx, _params| {
+            loop {
+                if ctx.is_cancelled() {
+                    observed_h.store(true, Ordering::SeqCst);
+                    return Ok(json!({ "cancelled": true }));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = WebSocketServer::new(router);
+        let server_task = serve_one(listener, "/repe", server).await;
+
+        let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
+            .await
+            .unwrap();
+        // Fire the long off-reader handler as a notify so there is no
+        // held response future (and thus no client clone) keeping the
+        // connection open: dropping the sole client handle truly closes
+        // it, which is what triggers the disconnect we want to observe.
+        client.notify_json("/run", &json!({})).await.unwrap();
+
+        // Let the handler reach its poll loop, then disconnect.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(client);
+
+        let mut seen = false;
+        for _ in 0..200 {
+            if observed.load(Ordering::SeqCst) {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            seen,
+            "off-reader handler did not observe cancellation on disconnect"
+        );
+        server_task.abort();
+    }
+
+    // ---- Request 2: graceful connection drain on shutdown ----------
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn graceful_drain_cancels_inflight_and_returns() {
+        use std::sync::atomic::AtomicBool;
+        // serve_listener_with_graceful_drain: on shutdown the drain
+        // cancels in-flight off-reader handlers (so a cooperative handler
+        // winds down) and returns Ok within the deadline. The client
+        // stays connected, so cancellation comes purely from the drain.
+        let observed = Arc::new(AtomicBool::new(false));
+        let observed_h = Arc::clone(&observed);
+
+        let router = Router::new().with_json_ctx_blocking("/run", move |ctx, _params| {
+            loop {
+                if ctx.is_cancelled() {
+                    observed_h.store(true, Ordering::SeqCst);
+                    return Ok(json!({ "done": true }));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server = WebSocketServer::new(router);
+        let serve = tokio::spawn(async move {
+            server
+                .serve_listener_with_graceful_drain(
+                    listener,
+                    "/repe",
+                    async {
+                        let _ = shutdown_rx.await;
+                    },
+                    Duration::from_secs(5),
+                )
+                .await
+        });
+
+        let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
+            .await
+            .unwrap();
+        // Fire the handler as a notify so it runs off-reader without a
+        // held response future.
+        client.notify_json("/run", &json!({})).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        shutdown_tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .expect("serve did not return after graceful drain")
+            .expect("serve task panicked");
+        assert!(result.is_ok(), "serve returned error: {result:?}");
+        // The handler observes the drain's cancel within its poll
+        // interval, which can land just after the connection task (and
+        // thus serve) has already returned -- so poll for it.
+        let mut seen = false;
+        for _ in 0..200 {
+            if observed.load(Ordering::SeqCst) {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(seen, "handler did not observe drain cancellation");
+
+        drop(client);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn graceful_drain_aborts_uncooperative_handler_after_timeout() {
+        // A handler that never checks cancellation blocks until the test
+        // releases it. The drain must abort the connection at its
+        // deadline rather than wait for the handler, so serve returns
+        // promptly despite the stuck blocking thread.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+
+        let router = Router::new().with_json_blocking("/stuck", move |_| {
+            let _ = release_rx.lock().unwrap().recv();
+            Ok(json!({ "done": true }))
+        });
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server = WebSocketServer::new(router);
+        let serve = tokio::spawn(async move {
+            server
+                .serve_listener_with_graceful_drain(
+                    listener,
+                    "/repe",
+                    async {
+                        let _ = shutdown_rx.await;
+                    },
+                    Duration::from_millis(300),
+                )
+                .await
+        });
+
+        let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
+            .await
+            .unwrap();
+        let runner = client.clone();
+        let _call = tokio::spawn(async move { runner.call_json("/stuck", &json!({})).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        shutdown_tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(3), serve)
+            .await
+            .expect("graceful drain hung on an uncooperative handler")
+            .expect("serve task panicked");
+        assert!(result.is_ok(), "serve returned error: {result:?}");
+
+        // Release the blocking handler so its thread exits cleanly.
+        let _ = release_tx.send(());
+        drop(client);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cohosting_serve_connection_with_cancel_wakes_handler() {
+        use std::sync::atomic::AtomicBool;
+        // The co-hosting shape: an embedder owns its accept loop and
+        // serves through serve_connection_with_cancel with a shared
+        // ShutdownToken. Cancelling the token wakes an in-flight
+        // off-reader handler even though the client stays connected.
+        let observed = Arc::new(AtomicBool::new(false));
+        let observed_h = Arc::clone(&observed);
+
+        let router = Router::new().with_json_ctx_blocking("/run", move |ctx, _params| {
+            loop {
+                if ctx.is_cancelled() {
+                    observed_h.store(true, Ordering::SeqCst);
+                    return Ok(json!({ "done": true }));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shared = WebSocketServer::new(router).into_shared();
+        let token = ShutdownToken::new();
+        let token_for_loop = token.clone();
+
+        let accept_task = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                if let Ok(ws) = WebSocketServer::accept(stream, "/repe").await {
+                    let _ = shared
+                        .serve_connection_with_cancel(ws, &token_for_loop)
+                        .await;
+                }
+            }
+        });
+
+        let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
+            .await
+            .unwrap();
+        client.notify_json("/run", &json!({})).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        token.cancel();
+
+        let mut seen = false;
+        for _ in 0..200 {
+            if observed.load(Ordering::SeqCst) {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(seen, "handler did not observe ShutdownToken cancellation");
+
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), accept_task).await;
+    }
+
+    // ---- Request 3: structured error hook --------------------------
+
+    #[test]
+    fn connection_error_maps_to_wire_code() {
+        assert_eq!(
+            ConnectionError::HandlerPanic {
+                method: "/x".into()
+            }
+            .error_code(),
+            Some(ErrorCode::InternalError)
+        );
+        assert_eq!(
+            ConnectionError::Saturation {
+                method: "/x".into()
+            }
+            .error_code(),
+            Some(ErrorCode::ResourceExhausted)
+        );
+        assert_eq!(
+            ConnectionError::Connection(RepeError::ReservedNonZero).error_code(),
+            None
+        );
+        assert_eq!(
+            ConnectionError::Handshake(RepeError::ReservedNonZero).error_code(),
+            None
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn on_error_hook_receives_handler_panic() {
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let events_h = Arc::clone(&events);
+
+        let router = Router::new()
+            .with_json_blocking(
+                "/boom",
+                |_| -> Result<serde_json::Value, (ErrorCode, String)> {
+                    panic!("kaboom");
+                },
+            )
+            .with_json("/ping", |_| Ok(json!({ "ok": true })));
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = WebSocketServer::new(router).on_error(move |err| {
+            if let ConnectionError::HandlerPanic { method } = err {
+                events_h.lock().unwrap().push(format!("panic:{method}"));
+            }
+        });
+        let server_task = serve_one(listener, "/repe", server).await;
+
+        let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
+            .await
+            .unwrap();
+        // The panic is caught and surfaces as an InternalError response.
+        let err = client.call_json("/boom", &json!({})).await.unwrap_err();
+        match err {
+            RepeError::ServerError { code, .. } => assert_eq!(code, ErrorCode::InternalError),
+            other => panic!("expected ServerError, got {other:?}"),
+        }
+        // Connection survives; round-trip to be sure the hook ran.
+        let _ = client.call_json("/ping", &json!({})).await.unwrap();
+
+        let mut seen = false;
+        for _ in 0..200 {
+            if events.lock().unwrap().iter().any(|e| e == "panic:/boom") {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(seen, "on_error did not receive HandlerPanic for /boom");
+        drop(client);
+        server_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn on_error_hook_receives_saturation() {
+        use std::sync::Condvar;
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let events_h = Arc::clone(&events);
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let gate_hold = Arc::clone(&gate);
+
+        let router = Router::new().with_json_blocking("/hold", move |_| {
+            let (lock, cv) = &*gate_hold;
+            let mut ready = lock.lock().unwrap();
+            while !*ready {
+                ready = cv.wait(ready).unwrap();
+            }
+            Ok(json!({ "released": true }))
+        });
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = WebSocketServer::new(router)
+            .with_offreader_limit(1)
+            .on_error(move |err| {
+                if let ConnectionError::Saturation { method } = err {
+                    events_h.lock().unwrap().push(format!("sat:{method}"));
+                }
+            });
+        let server_task = serve_one(listener, "/repe", server).await;
+
+        let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
+            .await
+            .unwrap();
+        let holder = client.clone();
+        let _first = tokio::spawn(async move { holder.call_json("/hold", &json!({})).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Second /hold saturates the cap-of-1 and is rejected.
+        let err = client.call_json("/hold", &json!({})).await.unwrap_err();
+        match err {
+            RepeError::ServerError { code, .. } => assert_eq!(code, ErrorCode::ResourceExhausted),
+            other => panic!("expected ServerError, got {other:?}"),
+        }
+
+        let mut seen = false;
+        for _ in 0..200 {
+            if events.lock().unwrap().iter().any(|e| e == "sat:/hold") {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(seen, "on_error did not receive Saturation for /hold");
+
+        // Release the first handler so its thread exits cleanly.
+        {
+            let (lock, cv) = &*gate;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        drop(client);
+        server_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn on_error_hook_receives_handshake_error() {
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let events_h = Arc::clone(&events);
+
+        let router = Router::new().with_json("/ping", |_| Ok(json!({ "ok": true })));
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server = WebSocketServer::new(router).on_error(move |err| {
+            if let ConnectionError::Handshake(_) = err {
+                events_h.lock().unwrap().push("handshake".into());
+            }
+        });
+        let serve = tokio::spawn(async move {
+            server
+                .serve_listener_with_shutdown(listener, "/repe", async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        // Connect to the wrong path: the server rejects the upgrade, so
+        // its accept loop reports a Handshake error through on_error.
+        let bad = WebSocketClient::connect(&format!("ws://{addr}/wrong")).await;
+        assert!(bad.is_err(), "connect to wrong path should fail");
+
+        let mut seen = false;
+        for _ in 0..200 {
+            if !events.lock().unwrap().is_empty() {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(seen, "on_error did not receive a Handshake error");
+
+        shutdown_tx.send(()).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), serve).await;
     }
 }

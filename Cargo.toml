@@ -23,7 +23,7 @@ include = [
 default = []
 parking-lot = ["dep:parking_lot"]
 fleet-udp = ["dep:uniudp"]
-websocket = ["dep:futures-util", "dep:tokio-tungstenite"]
+websocket = ["dep:futures-util", "dep:tokio-tungstenite", "dep:tokio-util"]
 websocket-wasm = [
     "dep:futures-channel",
     "dep:futures-util",
@@ -38,6 +38,10 @@ cli = ["websocket", "dep:clap", "dep:clap_complete"]
 name = "repe"
 path = "src/bin/repe.rs"
 required-features = ["cli"]
+
+[[example]]
+name = "websocket_graceful_server"
+required-features = ["websocket"]
 
 [dependencies]
 beve = "0.1"
@@ -55,6 +59,11 @@ clap_complete = { version = "4", optional = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "io-util", "sync"] }
 tokio-tungstenite = { version = "0.24", optional = true }
+# `CancellationToken` (in `tokio_util::sync`, gated behind the `rt`
+# feature) backs the off-reader handler cancellation signal threaded
+# onto `CallContext` and the server-level graceful drain. Pulled in
+# only with the `websocket` feature.
+tokio-util = { version = "0.7", optional = true, default-features = false, features = ["rt"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = { version = "0.3", optional = true }
