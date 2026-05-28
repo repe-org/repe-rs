@@ -476,7 +476,7 @@ fn decode_response(msg: &Message) -> Result<Option<DecodedBody>, CliError> {
             |e| CliError::Rpc(format!("server returned malformed BEVE body: {e}")),
         )?))),
         Ok(BodyFormat::Utf8) => Ok(Some(DecodedBody::Utf8Raw(msg.body_utf8()))),
-        Ok(BodyFormat::RawBinary) | Err(_) => Err(CliError::Rpc(format!(
+        Ok(BodyFormat::RawBinary) | Ok(_) | Err(_) => Err(CliError::Rpc(format!(
             "server returned {} raw-binary bytes (cannot render as JSON)",
             msg.body.len()
         ))),
