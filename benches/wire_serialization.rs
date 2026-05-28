@@ -50,9 +50,7 @@ fn build_message_with_reserve(body_len: usize) -> Message {
 fn bench_wire_serialization(c: &mut Criterion) {
     let mut group = c.benchmark_group("wire_serialization");
     for &size in BODY_SIZES {
-        group.throughput(Throughput::Bytes(
-            (HEADER_SIZE + QUERY.len() + size) as u64,
-        ));
+        group.throughput(Throughput::Bytes((HEADER_SIZE + QUERY.len() + size) as u64));
 
         group.bench_with_input(BenchmarkId::new("to_vec", size), &size, |b, &size| {
             // Build outside the timing loop; the cost being measured is the

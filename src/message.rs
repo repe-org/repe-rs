@@ -572,7 +572,11 @@ mod tests {
             .build();
         let wire = msg.into_wire_bytes();
         assert_eq!(wire.len(), total);
-        assert_eq!(wire.as_ptr(), body_ptr, "fast path should reuse body buffer");
+        assert_eq!(
+            wire.as_ptr(),
+            body_ptr,
+            "fast path should reuse body buffer"
+        );
     }
 
     #[test]
