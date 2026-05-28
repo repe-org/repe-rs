@@ -18,6 +18,7 @@ include = [
     "/src/**",
     "/examples/**",
     "/tests/**",
+    "/benches/**",
 ]
 
 [package.metadata.docs.rs]
@@ -88,3 +89,18 @@ web-sys = { version = "0.3", optional = true, features = [
 
 [dev-dependencies]
 rand = "0.8"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+# Wire-serialization throughput: `Message::to_vec` vs the new
+# `Message::into_wire_bytes` for the WebSocket-style outbound path, sized to
+# cover both small responses and multi-MiB streaming bodies.
+name = "wire_serialization"
+harness = false
+
+[[bench]]
+# Router dispatch throughput: registered HashMap routes, `Registry`-backed
+# routes, and `RepeStruct`-backed routes, each measured with and without a
+# middleware pipeline so the hoisted middleware wrap is visible.
+name = "route_dispatch"
+harness = false
