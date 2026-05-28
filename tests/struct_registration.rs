@@ -603,3 +603,68 @@ fn struct_with_root_prefix_routes() {
 
     assert!(router.get("/i").is_none(), "prefix should scope visibility");
 }
+
+/// Pins down the RFC 6901 split between `""` and `"/"` at the dispatch
+/// boundary so the routing fast path does not silently collapse them.
+///
+/// * `""` → empty pointer → no reference tokens → serialize the whole struct.
+/// * `"/"` → pointer with a single empty reference token → field named `""`,
+///   which the derive-macro emits as `InvalidPath` because no such field
+///   exists.
+///
+/// Holds for both a root-mounted struct (`""`) and a prefix-mounted struct
+/// (`"/svc"`), where the trailing-slash form is `"/svc/"`.
+#[test]
+fn struct_dispatch_distinguishes_root_from_trailing_slash() {
+    // Root-mounted struct: "" → whole struct, "/" → InvalidPath.
+    let root_shared = Arc::new(Mutex::new(RootStruct {
+        foo: 7,
+        bar: "ok".into(),
+    }));
+    let root_router = Router::new().with_struct_shared("", root_shared);
+
+    let whole = root_router
+        .get("")
+        .unwrap()
+        .handle(&request_empty(""))
+        .unwrap();
+    assert!(!whole.is_error(), "empty query should return the struct");
+    assert_eq!(parse_body(&whole), json!({"foo": 7, "bar": "ok"}));
+
+    let trailing_root = root_router
+        .get("/")
+        .unwrap()
+        .handle(&request_empty("/"))
+        .unwrap();
+    assert!(
+        trailing_root.is_error(),
+        "lone `/` should resolve to the empty-named field and miss"
+    );
+    assert_eq!(trailing_root.header.ec, ErrorCode::MethodNotFound as u32);
+
+    // Prefix-mounted struct: "/svc" → whole struct, "/svc/" → InvalidPath.
+    let svc_shared = Arc::new(Mutex::new(RootStruct {
+        foo: 1,
+        bar: "x".into(),
+    }));
+    let svc_router = Router::new().with_struct_shared("/svc", svc_shared);
+
+    let svc_whole = svc_router
+        .get("/svc")
+        .unwrap()
+        .handle(&request_empty("/svc"))
+        .unwrap();
+    assert!(!svc_whole.is_error(), "/svc should return the struct");
+    assert_eq!(parse_body(&svc_whole), json!({"foo": 1, "bar": "x"}));
+
+    let svc_trailing = svc_router
+        .get("/svc/")
+        .unwrap()
+        .handle(&request_empty("/svc/"))
+        .unwrap();
+    assert!(
+        svc_trailing.is_error(),
+        "/svc/ should resolve to the empty-named field and miss"
+    );
+    assert_eq!(svc_trailing.header.ec, ErrorCode::MethodNotFound as u32);
+}
