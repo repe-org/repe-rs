@@ -434,12 +434,94 @@ where
     }
 }
 
-trait StructRouterEntry: Send + Sync {
-    fn handler_for(&self, path: &str) -> Option<Arc<dyn HandlerErased>>;
+/// One handler entry in `Router::inner`.
+///
+/// `raw` is the bare handler as registered; `dispatched` is `raw` already
+/// wrapped in any active [`MiddlewarePipeline`]. Keeping both means dispatch
+/// is a single `Arc::clone(&entry.dispatched)` (no per-request wrap allocation)
+/// while [`Router::register_middleware`] can still rebuild the wrapped form
+/// across every existing entry when the middleware chain changes.
+///
+/// With no middleware registered, `raw` and `dispatched` are clones of the
+/// same `Arc` — no extra allocation for plain routes.
+#[derive(Clone)]
+struct RouterMapEntry {
+    raw: Arc<dyn HandlerErased>,
+    dispatched: Arc<dyn HandlerErased>,
 }
 
-trait RegistryRouterEntry: Send + Sync {
-    fn handler_for(&self, path: &str) -> Option<Arc<dyn HandlerErased>>;
+/// Internal router entry for a [`Registry`] mounted at a fixed prefix.
+///
+/// Holds the normalized prefix once for path matching plus both the raw
+/// `Arc<RegisteredRegistry>` (coerced to `Arc<dyn HandlerErased>`) and the
+/// pre-middleware-wrapped form used at dispatch. Lookup is a prefix check plus
+/// an `Arc` refcount bump; the per-request `String` + `Arc::new` that the
+/// original `RegistryRequestHandler` cost — and the per-request
+/// `MiddlewarePipeline` allocation — have been folded away.
+#[derive(Clone)]
+struct RegistryEntry {
+    prefix: String,
+    raw: Arc<dyn HandlerErased>,
+    dispatched: Arc<dyn HandlerErased>,
+}
+
+impl RegistryEntry {
+    fn matches(&self, path: &str) -> bool {
+        if self.prefix.is_empty() {
+            return true;
+        }
+        if path == self.prefix {
+            return true;
+        }
+        path.strip_prefix(&self.prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+    }
+}
+
+/// Internal router entry for a [`RepeStruct`] mounted at a fixed root.
+///
+/// Holds the normalized root once for path matching plus both the raw
+/// `Arc<RegisteredStruct<T, L>>` (coerced to `Arc<dyn HandlerErased>`) and the
+/// pre-middleware-wrapped form used at dispatch. Lookup is a prefix check plus
+/// an `Arc` refcount bump; the per-request `Vec<String>` from
+/// `json_pointer::parse`, the per-request `String`, the per-request
+/// `Arc::new` that the original `StructRequestHandler` cost, and the
+/// per-request `MiddlewarePipeline` allocation have all been folded away.
+#[derive(Clone)]
+struct StructEntry {
+    root: String,
+    raw: Arc<dyn HandlerErased>,
+    dispatched: Arc<dyn HandlerErased>,
+}
+
+impl StructEntry {
+    fn matches(&self, path: &str) -> bool {
+        if self.root.is_empty() {
+            return true;
+        }
+        if path == self.root {
+            return true;
+        }
+        path.strip_prefix(&self.root)
+            .is_some_and(|rest| rest.starts_with('/'))
+    }
+}
+
+/// Wrap `handler` in the active middleware pipeline, or return it unchanged
+/// when no middleware is registered. Built once at registration / middleware
+/// change rather than per dispatch.
+fn wrap_with_middlewares(
+    handler: &Arc<dyn HandlerErased>,
+    middlewares: &Arc<Vec<Arc<dyn Middleware>>>,
+) -> Arc<dyn HandlerErased> {
+    if middlewares.is_empty() {
+        Arc::clone(handler)
+    } else {
+        Arc::new(MiddlewarePipeline {
+            handler: Arc::clone(handler),
+            middlewares: Arc::clone(middlewares),
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -554,9 +636,9 @@ impl<T: ?Sized + Send + Sync> Lockable<T> for parking_lot::RwLock<T> {
 
 #[derive(Clone)]
 pub struct Router {
-    inner: Arc<HashMap<String, Arc<dyn HandlerErased>>>,
-    structs: Arc<Vec<Arc<dyn StructRouterEntry>>>,
-    registries: Arc<Vec<Arc<dyn RegistryRouterEntry>>>,
+    inner: Arc<HashMap<String, RouterMapEntry>>,
+    structs: Arc<Vec<StructEntry>>,
+    registries: Arc<Vec<RegistryEntry>>,
     middlewares: Arc<Vec<Arc<dyn Middleware>>>,
 }
 
@@ -570,18 +652,25 @@ impl Router {
         }
     }
 
+    /// Insert a raw handler into `self.inner`, pre-wrapping it in the active
+    /// middleware pipeline. Centralizes the boilerplate every `with_*`
+    /// registrar would otherwise repeat, and keeps the wrap-on-registration
+    /// invariant in one place so [`register_middleware`] only has to rebuild
+    /// the `dispatched` slot.
+    fn insert_route(&mut self, path: &str, raw: Arc<dyn HandlerErased>) {
+        let dispatched = wrap_with_middlewares(&raw, &self.middlewares);
+        let mut map = self.inner.as_ref().clone();
+        map.insert(path.to_string(), RouterMapEntry { raw, dispatched });
+        self.inner = Arc::new(map);
+    }
+
     /// Add a JSON Value-based handler. Alias: `with`.
     pub fn with_json(
         mut self,
         path: &str,
         handler: impl Fn(Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static,
     ) -> Self {
-        let mut map = self.inner.as_ref().clone();
-        map.insert(
-            path.to_string(),
-            Arc::new(JsonHandler(handler)) as Arc<dyn HandlerErased>,
-        );
-        self.inner = Arc::new(map);
+        self.insert_route(path, Arc::new(JsonHandler(handler)));
         self
     }
 
@@ -592,6 +681,18 @@ impl Router {
     }
 
     /// Register middleware in-place so callers can retain the shared handle.
+    ///
+    /// Existing routes have their `dispatched` slot rebuilt against the new
+    /// middleware chain so future lookups remain a single `Arc::clone` with
+    /// no per-request wrap allocation. The rebuild is a one-time `Arc::new`
+    /// per route, paid only here.
+    ///
+    /// Cost note: each call walks every registered route once, so chaining
+    /// `N` middleware registrations after `K` routes is `O(N·K)` setup. This
+    /// only runs at builder time, never on the dispatch hot path, and the
+    /// typical usage shape (a handful of middlewares registered once) is
+    /// nowhere near that worst case. A future batch helper that takes
+    /// several middlewares at once could amortize the rebuild to `O(K)`.
     pub fn register_middleware(
         &mut self,
         middleware: impl Middleware + 'static,
@@ -600,6 +701,47 @@ impl Router {
         let arc: Arc<dyn Middleware> = Arc::new(middleware);
         list.push(arc.clone());
         self.middlewares = Arc::new(list);
+
+        // Rebuild dispatched slots so middleware applies uniformly to every
+        // already-registered route (HashMap entries, registries, structs).
+        let rebuilt_map: HashMap<String, RouterMapEntry> = self
+            .inner
+            .iter()
+            .map(|(path, entry)| {
+                let dispatched = wrap_with_middlewares(&entry.raw, &self.middlewares);
+                (
+                    path.clone(),
+                    RouterMapEntry {
+                        raw: Arc::clone(&entry.raw),
+                        dispatched,
+                    },
+                )
+            })
+            .collect();
+        self.inner = Arc::new(rebuilt_map);
+
+        let rebuilt_registries: Vec<RegistryEntry> = self
+            .registries
+            .iter()
+            .map(|entry| RegistryEntry {
+                prefix: entry.prefix.clone(),
+                raw: Arc::clone(&entry.raw),
+                dispatched: wrap_with_middlewares(&entry.raw, &self.middlewares),
+            })
+            .collect();
+        self.registries = Arc::new(rebuilt_registries);
+
+        let rebuilt_structs: Vec<StructEntry> = self
+            .structs
+            .iter()
+            .map(|entry| StructEntry {
+                root: entry.root.clone(),
+                raw: Arc::clone(&entry.raw),
+                dispatched: wrap_with_middlewares(&entry.raw, &self.middlewares),
+            })
+            .collect();
+        self.structs = Arc::new(rebuilt_structs);
+
         arc
     }
 
@@ -621,13 +763,10 @@ impl Router {
         R: Serialize + Send + Sync + 'static,
         F: TypedHandlerFn<T, R>,
     {
-        let mut map = self.inner.as_ref().clone();
-        map.insert(
-            path.to_string(),
-            Arc::new(TypedHandler::<T, R, F>(f, std::marker::PhantomData))
-                as Arc<dyn HandlerErased>,
+        self.insert_route(
+            path,
+            Arc::new(TypedHandler::<T, R, F>(f, std::marker::PhantomData)),
         );
-        self.inner = Arc::new(map);
         self
     }
 
@@ -664,12 +803,7 @@ impl Router {
     where
         F: Fn(&CallContext, Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static,
     {
-        let mut map = self.inner.as_ref().clone();
-        map.insert(
-            path.to_string(),
-            Arc::new(JsonHandlerCtx(handler)) as Arc<dyn HandlerErased>,
-        );
-        self.inner = Arc::new(map);
+        self.insert_route(path, Arc::new(JsonHandlerCtx(handler)));
         self
     }
 
@@ -683,13 +817,10 @@ impl Router {
         R: Serialize + Send + Sync + 'static,
         F: TypedHandlerFnCtx<T, R>,
     {
-        let mut map = self.inner.as_ref().clone();
-        map.insert(
-            path.to_string(),
-            Arc::new(TypedHandlerCtx::<T, R, F>(f, std::marker::PhantomData))
-                as Arc<dyn HandlerErased>,
+        self.insert_route(
+            path,
+            Arc::new(TypedHandlerCtx::<T, R, F>(f, std::marker::PhantomData)),
         );
-        self.inner = Arc::new(map);
         self
     }
 
@@ -705,12 +836,7 @@ impl Router {
         path: &str,
         handler: impl Fn(Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static,
     ) -> Self {
-        let mut map = self.inner.as_ref().clone();
-        map.insert(
-            path.to_string(),
-            Arc::new(OffReaderHandler(JsonHandler(handler))) as Arc<dyn HandlerErased>,
-        );
-        self.inner = Arc::new(map);
+        self.insert_route(path, Arc::new(OffReaderHandler(JsonHandler(handler))));
         self
     }
 
@@ -720,12 +846,7 @@ impl Router {
     where
         F: Fn(&CallContext, Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static,
     {
-        let mut map = self.inner.as_ref().clone();
-        map.insert(
-            path.to_string(),
-            Arc::new(OffReaderHandler(JsonHandlerCtx(handler))) as Arc<dyn HandlerErased>,
-        );
-        self.inner = Arc::new(map);
+        self.insert_route(path, Arc::new(OffReaderHandler(JsonHandlerCtx(handler))));
         self
     }
 
@@ -737,15 +858,13 @@ impl Router {
         R: Serialize + Send + Sync + 'static,
         F: TypedHandlerFn<T, R>,
     {
-        let mut map = self.inner.as_ref().clone();
-        map.insert(
-            path.to_string(),
+        self.insert_route(
+            path,
             Arc::new(OffReaderHandler(TypedHandler::<T, R, F>(
                 f,
                 std::marker::PhantomData,
-            ))) as Arc<dyn HandlerErased>,
+            ))),
         );
-        self.inner = Arc::new(map);
         self
     }
 
@@ -757,15 +876,13 @@ impl Router {
         R: Serialize + Send + Sync + 'static,
         F: TypedHandlerFnCtx<T, R>,
     {
-        let mut map = self.inner.as_ref().clone();
-        map.insert(
-            path.to_string(),
+        self.insert_route(
+            path,
             Arc::new(OffReaderHandler(TypedHandlerCtx::<T, R, F>(
                 f,
                 std::marker::PhantomData,
-            ))) as Arc<dyn HandlerErased>,
+            ))),
         );
-        self.inner = Arc::new(map);
         self
     }
 
@@ -775,12 +892,7 @@ impl Router {
     where
         H: JsonTypedHandler + 'static,
     {
-        let mut map = self.inner.as_ref().clone();
-        map.insert(
-            path.to_string(),
-            Arc::new(JsonTypedAdapter(handler)) as Arc<dyn HandlerErased>,
-        );
-        self.inner = Arc::new(map);
+        self.insert_route(path, Arc::new(JsonTypedAdapter(handler)));
         self
     }
 
@@ -805,11 +917,21 @@ impl Router {
         T: RepeStruct + 'static,
         L: Lockable<T> + 'static,
     {
-        let mut entries = (*self.structs).clone();
-        entries.push(Arc::new(RegisteredStruct::<T, L>::new(
+        let registered = Arc::new(RegisteredStruct::<T, L>::new(root, Arc::clone(&shared)));
+        let root = registered.root.clone();
+        // `Arc<RegisteredStruct<T, L>>` coerces to `Arc<dyn HandlerErased>`
+        // because `RegisteredStruct: HandlerErased + Sized`. The handler is
+        // built once at registration so dispatch is a clone of this Arc, not
+        // a fresh allocation.
+        let raw: Arc<dyn HandlerErased> = registered;
+        let dispatched = wrap_with_middlewares(&raw, &self.middlewares);
+        let entry = StructEntry {
             root,
-            Arc::clone(&shared),
-        )));
+            raw,
+            dispatched,
+        };
+        let mut entries = (*self.structs).clone();
+        entries.push(entry);
         self.structs = Arc::new(entries);
         shared
     }
@@ -849,41 +971,35 @@ impl Router {
         path_prefix: &str,
         registry: Arc<Registry>,
     ) -> Arc<Registry> {
+        let registered = Arc::new(RegisteredRegistry::new(path_prefix, Arc::clone(&registry)));
+        let prefix = registered.prefix.clone();
+        // `Arc<RegisteredRegistry>` coerces to `Arc<dyn HandlerErased>` — the
+        // handler is built once at registration so dispatch is a clone of this
+        // Arc, not a fresh allocation.
+        let raw: Arc<dyn HandlerErased> = registered;
+        let dispatched = wrap_with_middlewares(&raw, &self.middlewares);
+        let entry = RegistryEntry {
+            prefix,
+            raw,
+            dispatched,
+        };
         let mut entries = (*self.registries).clone();
-        entries.push(Arc::new(RegisteredRegistry::new(
-            path_prefix,
-            Arc::clone(&registry),
-        )));
+        entries.push(entry);
         self.registries = Arc::new(entries);
         registry
     }
 
     pub fn get(&self, path: &str) -> Option<Arc<dyn HandlerErased>> {
-        let handler = if let Some(handler) = self.inner.get(path) {
-            Some(handler.clone())
-        } else if let Some(handler) = self
-            .registries
-            .iter()
-            .find_map(|entry| entry.handler_for(path))
-        {
-            Some(handler)
-        } else {
-            self.structs
-                .iter()
-                .find_map(|entry| entry.handler_for(path))
-        };
-        handler.map(|h| self.wrap_handler(h))
-    }
-
-    fn wrap_handler(&self, handler: Arc<dyn HandlerErased>) -> Arc<dyn HandlerErased> {
-        if self.middlewares.is_empty() {
-            handler
-        } else {
-            Arc::new(MiddlewarePipeline {
-                handler,
-                middlewares: Arc::clone(&self.middlewares),
-            })
+        if let Some(entry) = self.inner.get(path) {
+            return Some(Arc::clone(&entry.dispatched));
         }
+        if let Some(entry) = self.registries.iter().find(|entry| entry.matches(path)) {
+            return Some(Arc::clone(&entry.dispatched));
+        }
+        self.structs
+            .iter()
+            .find(|entry| entry.matches(path))
+            .map(|entry| Arc::clone(&entry.dispatched))
     }
 }
 
@@ -948,41 +1064,40 @@ impl RegisteredRegistry {
     }
 }
 
-impl RegistryRouterEntry for RegisteredRegistry {
-    fn handler_for(&self, path: &str) -> Option<Arc<dyn HandlerErased>> {
-        let pointer = self.pointer_for(path)?.to_string();
-        Some(Arc::new(RegistryRequestHandler {
-            registry: Arc::clone(&self.registry),
-            pointer,
-        }))
-    }
-}
-
-struct RegistryRequestHandler {
-    registry: Arc<Registry>,
-    pointer: String,
-}
-
-impl HandlerErased for RegistryRequestHandler {
+impl HandlerErased for RegisteredRegistry {
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
+        let path = req.query_str().unwrap_or("");
+        let Some(pointer) = self.pointer_for(path) else {
+            return Ok(create_error_response_like(
+                req,
+                ErrorCode::MethodNotFound,
+                format!("path is not below registry prefix: {path}"),
+            ));
+        };
         let body = match Registry::decode_body(req) {
             Ok(value) => value,
             Err(err) => return Ok(create_error_response_like(req, err.code(), err.to_string())),
         };
-
-        match self.registry.dispatch(&self.pointer, body) {
+        match self.registry.dispatch(pointer, body) {
             Ok(value) => create_response(req, value, BodyFormat::Json),
             Err(err) => Ok(create_error_response_like(req, err.code(), err.to_string())),
         }
     }
 
     fn handle_with_ctx(&self, req: &Message, ctx: &CallContext) -> Result<Message, RepeError> {
+        let path = req.query_str().unwrap_or("");
+        let Some(pointer) = self.pointer_for(path) else {
+            return Ok(create_error_response_like(
+                req,
+                ErrorCode::MethodNotFound,
+                format!("path is not below registry prefix: {path}"),
+            ));
+        };
         let body = match Registry::decode_body(req) {
             Ok(value) => value,
             Err(err) => return Ok(create_error_response_like(req, err.code(), err.to_string())),
         };
-
-        match self.registry.dispatch_with_ctx(&self.pointer, body, ctx) {
+        match self.registry.dispatch_with_ctx(pointer, body, ctx) {
             Ok(value) => create_response(req, value, BodyFormat::Json),
             Err(err) => Ok(create_error_response_like(req, err.code(), err.to_string())),
         }
@@ -1027,59 +1142,21 @@ where
     }
 }
 
-impl<T, L> StructRouterEntry for RegisteredStruct<T, L>
-where
-    T: RepeStruct + 'static,
-    L: Lockable<T> + 'static,
-{
-    fn handler_for(&self, path: &str) -> Option<Arc<dyn HandlerErased>> {
-        let relative = self.relative_pointer(path)?;
-        let tokens = crate::json_pointer::parse(relative);
-        let full_path = if path.is_empty() {
-            String::from("")
-        } else {
-            path.to_string()
-        };
-        Some(Arc::new(StructRequestHandler::<T, L>::new(
-            self.shared.clone(),
-            tokens,
-            full_path,
-        )))
-    }
-}
-
-struct StructRequestHandler<T, L>
-where
-    T: RepeStruct + 'static,
-    L: Lockable<T> + 'static,
-{
-    shared: Arc<L>,
-    segments: Vec<String>,
-    full_path: String,
-    phantom: std::marker::PhantomData<T>,
-}
-
-impl<T, L> StructRequestHandler<T, L>
-where
-    T: RepeStruct + 'static,
-    L: Lockable<T> + 'static,
-{
-    fn new(shared: Arc<L>, segments: Vec<String>, full_path: String) -> Self {
-        Self {
-            shared,
-            segments,
-            full_path,
-            phantom: std::marker::PhantomData,
-        }
-    }
-}
-
-impl<T, L> HandlerErased for StructRequestHandler<T, L>
+impl<T, L> HandlerErased for RegisteredStruct<T, L>
 where
     T: RepeStruct + 'static,
     L: Lockable<T> + 'static,
 {
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
+        let path = req.query_str().unwrap_or("");
+        let Some(relative) = self.relative_pointer(path) else {
+            return Ok(create_error_response_like(
+                req,
+                ErrorCode::MethodNotFound,
+                format!("path is not below struct root: {path}"),
+            ));
+        };
+
         let body = if req.body.is_empty() {
             None
         } else {
@@ -1096,8 +1173,8 @@ where
                         req,
                         ErrorCode::InvalidBody,
                         format!(
-                            "struct handler `{}` requires JSON or BEVE body, got format {}",
-                            self.full_path, req.header.body_format
+                            "struct handler `{path}` requires JSON or BEVE body, got format {}",
+                            req.header.body_format
                         ),
                     ));
                 }
@@ -1109,10 +1186,10 @@ where
             Err(err) => {
                 let detail = match err {
                     LockError::Poisoned(msg) => {
-                        format!("struct handler `{}` lock poisoned: {}", self.full_path, msg)
+                        format!("struct handler `{path}` lock poisoned: {msg}")
                     }
                     LockError::Other(msg) => {
-                        format!("struct handler `{}` lock error: {}", self.full_path, msg)
+                        format!("struct handler `{path}` lock error: {msg}")
                     }
                 };
                 return Ok(create_error_response_like(
@@ -1123,18 +1200,79 @@ where
             }
         };
 
-        let mut seg_refs = Vec::with_capacity(self.segments.len());
-        for segment in &self.segments {
-            seg_refs.push(segment.as_str());
-        }
+        dispatch_struct_segments(&mut *guard, relative, body, req)
+    }
+}
 
-        match guard.repe_handle(&seg_refs, body) {
-            Ok(result) => {
-                let value = result.unwrap_or(Value::Null);
-                create_response(req, value, BodyFormat::Json)
+/// Run a `RepeStruct::repe_handle` call after parsing `relative` into
+/// path segments and map the result back to a `Message`.
+///
+/// Segment parsing mirrors [`crate::json_pointer::parse`] byte-for-byte so the
+/// dispatch result is independent of which path is taken:
+///
+/// * `""` → no reference tokens; calls `repe_handle(&[], _)` (whole struct).
+/// * `"/"` → one empty reference token; calls `repe_handle(&[""], _)`. The
+///   derive-macro impls treat this as `InvalidPath`, matching RFC 6901
+///   semantics ("/" points at a field named `""`).
+///
+/// The escape-free fast path (`!relative.contains('~')`, the common case for
+/// JSON Pointers) avoids the `Vec<String>` from `json_pointer::parse` and
+/// drops segment `&str`s into a fixed-size stack buffer, spilling to a
+/// `Vec<&str>` only when the path is unusually deep. The escape path keeps the
+/// original `Vec<String>` + `Vec<&str>` shape because each escaped segment
+/// genuinely needs an owned `String`.
+fn dispatch_struct_segments<T>(
+    handler: &mut T,
+    relative: &str,
+    body: Option<Value>,
+    req: &Message,
+) -> Result<Message, RepeError>
+where
+    T: RepeStruct + ?Sized,
+{
+    const STACK_SEGS: usize = 16;
+
+    let result = if !relative.contains('~') {
+        if relative.is_empty() {
+            handler.repe_handle(&[], body)
+        } else if relative == "/" {
+            // RFC 6901: "/" decodes to a single empty reference token. The
+            // old `json_pointer::parse("/")` path returned `vec![""]`; the
+            // fast path must match so trailing-slash requests still surface
+            // as `InvalidPath` rather than silently serving the whole struct.
+            handler.repe_handle(&[""], body)
+        } else {
+            let trimmed = relative.strip_prefix('/').unwrap_or(relative);
+            let mut stack: [&str; STACK_SEGS] = [""; STACK_SEGS];
+            let mut count = 0usize;
+            let mut overflow: Option<Vec<&str>> = None;
+            for seg in trimmed.split('/') {
+                if let Some(v) = overflow.as_mut() {
+                    v.push(seg);
+                } else if count < STACK_SEGS {
+                    stack[count] = seg;
+                    count += 1;
+                } else {
+                    let mut v = Vec::with_capacity(STACK_SEGS + 4);
+                    v.extend_from_slice(&stack);
+                    v.push(seg);
+                    overflow = Some(v);
+                }
             }
-            Err(err) => Ok(create_error_response_like(req, err.code(), err.to_string())),
+            match overflow.as_deref() {
+                Some(v) => handler.repe_handle(v, body),
+                None => handler.repe_handle(&stack[..count], body),
+            }
         }
+    } else {
+        let owned = crate::json_pointer::parse(relative);
+        let seg_refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        handler.repe_handle(&seg_refs, body)
+    };
+
+    match result {
+        Ok(value) => create_response(req, value.unwrap_or(Value::Null), BodyFormat::Json),
+        Err(err) => Ok(create_error_response_like(req, err.code(), err.to_string())),
     }
 }
 

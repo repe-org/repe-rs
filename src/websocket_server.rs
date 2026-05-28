@@ -748,7 +748,7 @@ where
 
         if let Some(response) = upstream.forward_message(&request).await? {
             writer
-                .send(WsMessage::Binary(response.to_vec()))
+                .send(WsMessage::Binary(response.into_wire_bytes()))
                 .await
                 .map_err(websocket_transport_error)?;
         }
@@ -1055,7 +1055,7 @@ async fn writer_task(
             msg = outbound_rx.recv() => match msg {
                 Some(m) => {
                     if let Err(err) = ws_writer
-                        .send(WsMessage::Binary(m.to_vec()))
+                        .send(WsMessage::Binary(m.into_wire_bytes()))
                         .await
                     {
                         result = Err(websocket_transport_error(err));
@@ -1073,7 +1073,7 @@ async fn writer_task(
                 // drops.
                 let deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
                 while let Ok(m) = outbound_rx.try_recv() {
-                    let send_fut = ws_writer.send(WsMessage::Binary(m.to_vec()));
+                    let send_fut = ws_writer.send(WsMessage::Binary(m.into_wire_bytes()));
                     match tokio::time::timeout_at(deadline, send_fut).await {
                         Ok(Ok(())) => {}
                         Ok(Err(err)) => {

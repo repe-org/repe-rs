@@ -64,6 +64,63 @@ impl Message {
         Ok(())
     }
 
+    /// Consume the message and produce its wire-frame bytes.
+    ///
+    /// Prefer this over [`to_vec`](Self::to_vec) on outbound paths where the
+    /// `Message` is being shipped to a sink that takes an owned `Vec<u8>` (e.g.
+    /// the WebSocket writer): `to_vec` always allocates a fresh frame buffer
+    /// and copies the body into it, whereas `into_wire_bytes` reuses the body
+    /// allocation when it already has the spare capacity to host the header
+    /// and query prefix.
+    ///
+    /// Fast path (zero new allocations, one body memcpy to shift to the back):
+    /// triggers when `body.capacity() >= HEADER_SIZE + query.len() +
+    /// body.len()`. Callers that care about streaming throughput can guarantee
+    /// the fast path by constructing the body via
+    /// `Vec::with_capacity(body_len + HEADER_SIZE + query.len())` and then
+    /// passing it to `MessageBuilder::body_bytes`.
+    ///
+    /// Slow path: when the body has no spare capacity for the prefix, a fresh
+    /// `Vec<u8>` is allocated. The byte output is identical to `to_vec`.
+    pub fn into_wire_bytes(self) -> Vec<u8> {
+        let Self {
+            header,
+            query,
+            mut body,
+        } = self;
+        let prefix_len = HEADER_SIZE + query.len();
+        let body_len = body.len();
+        let total = prefix_len + body_len;
+
+        if body.capacity() >= total {
+            // Reuse the body allocation: grow in place, shift the body bytes
+            // to the back, then overwrite the prefix with header + query.
+            body.resize(total, 0);
+            if body_len > 0 {
+                body.copy_within(0..body_len, prefix_len);
+            }
+            body[..HEADER_SIZE].copy_from_slice(&header.encode());
+            if !query.is_empty() {
+                body[HEADER_SIZE..prefix_len].copy_from_slice(&query);
+            }
+            body
+        } else {
+            // No room in body for the prefix: fall back to a fresh allocation.
+            // Same cost as `to_vec`, but consumes self so the original query
+            // and body buffers are released as soon as the wire bytes are
+            // produced.
+            let mut out = Vec::with_capacity(total);
+            out.extend_from_slice(&header.encode());
+            if !query.is_empty() {
+                out.extend_from_slice(&query);
+            }
+            if body_len > 0 {
+                out.append(&mut body);
+            }
+            out
+        }
+    }
+
     pub fn from_slice(buf: &[u8]) -> Result<Self, RepeError> {
         if buf.len() < HEADER_SIZE {
             return Err(RepeError::InvalidHeaderLength(buf.len()));
@@ -426,6 +483,100 @@ mod tests {
         msg.write_to(&mut got).expect("write_to");
         assert_eq!(got, expected);
         assert_eq!(msg.serialized_len(), expected.len());
+    }
+
+    #[test]
+    fn into_wire_bytes_matches_to_vec_slow_path() {
+        // Body allocated with cap == len, so into_wire_bytes hits the fresh-
+        // allocation fallback. Output must still equal to_vec.
+        let msg = Message::builder()
+            .id(42)
+            .query_str("/collect/file_chunk")
+            .query_format(QueryFormat::JsonPointer)
+            .body_bytes(vec![0xDEu8; 1024])
+            .body_format(BodyFormat::Beve)
+            .build();
+        let expected = msg.to_vec();
+        let got = msg.into_wire_bytes();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn into_wire_bytes_matches_to_vec_fast_path() {
+        // Body pre-allocated with prefix room so into_wire_bytes takes the
+        // in-place fast path. Output must still equal to_vec.
+        let query = b"/collect/file_chunk";
+        let body_len = 4096;
+        let mut body = Vec::with_capacity(HEADER_SIZE + query.len() + body_len);
+        body.resize(body_len, 0xAB);
+        let msg = Message::builder()
+            .id(42)
+            .query_bytes(query.to_vec())
+            .query_format(QueryFormat::JsonPointer)
+            .body_bytes(body)
+            .body_format(BodyFormat::Beve)
+            .build();
+        let expected = msg.clone().to_vec();
+        let got = msg.into_wire_bytes();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn into_wire_bytes_handles_empty_query_and_body() {
+        let msg = Message::builder().id(1).build();
+        let expected = msg.to_vec();
+        let got = msg.into_wire_bytes();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn into_wire_bytes_handles_empty_body_only() {
+        let msg = Message::builder()
+            .id(2)
+            .query_str("/notify")
+            .query_format(QueryFormat::JsonPointer)
+            .build();
+        let expected = msg.to_vec();
+        let got = msg.into_wire_bytes();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn into_wire_bytes_handles_empty_query_only() {
+        let msg = Message::builder()
+            .id(3)
+            .body_bytes(vec![1u8, 2, 3])
+            .body_format(BodyFormat::RawBinary)
+            .build();
+        let expected = msg.clone().to_vec();
+        let got = msg.into_wire_bytes();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn into_wire_bytes_fast_path_does_not_reallocate() {
+        // Confirm that when the body has room for the prefix, the resulting
+        // Vec reuses the body's original allocation (same data pointer).
+        let query = b"/q";
+        let body_len = 256;
+        let total = HEADER_SIZE + query.len() + body_len;
+        let mut body = Vec::with_capacity(total);
+        body.resize(body_len, 0x42);
+        let body_ptr = body.as_ptr();
+        let msg = Message::builder()
+            .id(1)
+            .query_bytes(query.to_vec())
+            .query_format(QueryFormat::JsonPointer)
+            .body_bytes(body)
+            .body_format(BodyFormat::RawBinary)
+            .build();
+        let wire = msg.into_wire_bytes();
+        assert_eq!(wire.len(), total);
+        assert_eq!(
+            wire.as_ptr(),
+            body_ptr,
+            "fast path should reuse body buffer"
+        );
     }
 
     #[test]

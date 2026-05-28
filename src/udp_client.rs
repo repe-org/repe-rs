@@ -143,7 +143,7 @@ impl UniUdpClient {
         let repe_id = self.next_repe_message_id();
         let message =
             build_message_for_udp(repe_id, method, params, query_format, body_format, notify)?;
-        let payload = message.to_vec();
+        let payload = message.into_wire_bytes();
         let request = SendRequest::new(self.inner.destination, &payload)
             .with_options(self.send_options())
             .with_identity(SendIdentityOverrides::new().with_message_id(repe_id));
