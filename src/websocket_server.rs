@@ -318,7 +318,7 @@ impl WebSocketServer {
     /// Defaults to [`DEFAULT_OFFREADER_LIMIT`].
     ///
     /// When the cap is reached, a further off-reader request gets an
-    /// error response (`ErrorCode::ApplicationErrorBase`) and the client
+    /// error response ([`ErrorCode::ResourceExhausted`]) and the client
     /// should retry; the request is never queued and the reader is never
     /// blocked waiting for a slot — blocking it would stall the very
     /// frames (ACKs, cancels) that in-flight transfers need to finish
