@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-05-28
+
+### Added
+- `Message::into_wire_bytes(self) -> Vec<u8>` — consuming counterpart to `to_vec` for outbound paths where the message is shipped to a sink that takes an owned `Vec<u8>` (the built-in WebSocket writer and `UdpClient` send paths). Fast path is zero new allocations and one in-place body memcpy via `copy_within` when the body already has capacity for the `HEADER_SIZE + query.len()` prefix; opt in by constructing bodies via `Vec::with_capacity(body_len + HEADER_SIZE + query.len())` and feeding them to `MessageBuilder::body_bytes`. Slow path falls back to a fresh allocation matching `to_vec`'s cost while still releasing the original query and body buffers as soon as the wire bytes are produced. `Message::to_vec` is unchanged.
+- Two `criterion` benches under `benches/`: `wire_serialization` measures `to_vec` against both `into_wire_bytes` paths across body sizes from 64 B to 4 MiB; `route_dispatch` measures `Router::get` and full `get + handle` cycles across plain HashMap, `Registry`-backed, and `RepeStruct` routes, each with and without an attached middleware. Pulled in as a `dev-dependencies` entry only.
+
+### Changed
+- Routing dispatch is now allocation-free per request on registry and struct routes. `RegisteredRegistry` and `RegisteredStruct<T, L>` implement `HandlerErased` directly: each registration builds one handler `Arc<dyn HandlerErased>` once and `Router::get` is now a prefix check (or HashMap probe) plus a single `Arc::clone`. Previously every registry hit allocated a fresh `String` for the JSON pointer and an `Arc::new(RegistryRequestHandler { ... })`; every struct hit allocated a `Vec<String>` from `json_pointer::parse`, a `String`, and an `Arc::new(StructRequestHandler { ... })` — all gone. The escape-free struct fast path also drops segment `&str`s into a 16-slot stack buffer with heap overflow, skipping the `Vec<String>` from `json_pointer::parse` entirely for the typical 1–4 segment pointer.
+- Middleware wrapping hoisted from `Router::get` to registration time. Each route entry carries both a `raw` and a `dispatched` handler `Arc`, where `dispatched` is `raw` already wrapped in any active `MiddlewarePipeline`. `Router::get` returns `dispatched` directly, so plain routes pay nothing per dispatch for middleware they do not touch and middleware-equipped routes no longer pay an `Arc::new(MiddlewarePipeline)` per request. `register_middleware` rebuilds the `dispatched` slot across every existing route so semantics stay uniform; cost is `O(N·K)` for `N` middleware registrations after `K` routes, paid only at builder time.
+- WebSocket writer (`writer_task` and the proxy forwarding path) and `UdpClient::send` switch from `Message::to_vec` to `Message::into_wire_bytes`, picking up the slow-path savings without callers needing to change anything. Behavior is byte-identical; the fast path activates if callers opt in with a pre-reserved body.
+
+### Fixed
+- The `repe` CLI now compiles under `cargo check --all-features`. v3.0.0 added `#[non_exhaustive]` to `BodyFormat`, `QueryFormat`, and `ErrorCode` but did not update the bin's response-decoding match; bin targets compile as a separate crate so the attribute applies across the boundary, and `cargo check --all-features` failed on the bin until the unknown-variant wildcard landed.
+
+### Notes
+- Existing `create_response` builders produce `Vec<u8>` bodies with `capacity == len`, so today's WebSocket-server outbound responses land on the `into_wire_bytes` slow path (same memcpy cost as `to_vec`, with the body buffer released sooner). The fast path is available for callers that opt in — most relevantly `repe::stream` chunk producers building their own response bodies, where the prefix reservation removes the per-chunk body copy entirely.
+- Bench numbers under `cargo bench --quick`: `router_get/plain_with_middleware` matches `router_get/plain` (~33 ns), `router_get/registry|struct` is ~10 ns, and `wire_serialization/into_wire_bytes_fast` is roughly 1.5× the throughput of `to_vec` at 4 KiB and 7× at 64 KiB.
+
 ## [3.0.0] - 2026-05-27
 
 ### Added
