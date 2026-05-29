@@ -100,6 +100,40 @@ Per-peer broadcast helpers all encode the body once on the caller's task and clo
 
 Each helper returns a `HashMap<PeerId, Result<(), PeerSendError>>` so callers can prune dead peers (`PeerSendError::Disconnected`) or surface backpressure (`PeerSendError::Full`).
 
+### Addressing peers by an embedder key
+
+`PeerId` is the registry's canonical, server-minted key: it is what `with_peer_registry` auto-inserts and what the `broadcast_notify_*` result maps are keyed by. When your own client identity is something else — a UUID/token from the handshake, a domain id — attach it as a secondary **alias** instead of maintaining a parallel `key -> PeerId` map by hand:
+
+- `alias<K: Into<String>>(peer_id, key)` associates an embedder key with an already-inserted peer. Returns `false` if the peer is gone (no dangling alias is created). A peer may carry several aliases; a given key addresses at most one peer (re-aliasing moves it).
+- `get_by<Q>(&key)` resolves an alias to its `PeerHandle` for a **targeted push** by your own identity (`peers.get_by("session-abc").map(|h| h.send_notify(...))`). The lookup is generic over the borrowed key form, like `HashMap::get`, so string aliases are queried with a `&str`.
+- `key_for(peer_id)` / `aliases_for(peer_id)` map a `PeerId` **back** to your key(s). Use these to read a `broadcast_notify_*` result map by your own identity — e.g. to answer "which of *my* clients hit `PeerSendError::Full`?". `key_for` returns the first alias (the common single-alias case); `aliases_for` returns all of them.
+
+`PeerId` stays canonical, so the auto-insert path is untouched and the whole feature is additive. Aliases are cleaned up automatically: `remove` (which `with_peer_registry` routes disconnect through) drops the peer's primary entry and every alias pointing at it, so a disconnect needs no extra bookkeeping. Aliases are owned `String`s; convert a non-string key with `to_string()`.
+
+When the key rides in the upgrade request itself, derive it at connect time with [`on_peer_connect_with_handshake`](#lifecycle-hooks):
+
+```rust
+use repe::{PeerRegistry, NotifyBody, WebSocketServer};
+
+let peers = PeerRegistry::new();
+let server = WebSocketServer::new(router)
+    .with_peer_registry(peers.clone())
+    .on_peer_connect_with_handshake({
+        let peers = peers.clone();
+        move |peer, hs| {
+            // e.g. a bearer token in the Authorization header
+            if let Some(token) = hs.header("authorization") {
+                peers.alias(peer.peer_id(), token);
+            }
+        }
+    });
+
+// Later, anywhere holding a registry clone — a targeted push by your key:
+if let Some(handle) = peers.get_by("Bearer abc123") {
+    let _ = handle.send_notify("/nudge", NotifyBody::Json(b"{}".to_vec()));
+}
+```
+
 ### Lifecycle hooks
 
 `with_peer_registry` is sugar over two lower-level hooks:
@@ -117,6 +151,8 @@ The connect hook runs synchronously on the accept task **before** the reader/wri
 After the hook returns, the outbound channel is strict FIFO across both notifies and responses on the same connection: a notify pushed by a background broadcaster at time T arrives on the wire in the order it was enqueued relative to any handler response also enqueued at time T. Clients de-multiplex by the `notify` header flag (`WebSocketClient::subscribe_notifies()`); notifies do not "cut the line" past in-flight responses.
 
 The disconnect hook fires from a `Drop` guard, so it runs on every exit path: clean Close frame, transport error, handler panic, or a panic in a *later* connect hook (the guard is built before the connect-hook loop). Exactly once per accepted connection.
+
+`on_peer_connect_with_handshake(|peer, hs|)` is a sibling connect hook that additionally receives a `HandshakeContext` — the upgrade request's `path()`, `query()`, and `header(name)` (case-insensitive). Use it when your client identity rides in the handshake: derive your key from the request and `alias` the just-inserted peer (see [Addressing peers by an embedder key](#addressing-peers-by-an-embedder-key)). These hooks fire **after** the plain `on_peer_connect` hooks — so a `with_peer_registry` insert has already landed and the peer is present for `alias` — and still before any traffic is processed. The context is available wherever the handshake is: the built-in `serve*` loops, and the co-hosting `accept_with_handshake` + `serve_connection_with_handshake` (or `serve_connection_with_cancel_and_handshake`) path. A connection served through plain `serve_connection`, which carries no captured handshake, does not fire these hooks. If your key instead arrives in a request *body*, this hook is unnecessary — the handler already has both the key and the peer via `CallContext::peer`.
 
 `PeerHandle::send_notify` returning `Ok(())` means the message was queued onto the outbound channel, not that it was written to the wire. During concurrent disconnect, a late-arriving send may queue successfully but be dropped when the writer task exits and the bounded receiver is released. This is intrinsic to async shutdown; treat `Ok` as best-effort delivery, not as confirmation.
 
@@ -302,10 +338,10 @@ The server tracks every connection it accepts in a `JoinSet`, so you do not have
 
 ## One-Port Co-Hosting
 
-To share a single TCP port between the REPE WebSocket endpoint and your own HTTP routes, drive connections yourself instead of using the built-in accept loop. `WebSocketServer::into_shared()` consumes the builder into a cheap, cloneable `SharedWebSocketServer` — the per-connection configuration is built once, each clone is an `Arc` clone, and the handle is `Send + Sync + 'static`. Then, for each accepted stream, peek the upgrade request and route it: `WebSocketServer::accept(stream, path)` performs the REPE handshake (validating `path`), and `SharedWebSocketServer::serve_connection(ws)` runs that connection's reader/writer loop. Connect/disconnect hooks and any attached `PeerRegistry` fire exactly as under `serve`.
+To share a single TCP port between the REPE WebSocket endpoint and your own HTTP routes, drive connections yourself instead of using the built-in accept loop. `WebSocketServer::into_shared()` consumes the builder into a cheap, cloneable `SharedWebSocketServer` — the per-connection configuration is built once, each clone is an `Arc` clone, and the handle is `Send + Sync + 'static`. Then, for each accepted stream, classify it and route it: `is_websocket_upgrade(&stream)` reports whether the client is opening a WebSocket upgrade, `WebSocketServer::accept(stream, path)` performs the REPE handshake (validating `path`), and `SharedWebSocketServer::serve_connection(ws)` runs that connection's reader/writer loop. Connect/disconnect hooks and any attached `PeerRegistry` fire exactly as under `serve`.
 
 ```rust
-use repe::websocket_server::WebSocketServer;
+use repe::{is_websocket_upgrade, WebSocketServer};
 
 let shared = WebSocketServer::new(router).into_shared();
 let listener = tokio::net::TcpListener::bind("0.0.0.0:8081").await?;
@@ -313,16 +349,22 @@ loop {
     let (stream, _addr) = listener.accept().await?;
     let shared = shared.clone();
     tokio::spawn(async move {
-        if looks_like_websocket_upgrade(&stream) {     // your own header peek
-            if let Ok(ws) = WebSocketServer::accept(stream, "/repe").await {
-                let _ = shared.serve_connection(ws).await;
+        match is_websocket_upgrade(&stream).await {
+            Ok(true) => {
+                if let Ok(ws) = WebSocketServer::accept(stream, "/repe").await {
+                    let _ = shared.serve_connection(ws).await;
+                }
             }
-        } else {
-            serve_http(stream).await;                  // your own HTTP handler
+            Ok(false) => { let _ = serve_http(stream).await; }  // your own HTTP handler
+            Err(err) => eprintln!("peek failed: {err}"),
         }
     });
 }
 ```
+
+`is_websocket_upgrade` is **non-destructive**: it peeks (`TcpStream::peek`) and leaves the request bytes in the socket buffer, because `WebSocketServer::accept` replays the handshake from the start of the stream. It is a sniff — it looks for an `Upgrade: websocket` header — and `accept` still does the authoritative RFC 6455 validation on the `true` branch, so a false positive fails the handshake rather than corrupting anything. A helper that *parsed* the request would consume the bytes and break `accept`; the peek-and-sniff keeps repe out of the business of serving HTTP while removing the trickiest part of the fork.
+
+`examples/websocket_cohosting.rs` is a runnable end-to-end demo: it fills in both pieces the sketch above leaves open — the `is_websocket_upgrade` classifier and a minimal, dependency-free `serve_http` (a `/healthz` probe plus a small JSON `GET`) — and drives both forks against one port. Run it with `cargo run --example websocket_cohosting --features websocket`.
 
 The built-in `serve` / `serve_listener` loop is itself implemented on top of `into_shared` + `accept` + `serve_connection`, so a co-hosted connection behaves identically to one accepted by the built-in loop.
 

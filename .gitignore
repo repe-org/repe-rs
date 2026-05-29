@@ -5,6 +5,7 @@ PR_DESCRIPTION.md
 dev/pr-description.md
 dev/feature-expansion-plan.md
 dev/push-capable-websocket-server.md
+dev/http-cohosting-and-keyed-peer-registry.md
 PR.md
 
 # MkDocs build output and local virtualenv

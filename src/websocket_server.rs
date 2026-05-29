@@ -30,6 +30,7 @@ use tokio_tungstenite::{WebSocketStream, accept_hdr_async};
 use tokio_util::sync::CancellationToken;
 
 type ConnectHook = Arc<dyn Fn(PeerHandle) + Send + Sync>;
+type ConnectCtxHook = Arc<dyn Fn(&PeerHandle, &HandshakeContext) + Send + Sync>;
 type DisconnectHook = Arc<dyn Fn(PeerId) + Send + Sync>;
 type ErrorHook = Arc<dyn Fn(&ConnectionError) + Send + Sync>;
 
@@ -144,6 +145,85 @@ impl std::error::Error for ConnectionError {
             ConnectionError::Handshake(err) | ConnectionError::Connection(err) => Some(err),
             ConnectionError::HandlerPanic { .. } | ConnectionError::Saturation { .. } => None,
         }
+    }
+}
+
+/// Read-only snapshot of the WebSocket upgrade request, captured during
+/// the handshake and handed to an
+/// [`on_peer_connect_with_handshake`](WebSocketServer::on_peer_connect_with_handshake)
+/// hook.
+///
+/// An embedder whose canonical client identity rides in the upgrade
+/// request — a token in the query string, an auth header — derives its
+/// key from this context at connect time and attaches it to the
+/// freshly-inserted peer with
+/// [`PeerRegistry::alias`](crate::PeerRegistry::alias), so later targeted
+/// pushes can address the peer by that key. The path, query, and headers
+/// are captured as owned values, so the context outlives the handshake
+/// and is cheap to clone.
+///
+/// If the embedder's key instead arrives in a request *body*, this hook
+/// is unnecessary — the handler already has both the key and the peer via
+/// [`CallContext::peer`](crate::CallContext::peer).
+#[derive(Clone, Debug)]
+pub struct HandshakeContext {
+    path: String,
+    query: Option<String>,
+    headers: Vec<(String, String)>,
+}
+
+impl HandshakeContext {
+    /// Capture the parts of an upgrade [`Request`] an embedder may key on.
+    fn from_request(request: &Request) -> Self {
+        let uri = request.uri();
+        let headers = request
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        Self {
+            path: uri.path().to_owned(),
+            query: uri.query().map(str::to_owned),
+            headers,
+        }
+    }
+
+    /// The request-target path of the upgrade (e.g. `/repe`). This is the
+    /// same path [`WebSocketServer::accept`] validated against, normalized
+    /// by the client; the query string is not included.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// The raw query string of the upgrade request (the part after `?`),
+    /// if present. Percent-decoding and key/value splitting are left to
+    /// the embedder so repe pulls in no URL-parsing dependency.
+    pub fn query(&self) -> Option<&str> {
+        self.query.as_deref()
+    }
+
+    /// The first value of the named header, matched case-insensitively
+    /// (HTTP header names are case-insensitive). Returns `None` if the
+    /// header was absent or its value was not valid UTF-8.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Iterate over every captured header as `(name, value)` pairs, in
+    /// the order they arrived. Header names retain the case the client
+    /// sent; use [`header`](Self::header) for a case-insensitive lookup.
+    pub fn headers(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
     }
 }
 
@@ -275,6 +355,7 @@ pub struct WebSocketServer {
     offreader_limit: Option<usize>,
     peer_id_counter: Arc<AtomicU64>,
     on_connect: Vec<ConnectHook>,
+    on_connect_ctx: Vec<ConnectCtxHook>,
     on_disconnect: Vec<DisconnectHook>,
     on_error: Vec<ErrorHook>,
 }
@@ -287,6 +368,7 @@ impl WebSocketServer {
             offreader_limit: Some(DEFAULT_OFFREADER_LIMIT),
             peer_id_counter: Arc::new(AtomicU64::new(0)),
             on_connect: Vec::new(),
+            on_connect_ctx: Vec::new(),
             on_disconnect: Vec::new(),
             on_error: Vec::new(),
         }
@@ -367,6 +449,51 @@ impl WebSocketServer {
         F: Fn(PeerHandle) + Send + Sync + 'static,
     {
         self.on_connect.push(Arc::new(f));
+        self
+    }
+
+    /// Like [`on_peer_connect`](Self::on_peer_connect), but the callback
+    /// also receives the [`HandshakeContext`] of the upgrade request
+    /// (path, query, headers). Use it when the embedder's client identity
+    /// rides in the handshake: derive a key from the request and attach it
+    /// to the just-inserted peer with
+    /// [`PeerRegistry::alias`](crate::PeerRegistry::alias), so later
+    /// targeted pushes can address the peer by that key.
+    ///
+    /// ```ignore
+    /// let peers = PeerRegistry::new();
+    /// let server = WebSocketServer::new(router)
+    ///     .with_peer_registry(peers.clone())
+    ///     .on_peer_connect_with_handshake({
+    ///         let peers = peers.clone();
+    ///         move |peer, hs| {
+    ///             if let Some(token) = hs.header("authorization") {
+    ///                 peers.alias(peer.peer_id(), token);
+    ///             }
+    ///         }
+    ///     });
+    /// ```
+    ///
+    /// These hooks fire **after** the plain
+    /// [`on_peer_connect`](Self::on_peer_connect) hooks (so a
+    /// [`with_peer_registry`](Self::with_peer_registry) insert has already
+    /// run and the peer is present for `alias`), in registration order,
+    /// and still before the connection processes any traffic. Like the
+    /// plain hook the callback runs synchronously on the accept task and
+    /// must not block.
+    ///
+    /// The context is available wherever the handshake is: the built-in
+    /// `serve*` loops, and the co-hosting
+    /// [`accept_with_handshake`](Self::accept_with_handshake) +
+    /// [`serve_connection_with_handshake`](SharedWebSocketServer::serve_connection_with_handshake)
+    /// path. A connection served through plain
+    /// [`serve_connection`](SharedWebSocketServer::serve_connection)
+    /// (which carries no captured handshake) does not fire these hooks.
+    pub fn on_peer_connect_with_handshake<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&PeerHandle, &HandshakeContext) + Send + Sync + 'static,
+    {
+        self.on_connect_ctx.push(Arc::new(f));
         self
     }
 
@@ -460,7 +587,7 @@ impl WebSocketServer {
         path: &str,
         shutdown: impl Future<Output = ()>,
     ) -> std::io::Result<()> {
-        let path = path.to_string();
+        let path = normalize_path(path);
         let shared = self.into_shared();
 
         tokio::pin!(shutdown);
@@ -473,16 +600,7 @@ impl WebSocketServer {
                     let path = path.clone();
                     let shared = shared.clone();
                     tokio::spawn(async move {
-                        match WebSocketServer::accept(stream, &path).await {
-                            Ok(ws_stream) => {
-                                if let Err(err) = shared.serve_connection(ws_stream).await {
-                                    shared.report_error(ConnectionError::Connection(err));
-                                }
-                            }
-                            Err(err) => {
-                                shared.report_error(ConnectionError::Handshake(err));
-                            }
-                        }
+                        shared.accept_and_serve(stream, &path, None).await;
                     });
                 }
                 _ = &mut shutdown => break,
@@ -550,7 +668,7 @@ impl WebSocketServer {
         shutdown: impl Future<Output = ()>,
         drain_timeout: Duration,
     ) -> std::io::Result<()> {
-        let path = path.to_string();
+        let path = normalize_path(path);
         let shared = self.into_shared();
         // Parent of every connection's cancellation token. Cancelled once
         // on shutdown to wake all in-flight handlers at once.
@@ -566,18 +684,7 @@ impl WebSocketServer {
                     let shared = shared.clone();
                     let parent = parent.clone();
                     conns.spawn(async move {
-                        match WebSocketServer::accept(stream, &path).await {
-                            Ok(ws_stream) => {
-                                if let Err(err) =
-                                    shared.serve_connection_with_cancel(ws_stream, &parent).await
-                                {
-                                    shared.report_error(ConnectionError::Connection(err));
-                                }
-                            }
-                            Err(err) => {
-                                shared.report_error(ConnectionError::Handshake(err));
-                            }
-                        }
+                        shared.accept_and_serve(stream, &path, Some(&parent)).await;
                     });
                     // Reap finished connections so the JoinSet tracks only
                     // live ones rather than growing with every accept.
@@ -625,6 +732,7 @@ impl WebSocketServer {
                 offreader_limit: self.offreader_limit,
                 peer_id_counter: self.peer_id_counter,
                 on_connect: Arc::new(self.on_connect),
+                on_connect_ctx: Arc::new(self.on_connect_ctx),
                 on_disconnect: Arc::new(self.on_disconnect),
                 on_error: Arc::new(self.on_error),
             }),
@@ -644,7 +752,35 @@ impl WebSocketServer {
         stream: TcpStream,
         path: &str,
     ) -> Result<WebSocketStream<TcpStream>, RepeError> {
-        accept_repe_websocket(stream, &normalize_path(path)).await
+        // No handshake capture: this path feeds `serve_connection`, which
+        // does not fire handshake-aware hooks.
+        accept_repe_websocket(stream, &normalize_path(path), false)
+            .await
+            .map(|(ws, _handshake)| ws)
+    }
+
+    /// Like [`accept`](Self::accept), but also returns the
+    /// [`HandshakeContext`] of the upgrade request so a co-hosting
+    /// embedder can fire
+    /// [`on_peer_connect_with_handshake`](Self::on_peer_connect_with_handshake)
+    /// hooks. Pair the returned context with
+    /// [`SharedWebSocketServer::serve_connection_with_handshake`] (or
+    /// [`serve_connection_with_cancel_and_handshake`](SharedWebSocketServer::serve_connection_with_cancel_and_handshake)).
+    ///
+    /// The built-in `serve*` loops capture this context for you, so this
+    /// pairing is only needed when the embedder owns its own accept loop
+    /// (one-port co-hosting) *and* keys peers off the handshake.
+    pub async fn accept_with_handshake(
+        stream: TcpStream,
+        path: &str,
+    ) -> Result<(WebSocketStream<TcpStream>, HandshakeContext), RepeError> {
+        let (ws, handshake) = accept_repe_websocket(stream, &normalize_path(path), true).await?;
+        // `capture_handshake = true` always yields `Some` on the accept
+        // path (the validator populates it before returning `Ok`).
+        Ok((
+            ws,
+            handshake.expect("handshake captured when capture_handshake is set"),
+        ))
     }
 }
 
@@ -654,6 +790,7 @@ struct ConnectionConfig {
     offreader_limit: Option<usize>,
     peer_id_counter: Arc<AtomicU64>,
     on_connect: Arc<Vec<ConnectHook>>,
+    on_connect_ctx: Arc<Vec<ConnectCtxHook>>,
     on_disconnect: Arc<Vec<DisconnectHook>>,
     on_error: Arc<Vec<ErrorHook>>,
 }
@@ -690,8 +827,30 @@ impl SharedWebSocketServer {
     /// [`serve_connection_with_cancel`](Self::serve_connection_with_cancel).
     pub async fn serve_connection(&self, ws: WebSocketStream<TcpStream>) -> Result<(), RepeError> {
         // No parent: the connection token is cancelled only when this
-        // connection's reader exits (disconnect).
-        handle_connection_with_config(ws, Arc::clone(&self.config), CancellationToken::new()).await
+        // connection's reader exits (disconnect). No captured handshake,
+        // so on_peer_connect_with_handshake hooks do not fire.
+        handle_connection_with_config(ws, Arc::clone(&self.config), CancellationToken::new(), None)
+            .await
+    }
+
+    /// Like [`serve_connection`](Self::serve_connection), but threads the
+    /// [`HandshakeContext`] from [`WebSocketServer::accept_with_handshake`]
+    /// through so
+    /// [`on_peer_connect_with_handshake`](WebSocketServer::on_peer_connect_with_handshake)
+    /// hooks fire for this connection. For a one-port co-hosting embedder
+    /// that keys peers off the upgrade request.
+    pub async fn serve_connection_with_handshake(
+        &self,
+        ws: WebSocketStream<TcpStream>,
+        handshake: HandshakeContext,
+    ) -> Result<(), RepeError> {
+        handle_connection_with_config(
+            ws,
+            Arc::clone(&self.config),
+            CancellationToken::new(),
+            Some(handshake),
+        )
+        .await
     }
 
     /// Like [`serve_connection`](Self::serve_connection), but ties this
@@ -711,7 +870,30 @@ impl SharedWebSocketServer {
         ws: WebSocketStream<TcpStream>,
         shutdown: &ShutdownToken,
     ) -> Result<(), RepeError> {
-        handle_connection_with_config(ws, Arc::clone(&self.config), shutdown.child_token()).await
+        handle_connection_with_config(ws, Arc::clone(&self.config), shutdown.child_token(), None)
+            .await
+    }
+
+    /// [`serve_connection_with_cancel`](Self::serve_connection_with_cancel)
+    /// plus the captured [`HandshakeContext`] — the union of co-hosting,
+    /// embedder-driven drain, and handshake-keyed peers. Cancelling the
+    /// shared [`ShutdownToken`] winds the connection's in-flight off-reader
+    /// handlers down, and
+    /// [`on_peer_connect_with_handshake`](WebSocketServer::on_peer_connect_with_handshake)
+    /// hooks fire from the captured `handshake`.
+    pub async fn serve_connection_with_cancel_and_handshake(
+        &self,
+        ws: WebSocketStream<TcpStream>,
+        handshake: HandshakeContext,
+        shutdown: &ShutdownToken,
+    ) -> Result<(), RepeError> {
+        handle_connection_with_config(
+            ws,
+            Arc::clone(&self.config),
+            shutdown.child_token(),
+            Some(handshake),
+        )
+        .await
     }
 
     /// Report a transport-level error through this server's
@@ -721,6 +903,41 @@ impl SharedWebSocketServer {
     /// [`serve_connection`](Self::serve_connection) however it likes.
     pub(crate) fn report_error(&self, err: ConnectionError) {
         report_error(&self.config.on_error, err);
+    }
+
+    /// One connection's full lifecycle for the built-in accept loops:
+    /// handshake, serve, and report any handshake/connection error. The
+    /// [`HandshakeContext`] is captured only when a handshake-aware connect
+    /// hook is registered, so a server that uses none pays nothing extra on
+    /// the accept path. `expected_path` must already be normalized.
+    /// `shutdown` is `Some` for the graceful-drain loop (ties the
+    /// connection token to the shared trigger) and `None` otherwise.
+    async fn accept_and_serve(
+        &self,
+        stream: TcpStream,
+        expected_path: &str,
+        shutdown: Option<&ShutdownToken>,
+    ) {
+        let capture = !self.config.on_connect_ctx.is_empty();
+        match accept_repe_websocket(stream, expected_path, capture).await {
+            Ok((ws, handshake)) => {
+                let conn_token = match shutdown {
+                    Some(token) => token.child_token(),
+                    None => CancellationToken::new(),
+                };
+                if let Err(err) = handle_connection_with_config(
+                    ws,
+                    Arc::clone(&self.config),
+                    conn_token,
+                    handshake,
+                )
+                .await
+                {
+                    self.report_error(ConnectionError::Connection(err));
+                }
+            }
+            Err(err) => self.report_error(ConnectionError::Handshake(err)),
+        }
     }
 }
 
@@ -758,24 +975,49 @@ where
     writer.close().await.map_err(websocket_transport_error)
 }
 
+/// Perform the REPE upgrade handshake, optionally capturing the request
+/// context. `capture_handshake` is `false` for the plain accept paths so
+/// they pay no per-connection cost building a [`HandshakeContext`] no hook
+/// will read; it is `true` only when an
+/// [`on_peer_connect_with_handshake`](WebSocketServer::on_peer_connect_with_handshake)
+/// hook (or the explicit
+/// [`accept_with_handshake`](WebSocketServer::accept_with_handshake)) needs
+/// it. The returned `Option` is `Some` iff `capture_handshake` was `true`.
 async fn accept_repe_websocket(
     stream: TcpStream,
     expected_path: &str,
-) -> Result<WebSocketStream<TcpStream>, RepeError> {
-    accept_hdr_async(
+    capture_handshake: bool,
+) -> Result<(WebSocketStream<TcpStream>, Option<HandshakeContext>), RepeError> {
+    // The handshake `Callback` borrows the request only for the duration
+    // of `on_request`, so stash the captured context in a shared slot the
+    // validator fills and we read back once the upgrade completes. When no
+    // hook will read it, the slot is absent and the validator skips the
+    // capture entirely.
+    let captured = capture_handshake.then(|| Arc::new(std::sync::Mutex::new(None)));
+    let ws = accept_hdr_async(
         stream,
         WebSocketPathValidator {
             expected: expected_path.to_owned(),
+            captured: captured.clone(),
         },
     )
     .await
-    .map_err(websocket_transport_error)
+    .map_err(websocket_transport_error)?;
+    // The validator populates the slot on the accept path; a rejected path
+    // returns `Err` above before we get here.
+    let handshake = captured.and_then(|slot| {
+        slot.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    });
+    Ok((ws, handshake))
 }
 
 async fn handle_connection_with_config(
     ws_stream: WebSocketStream<TcpStream>,
     config: Arc<ConnectionConfig>,
     conn_token: CancellationToken,
+    handshake: Option<HandshakeContext>,
 ) -> Result<(), RepeError> {
     let (outbound_tx, outbound_rx) = mpsc::channel::<Message>(config.outbound_capacity);
 
@@ -827,6 +1069,16 @@ async fn handle_connection_with_config(
         // outbound channel when the writer task begins draining.
         for hook in config.on_connect.iter() {
             hook(peer.clone());
+        }
+        // Handshake-aware hooks run after the plain ones (so a
+        // `with_peer_registry` insert has already landed and the peer is
+        // present for `alias`) and only when a handshake was captured
+        // (the built-in `serve*` loops and the `*_with_handshake`
+        // co-hosting path; not plain `serve_connection`).
+        if let Some(handshake) = &handshake {
+            for hook in config.on_connect_ctx.iter() {
+                hook(&peer, handshake);
+            }
         }
 
         // Bundle the per-connection dispatch state for the reader. `peer`
@@ -1158,6 +1410,92 @@ fn decode_request_frame(frame: WsMessage) -> Result<FrameAction, RepeError> {
     }
 }
 
+/// Peek at an accepted `stream` and report whether the client is opening
+/// a WebSocket upgrade (as opposed to issuing a plain HTTP request),
+/// **without consuming any bytes**.
+///
+/// This is the WS-vs-HTTP fork a one-port co-hosting embedder needs: route
+/// `true` to [`WebSocketServer::accept`] +
+/// [`serve_connection`](SharedWebSocketServer::serve_connection) and `false`
+/// to your own HTTP handler, all on one TCP port. Because
+/// [`WebSocketServer::accept`] replays the handshake from the start of the
+/// stream, this helper only *peeks* (`TcpStream::peek`) — it leaves the
+/// request bytes in the socket buffer so the subsequent `accept` (or your
+/// HTTP handler) sees the full request intact. See
+/// `examples/websocket_cohosting.rs` for the worked fork.
+///
+/// The classification is a sniff, not a full handshake validation: it
+/// looks for an `Upgrade: websocket` header (compared case-insensitively,
+/// per RFC 6455 §4.2.1) within the request head, and matches the
+/// `websocket` token only inside that header's value, so a plain
+/// `GET /websocket-status` request is not misclassified.
+/// [`WebSocketServer::accept`] still performs the authoritative RFC 6455
+/// validation on the `true` branch, so a false positive there fails the
+/// handshake rather than corrupting anything.
+///
+/// The peek reads the request head that arrives in the connection's first
+/// readable chunk (bounded to 1 KiB). A WebSocket upgrade request — a
+/// short `GET` line plus its `Upgrade`/`Connection` headers — fits well
+/// within that, and those headers lead the block.
+///
+/// # Errors
+///
+/// Returns the underlying [`std::io::Error`] if peeking the stream fails.
+/// A peer that connects and sends nothing yet is reported as `false`
+/// (`peek` resolves once at least one byte is readable; an immediate EOF
+/// yields an empty, non-upgrade head).
+pub async fn is_websocket_upgrade(stream: &TcpStream) -> std::io::Result<bool> {
+    let mut buf = [0u8; 1024];
+    let n = stream.peek(&mut buf).await?;
+    Ok(head_requests_websocket_upgrade(&buf[..n]))
+}
+
+/// Scan an HTTP request head for a WebSocket upgrade signal. Pure and
+/// byte-slice-based so it is unit-testable without a socket.
+fn head_requests_websocket_upgrade(head: &[u8]) -> bool {
+    // Restrict to the header block when its terminator is present, so a
+    // body can never contribute a spurious match.
+    let block = match find_subslice(head, b"\r\n\r\n") {
+        Some(end) => &head[..end],
+        None => head,
+    };
+    for line in block.split(|&b| b == b'\n') {
+        // `trim_ascii` strips the trailing CR (and any surrounding space).
+        let line = line.trim_ascii();
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            continue;
+        };
+        let (name, rest) = line.split_at(colon);
+        // `rest` starts at the colon; skip it for the value.
+        if name.eq_ignore_ascii_case(b"upgrade")
+            && contains_ignore_ascii_case(&rest[1..], b"websocket")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// First index of `needle` within `haystack`, or `None`. `needle` must be
+/// non-empty.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Whether `haystack` contains `needle` as a contiguous run, compared
+/// ASCII-case-insensitively.
+fn contains_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle))
+}
+
 fn normalize_path(path: &str) -> String {
     if path.is_empty() || path == "/" {
         "/".to_string()
@@ -1194,12 +1532,24 @@ fn websocket_invalid_data_error(message: &str) -> RepeError {
 
 struct WebSocketPathValidator {
     expected: String,
+    /// Where to stash the captured [`HandshakeContext`], or `None` when no
+    /// hook will read it (the plain accept paths) so the capture is
+    /// skipped entirely.
+    captured: Option<Arc<std::sync::Mutex<Option<HandshakeContext>>>>,
 }
 
 impl Callback for WebSocketPathValidator {
     #[allow(clippy::result_large_err)]
     fn on_request(self, request: &Request, response: Response) -> Result<Response, ErrorResponse> {
         if request.uri().path() == self.expected {
+            // Capture the request context for the connect hook before the
+            // borrow ends, but only when a slot was provided (a hook needs
+            // it) and only on the accept path (a rejected upgrade returns
+            // below without capturing).
+            if let Some(slot) = &self.captured {
+                *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some(HandshakeContext::from_request(request));
+            }
             Ok(response)
         } else {
             Err(path_not_found_response(request))
@@ -1226,10 +1576,11 @@ mod tests {
             offreader_limit: Some(DEFAULT_OFFREADER_LIMIT),
             peer_id_counter: Arc::new(AtomicU64::new(0)),
             on_connect: Arc::new(Vec::new()),
+            on_connect_ctx: Arc::new(Vec::new()),
             on_disconnect: Arc::new(Vec::new()),
             on_error: Arc::new(Vec::new()),
         });
-        handle_connection_with_config(ws_stream, config, CancellationToken::new()).await
+        handle_connection_with_config(ws_stream, config, CancellationToken::new(), None).await
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1245,7 +1596,8 @@ mod tests {
 
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let ws_stream = accept_repe_websocket(stream, "/repe").await.unwrap();
+            let (ws_stream, _handshake) =
+                accept_repe_websocket(stream, "/repe", false).await.unwrap();
             run_default_connection(ws_stream, router).await.unwrap();
         });
 
@@ -1334,7 +1686,8 @@ mod tests {
         let proxy_task = tokio::spawn(async move {
             let upstream = AsyncClient::connect(upstream_addr).await.unwrap();
             let (stream, _) = proxy_listener.accept().await.unwrap();
-            let ws_stream = accept_repe_websocket(stream, "/repe").await.unwrap();
+            let (ws_stream, _handshake) =
+                accept_repe_websocket(stream, "/repe", false).await.unwrap();
             proxy_connection(ws_stream, upstream).await.unwrap();
         });
 
@@ -2750,5 +3103,239 @@ mod tests {
 
         shutdown_tx.send(()).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(5), serve).await;
+    }
+
+    // ---- Friction 1: one-port co-hosting WS-vs-HTTP classifier ------
+
+    #[test]
+    fn classifier_detects_websocket_upgrade_head() {
+        let req = b"GET /repe HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\
+                    Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\n\
+                    Sec-WebSocket-Version: 13\r\n\r\n";
+        assert!(head_requests_websocket_upgrade(req));
+    }
+
+    #[test]
+    fn classifier_is_case_insensitive() {
+        let req = b"GET / HTTP/1.1\r\nupgrade: WebSocket\r\n\r\n";
+        assert!(head_requests_websocket_upgrade(req));
+    }
+
+    #[test]
+    fn classifier_rejects_plain_http() {
+        let req = b"GET /healthz HTTP/1.1\r\nHost: x\r\nAccept: */*\r\n\r\n";
+        assert!(!head_requests_websocket_upgrade(req));
+    }
+
+    #[test]
+    fn classifier_ignores_websocket_outside_the_upgrade_header() {
+        // "websocket" appears in the request target and a header value but
+        // never as an Upgrade header, so this is a plain HTTP request.
+        let req =
+            b"GET /websocket-status HTTP/1.1\r\nHost: x\r\nUser-Agent: websocket-probe/1.0\r\n\r\n";
+        assert!(!head_requests_websocket_upgrade(req));
+    }
+
+    #[test]
+    fn classifier_handles_head_without_terminator() {
+        // The first readable chunk ended mid-header, but the Upgrade line
+        // is already complete and present.
+        let req = b"GET /repe HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upg";
+        assert!(head_requests_websocket_upgrade(req));
+    }
+
+    #[test]
+    fn classifier_empty_head_is_not_upgrade() {
+        assert!(!head_requests_websocket_upgrade(b""));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn is_websocket_upgrade_peeks_without_consuming() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // The server classifies each accepted stream and confirms peek left
+        // the request head intact for a subsequent reader (`accept`).
+        let server = tokio::spawn(async move {
+            let mut verdicts = Vec::new();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let is_ws = is_websocket_upgrade(&stream).await.unwrap();
+                // Peek again: the bytes must still be there (non-destructive).
+                let mut buf = [0u8; 32];
+                let n = stream.peek(&mut buf).await.unwrap();
+                verdicts.push((is_ws, buf[..n].starts_with(b"GET ")));
+            }
+            verdicts
+        });
+
+        let mut ws_like = TcpStream::connect(addr).await.unwrap();
+        ws_like
+            .write_all(b"GET /repe HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+            .await
+            .unwrap();
+        ws_like.flush().await.unwrap();
+
+        let mut http = TcpStream::connect(addr).await.unwrap();
+        http.write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        http.flush().await.unwrap();
+
+        let verdicts = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("classifier server hung")
+            .unwrap();
+        // Connection order is deterministic on loopback (first connect is
+        // accepted first), but assert on the set to stay robust: exactly one
+        // upgrade and one non-upgrade, both with their head still readable.
+        assert!(verdicts.iter().all(|(_, head_intact)| *head_intact));
+        let upgrades = verdicts.iter().filter(|(is_ws, _)| *is_ws).count();
+        assert_eq!(upgrades, 1, "exactly one stream should classify as WS");
+
+        drop(ws_like);
+        drop(http);
+    }
+
+    // ---- Friction 2: handshake-context connect hook + alias --------
+
+    /// Co-hosting accept loop that threads the captured [`HandshakeContext`]
+    /// so `on_peer_connect_with_handshake` hooks fire (mirrors the built-in
+    /// `serve*` loops, which also capture it).
+    async fn serve_one_with_handshake(
+        listener: TcpListener,
+        path: &str,
+        server: WebSocketServer,
+    ) -> tokio::task::JoinHandle<()> {
+        let path = path.to_string();
+        let shared = server.into_shared();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let path = path.clone();
+                let shared = shared.clone();
+                tokio::spawn(async move {
+                    if let Ok((ws, hs)) =
+                        WebSocketServer::accept_with_handshake(stream, &path).await
+                    {
+                        let _ = shared.serve_connection_with_handshake(ws, hs).await;
+                    }
+                });
+            }
+        })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handshake_query_param_drives_alias_for_targeted_push() {
+        let router = Router::new().with_json("/ping", |_| Ok(json!({ "ok": true })));
+        let peers = PeerRegistry::new();
+
+        // Capture the context fields the hook saw, to assert the handshake
+        // was threaded through with its path, query, and headers intact.
+        let captured = Arc::new(Mutex::new(None::<(String, Option<String>, Option<String>)>));
+        let captured_hook = Arc::clone(&captured);
+        let peers_hook = peers.clone();
+        let server = WebSocketServer::new(router)
+            .with_peer_registry(peers.clone())
+            .on_peer_connect_with_handshake(move |peer, hs| {
+                *captured_hook.lock().unwrap() = Some((
+                    hs.path().to_string(),
+                    hs.query().map(str::to_string),
+                    hs.header("upgrade").map(str::to_string),
+                ));
+                // The embedder's key rides in the query string: token=<id>.
+                if let Some(token) = hs.query().and_then(|q| q.strip_prefix("token=")) {
+                    peers_hook.alias(peer.peer_id(), token);
+                }
+            });
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = serve_one_with_handshake(listener, "/repe", server).await;
+
+        let client = WebSocketClient::connect(&format!("ws://{addr}/repe?token=abc123"))
+            .await
+            .unwrap();
+        let mut notifies = client.subscribe_notifies().expect("subscribe");
+        // Round-trip so the connect hooks (registry insert, then alias) ran.
+        client.call_json("/ping", &json!({})).await.unwrap();
+
+        // The hook observed the upgrade request context.
+        let seen = captured.lock().unwrap().clone().expect("hook fired");
+        assert_eq!(seen.0, "/repe");
+        assert_eq!(seen.1.as_deref(), Some("token=abc123"));
+        assert_eq!(seen.2.as_deref(), Some("websocket"));
+
+        // Targeted push addressed by the embedder's own identity -- no
+        // parallel key -> PeerId map maintained by hand.
+        let handle = peers.get_by("abc123").expect("alias resolved to a peer");
+        handle
+            .send_notify("/nudge", NotifyBody::Json(b"{}".to_vec()))
+            .unwrap();
+
+        let pushed = tokio::time::timeout(Duration::from_secs(2), notifies.recv())
+            .await
+            .expect("nudge did not arrive")
+            .expect("notify channel closed");
+        assert_eq!(pushed.query_str().unwrap(), "/nudge");
+
+        // Disconnect drops the peer and its alias in one step.
+        drop(client);
+        for _ in 0..50 {
+            if peers.get_by("abc123").is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            peers.get_by("abc123").is_none(),
+            "alias not cleaned up on disconnect"
+        );
+        server_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn plain_serve_connection_does_not_fire_handshake_hook() {
+        // A connection served through plain `serve_connection` carries no
+        // captured handshake, so `on_peer_connect_with_handshake` must not
+        // fire (while the plain `on_peer_connect` still does).
+        use std::sync::atomic::AtomicUsize;
+        let plain = Arc::new(AtomicUsize::new(0));
+        let ctx = Arc::new(AtomicUsize::new(0));
+        let plain_h = Arc::clone(&plain);
+        let ctx_h = Arc::clone(&ctx);
+
+        let router = Router::new().with_json("/ping", |_| Ok(json!({ "ok": true })));
+        let server = WebSocketServer::new(router)
+            .on_peer_connect(move |_| {
+                plain_h.fetch_add(1, Ordering::SeqCst);
+            })
+            .on_peer_connect_with_handshake(move |_, _| {
+                ctx_h.fetch_add(1, Ordering::SeqCst);
+            });
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // serve_one uses plain accept + serve_connection (no handshake).
+        let server_task = serve_one(listener, "/repe", server).await;
+
+        let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
+            .await
+            .unwrap();
+        client.call_json("/ping", &json!({})).await.unwrap();
+
+        assert_eq!(plain.load(Ordering::SeqCst), 1, "plain connect hook ran");
+        assert_eq!(
+            ctx.load(Ordering::SeqCst),
+            0,
+            "handshake hook must not fire without a captured handshake"
+        );
+
+        drop(client);
+        server_task.abort();
     }
 }

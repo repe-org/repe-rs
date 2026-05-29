@@ -96,5 +96,6 @@ pub use wasm_client::WasmClient;
 pub use websocket_client::{AlreadySubscribed, WebSocketClient};
 #[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]
 pub use websocket_server::{
-    ConnectionError, SharedWebSocketServer, ShutdownToken, WebSocketServer, proxy_connection,
+    ConnectionError, HandshakeContext, SharedWebSocketServer, ShutdownToken, WebSocketServer,
+    is_websocket_upgrade, proxy_connection,
 };

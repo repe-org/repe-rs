@@ -51,6 +51,10 @@ required-features = ["cli"]
 name = "websocket_graceful_server"
 required-features = ["websocket"]
 
+[[example]]
+name = "websocket_cohosting"
+required-features = ["websocket"]
+
 [dependencies]
 beve = "0.1"
 serde = { version = "1", features = ["derive" ] }
