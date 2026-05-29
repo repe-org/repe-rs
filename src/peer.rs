@@ -582,9 +582,13 @@ impl PeerRegistry {
         // Purge this peer's aliases via the reverse index (no full scan).
         if let Some(keys) = inner.alias_index.remove(&id) {
             for key in keys {
-                // Guard against a key that was re-pointed to another peer
-                // after this one acquired it; that peer now owns the
-                // forward mapping and must keep it.
+                // Defensive: `alias` retains a re-pointed key out of its
+                // previous owner's `alias_index`, so under that invariant
+                // every key reached here still maps to `id` and this check
+                // always passes. It is kept so a future change that broke
+                // the invariant could not turn a stale reverse-index entry
+                // into the wrongful removal of another peer's live forward
+                // mapping.
                 if inner.aliases.get(&key) == Some(&id) {
                     inner.aliases.remove(&key);
                 }

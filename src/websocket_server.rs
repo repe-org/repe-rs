@@ -165,7 +165,7 @@ impl std::error::Error for ConnectionError {
 /// If the embedder's key instead arrives in a request *body*, this hook
 /// is unnecessary — the handler already has both the key and the peer via
 /// [`CallContext::peer`](crate::CallContext::peer).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HandshakeContext {
     path: String,
     query: Option<String>,
@@ -179,11 +179,18 @@ impl HandshakeContext {
         let headers = request
             .headers()
             .iter()
-            .map(|(name, value)| {
-                (
-                    name.as_str().to_owned(),
-                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
-                )
+            .filter_map(|(name, value)| {
+                // Keep only values that round-trip to clean text. The
+                // documented use is keying off a token / auth header, so a
+                // value that is not valid (visible ASCII) text is better
+                // surfaced as an absent header (fail-closed: the embedder
+                // sees `None` and can reject the connection) than captured
+                // as a lossily-mangled string that no `get_by` lookup would
+                // ever match.
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.as_str().to_owned(), v.to_owned()))
             })
             .collect();
         Self {
@@ -209,7 +216,10 @@ impl HandshakeContext {
 
     /// The first value of the named header, matched case-insensitively
     /// (HTTP header names are case-insensitive). Returns `None` if the
-    /// header was absent or its value was not valid UTF-8.
+    /// header was absent, or if its value was not valid (visible ASCII)
+    /// text — such values are dropped at capture rather than mangled, so a
+    /// token or auth header that cannot round-trip to a clean string reads
+    /// as absent rather than as a corrupted key.
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
@@ -220,10 +230,37 @@ impl HandshakeContext {
     /// Iterate over every captured header as `(name, value)` pairs, in
     /// the order they arrived. Header names retain the case the client
     /// sent; use [`header`](Self::header) for a case-insensitive lookup.
+    /// Headers whose value was not valid (visible ASCII) text are dropped
+    /// at capture (see [`header`](Self::header)), so they do not appear
+    /// here either.
     pub fn headers(&self) -> impl Iterator<Item = (&str, &str)> {
         self.headers
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+}
+
+impl std::fmt::Debug for HandshakeContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Hand-written rather than derived (mirroring `PeerHandle` and
+        // `CallContext` in the peer module): the query string and header
+        // values can carry credentials — the documented use keys off an
+        // auth header or a token in the query — so a routine
+        // `tracing::debug!(?ctx)` must not spill them into logs. The path
+        // and header names are safe to show; values and the query are
+        // redacted.
+        f.debug_struct("HandshakeContext")
+            .field("path", &self.path)
+            .field("query", &self.query.as_ref().map(|_| "<redacted>"))
+            .field(
+                "headers",
+                &self
+                    .headers
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
     }
 }
 
@@ -1429,21 +1466,44 @@ fn decode_request_frame(frame: WsMessage) -> Result<FrameAction, RepeError> {
 /// per RFC 6455 §4.2.1) within the request head, and matches the
 /// `websocket` token only inside that header's value, so a plain
 /// `GET /websocket-status` request is not misclassified.
-/// [`WebSocketServer::accept`] still performs the authoritative RFC 6455
-/// validation on the `true` branch, so a false positive there fails the
-/// handshake rather than corrupting anything.
+///
+/// The two misclassification directions are **not** symmetric:
+///
+/// - A false positive (plain HTTP sniffed as an upgrade) is harmless. The
+///   `true` branch hands off to [`WebSocketServer::accept`], whose
+///   authoritative RFC 6455 validation rejects the request and fails the
+///   handshake rather than corrupting anything.
+/// - A false negative is **not** recoverable here. If a real upgrade's
+///   `Upgrade` header has not arrived in the connection's first readable
+///   chunk (TCP may split the request head across segments) or falls
+///   beyond the 1 KiB peek window, the request is routed to the HTTP
+///   handler with no second look.
 ///
 /// The peek reads the request head that arrives in the connection's first
-/// readable chunk (bounded to 1 KiB). A WebSocket upgrade request — a
-/// short `GET` line plus its `Upgrade`/`Connection` headers — fits well
-/// within that, and those headers lead the block.
+/// readable chunk (bounded to 1 KiB). A real WebSocket upgrade — a short
+/// `GET` line plus its `Upgrade`/`Connection` headers — sends a compact
+/// head with those headers up front, so a false negative is unlikely on a
+/// sane network; but it depends on client and network framing, not on the
+/// heuristic alone. An embedder that must be exact can read and buffer the
+/// request head itself (up to the terminating `\r\n\r\n`) before
+/// classifying.
 ///
 /// # Errors
 ///
 /// Returns the underlying [`std::io::Error`] if peeking the stream fails.
-/// A peer that connects and sends nothing yet is reported as `false`
-/// (`peek` resolves once at least one byte is readable; an immediate EOF
-/// yields an empty, non-upgrade head).
+///
+/// # Blocking and timeouts
+///
+/// `peek` resolves only once at least one byte is readable. A peer that
+/// connects and immediately closes (EOF) yields an empty, non-upgrade head
+/// and is reported as `false`; but a peer that connects and holds the
+/// socket open *without sending* leaves this future pending indefinitely,
+/// pinning the spawned task (a slowloris). This mirrors
+/// [`WebSocketServer::accept`], which likewise awaits the client's bytes,
+/// so it is not specific to co-hosting — but because this helper is the
+/// recommended one-port entry point, production embedders should wrap the
+/// peek in a [`tokio::time::timeout`] and drop the connection if the
+/// request head does not arrive promptly.
 pub async fn is_websocket_upgrade(stream: &TcpStream) -> std::io::Result<bool> {
     let mut buf = [0u8; 1024];
     let n = stream.peek(&mut buf).await?;
@@ -3337,5 +3397,60 @@ mod tests {
 
         drop(client);
         server_task.abort();
+    }
+
+    #[test]
+    fn handshake_capture_drops_non_ascii_header_values_and_keeps_ascii() {
+        // The capture path keeps only header values that round-trip to
+        // clean text, so an embedder keying off a token / auth header sees
+        // a non-ASCII value as absent (fail-closed) rather than as a
+        // U+FFFD-mangled key that no `get_by` lookup would ever match.
+        use tungstenite::http;
+        let garbled = http::HeaderValue::from_bytes(&[0xFF, 0xFE]).unwrap();
+        let request = http::Request::builder()
+            .uri("/repe?token=abc123")
+            .header("authorization", "Bearer good-token")
+            .header("x-garbled", garbled)
+            .body(())
+            .unwrap();
+
+        let ctx = HandshakeContext::from_request(&request);
+
+        // The ASCII header survives and stays case-insensitively addressable.
+        assert_eq!(ctx.header("authorization"), Some("Bearer good-token"));
+        assert_eq!(ctx.header("Authorization"), Some("Bearer good-token"));
+        // The non-ASCII value is dropped at capture: absent, not mangled.
+        assert_eq!(ctx.header("x-garbled"), None);
+        // ...and it is absent from the full iterator too.
+        assert!(ctx.headers().all(|(name, _)| name != "x-garbled"));
+        // Path and query are still captured verbatim.
+        assert_eq!(ctx.path(), "/repe");
+        assert_eq!(ctx.query(), Some("token=abc123"));
+    }
+
+    #[test]
+    fn handshake_debug_redacts_credentials() {
+        // The hand-written Debug must not spill the query string or header
+        // values (the documented key / token carriers) into logs.
+        use tungstenite::http;
+        let request = http::Request::builder()
+            .uri("/repe?token=super-secret")
+            .header("authorization", "Bearer super-secret")
+            .body(())
+            .unwrap();
+
+        let ctx = HandshakeContext::from_request(&request);
+        let rendered = format!("{ctx:?}");
+
+        // Neither secret value appears anywhere in the rendering.
+        assert!(
+            !rendered.contains("super-secret"),
+            "Debug leaked a credential: {rendered}"
+        );
+        // The safe-to-show shape does: the path and the header *name*.
+        assert!(rendered.contains("/repe"), "rendered = {rendered}");
+        assert!(rendered.contains("authorization"), "rendered = {rendered}");
+        // Query presence is signalled without exposing its value.
+        assert!(rendered.contains("<redacted>"), "rendered = {rendered}");
     }
 }
