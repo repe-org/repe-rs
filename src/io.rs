@@ -44,9 +44,26 @@ pub fn write_message<W: Write>(w: &mut W, msg: &Message) -> Result<(), RepeError
 /// do so produces an unframed message on the wire and the receiving side will
 /// either block (short body) or misinterpret subsequent frames (long body).
 ///
-/// Pairs with `beve::to_writer_streaming` so that a large binary body can be
-/// BEVE-encoded directly into the caller-supplied writer with zero
-/// intermediate `Vec<u8>`.
+/// Because REPE frames are length-prefixed, `body_len` has to be known before
+/// the body is written. Two patterns supply a serialized body without building
+/// a full wire-frame `Vec`:
+///
+/// * **Reusable scratch buffer** (recommended for a writer sending many
+///   frames): serialize the body once into a caller-owned `Vec<u8>` with
+///   [`beve::to_vec_into`], which reuses the buffer's allocation and clears it
+///   on each call, then pass `scratch.len()` as `body_len` and
+///   `|w| w.write_all(&scratch)` as the writer. One encode per message and,
+///   once the buffer has grown to fit the largest body, no further allocation.
+///   See `examples/beve_streaming_body.rs`.
+/// * **Known-length raw body**: when the length is already known (a file
+///   chunk, a pre-sized buffer), pass it directly and have `body_writer` emit
+///   the bytes with `w.write_all(..)` — no body buffer at all.
+///
+/// Truly streaming an unbounded body too large to hold in memory needs its
+/// encoded length without buffering. BEVE cannot compute that without a
+/// traversal, so `beve::to_writer_streaming` only avoids the in-memory body if
+/// paired with a separate size pass — worth it only when not holding the body
+/// matters more than the second traversal.
 pub fn write_message_streaming<W, F>(
     w: &mut W,
     mut header: Header,
@@ -143,6 +160,69 @@ mod tests {
         .unwrap();
 
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn streaming_beve_body_via_reused_scratch() {
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct SensorFrame {
+            id: u64,
+            samples: Vec<f64>,
+        }
+
+        let query = b"/ingest/frame";
+        // One scratch buffer for the writer; reused across every frame.
+        let mut scratch = Vec::new();
+
+        let big = SensorFrame {
+            id: 1,
+            samples: vec![1.25; 4096],
+        };
+
+        // Serialize the body once into the caller-owned buffer, then frame it.
+        beve::to_vec_into(&mut scratch, &big).unwrap();
+        let mut header = Header::new();
+        header.id = big.id;
+        header.query_format = QueryFormat::JsonPointer as u16;
+        header.body_format = BodyFormat::Beve as u16;
+        let mut streamed = Vec::new();
+        write_message_streaming(&mut streamed, header, query, scratch.len() as u64, |w| {
+            w.write_all(&scratch)
+        })
+        .unwrap();
+
+        // The streamed frame is byte-identical to the fully-buffered Message.
+        let reference = Message::builder()
+            .id(big.id)
+            .query_bytes(query.to_vec())
+            .query_format(QueryFormat::JsonPointer)
+            .body_bytes(beve::to_vec(&big).unwrap())
+            .body_format(BodyFormat::Beve)
+            .build()
+            .to_vec();
+        assert_eq!(streamed, reference);
+
+        // ...and round-trips back to the original value.
+        let parsed = Message::from_slice(&streamed).unwrap();
+        let decoded: SensorFrame = parsed.beve_body().unwrap();
+        assert_eq!(decoded, big);
+
+        // A subsequent smaller body reuses the buffer: `to_vec_into` clears but
+        // keeps capacity, so no reallocation once it has grown to the largest
+        // body seen.
+        let cap_after_big = scratch.capacity();
+        let small = SensorFrame {
+            id: 2,
+            samples: vec![0.0; 16],
+        };
+        beve::to_vec_into(&mut scratch, &small).unwrap();
+        assert!(
+            scratch.capacity() <= cap_after_big,
+            "smaller body must reuse the scratch allocation, not grow it"
+        );
+        assert!(scratch.len() < cap_after_big);
     }
 
     #[test]
