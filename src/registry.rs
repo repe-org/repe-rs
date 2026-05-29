@@ -2,6 +2,7 @@ use crate::constants::{BodyFormat, ErrorCode};
 use crate::message::Message;
 use crate::peer::CallContext;
 use serde_json::{Map, Value, json};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -107,7 +108,14 @@ where
 
 struct RegistryState {
     root: Value,
-    functions: HashMap<Vec<String>, RegistryFunction>,
+    /// Callable entries keyed by their canonical JSON Pointer string (the
+    /// `canonical_pointer` form computed once at registration). Keying on the
+    /// canonical `String` rather than the parsed `Vec<String>` segments lets
+    /// dispatch probe the map with a borrowed `&str`: for the escape-free
+    /// common case the wire pointer already *is* its own canonical key, so a
+    /// function call resolves without allocating the per-segment `Vec<String>`
+    /// + `String`s that routing previously required on every request.
+    functions: HashMap<String, RegistryFunction>,
 }
 
 impl Default for RegistryState {
@@ -211,7 +219,9 @@ impl Registry {
             });
         }
         let _ = ensure_object_parent(&mut state.root, &segments)?;
-        state.functions.insert(segments, function);
+        state
+            .functions
+            .insert(canonical_pointer(&segments), function);
         Ok(())
     }
 
@@ -247,15 +257,22 @@ impl Registry {
         body: Option<Value>,
         ctx: &CallContext,
     ) -> Result<Value, RegistryError> {
-        let segments = parse_pointer(pointer)?;
+        // Resolve the function-lookup key up front. For the escape-free common
+        // case `key` borrows `pointer` directly (no allocation); only escaped
+        // pointers fall back to an owned canonical string. Crucially, the
+        // per-segment `Vec<String>` from `parse_pointer` is now allocated only
+        // on the value-tree fallback paths below, never on a function call.
+        let key = canonical_key(pointer)?;
+
         if body.is_none() {
             let state = self.read_state();
-            if state.functions.contains_key(&segments) {
+            if state.functions.contains_key(key.as_ref()) {
                 return Ok(json!({
                     "type": "function",
-                    "path": canonical_pointer(&segments),
+                    "path": key.as_ref(),
                 }));
             }
+            let segments = parse_pointer(pointer)?;
             return resolve_ref(&state.root, &segments).cloned();
         }
 
@@ -263,7 +280,7 @@ impl Registry {
 
         let function = {
             let state = self.read_state();
-            state.functions.get(&segments).cloned()
+            state.functions.get(key.as_ref()).cloned()
         };
         if let Some(f) = function {
             return f
@@ -271,6 +288,7 @@ impl Registry {
                 .map_err(|(code, message)| RegistryError::Execution { code, message });
         }
 
+        let segments = parse_pointer(pointer)?;
         let mut state = self.write_state();
         if segments.is_empty() {
             let Value::Object(object) = payload else {
@@ -337,6 +355,39 @@ fn parse_registration_path(path: &str) -> Result<Vec<String>, RegistryError> {
         return parse_pointer(path);
     }
     parse_pointer(&format!("/{path}"))
+}
+
+/// Compute the canonical JSON-Pointer key used to probe `RegistryState::functions`,
+/// borrowing the input when possible.
+///
+/// The function map is keyed by `canonical_pointer(parse_pointer(p))`. For any
+/// valid `/`-prefixed pointer, `escape ∘ unescape` round-trips each reference
+/// token, so that canonical form is byte-identical to `p` itself — meaning an
+/// escape-free pointer (the overwhelmingly common case) is *already* its own
+/// canonical key and can be returned as a borrow with zero allocation. Only
+/// pointers containing a `~` escape need the parse + re-escape round-trip, and
+/// only those allocate.
+///
+/// Errors exactly where [`parse_pointer`] would: a non-empty pointer without a
+/// leading `/`, or a malformed `~` escape.
+fn canonical_key(pointer: &str) -> Result<Cow<'_, str>, RegistryError> {
+    if pointer.is_empty() || pointer == "/" {
+        // No function can register at the root, so this never matches a
+        // callable; normalize to "/" to mirror `canonical_pointer(&[])`.
+        return Ok(Cow::Borrowed("/"));
+    }
+    if !pointer.starts_with('/') {
+        return Err(RegistryError::InvalidPointer {
+            pointer: pointer.to_string(),
+        });
+    }
+    if !pointer.contains('~') {
+        // Already canonical: slash-prefixed and escape-free.
+        return Ok(Cow::Borrowed(pointer));
+    }
+    // Escaped tokens need validation (rejecting malformed `~` sequences) and
+    // re-canonicalization; this allocates, but escapes are rare in practice.
+    Ok(Cow::Owned(canonical_pointer(&parse_pointer(pointer)?)))
 }
 
 fn parse_pointer(pointer: &str) -> Result<Vec<String>, RegistryError> {
@@ -635,6 +686,50 @@ mod tests {
             .dispatch("/add", Some(json!({"a": 2, "b": 3})))
             .expect("call");
         assert_eq!(call_result, Value::from(5));
+    }
+
+    #[test]
+    fn dispatch_resolves_functions_at_escaped_pointers() {
+        // The function map is keyed by the canonical pointer string. A pointer
+        // whose reference token contains an escaped `/` (`~1`) or `~` (`~0`)
+        // must still register and dispatch: registration stores the canonical
+        // key, and dispatch rebuilds the byte-identical key via
+        // `canonical_key`'s owned (escape) path. This is the branch the
+        // borrow-the-wire-pointer fast path cannot cover.
+        let registry = Registry::new();
+        registry
+            .register_function("/a~1b/run", |_params| Ok(Value::from("slash")))
+            .expect("register escaped-slash function");
+        registry
+            .register_function("/m~0n", |_params| Ok(Value::from("tilde")))
+            .expect("register escaped-tilde function");
+
+        // Metadata read echoes the canonical (re-escaped) pointer.
+        let info = registry.dispatch("/a~1b/run", None).expect("info");
+        assert_eq!(info["type"], "function");
+        assert_eq!(info["path"], "/a~1b/run");
+
+        // Calls resolve to the correct handler through the owned canonical key.
+        assert_eq!(
+            registry
+                .dispatch("/a~1b/run", Some(json!({})))
+                .expect("call slash"),
+            Value::from("slash")
+        );
+        assert_eq!(
+            registry
+                .dispatch("/m~0n", Some(json!({})))
+                .expect("call tilde"),
+            Value::from("tilde")
+        );
+
+        // Write fallback still works after the lookup reorder: an escaped
+        // non-function pointer parses to segments and writes under the parent.
+        let written = registry
+            .dispatch("/a~1b/note", Some(json!("hi")))
+            .expect("write");
+        assert_eq!(written["status"], "ok");
+        assert_eq!(written["path"], "/a~1b/note");
     }
 
     #[test]
