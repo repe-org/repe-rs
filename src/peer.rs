@@ -28,8 +28,10 @@
 use crate::constants::BodyFormat;
 use crate::error::RepeError;
 use serde::Serialize;
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::future::Future;
+use std::hash::Hash;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -346,10 +348,55 @@ impl std::fmt::Debug for CallContext<'_> {
 ///     publisher.broadcast_notify_json("/state/changed", &snapshot);
 /// });
 /// ```
+///
+/// # Addressing peers by an embedder key
+///
+/// [`PeerId`] is the registry's canonical, server-minted key — it is what
+/// [`with_peer_registry`](crate::websocket_server::WebSocketServer::with_peer_registry)
+/// auto-inserts and what the `broadcast_notify_*` result maps are keyed
+/// by. An embedder whose own client identity is something else (a
+/// UUID/token from the handshake, a domain id) can attach a secondary
+/// **alias** to an already-inserted peer with [`alias`](Self::alias) and
+/// then address it by that key with [`get_by`](Self::get_by), without
+/// maintaining a parallel `key -> PeerId` map by hand. Aliases are owned
+/// strings; a non-string key is converted with `to_string()`.
+///
+/// ```ignore
+/// // In an on_peer_connect_with_handshake hook the embedder derives its
+/// // key from the upgrade request and aliases the freshly-inserted peer:
+/// peers.alias(peer.peer_id(), token_from_handshake);
+///
+/// // Later, a targeted push addressed by the embedder's own identity:
+/// if let Some(handle) = peers.get_by("session-abc123") {
+///     let _ = handle.send_notify("/nudge", NotifyBody::Json(payload));
+/// }
+/// ```
+///
+/// Aliases are cleaned up automatically: [`remove`](Self::remove) (which
+/// `with_peer_registry` routes disconnect through) drops the peer's
+/// primary entry and every alias pointing at it. To interpret a
+/// `broadcast_notify_*` result map by the embedder's own identity, map
+/// each [`PeerId`] back with [`key_for`](Self::key_for) /
+/// [`aliases_for`](Self::aliases_for).
 #[derive(Clone)]
 pub struct PeerRegistry {
-    inner: Arc<Mutex<HashMap<PeerId, PeerHandle>>>,
+    inner: Arc<Mutex<RegistryInner>>,
     next_id: Arc<AtomicU64>,
+}
+
+/// Backing storage for a [`PeerRegistry`], guarded by one mutex so the
+/// primary map and the alias indices never drift out of sync.
+#[derive(Default)]
+struct RegistryInner {
+    /// Canonical map: the server-minted [`PeerId`] to its handle.
+    peers: HashMap<PeerId, PeerHandle>,
+    /// Forward alias lookup: an embedder-supplied key to the peer it
+    /// addresses. Many keys may point at one peer.
+    aliases: HashMap<String, PeerId>,
+    /// Reverse index: a peer to the aliases pointing at it, so a close can
+    /// purge those aliases without scanning the whole forward map.
+    /// Preserves alias insertion order so [`key_for`] is well-defined.
+    alias_index: HashMap<PeerId, Vec<String>>,
 }
 
 impl Default for PeerRegistry {
@@ -362,7 +409,7 @@ impl PeerRegistry {
     /// Build an empty registry.
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(HashMap::new())),
+            inner: Arc::new(Mutex::new(RegistryInner::default())),
             next_id: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -395,12 +442,12 @@ impl PeerRegistry {
 
     /// Current number of connected peers.
     pub fn len(&self) -> usize {
-        self.lock().len()
+        self.lock().peers.len()
     }
 
     /// `true` if no peers are connected.
     pub fn is_empty(&self) -> bool {
-        self.lock().is_empty()
+        self.lock().peers.is_empty()
     }
 
     /// Snapshot of currently-connected peer handles.
@@ -409,13 +456,96 @@ impl PeerRegistry {
     /// into the returned `Vec`; callers can iterate freely without
     /// blocking inserts or removals.
     pub fn peers(&self) -> Vec<PeerHandle> {
-        self.lock().values().cloned().collect()
+        self.lock().peers.values().cloned().collect()
     }
 
     /// Look up a peer by id. Returns `None` if the peer has
     /// disconnected.
     pub fn get(&self, id: PeerId) -> Option<PeerHandle> {
-        self.lock().get(&id).cloned()
+        self.lock().peers.get(&id).cloned()
+    }
+
+    /// Associate an embedder-supplied `key` with an already-inserted
+    /// peer, so the peer can later be addressed by that key through
+    /// [`get_by`](Self::get_by) without the embedder maintaining a
+    /// parallel `key -> PeerId` map.
+    ///
+    /// Returns `true` if the alias was attached, `false` if `peer_id`
+    /// is not currently in the registry (e.g. the peer already
+    /// disconnected) — in which case no dangling alias is created.
+    ///
+    /// A peer may carry several aliases (e.g. a user id and a session
+    /// id); calling `alias` again with a fresh key adds another. If
+    /// `key` was already pointing at a *different* peer, it is moved to
+    /// `peer_id` (a key addresses at most one peer). Re-attaching a key
+    /// the peer already has is a no-op.
+    ///
+    /// The alias is dropped automatically when the peer is
+    /// [`remove`](Self::remove)d, so an embedder using
+    /// [`with_peer_registry`](crate::websocket_server::WebSocketServer::with_peer_registry)
+    /// never has to clean it up on disconnect.
+    pub fn alias<K: Into<String>>(&self, peer_id: PeerId, key: K) -> bool {
+        let key = key.into();
+        let mut guard = self.lock();
+        let inner: &mut RegistryInner = &mut guard;
+        if !inner.peers.contains_key(&peer_id) {
+            return false;
+        }
+        match inner.aliases.insert(key.clone(), peer_id) {
+            // The key already addressed this same peer: the reverse index
+            // already lists it, so there is nothing to add.
+            Some(prev) if prev == peer_id => return true,
+            // The key addressed a different peer: detach it there before
+            // recording it under the new owner.
+            Some(prev) => {
+                if let Some(keys) = inner.alias_index.get_mut(&prev) {
+                    keys.retain(|k| k != &key);
+                }
+            }
+            None => {}
+        }
+        inner.alias_index.entry(peer_id).or_default().push(key);
+        true
+    }
+
+    /// Look up a peer by an embedder [`alias`](Self::alias). Returns
+    /// `None` if no peer is aliased by `key` or the aliased peer has
+    /// since disconnected.
+    ///
+    /// The lookup is generic over the borrowed key form, mirroring
+    /// [`HashMap::get`](std::collections::HashMap::get): a registry whose
+    /// aliases are owned `String`s can be queried with a `&str`.
+    pub fn get_by<Q>(&self, key: &Q) -> Option<PeerHandle>
+    where
+        String: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let guard = self.lock();
+        let id = *guard.aliases.get(key)?;
+        guard.peers.get(&id).cloned()
+    }
+
+    /// The first alias (in registration order) attached to `peer_id`, if
+    /// any. When each peer carries a single alias — the common case —
+    /// this is that alias, letting an embedder map a [`PeerId`] from a
+    /// `broadcast_notify_*` result back to its own client identity. Use
+    /// [`aliases_for`](Self::aliases_for) when a peer may carry several.
+    pub fn key_for(&self, peer_id: PeerId) -> Option<String> {
+        self.lock()
+            .alias_index
+            .get(&peer_id)
+            .and_then(|keys| keys.first().cloned())
+    }
+
+    /// Every alias attached to `peer_id`, in registration order (empty if
+    /// the peer has none or is gone). The owned `Vec` is a snapshot; the
+    /// registry lock is released before it is returned.
+    pub fn aliases_for(&self, peer_id: PeerId) -> Vec<String> {
+        self.lock()
+            .alias_index
+            .get(&peer_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Insert a peer.
@@ -429,7 +559,7 @@ impl PeerRegistry {
     /// (two servers minting `PeerId(0)` against a shared registry)
     /// fires loudly in tests.
     pub fn insert(&self, peer: PeerHandle) {
-        let prev = self.lock().insert(peer.peer_id(), peer);
+        let prev = self.lock().peers.insert(peer.peer_id(), peer);
         debug_assert!(
             prev.is_none(),
             "PeerRegistry::insert overwrote an existing peer; \
@@ -439,9 +569,32 @@ impl PeerRegistry {
         );
     }
 
-    /// Remove a peer. Returns the removed handle if it was present.
+    /// Remove a peer, dropping its primary entry and every
+    /// [`alias`](Self::alias) pointing at it. Returns the removed handle
+    /// if it was present.
+    ///
+    /// `with_peer_registry` routes disconnect through this method, so an
+    /// embedder's aliases are cleaned up on close with no extra wiring.
     pub fn remove(&self, id: PeerId) -> Option<PeerHandle> {
-        self.lock().remove(&id)
+        let mut guard = self.lock();
+        let inner: &mut RegistryInner = &mut guard;
+        let removed = inner.peers.remove(&id);
+        // Purge this peer's aliases via the reverse index (no full scan).
+        if let Some(keys) = inner.alias_index.remove(&id) {
+            for key in keys {
+                // Defensive: `alias` retains a re-pointed key out of its
+                // previous owner's `alias_index`, so under that invariant
+                // every key reached here still maps to `id` and this check
+                // always passes. It is kept so a future change that broke
+                // the invariant could not turn a stale reverse-index entry
+                // into the wrongful removal of another peer's live forward
+                // mapping.
+                if inner.aliases.get(&key) == Some(&id) {
+                    inner.aliases.remove(&key);
+                }
+            }
+        }
+        removed
     }
 
     /// Broadcast a JSON-bodied notify to every connected peer.
@@ -534,12 +687,13 @@ impl PeerRegistry {
         out
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PeerId, PeerHandle>> {
-        // Recover from poison: the map's invariants (an `Arc`-keyed
-        // `HashMap<PeerId, PeerHandle>` with no cross-entry coupling)
-        // cannot be left inconsistent by any single insert/remove, so
-        // honoring the poison would block the registry forever on the
-        // strength of an unrelated panic in some other code path.
+    fn lock(&self) -> std::sync::MutexGuard<'_, RegistryInner> {
+        // Recover from poison: every public mutation takes this one lock
+        // and leaves the peer map and its alias indices mutually
+        // consistent before releasing it, so a panic in unrelated code
+        // cannot have torn that invariant. Honoring the poison would
+        // instead block the registry forever on the strength of that
+        // unrelated panic.
         match self.inner.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -676,5 +830,130 @@ mod tests {
         let peer = PeerHandle::new(PeerId(4), sink);
         assert!(!CallContext::detached("/m").is_cancelled());
         assert!(!CallContext::new("/m", &peer).is_cancelled());
+    }
+
+    // ---- Alias index (embedder-keyed peer lookup) ------------------
+
+    fn connected_peer(id: u64) -> PeerHandle {
+        PeerHandle::new(
+            PeerId(id),
+            Arc::new(CapturingSink {
+                connected: true,
+                ..Default::default()
+            }),
+        )
+    }
+
+    #[test]
+    fn alias_then_get_by_resolves_to_the_peer() {
+        let registry = PeerRegistry::new();
+        let peer = connected_peer(1);
+        registry.insert(peer.clone());
+
+        assert!(registry.alias(peer.peer_id(), "session-abc"));
+        // Generic lookup: aliases are owned Strings, queryable by &str.
+        let found = registry.get_by("session-abc").expect("alias resolves");
+        assert_eq!(found.peer_id(), PeerId(1));
+        // Reverse lookup recovers the embedder key from a PeerId.
+        assert_eq!(registry.key_for(PeerId(1)).as_deref(), Some("session-abc"));
+        assert_eq!(registry.aliases_for(PeerId(1)), vec!["session-abc"]);
+    }
+
+    #[test]
+    fn alias_on_absent_peer_is_rejected() {
+        let registry = PeerRegistry::new();
+        // No peer with this id is registered, so no dangling alias forms.
+        assert!(!registry.alias(PeerId(7), "ghost"));
+        assert!(registry.get_by("ghost").is_none());
+        assert!(registry.key_for(PeerId(7)).is_none());
+    }
+
+    #[test]
+    fn get_by_missing_key_is_none() {
+        let registry = PeerRegistry::new();
+        registry.insert(connected_peer(1));
+        assert!(registry.get_by("nope").is_none());
+    }
+
+    #[test]
+    fn remove_purges_all_aliases() {
+        let registry = PeerRegistry::new();
+        let peer = connected_peer(1);
+        registry.insert(peer.clone());
+        registry.alias(peer.peer_id(), "user-1");
+        registry.alias(peer.peer_id(), "session-1");
+        assert_eq!(registry.aliases_for(PeerId(1)).len(), 2);
+
+        let removed = registry.remove(PeerId(1)).expect("peer was present");
+        assert_eq!(removed.peer_id(), PeerId(1));
+        // Both the primary entry and every alias are gone.
+        assert!(registry.get_by("user-1").is_none());
+        assert!(registry.get_by("session-1").is_none());
+        assert!(registry.aliases_for(PeerId(1)).is_empty());
+        assert!(registry.key_for(PeerId(1)).is_none());
+    }
+
+    #[test]
+    fn multiple_aliases_address_one_peer() {
+        let registry = PeerRegistry::new();
+        let peer = connected_peer(5);
+        registry.insert(peer.clone());
+        registry.alias(peer.peer_id(), "u-5");
+        registry.alias(peer.peer_id(), "s-5");
+
+        assert_eq!(registry.get_by("u-5").unwrap().peer_id(), PeerId(5));
+        assert_eq!(registry.get_by("s-5").unwrap().peer_id(), PeerId(5));
+        // Registration order is preserved.
+        assert_eq!(registry.aliases_for(PeerId(5)), vec!["u-5", "s-5"]);
+    }
+
+    #[test]
+    fn re_aliasing_a_key_moves_it_to_the_new_peer() {
+        let registry = PeerRegistry::new();
+        registry.insert(connected_peer(1));
+        registry.insert(connected_peer(2));
+
+        registry.alias(PeerId(1), "shared");
+        assert_eq!(registry.get_by("shared").unwrap().peer_id(), PeerId(1));
+
+        // Re-point the same key at peer 2: a key addresses at most one peer.
+        registry.alias(PeerId(2), "shared");
+        assert_eq!(registry.get_by("shared").unwrap().peer_id(), PeerId(2));
+        // The old owner no longer lists it in its reverse index.
+        assert!(registry.aliases_for(PeerId(1)).is_empty());
+        assert_eq!(registry.aliases_for(PeerId(2)), vec!["shared"]);
+
+        // Removing the old owner must not disturb the re-pointed alias.
+        registry.remove(PeerId(1));
+        assert_eq!(registry.get_by("shared").unwrap().peer_id(), PeerId(2));
+    }
+
+    #[test]
+    fn re_aliasing_same_peer_is_idempotent() {
+        let registry = PeerRegistry::new();
+        registry.insert(connected_peer(1));
+        assert!(registry.alias(PeerId(1), "k"));
+        assert!(registry.alias(PeerId(1), "k"));
+        // The key is not duplicated in the reverse index.
+        assert_eq!(registry.aliases_for(PeerId(1)), vec!["k"]);
+    }
+
+    #[test]
+    fn aliases_let_broadcast_results_map_back_to_keys() {
+        // The motivating case: a broadcast returns HashMap<PeerId, _>, and
+        // the embedder reads it by its own identity via key_for.
+        let registry = PeerRegistry::new();
+        registry.insert(connected_peer(1));
+        registry.insert(connected_peer(2));
+        registry.alias(PeerId(1), "alice");
+        registry.alias(PeerId(2), "bob");
+
+        let results = registry.broadcast_notify_utf8("/ping", "hi");
+        let keyed: std::collections::HashMap<String, _> = results
+            .into_iter()
+            .filter_map(|(id, r)| registry.key_for(id).map(|k| (k, r)))
+            .collect();
+        assert!(keyed.contains_key("alice"));
+        assert!(keyed.contains_key("bob"));
     }
 }

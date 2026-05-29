@@ -24,6 +24,24 @@ pub struct TransportFlakyServer {
 }
 
 impl TransportFlakyServer {
+    /// A flaky TCP server: the first `failures_before_success` *request-bearing*
+    /// connections are dropped without a reply (simulating a transport-level
+    /// failure), and every request after that is answered normally.
+    ///
+    /// Two properties keep the simulation deterministic under load, where it
+    /// would otherwise flake:
+    ///
+    /// - Each connection is serviced on its own thread, so an idle probe (such
+    ///   as the connect-time TCP handshake, which carries no request) cannot
+    ///   block the accept loop while the client is retrying on a fresh
+    ///   connection. A single-threaded loop here serialized those, and under
+    ///   CPU contention the head-of-line stall blew past the client's
+    ///   per-attempt timeout.
+    /// - The attempt counter advances only once a request has actually been
+    ///   read, so the failure budget tracks real call attempts rather than raw
+    ///   TCP accepts. An idle connection that never sends a request is not
+    ///   counted, which is what made "fail the first N attempts" depend on
+    ///   exactly how the client opened its sockets.
     pub fn spawn(failures_before_success: usize) -> (Self, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
         listener
@@ -40,32 +58,47 @@ impl TransportFlakyServer {
             while !stop_thread.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        let current = attempts_thread.fetch_add(1, Ordering::SeqCst) + 1;
-                        let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-                        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-                        let req = match read_message(&mut reader) {
-                            Ok(req) => req,
-                            Err(_) => continue,
-                        };
+                        let attempts = Arc::clone(&attempts_thread);
+                        // Service each connection on its own (detached) thread
+                        // so a slow or idle peer never stalls the accept loop.
+                        thread::spawn(move || {
+                            // Only a safety net so an idle connection's thread
+                            // eventually exits; a request-bearing connection is
+                            // read in microseconds, far inside this window.
+                            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                            let mut reader =
+                                BufReader::new(stream.try_clone().expect("clone stream"));
+                            let Ok(req) = read_message(&mut reader) else {
+                                // No request arrived (idle probe or the peer
+                                // closed): not an attempt, nothing to fail.
+                                return;
+                            };
 
-                        if current <= failures_before_success {
-                            // Simulate a transport-level failure by closing without replying.
-                            continue;
-                        }
+                            // Count only once a real request has been read.
+                            let current = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                            if current <= failures_before_success {
+                                // Simulate a transport-level failure by closing
+                                // without replying.
+                                return;
+                            }
 
-                        let resp = if req.query_utf8() == "/flaky" {
-                            json_response_for(&req, &json!({"success": true, "attempt": current}))
-                        } else {
-                            error_response_for(&req, ErrorCode::MethodNotFound, "unknown route")
-                        };
+                            let resp = if req.query_utf8() == "/flaky" {
+                                json_response_for(
+                                    &req,
+                                    &json!({"success": true, "attempt": current}),
+                                )
+                            } else {
+                                error_response_for(&req, ErrorCode::MethodNotFound, "unknown route")
+                            };
 
-                        let mut writer = BufWriter::new(stream);
-                        if write_message(&mut writer, &resp).is_ok() {
-                            let _ = writer.flush();
-                        }
+                            let mut writer = BufWriter::new(stream);
+                            if write_message(&mut writer, &resp).is_ok() {
+                                let _ = writer.flush();
+                            }
+                        });
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
+                        thread::sleep(Duration::from_millis(5));
                     }
                     Err(_) => break,
                 }
