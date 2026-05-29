@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+## [3.2.0] - 2026-05-29
+
+### Added
+- One-port co-hosting classifier: `is_websocket_upgrade(&TcpStream) -> io::Result<bool>` (re-exported at the crate root). A non-destructive WS-vs-HTTP sniff that lets a single accept loop fork REPE WebSocket upgrades to `SharedWebSocketServer::serve_connection` and everything else to the embedder's own HTTP handler on one TCP port. It uses `TcpStream::peek`, so the request bytes stay in the socket buffer for the subsequent `WebSocketServer::accept` (which replays the handshake from the start of the stream); it matches the `websocket` token only inside an `Upgrade` header's value, so `GET /websocket-status` is not misclassified, and `accept` still performs the authoritative RFC 6455 validation on the `true` branch.
+- `examples/websocket_cohosting.rs`: a runnable end-to-end demo that fills in both halves of the co-hosting pattern — the classifier plus a minimal, dependency-free `serve_http` (`/healthz` plus a JSON `GET`) — driving both forks against one port. Linked from the co-hosting section of `docs/websocket.md`.
+- `PeerRegistry` alias index, for an embedder whose client identity is its own key (a UUID, a token) rather than the server-minted `PeerId`: `alias(peer_id, key)`, `get_by(&key)` (generic borrowed lookup like `HashMap::get`), `key_for(peer_id)`, and `aliases_for(peer_id)`. `PeerId` stays canonical, so `with_peer_registry` auto-insert is unchanged. A reverse index lets `remove` purge a peer's aliases without scanning the forward map, so disconnect cleanup stays automatic; `key_for` / `aliases_for` map a `PeerId` from a `broadcast_notify_*` result map back to the embedder's identity. Replaces hand-maintaining a parallel `key -> PeerId` map.
+- `HandshakeContext` and `WebSocketServer::on_peer_connect_with_handshake(f)` (both re-exported at the crate root): a connect hook that also receives the upgrade request's `path()`, `query()`, and `header(name)`, so an embedder whose key rides in the handshake can derive it and `alias` the freshly-inserted peer at connect time. It fires *after* the plain `on_peer_connect` hooks, so a `with_peer_registry` insert has already landed and the peer is present for `alias`. The context is threaded through the built-in `serve*` loops and the new co-hosting methods `WebSocketServer::accept_with_handshake`, `SharedWebSocketServer::serve_connection_with_handshake`, and `serve_connection_with_cancel_and_handshake`. Capture is pay-for-what-you-use: the accept path builds a `HandshakeContext` only when such a hook is registered (or `accept_with_handshake` is called).
+
+### Notes
+- Strictly additive. No existing signature changes; `PeerRegistry::new()` and the existing `accept` / `serve_connection` paths are untouched.
+- `HandshakeContext` is built for keying off an auth/token header, so two properties guard that use: `header(name)` is fail-closed — a value that is not valid (visible ASCII) text is dropped at capture rather than lossily replaced with U+FFFD, so a non-ASCII token reads as absent instead of a silently corrupted key — and its `Debug` is hand-written to redact header values and the query string, so a routine `tracing::debug!(?ctx)` cannot leak the credential the use case keys on.
+- `is_websocket_upgrade` peeks only the connection's first readable chunk (bounded to 1 KiB). A false positive is caught by `accept`'s authoritative validation; a false negative (an `Upgrade` header split across TCP segments or beyond the peek window) routes to the HTTP handler with no recovery. The peek also blocks until the client sends a byte, so a production embedder should wrap it in a `tokio::time::timeout` to keep a silent client from pinning the task.
+- The larger surfaces remain intentionally deferred per the crate's "hold higher-level surfaces until a second distinct consumer exists" discipline: a built-in HTTP route table, a generic `PeerRegistry<K>`, and an opaque `PeerHandle` tag.
+
 ## [3.1.0] - 2026-05-28
 
 ### Added
