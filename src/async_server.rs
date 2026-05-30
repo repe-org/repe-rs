@@ -76,14 +76,16 @@ async fn handle_connection(
 
         let view = MessageView::from_slice(&buf)?;
         if let Some(resp) = route_request_view(&router, &view) {
-            // Echo the query as a borrowed slice of `buf`; no response query buffer.
+            // Echo the request query (a borrowed slice of `buf`) unless the
+            // handler set its own; no response query buffer either way.
+            let echo = crate::message::response_echo_query(&resp, view.query);
             if let Some(dur) = write_timeout {
-                timeout(dur, write_view_response(&mut writer, &resp, view.query))
+                timeout(dur, write_view_response(&mut writer, &resp, echo))
                     .await
                     .ok();
                 timeout(dur, writer.flush()).await.ok();
             } else {
-                write_view_response(&mut writer, &resp, view.query).await?;
+                write_view_response(&mut writer, &resp, echo).await?;
                 writer.flush().await?;
             }
         }

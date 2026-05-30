@@ -51,13 +51,13 @@ pub enum Execution {
 /// # Response query echo
 ///
 /// REPE responses echo the request's query verbatim, but that echo is the
-/// **dispatch layer's** responsibility, not the handler's. The built-in
-/// handlers return responses with an *empty* query; the server
-/// ([`Server`], [`AsyncServer`](crate::AsyncServer), and the WebSocket
-/// server) then moves the request's query buffer into the response after
-/// the handler returns (see `route_request` and the WebSocket dispatch
-/// loop). This turns the per-response query echo from a clone into a buffer
-/// move.
+/// **dispatch layer's** responsibility, not the handler's: the built-in
+/// handlers return responses with an *empty* query. The WebSocket server moves
+/// the request's query buffer into the response after the handler returns; the
+/// TCP ([`Server`]) and async ([`AsyncServer`](crate::AsyncServer)) servers
+/// take the borrowing [`handle_view`](Self::handle_view) path and frame the
+/// response with the query borrowed straight from their read buffer. Either way
+/// the per-response query echo costs no allocation.
 ///
 /// Two consequences:
 ///
@@ -67,8 +67,9 @@ pub enum Execution {
 ///   needs a complete, query-echoing response without a server should build
 ///   it with [`create_response`](crate::message::create_response), which
 ///   echoes the query itself.
-/// * A *custom* implementor may set the response query itself; the dispatch
-///   layer only fills an empty one, so a hand-set echo is left untouched.
+/// * A *custom* implementor may set the response query itself; both the owned
+///   and the borrowing dispatch paths only fill an empty one, so a hand-set
+///   echo is left untouched.
 pub trait HandlerErased: Send + Sync {
     fn handle(&self, req: &Message) -> Result<Message, RepeError>;
 
@@ -80,10 +81,11 @@ pub trait HandlerErased: Send + Sync {
     /// push notifies to the originator during request handling) or
     /// the dispatched method. The built-in
     /// `WebSocketServer` invokes this method per request with a
-    /// [`CallContext`] carrying the peer; the TCP servers invoke
-    /// `handle` directly, so context-aware handlers also need to
-    /// behave correctly when no peer is available (see
-    /// [`CallContext::detached`]).
+    /// [`CallContext`] carrying the peer; the TCP and async servers
+    /// reach it through [`handle_view`](Self::handle_view)'s default
+    /// with a peer-less [`CallContext::detached`] context, so
+    /// context-aware handlers must also behave correctly when no peer
+    /// is available.
     fn handle_with_ctx(&self, req: &Message, _ctx: &CallContext) -> Result<Message, RepeError> {
         self.handle(req)
     }
@@ -92,7 +94,7 @@ pub trait HandlerErased: Send + Sync {
     /// instead of an owned [`Message`].
     ///
     /// A server that reads each frame into a reusable per-connection buffer (see
-    /// [`read_message_into`](crate::read_message_into)) can dispatch through this
+    /// [`read_message_into`]) can dispatch through this
     /// method without the per-request query and body `Vec` allocations that an
     /// owned [`Message`] requires. As with [`handle_with_ctx`](Self::handle_with_ctx),
     /// the returned response leaves its query empty; the writer supplies the
@@ -101,9 +103,11 @@ pub trait HandlerErased: Send + Sync {
     /// The default implementation materializes an owned [`Message`] from the view
     /// (copying the query and body) and delegates to
     /// [`handle_with_ctx`](Self::handle_with_ctx), so existing handlers work
-    /// unchanged. The built-in handlers override it to decode straight from the
-    /// borrowed body and skip those copies.
-    #[doc(hidden)]
+    /// unchanged. The built-in JSON and typed handlers ([`Router::with_json`] /
+    /// [`Router::with_typed`]) override it to decode straight from the borrowed
+    /// body and skip those copies; the other built-ins (context-aware, struct,
+    /// registry, and any middleware-wrapped route) use the owning default until
+    /// they are likewise overridden.
     fn handle_view(&self, view: &MessageView, ctx: &CallContext) -> Result<Message, RepeError> {
         self.handle_with_ctx(&view.to_message(), ctx)
     }
@@ -1518,9 +1522,11 @@ fn handle_connection(
         }
         let view = MessageView::from_slice(&buf)?;
         if let Some(resp) = route_request_view(&router, &view) {
-            // Frame the query-less response, echoing the query as a borrowed
-            // slice of `buf` rather than copying it into the response.
-            write_message_streaming(&mut writer, resp.header, view.query, resp.body.len() as u64, |w| {
+            // Echo the request query (a borrowed slice of `buf`) unless the
+            // handler set its own — matching the owned path's stamp rule — so no
+            // query buffer is copied into the response on the common path.
+            let echo = crate::message::response_echo_query(&resp, view.query);
+            write_message_streaming(&mut writer, resp.header, echo, resp.body.len() as u64, |w| {
                 w.write_all(&resp.body)
             })?;
             writer.flush()?;

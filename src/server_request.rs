@@ -108,10 +108,11 @@ pub(crate) fn resolve(router: &Router, req: &Message) -> Resolution {
     }
 }
 
-/// Borrowing twin of [`route_request`]: validate, resolve, and dispatch from a
-/// borrowed [`MessageView`], returning a **query-less** response. The caller
-/// frames the response echoing `view.query` (a borrowed slice of its read
-/// buffer), so the inbound path allocates no per-request query or body `Vec`.
+/// Borrowing counterpart of the owned [`resolve`] + [`dispatch`] path: validate,
+/// resolve, and dispatch from a borrowed [`MessageView`], returning a
+/// **query-less** response. The caller frames the response echoing `view.query`
+/// (a borrowed slice of its read buffer), so the inbound path allocates no
+/// per-request query or body `Vec`.
 /// Returns `None` for a notify or a validation failure on a notify.
 pub(crate) fn route_request_view(router: &Router, view: &MessageView) -> Option<Message> {
     match route(router, &view.header, view.query) {

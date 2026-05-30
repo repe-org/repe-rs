@@ -201,6 +201,12 @@ fn json_dispatch_view_allocation_budget() {
     //   0  write_message_streaming (reuses `out`)
     //   ----
     //   3   (down from 5 on the owned path)
+    //
+    // NOTE: this 5→3 win applies to `with_json`/`with_typed` routes, which
+    // override `handle_view` to decode from the borrowed body. Context-aware,
+    // struct, registry, and middleware-wrapped routes use the owning
+    // `handle_view` default (`MessageView::to_message`) and keep the owned
+    // path's 2 read allocations until they too are overridden.
     const EXPECTED: usize = 3;
     let router = Router::new().with_json("/echo", |v: serde_json::Value| Ok(v));
     let wire = request("/echo", json!({"x": 1}));

@@ -403,6 +403,45 @@ mod tests {
     }
 
     #[test]
+    fn error_response_view_matches_owned_query_format() {
+        // The borrowing error path must frame byte-identically to the owned
+        // (WebSocket) path. Both leave query_format at the create_error_message
+        // default (RawBinary), so a JsonPointer request still yields the same
+        // error frame regardless of transport.
+        let req = Message::builder()
+            .id(9)
+            .query_str("/missing")
+            .query_format(QueryFormat::JsonPointer)
+            .body_utf8("{}")
+            .build();
+        let owned = create_error_response_like(&req, ErrorCode::MethodNotFound, "nope");
+
+        let bytes = req.to_vec();
+        let view = MessageView::from_slice(&bytes).unwrap();
+        let viewed = create_error_response_unstamped_view(&view, ErrorCode::MethodNotFound, "nope");
+
+        assert_eq!(viewed.header.query_format, owned.header.query_format);
+        assert_eq!(viewed.header.id, owned.header.id);
+        assert_eq!(viewed.header.ec, owned.header.ec);
+        assert_eq!(viewed.body, owned.body);
+    }
+
+    #[test]
+    fn response_echo_query_prefers_a_handler_set_query() {
+        // Empty response query -> echo the request query (the common case).
+        let empty = Message::builder().id(1).build();
+        assert_eq!(response_echo_query(&empty, b"/req"), b"/req");
+
+        // A query the handler set itself is preserved, not overwritten.
+        let custom = Message::builder()
+            .id(1)
+            .query_str("/handler-set")
+            .query_format(QueryFormat::JsonPointer)
+            .build();
+        assert_eq!(response_echo_query(&custom, b"/req"), b"/handler-set");
+    }
+
+    #[test]
     fn create_response_propagates_serialization_error() {
         struct Fails;
 
@@ -779,24 +818,6 @@ pub fn create_response(
     finish_response(builder, result, body_format)
 }
 
-/// Like [`create_response`], but consumes `request` so the response reuses the
-/// request's `query` buffer (an owned `Vec<u8>` move) instead of cloning it.
-///
-/// The response always echoes the request query verbatim, so on a dispatch path
-/// that owns the request and drops it right after responding, moving the buffer
-/// removes the per-response allocation + copy that [`create_response`] pays.
-/// The request body has already been consumed to produce `result` by the time
-/// this is called, so dropping the rest of `request` costs nothing extra.
-pub fn create_response_owned(
-    request: Message,
-    result: impl serde::Serialize,
-    body_format: BodyFormat,
-) -> Result<Message, RepeError> {
-    let builder = response_header_builder(request.header.id, request.header.query_format)
-        .query_bytes(request.query); // moved, not cloned
-    finish_response(builder, result, body_format)
-}
-
 /// Build a success response that leaves the query **empty**, for the dispatch
 /// boundary to fill by moving the request's query in (see
 /// [`stamp_response_query`]).
@@ -839,6 +860,22 @@ pub(crate) fn stamp_response_query(response: &mut Message, request_query: Vec<u8
         HEADER_SIZE as u64 + response.header.query_length + response.header.body_length;
 }
 
+/// Pick the query bytes the borrowing dispatch path frames `response` with.
+///
+/// The borrowing twin of [`stamp_response_query`]: the request query (a borrowed
+/// slice of the read buffer) is echoed when the handler left the response query
+/// empty, but a query the handler set itself is preserved. Keeps the TCP/async
+/// borrowing writers consistent with the owned/WebSocket path on the
+/// [`HandlerErased`](crate::server::HandlerErased) custom-response-query
+/// contract, instead of unconditionally overwriting with the request query.
+pub(crate) fn response_echo_query<'a>(response: &'a Message, request_query: &'a [u8]) -> &'a [u8] {
+    if response.query.is_empty() {
+        request_query
+    } else {
+        &response.query
+    }
+}
+
 /// Borrowing twin of [`create_response_unstamped`]: builds the same query-less
 /// success response from a [`MessageView`], without materializing an owned
 /// request. The view's query is echoed by the writer (e.g.
@@ -853,8 +890,10 @@ pub(crate) fn create_response_unstamped_view(
 }
 
 /// Borrowing, query-less error response from a [`MessageView`]. Mirrors
-/// [`create_error_response_like`] but leaves the query empty for the writer to
-/// supply from the borrowed view.
+/// [`create_error_response_like`] exactly: it sets only the request id and leaves
+/// the query empty (for the writer to supply from the borrowed view) and the
+/// `query_format` at its [`create_error_message`] default, so a view-path error
+/// frame is byte-identical to the owned/WebSocket path's.
 pub(crate) fn create_error_response_unstamped_view(
     view: &MessageView,
     code: ErrorCode,
@@ -862,7 +901,6 @@ pub(crate) fn create_error_response_unstamped_view(
 ) -> Message {
     let mut err = create_error_message(code, msg.as_ref());
     err.header.id = view.header.id;
-    err.header.query_format = view.header.query_format;
     err
 }
 
@@ -876,7 +914,8 @@ fn response_header_builder(id: u64, query_format: u16) -> MessageBuilder {
 }
 
 /// Serialize `result` into the response body per `body_format` and build the
-/// message. Shared by [`create_response`] and [`create_response_owned`].
+/// message. Shared by [`create_response`], [`create_response_unstamped`], and the
+/// `*_view` builders.
 fn finish_response(
     builder: MessageBuilder,
     result: impl serde::Serialize,

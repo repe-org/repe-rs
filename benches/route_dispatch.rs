@@ -222,49 +222,10 @@ fn bench_registry_value(c: &mut Criterion) {
     group.finish();
 }
 
-/// Isolates the per-response `query.clone()` paid by `create_response` against a
-/// `create_response_owned` that moves the request's query buffer instead. Both
-/// paths perform identical body serialization (a tiny JSON value) and header
-/// construction, so the delta is purely the query allocation + copy. A fresh
-/// request is built untimed per iteration via `iter_batched`.
-fn bench_response_build(c: &mut Criterion) {
-    use repe::message::{create_response, create_response_owned};
-
-    let result = json!({"ok": true});
-    let query = "/collect/file_chunk";
-    let make_req = || {
-        Message::builder()
-            .id(1)
-            .query_str(query)
-            .query_format(QueryFormat::JsonPointer)
-            .body_json(&json!({"x": 1}))
-            .unwrap()
-            .build()
-    };
-
-    let mut group = c.benchmark_group("response_build");
-    group.bench_function("clone_query", |b| {
-        b.iter_batched(
-            make_req,
-            |req| black_box(create_response(black_box(&req), &result, BodyFormat::Json).unwrap()),
-            criterion::BatchSize::SmallInput,
-        );
-    });
-    group.bench_function("move_query", |b| {
-        b.iter_batched(
-            make_req,
-            |req| black_box(create_response_owned(req, &result, BodyFormat::Json).unwrap()),
-            criterion::BatchSize::SmallInput,
-        );
-    });
-    group.finish();
-}
-
 criterion_group!(
     benches,
     bench_router_get,
     bench_full_dispatch,
-    bench_registry_value,
-    bench_response_build
+    bench_registry_value
 );
 criterion_main!(benches);
