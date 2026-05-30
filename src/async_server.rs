@@ -69,7 +69,7 @@ async fn handle_connection(
             read_message_async(&mut reader).await?
         };
 
-        if let Some(resp) = route_request(&router, &req) {
+        if let Some(resp) = route_request(&router, req) {
             if let Some(dur) = write_timeout {
                 timeout(dur, write_message_async(&mut writer, &resp))
                     .await

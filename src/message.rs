@@ -358,6 +358,38 @@ mod tests {
     }
 
     #[test]
+    fn unstamped_plus_stamp_equals_create_response() {
+        let req = Message::builder()
+            .id(5)
+            .query_str("/sum")
+            .query_format(QueryFormat::JsonPointer)
+            .body_json(&Pair { a: 1, b: 2 })
+            .unwrap()
+            .build();
+        let value = serde_json::json!({"ok": true});
+
+        // The echoing path.
+        let echoed = create_response(&req, &value, BodyFormat::Json).unwrap();
+
+        // The boundary path: build query-less, then stamp the moved query.
+        let mut staged = create_response_unstamped(&req, &value, BodyFormat::Json).unwrap();
+        assert!(staged.query.is_empty(), "handler leaves the query empty");
+        assert_eq!(staged.header.query_length, 0);
+        stamp_response_query(&mut staged, req.query.clone());
+
+        // Byte-for-byte identical to the echoing path, including the header.
+        assert_eq!(staged, echoed);
+        assert_eq!(staged.query, req.query);
+        assert_eq!(staged.header.length, echoed.header.length);
+
+        // Stamp is a no-op once a query is present (e.g. an error response) and
+        // when the request query is empty.
+        let before = staged.clone();
+        stamp_response_query(&mut staged, b"/other".to_vec());
+        assert_eq!(staged, before, "stamp must not overwrite an existing query");
+    }
+
+    #[test]
     fn create_response_propagates_serialization_error() {
         struct Fails;
 
@@ -750,6 +782,45 @@ pub fn create_response_owned(
     let builder = response_header_builder(request.header.id, request.header.query_format)
         .query_bytes(request.query); // moved, not cloned
     finish_response(builder, result, body_format)
+}
+
+/// Build a success response that leaves the query **empty**, for the dispatch
+/// boundary to fill by moving the request's query in (see
+/// [`stamp_response_query`]).
+///
+/// REPE responses echo the request query verbatim. Rather than have each
+/// built-in handler clone the request query into its response, the handlers
+/// build the response with this and the transport boundary — which owns the
+/// request and drops it right after — moves the query buffer in. That turns the
+/// per-response query echo from an allocation + copy into a buffer move.
+///
+/// Byte-for-byte equivalent to [`create_response`] once
+/// [`stamp_response_query`] has run with the originating request's query.
+pub(crate) fn create_response_unstamped(
+    request: &Message,
+    result: impl serde::Serialize,
+    body_format: BodyFormat,
+) -> Result<Message, RepeError> {
+    let builder = response_header_builder(request.header.id, request.header.query_format);
+    finish_response(builder, result, body_format)
+}
+
+/// Move `request_query` into a response left query-less by
+/// [`create_response_unstamped`], fixing up the header lengths.
+///
+/// A no-op when the response already carries a query (an error response from
+/// [`create_error_response_like`], or a custom handler that set its own) or when
+/// the request query is empty, so it is safe to call on every dispatched
+/// response. Built-in handlers leave the query empty precisely so this stamp
+/// echoes it with a buffer move instead of a clone.
+pub(crate) fn stamp_response_query(response: &mut Message, request_query: Vec<u8>) {
+    if request_query.is_empty() || !response.query.is_empty() {
+        return;
+    }
+    response.query = request_query;
+    response.header.query_length = response.query.len() as u64;
+    response.header.length =
+        HEADER_SIZE as u64 + response.header.query_length + response.header.body_length;
 }
 
 /// Shared response-builder prefix: echo the request id and query format with an

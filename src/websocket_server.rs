@@ -1,7 +1,7 @@
 use crate::async_client::AsyncClient;
 use crate::constants::{ErrorCode, QueryFormat};
 use crate::error::RepeError;
-use crate::message::{Message, create_error_response_like};
+use crate::message::{Message, create_error_response_like, stamp_response_query};
 use crate::peer::{
     CallContext, CancelSignal, NotifyBody, PeerHandle, PeerId, PeerRegistry, PeerSendError,
     PeerSink,
@@ -1214,7 +1214,12 @@ async fn reader_task(
                     // request handling and observe disconnect/shutdown.
                     let path = request.query_str().unwrap_or("");
                     let ctx = CallContext::with_cancel(path, &conn.peer, &inline_signal);
-                    if let Some(response) = dispatch(handler.as_ref(), &request, &ctx, notify) {
+                    let maybe_response = dispatch(handler.as_ref(), &request, &ctx, notify);
+                    // `ctx`'s borrow of `request` ends with the dispatch call
+                    // above, so the request query can now be moved into the
+                    // response instead of cloned by the handler.
+                    if let Some(mut response) = maybe_response {
+                        stamp_response_query(&mut response, request.query);
                         if conn.outbound_tx.send(response).await.is_err() {
                             // Writer task exited (likely wire error);
                             // abandon reader. The disconnect guard still
@@ -1321,7 +1326,11 @@ async fn spawn_off_reader(
                 })
             }
         };
-        if let Some(response) = response {
+        if let Some(mut response) = response {
+            // Echo the request query by moving its buffer into the response
+            // (handlers leave it empty); a panic error response already carries
+            // its own query, so the stamp is a no-op there.
+            stamp_response_query(&mut response, request.query);
             // Best-effort: the writer may already be gone if the
             // connection closed while this handler ran.
             let _ = outbound_tx.blocking_send(response);

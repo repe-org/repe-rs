@@ -2,7 +2,7 @@ use crate::constants::{BodyFormat, ErrorCode};
 use crate::error::RepeError;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::io::{read_message, write_message};
-use crate::message::{Message, create_error_response_like, create_response};
+use crate::message::{Message, create_error_response_like, create_response_unstamped};
 use crate::peer::{CallContext, PeerHandle};
 use crate::registry::Registry;
 #[cfg(not(target_arch = "wasm32"))]
@@ -43,6 +43,29 @@ pub enum Execution {
     OffReader,
 }
 
+/// A resolved request handler.
+///
+/// # Response query echo
+///
+/// REPE responses echo the request's query verbatim, but that echo is the
+/// **dispatch layer's** responsibility, not the handler's. The built-in
+/// handlers return responses with an *empty* query; the server
+/// ([`Server`], [`AsyncServer`](crate::AsyncServer), and the WebSocket
+/// server) then moves the request's query buffer into the response after
+/// the handler returns (see `route_request` and the WebSocket dispatch
+/// loop). This turns the per-response query echo from a clone into a buffer
+/// move.
+///
+/// Two consequences:
+///
+/// * Calling [`handle`](Self::handle) / [`handle_with_ctx`](Self::handle_with_ctx)
+///   directly (e.g. via [`Router::get`]) yields a response whose `query` is
+///   empty — it is only filled once dispatched through a server. Code that
+///   needs a complete, query-echoing response without a server should build
+///   it with [`create_response`](crate::message::create_response), which
+///   echoes the query itself.
+/// * A *custom* implementor may set the response query itself; the dispatch
+///   layer only fills an empty one, so a hand-set echo is left untouched.
 pub trait HandlerErased: Send + Sync {
     fn handle(&self, req: &Message) -> Result<Message, RepeError>;
 
@@ -229,7 +252,7 @@ where
             Err(err) => return Ok(err),
         };
         match (self.0)(param) {
-            Ok(value) => create_response(req, value, BodyFormat::Json),
+            Ok(value) => create_response_unstamped(req, value, BodyFormat::Json),
             Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
         }
     }
@@ -255,7 +278,7 @@ where
             Err(err) => return Ok(err),
         };
         match (self.0)(ctx, param) {
-            Ok(value) => create_response(req, value, BodyFormat::Json),
+            Ok(value) => create_response_unstamped(req, value, BodyFormat::Json),
             Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
         }
     }
@@ -368,7 +391,7 @@ where
         match self.0.call(t) {
             Ok(r) => {
                 let (value, format) = r.into_typed_response();
-                create_response(req, value, format)
+                create_response_unstamped(req, value, format)
             }
             Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
         }
@@ -427,7 +450,7 @@ where
         match self.0.call(ctx, t) {
             Ok(r) => {
                 let (value, format) = r.into_typed_response();
-                create_response(req, value, format)
+                create_response_unstamped(req, value, format)
             }
             Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
         }
@@ -1079,7 +1102,7 @@ impl HandlerErased for RegisteredRegistry {
             Err(err) => return Ok(create_error_response_like(req, err.code(), err.to_string())),
         };
         match self.registry.dispatch(pointer, body) {
-            Ok(value) => create_response(req, value, BodyFormat::Json),
+            Ok(value) => create_response_unstamped(req, value, BodyFormat::Json),
             Err(err) => Ok(create_error_response_like(req, err.code(), err.to_string())),
         }
     }
@@ -1098,7 +1121,7 @@ impl HandlerErased for RegisteredRegistry {
             Err(err) => return Ok(create_error_response_like(req, err.code(), err.to_string())),
         };
         match self.registry.dispatch_with_ctx(pointer, body, ctx) {
-            Ok(value) => create_response(req, value, BodyFormat::Json),
+            Ok(value) => create_response_unstamped(req, value, BodyFormat::Json),
             Err(err) => Ok(create_error_response_like(req, err.code(), err.to_string())),
         }
     }
@@ -1271,7 +1294,7 @@ where
     };
 
     match result {
-        Ok(value) => create_response(req, value.unwrap_or(Value::Null), BodyFormat::Json),
+        Ok(value) => create_response_unstamped(req, value.unwrap_or(Value::Null), BodyFormat::Json),
         Err(err) => Ok(create_error_response_like(req, err.code(), err.to_string())),
     }
 }
@@ -1303,7 +1326,7 @@ impl<H: JsonTypedHandler> HandlerErased for JsonTypedAdapter<H> {
             }
         };
         match self.0.call(t) {
-            Ok(r) => create_response(req, r, BodyFormat::Json),
+            Ok(r) => create_response_unstamped(req, r, BodyFormat::Json),
             Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
         }
     }
@@ -1402,7 +1425,7 @@ fn handle_connection(
             Err(RepeError::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e),
         };
-        if let Some(resp) = route_request(&router, &req) {
+        if let Some(resp) = route_request(&router, req) {
             write_message(&mut writer, &resp)?;
             writer.flush()?;
         }
@@ -1413,6 +1436,7 @@ fn handle_connection(
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    use crate::message::create_response;
     use crate::{QueryFormat, REPE_VERSION};
     use serde::{Deserialize, Serialize};
     use std::io::Read;
