@@ -729,14 +729,46 @@ pub fn create_response(
     result: impl serde::Serialize,
     body_format: BodyFormat,
 ) -> Result<Message, RepeError> {
-    let mut builder = Message::builder()
-        .id(request.header.id)
-        .query_bytes(request.query.clone())
-        .query_format(
-            QueryFormat::try_from(request.header.query_format).unwrap_or(QueryFormat::RawBinary),
-        )
-        .error_code(ErrorCode::Ok);
-    builder = match body_format {
+    let builder = response_header_builder(request.header.id, request.header.query_format)
+        .query_bytes(request.query.clone());
+    finish_response(builder, result, body_format)
+}
+
+/// Like [`create_response`], but consumes `request` so the response reuses the
+/// request's `query` buffer (an owned `Vec<u8>` move) instead of cloning it.
+///
+/// The response always echoes the request query verbatim, so on a dispatch path
+/// that owns the request and drops it right after responding, moving the buffer
+/// removes the per-response allocation + copy that [`create_response`] pays.
+/// The request body has already been consumed to produce `result` by the time
+/// this is called, so dropping the rest of `request` costs nothing extra.
+pub fn create_response_owned(
+    request: Message,
+    result: impl serde::Serialize,
+    body_format: BodyFormat,
+) -> Result<Message, RepeError> {
+    let builder = response_header_builder(request.header.id, request.header.query_format)
+        .query_bytes(request.query); // moved, not cloned
+    finish_response(builder, result, body_format)
+}
+
+/// Shared response-builder prefix: echo the request id and query format with an
+/// `Ok` error code. The caller supplies the query bytes (cloned or moved).
+fn response_header_builder(id: u64, query_format: u16) -> MessageBuilder {
+    Message::builder()
+        .id(id)
+        .query_format(QueryFormat::try_from(query_format).unwrap_or(QueryFormat::RawBinary))
+        .error_code(ErrorCode::Ok)
+}
+
+/// Serialize `result` into the response body per `body_format` and build the
+/// message. Shared by [`create_response`] and [`create_response_owned`].
+fn finish_response(
+    builder: MessageBuilder,
+    result: impl serde::Serialize,
+    body_format: BodyFormat,
+) -> Result<Message, RepeError> {
+    let builder = match body_format {
         BodyFormat::Json => builder.body_json(&result)?,
         BodyFormat::Utf8 => {
             let s = serde_json::to_string(&result)?; // convenience: stringify

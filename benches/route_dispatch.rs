@@ -77,6 +77,27 @@ fn build_registry_router(with_middleware: bool) -> Router {
     }
 }
 
+/// A registry holding a value three levels deep. Reads and writes against it
+/// exercise `parse_pointer` + `resolve_ref` / `set_pointer` — the value-tree
+/// walk that allocated a `String` per segment (the `walked`/`parent_path`
+/// clone plus the unconditional `unescape_token` allocation). The function
+/// route above never reaches that code: it resolves through `canonical_key`'s
+/// borrow fast path.
+fn build_registry_value_router() -> Router {
+    let registry = Arc::new(Registry::new());
+    registry.register_value("/a/b/c", json!({"v": 1})).unwrap();
+    Router::new().with_registry("/api", registry)
+}
+
+/// Empty body => READ (resolve_ref), not a function call.
+fn build_read_request(path: &str) -> Message {
+    Message::builder()
+        .id(1)
+        .query_str(path)
+        .query_format(QueryFormat::JsonPointer)
+        .build()
+}
+
 fn build_struct_router(with_middleware: bool) -> Router {
     let shared = Arc::new(Mutex::new(BenchStruct { counter: 7 }));
     let router = Router::new().with_struct_shared::<BenchStruct, _>("/svc", shared);
@@ -180,5 +201,70 @@ fn bench_full_dispatch(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_router_get, bench_full_dispatch);
+fn bench_registry_value(c: &mut Criterion) {
+    let router = build_registry_value_router();
+    let read_req = build_read_request("/api/a/b/c");
+    let write_req = build_request("/api/a/b/c"); // non-empty body => WRITE (set_pointer)
+
+    let mut group = c.benchmark_group("registry_value");
+    group.bench_function("read_depth3", |b| {
+        b.iter(|| {
+            let h = router.get(black_box("/api/a/b/c")).unwrap();
+            black_box(h.handle(&read_req).unwrap());
+        })
+    });
+    group.bench_function("write_depth3", |b| {
+        b.iter(|| {
+            let h = router.get(black_box("/api/a/b/c")).unwrap();
+            black_box(h.handle(&write_req).unwrap());
+        })
+    });
+    group.finish();
+}
+
+/// Isolates the per-response `query.clone()` paid by `create_response` against a
+/// `create_response_owned` that moves the request's query buffer instead. Both
+/// paths perform identical body serialization (a tiny JSON value) and header
+/// construction, so the delta is purely the query allocation + copy. A fresh
+/// request is built untimed per iteration via `iter_batched`.
+fn bench_response_build(c: &mut Criterion) {
+    use repe::message::{create_response, create_response_owned};
+
+    let result = json!({"ok": true});
+    let query = "/collect/file_chunk";
+    let make_req = || {
+        Message::builder()
+            .id(1)
+            .query_str(query)
+            .query_format(QueryFormat::JsonPointer)
+            .body_json(&json!({"x": 1}))
+            .unwrap()
+            .build()
+    };
+
+    let mut group = c.benchmark_group("response_build");
+    group.bench_function("clone_query", |b| {
+        b.iter_batched(
+            make_req,
+            |req| black_box(create_response(black_box(&req), &result, BodyFormat::Json).unwrap()),
+            criterion::BatchSize::SmallInput,
+        );
+    });
+    group.bench_function("move_query", |b| {
+        b.iter_batched(
+            make_req,
+            |req| black_box(create_response_owned(req, &result, BodyFormat::Json).unwrap()),
+            criterion::BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_router_get,
+    bench_full_dispatch,
+    bench_registry_value,
+    bench_response_build
+);
 criterion_main!(benches);
