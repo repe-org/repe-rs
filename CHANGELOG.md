@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+- Borrowing, zero-allocation read path for server dispatch. `read_message_into(reader, &mut Vec<u8>)` and `read_message_into_async` read a full frame into a reusable per-connection buffer; pair with `MessageView::from_slice`/`from_slice_exact` (the latter rejects trailing bytes, for one-message-per-frame transports) to dispatch via the new `HandlerErased::handle_view(&MessageView, &CallContext)` without the per-request query and body `Vec` allocations an owned `Message` requires. `handle_view`'s default materializes an owned `Message` (`MessageView::to_message`) and delegates to `handle_with_ctx`, so every existing handler works unchanged; the built-in JSON and typed handlers (`with_json` / `with_typed`) override it to decode straight from the borrowed body.
+- A measurement harness for the server hot path: `tests/allocations.rs` pins the per-request allocation count of read → dispatch → echo → write with a thread-local counting `#[global_allocator]` and `assert_eq` budgets (so a regression up *or* a deliberate reduction down is caught), and `benches/server_lifecycle.rs` measures the same cycle end-to-end.
+
+### Changed
+- The TCP, async, and WebSocket-inline servers now dispatch off the borrowing read path. The TCP and async servers keep one reusable read buffer per connection and frame the response echoing the query straight out of it, so steady-state request framing for `with_json`/`with_typed` routes allocates nothing (per-request allocations 5 → 3; `server_lifecycle` `json_echo` ~341→316 ns, `typed_sum` ~176→137 ns). The WebSocket inline path borrows the request from the tungstenite payload, eliminating the request body copy (5 → 4; the response query is still copied because the outbound channel carries owned messages framed later by the writer task); the WebSocket off-reader path keeps the owned decode (its spawned task outlives the read buffer).
+- Per-response query echo is now a buffer move (owned/WebSocket path) or a borrow (TCP/async), not a clone. Built-in handler responses leave the query empty and the dispatch layer supplies it; a handler that sets its own response query is left untouched. Registry JSON-pointer resolution borrows escape-free tokens (`Cow`) and builds error-path strings lazily, taking a depth-N pointer walk from ~`2N` `String` allocations to zero (`registry_value` read −33%, write −22%). Owned JSON/typed decoders parse a `Utf8`-framed body with strict `from_slice` (matching the borrowing path; drops a per-request `String`).
+
+### Notes
+- The 5→3 / "framing allocates nothing" win applies to `with_json`/`with_typed` routes, which override `handle_view`. Context-aware, struct, registry, and middleware-wrapped routes use the owning `handle_view` default (a correct owned copy) and keep the owned allocation count until overridden; middleware-wrapped routes are structurally bound to the owned path because the `Middleware` trait takes `&Message`.
+- Behavior change to a public trait method, documented on `HandlerErased`: built-in handlers' `handle` / `handle_with_ctx` now return a response whose `query` is *empty* — the dispatch layer fills it. Code that calls a handler directly (e.g. via `Router::get`) and needs a complete, query-echoing response should build it with `create_response`, which echoes the query itself. The owned/WebSocket error path and success frames are byte-identical to before. (One edge improvement: a `Utf8`-framed body containing invalid UTF-8 is now rejected strictly rather than lossily substituted.)
+
 ## [3.2.0] - 2026-05-29
 
 ### Added
