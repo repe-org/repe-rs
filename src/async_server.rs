@@ -1,9 +1,10 @@
-use crate::async_io::{read_message_async, write_message_async};
+use crate::async_io::read_message_into_async;
+use crate::constants::HEADER_SIZE;
 use crate::error::RepeError;
-use crate::message::Message;
+use crate::message::{Message, MessageView};
 use crate::server::Router;
-use crate::server_request::route_request;
-use tokio::io::AsyncWriteExt;
+use crate::server_request::route_request_view;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::io::{BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::time::{Duration, timeout};
@@ -59,28 +60,55 @@ async fn handle_connection(
     let (read_half, write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let mut writer = BufWriter::new(write_half);
+    // Reused across every request on this connection so steady-state framing
+    // allocates nothing: each frame is parsed as a borrowed `MessageView` and
+    // the response echoes the query straight out of `buf`.
+    let mut buf = Vec::new();
     loop {
-        let req: Message = if let Some(dur) = read_timeout {
-            match timeout(dur, read_message_async(&mut reader)).await {
+        if let Some(dur) = read_timeout {
+            match timeout(dur, read_message_into_async(&mut reader, &mut buf)).await {
                 Ok(r) => r?,
                 Err(_) => return Ok(()),
             }
         } else {
-            read_message_async(&mut reader).await?
-        };
+            read_message_into_async(&mut reader, &mut buf).await?;
+        }
 
-        if let Some(resp) = route_request(&router, req) {
+        let view = MessageView::from_slice(&buf)?;
+        if let Some(resp) = route_request_view(&router, &view) {
+            // Echo the query as a borrowed slice of `buf`; no response query buffer.
             if let Some(dur) = write_timeout {
-                timeout(dur, write_message_async(&mut writer, &resp))
+                timeout(dur, write_view_response(&mut writer, &resp, view.query))
                     .await
                     .ok();
                 timeout(dur, writer.flush()).await.ok();
             } else {
-                write_message_async(&mut writer, &resp).await?;
+                write_view_response(&mut writer, &resp, view.query).await?;
                 writer.flush().await?;
             }
         }
     }
+}
+
+/// Write a query-less response framed with an externally supplied (borrowed)
+/// query, the async counterpart of the TCP server's `write_message_streaming`
+/// call. Patches the header's `query_length`/`length` to match `query`.
+async fn write_view_response<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    resp: &Message,
+    query: &[u8],
+) -> Result<(), RepeError> {
+    let mut header = resp.header;
+    header.query_length = query.len() as u64;
+    header.length = HEADER_SIZE as u64 + header.query_length + header.body_length;
+    writer.write_all(&header.encode()).await?;
+    if !query.is_empty() {
+        writer.write_all(query).await?;
+    }
+    if !resp.body.is_empty() {
+        writer.write_all(&resp.body).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

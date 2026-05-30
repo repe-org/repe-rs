@@ -1,7 +1,7 @@
 use crate::constants::{BodyFormat, ErrorCode};
 use crate::error::RepeError;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::io::{read_message, write_message};
+use crate::io::{read_message_into, write_message_streaming};
 use crate::message::{
     Message, MessageView, create_error_response_like, create_error_response_unstamped_view,
     create_response_unstamped, create_response_unstamped_view,
@@ -9,7 +9,7 @@ use crate::message::{
 use crate::peer::{CallContext, PeerHandle};
 use crate::registry::Registry;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::server_request::route_request;
+use crate::server_request::route_request_view;
 use crate::structs::RepeStruct;
 use beve::from_slice as beve_from_slice;
 use serde::Serialize;
@@ -1506,14 +1506,23 @@ fn handle_connection(
     stream.set_write_timeout(write_timeout)?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = BufWriter::new(stream);
+    // One read buffer reused for every request on this connection, so steady-
+    // state request framing allocates nothing: the frame is parsed as a borrowed
+    // `MessageView` and the response echoes the query straight out of `buf`.
+    let mut buf = Vec::new();
     while running.load(Ordering::SeqCst) {
-        let req = match read_message(&mut reader) {
-            Ok(m) => m,
+        match read_message_into(&mut reader, &mut buf) {
+            Ok(()) => {}
             Err(RepeError::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e),
-        };
-        if let Some(resp) = route_request(&router, req) {
-            write_message(&mut writer, &resp)?;
+        }
+        let view = MessageView::from_slice(&buf)?;
+        if let Some(resp) = route_request_view(&router, &view) {
+            // Frame the query-less response, echoing the query as a borrowed
+            // slice of `buf` rather than copying it into the response.
+            write_message_streaming(&mut writer, resp.header, view.query, resp.body.len() as u64, |w| {
+                w.write_all(&resp.body)
+            })?;
             writer.flush()?;
         }
     }
@@ -1523,6 +1532,7 @@ fn handle_connection(
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    use crate::io::{read_message, write_message};
     use crate::message::create_response;
     use crate::{QueryFormat, REPE_VERSION};
     use serde::{Deserialize, Serialize};

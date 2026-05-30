@@ -826,6 +826,9 @@ pub(crate) fn create_response_unstamped(
 /// the request query is empty, so it is safe to call on every dispatched
 /// response. Built-in handlers leave the query empty precisely so this stamp
 /// echoes it with a buffer move instead of a clone.
+// Used by the owned dispatch boundary, which the WebSocket server takes; the
+// TCP/async servers echo the query through the borrowing path instead.
+#[cfg_attr(not(feature = "websocket"), allow(dead_code))]
 pub(crate) fn stamp_response_query(response: &mut Message, request_query: Vec<u8>) {
     if request_query.is_empty() || !response.query.is_empty() {
         return;
