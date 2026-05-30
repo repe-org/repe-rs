@@ -244,6 +244,22 @@ impl<'a> MessageView<'a> {
         })
     }
 
+    /// Like [`from_slice`](Self::from_slice) but rejects trailing bytes: errors
+    /// if `buf` is longer than the framed message. The borrowing counterpart of
+    /// [`Message::from_slice_exact`], for transports (e.g. a WebSocket binary
+    /// frame) that carry exactly one message per buffer.
+    pub fn from_slice_exact(buf: &'a [u8]) -> Result<Self, RepeError> {
+        let view = Self::from_slice(buf)?;
+        let expected = HEADER_SIZE + view.query.len() + view.body.len();
+        if buf.len() != expected {
+            return Err(RepeError::LengthMismatch {
+                expected: expected as u64,
+                got: buf.len() as u64,
+            });
+        }
+        Ok(view)
+    }
+
     /// View the query as a `&str`. Errors if the query is not valid UTF-8.
     pub fn query_str(&self) -> Result<&'a str, std::str::Utf8Error> {
         std::str::from_utf8(self.query)

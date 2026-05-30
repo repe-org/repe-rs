@@ -7,33 +7,13 @@ use crate::peer::CallContext;
 use crate::server::{HandlerErased, Router};
 use std::sync::Arc;
 
-/// Outcome of [`resolve`]: either a ready response (or `None`, for a
-/// notify or a request that produced no handler), or a resolved handler
-/// to hand to [`dispatch`].
-///
-/// The owned-`Message` resolve/dispatch path is used by the WebSocket server,
-/// which decodes whole frames from tungstenite payloads; the TCP and async
-/// servers take the borrowing [`route_request_view`] path instead. Hence these
-/// are allowed to be unused when the `websocket` feature is off.
-#[cfg_attr(not(feature = "websocket"), allow(dead_code))]
-pub(crate) enum Resolution {
-    /// Routing finished without invoking a handler — version/query
-    /// validation failed, or the method was not found. Send the inner
-    /// message, or nothing (`None`) for a notify.
-    Respond(Option<Message>),
-    /// Handler resolved. Run [`dispatch`]; `notify` controls whether a
-    /// response is produced.
-    Dispatch {
-        handler: Arc<dyn HandlerErased>,
-        notify: bool,
-    },
-}
-
 /// Validate the request envelope and look up the handler, independent of how
-/// the eventual response (and its query echo) is built. Shared by the owned
-/// path ([`resolve`]) and the borrowing path ([`route_request_view`]) so the
-/// two cannot drift on what counts as a valid request.
-enum RouteOutcome<'a> {
+/// the eventual response (and its query echo) is built. Shared by the TCP/async
+/// borrowing path ([`route_request_view`]) and the WebSocket reader (which
+/// resolves a borrowed [`MessageView`], then dispatches inline via
+/// [`dispatch_view`] or materializes an owned message for an off-reader handler),
+/// so they cannot drift on what counts as a valid request.
+pub(crate) enum RouteOutcome<'a> {
     /// A handler resolved; dispatch it. `path` is the already-validated query
     /// string (borrowed from the request), so the caller need not re-validate it
     /// to build a [`CallContext`].
@@ -51,7 +31,7 @@ enum RouteOutcome<'a> {
     },
 }
 
-fn route<'a>(router: &Router, header: &Header, query: &'a [u8]) -> RouteOutcome<'a> {
+pub(crate) fn route<'a>(router: &Router, header: &Header, query: &'a [u8]) -> RouteOutcome<'a> {
     let notify = header.notify == 1;
 
     if header.version != REPE_VERSION {
@@ -97,27 +77,7 @@ fn route<'a>(router: &Router, header: &Header, query: &'a [u8]) -> RouteOutcome<
     }
 }
 
-/// Validate the request envelope and look up the handler *without*
-/// invoking it. Splitting this out lets a caller (the WebSocket reader)
-/// inspect [`HandlerErased::execution`] and decide where to run
-/// [`dispatch`] — inline, or on a blocking thread — while the
-/// validation and error-response synthesis stay identical to the
-/// inline path.
-#[cfg_attr(not(feature = "websocket"), allow(dead_code))]
-pub(crate) fn resolve(router: &Router, req: &Message) -> Resolution {
-    match route(router, &req.header, &req.query) {
-        RouteOutcome::Dispatch { handler, notify, .. } => {
-            Resolution::Dispatch { handler, notify }
-        }
-        RouteOutcome::Reject {
-            notify,
-            code,
-            message,
-        } => Resolution::Respond((!notify).then(|| create_error_response_like(req, code, message))),
-    }
-}
-
-/// Borrowing counterpart of the owned [`resolve`] + [`dispatch`] path: validate,
+/// Borrowing counterpart of the owned [`dispatch`] path: validate,
 /// resolve, and dispatch from a borrowed [`MessageView`], returning a
 /// **query-less** response. The caller frames the response echoing `view.query`
 /// (a borrowed slice of its read buffer), so the inbound path allocates no
@@ -142,8 +102,9 @@ pub(crate) fn route_request_view(router: &Router, view: &MessageView) -> Option<
 }
 
 /// Borrowing twin of [`dispatch`]: invoke `handler.handle_view` and map the
-/// result to a query-less response (or `None` for a notify).
-fn dispatch_view(
+/// result to a query-less response (or `None` for a notify). Used by the
+/// TCP/async borrowing path and the WebSocket inline path.
+pub(crate) fn dispatch_view(
     handler: &dyn HandlerErased,
     view: &MessageView,
     ctx: &CallContext,
@@ -159,10 +120,11 @@ fn dispatch_view(
     })
 }
 
-/// Invoke a resolved handler with `ctx`. For a notify, runs the handler
-/// for its side effects and returns `None`; otherwise maps the result
-/// to a response. Shared by the inline and off-reader dispatch paths so
-/// their outcomes are identical.
+/// Invoke a resolved handler with `ctx` on an owned [`Message`]. For a notify,
+/// runs the handler for its side effects and returns `None`; otherwise maps the
+/// result to a response. Used by the WebSocket off-reader path, whose spawned
+/// blocking task owns the request (it outlives the read buffer, so it cannot
+/// borrow a view).
 #[cfg_attr(not(feature = "websocket"), allow(dead_code))]
 pub(crate) fn dispatch(
     handler: &dyn HandlerErased,

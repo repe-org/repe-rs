@@ -123,6 +123,23 @@ fn dispatch_cycle_view(
     .expect("write");
 }
 
+/// The WebSocket inline pattern: parse a borrowed `MessageView` from the
+/// tungstenite payload, dispatch via `handle_view`, then copy the borrowed query
+/// into the response because the outbound channel carries owned messages written
+/// later by the writer task. Replicates the (pub(crate)) `stamp_response_query`
+/// step via the public `Message`/`Header` fields.
+fn dispatch_cycle_ws_inline(router: &Router, wire: &[u8], path: &str) -> Message {
+    let view = MessageView::from_slice_exact(wire).expect("view");
+    let handler = router.get(path).expect("handler");
+    let ctx = CallContext::detached(path);
+    let mut resp = handler.handle_view(&view, &ctx).expect("dispatch");
+    resp.query = view.query.to_vec();
+    resp.header.query_length = resp.query.len() as u64;
+    resp.header.length =
+        HEADER_SIZE as u64 + resp.header.query_length + resp.header.body_length;
+    resp
+}
+
 #[test]
 fn framing_round_trip_allocates_only_query_and_body() {
     // The pure framing path, no dispatch: `read_message` allocates exactly one
@@ -222,5 +239,38 @@ fn json_dispatch_view_allocation_budget() {
     assert_eq!(
         allocs, EXPECTED,
         "borrowing-path allocation budget changed (was {EXPECTED}, now {allocs})"
+    );
+}
+
+#[test]
+fn websocket_inline_dispatch_allocation_budget() {
+    // The WebSocket inline path borrows the request body (no read-side body Vec),
+    // but unlike the TCP/async path it must copy the query into the response
+    // because the outbound channel carries owned messages framed later. So:
+    //
+    //   0  MessageView::from_slice_exact (borrows the payload)
+    //   2  serde_json decode of `{"x":1}`
+    //   1  serde_json encode of the response body
+    //   1  query copy for the owned response (outbound channel)
+    //   ----
+    //   4   (down from 5 on the owned WebSocket path — the read-side body Vec)
+    //
+    // As with the TCP path, this applies to with_json/with_typed routes; other
+    // handlers use the owning handle_view fallback.
+    const EXPECTED: usize = 4;
+    let router = Router::new().with_json("/echo", |v: serde_json::Value| Ok(v));
+    let wire = request("/echo", json!({"x": 1}));
+
+    // Warm up (router.get + handler internals touch no per-call statics here,
+    // but keep the shape identical to the other budgets).
+    let _ = dispatch_cycle_ws_inline(&router, &wire, "/echo");
+
+    let (_, allocs) = count_allocs(|| {
+        black_box(dispatch_cycle_ws_inline(&router, &wire, "/echo"));
+    });
+
+    assert_eq!(
+        allocs, EXPECTED,
+        "websocket-inline allocation budget changed (was {EXPECTED}, now {allocs})"
     );
 }

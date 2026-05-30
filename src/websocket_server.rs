@@ -1,13 +1,16 @@
 use crate::async_client::AsyncClient;
 use crate::constants::{ErrorCode, QueryFormat};
 use crate::error::RepeError;
-use crate::message::{Message, create_error_response_like, stamp_response_query};
+use crate::message::{
+    Message, MessageView, create_error_response_like, create_error_response_unstamped_view,
+    stamp_response_query,
+};
 use crate::peer::{
     CallContext, CancelSignal, NotifyBody, PeerHandle, PeerId, PeerRegistry, PeerSendError,
     PeerSink,
 };
 use crate::server::{Execution, HandlerErased, Router};
-use crate::server_request::{Resolution, dispatch, resolve};
+use crate::server_request::{RouteOutcome, dispatch, dispatch_view, route};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use std::future::Future;
@@ -994,10 +997,10 @@ where
             None => break,
         };
 
-        let request = match decode_request_frame(frame)? {
-            FrameAction::Message(message) => message,
-            FrameAction::Continue => continue,
-            FrameAction::Close => break,
+        let request = match decode_request_payload(frame)? {
+            FramePayload::Bytes(payload) => Message::from_slice_exact(&payload)?,
+            FramePayload::Continue => continue,
+            FramePayload::Close => break,
         };
 
         if let Some(response) = upstream.forward_message(&request).await? {
@@ -1187,39 +1190,53 @@ async fn reader_task(
             None => break,
         };
 
-        let request = match decode_request_frame(frame)? {
-            FrameAction::Message(message) => message,
-            FrameAction::Continue => continue,
-            FrameAction::Close => break,
+        let payload = match decode_request_payload(frame)? {
+            FramePayload::Bytes(payload) => payload,
+            FramePayload::Continue => continue,
+            FramePayload::Close => break,
         };
+        // Borrow the frame rather than copying its query and body into an owned
+        // Message; only the off-reader path (whose spawned task outlives
+        // `payload`) materializes one.
+        let view = MessageView::from_slice_exact(&payload)?;
 
-        // Resolve the route (version/query validation + handler lookup)
-        // here, on the reader, so the early error responses and the
-        // execution mode are computed identically for the inline and
-        // off-reader paths; only where dispatch runs differs.
-        match resolve(router, &request) {
-            Resolution::Respond(maybe_response) => {
-                if let Some(response) = maybe_response {
+        // Validate + look up the handler here, on the reader, so early error
+        // responses and the execution mode are computed identically for the
+        // inline and off-reader paths; only where dispatch runs differs.
+        match route(router, &view.header, view.query) {
+            RouteOutcome::Reject {
+                notify,
+                code,
+                message,
+            } => {
+                if !notify {
+                    let mut response = create_error_response_unstamped_view(&view, code, message);
+                    // The outbound channel carries owned messages written later
+                    // by the writer task, so copy the borrowed query in.
+                    stamp_response_query(&mut response, view.query.to_vec());
                     if conn.outbound_tx.send(response).await.is_err() {
                         break;
                     }
                 }
             }
-            Resolution::Dispatch { handler, notify } => match handler.execution() {
+            RouteOutcome::Dispatch {
+                handler,
+                notify,
+                path,
+            } => match handler.execution() {
                 Execution::Inline => {
                     // Thread the calling peer and the connection's
                     // cancellation signal to handlers so `with_json_ctx` /
                     // `with_typed_ctx` (and registry-backed callables) can
                     // push notifies back through this connection during
                     // request handling and observe disconnect/shutdown.
-                    let path = request.query_str().unwrap_or("");
                     let ctx = CallContext::with_cancel(path, &conn.peer, &inline_signal);
-                    let maybe_response = dispatch(handler.as_ref(), &request, &ctx, notify);
-                    // `ctx`'s borrow of `request` ends with the dispatch call
-                    // above, so the request query can now be moved into the
-                    // response instead of cloned by the handler.
-                    if let Some(mut response) = maybe_response {
-                        stamp_response_query(&mut response, request.query);
+                    if let Some(mut response) = dispatch_view(handler.as_ref(), &view, &ctx, notify)
+                    {
+                        // The response is query-less and the writer task frames
+                        // it later, so copy the borrowed query into it rather
+                        // than referencing `payload`.
+                        stamp_response_query(&mut response, view.query.to_vec());
                         if conn.outbound_tx.send(response).await.is_err() {
                             // Writer task exited (likely wire error);
                             // abandon reader. The disconnect guard still
@@ -1229,6 +1246,9 @@ async fn reader_task(
                     }
                 }
                 Execution::OffReader => {
+                    // The spawned blocking task outlives `payload`, so it needs
+                    // an owned request.
+                    let request = view.to_message();
                     if !spawn_off_reader(&offreader_sem, &conn, handler, request, notify).await {
                         break;
                     }
@@ -1439,17 +1459,19 @@ impl Drop for DisconnectGuard {
     }
 }
 
-enum FrameAction {
-    Message(Message),
+enum FramePayload {
+    /// A binary frame's raw bytes, to be parsed as a [`MessageView`] (reader) or
+    /// an owned [`Message`] (proxy) by the caller.
+    Bytes(Vec<u8>),
     Continue,
     Close,
 }
 
-fn decode_request_frame(frame: WsMessage) -> Result<FrameAction, RepeError> {
+fn decode_request_payload(frame: WsMessage) -> Result<FramePayload, RepeError> {
     match frame {
-        WsMessage::Binary(payload) => Message::from_slice_exact(&payload).map(FrameAction::Message),
-        WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_) => Ok(FrameAction::Continue),
-        WsMessage::Close(_) => Ok(FrameAction::Close),
+        WsMessage::Binary(payload) => Ok(FramePayload::Bytes(payload)),
+        WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_) => Ok(FramePayload::Continue),
+        WsMessage::Close(_) => Ok(FramePayload::Close),
         WsMessage::Text(_) => Err(websocket_invalid_data_error(
             "websocket transport requires binary messages",
         )),
