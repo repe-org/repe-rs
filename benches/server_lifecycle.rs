@@ -16,11 +16,14 @@
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use repe::server::Router;
-use repe::{CallContext, HEADER_SIZE, Message, QueryFormat, read_message, write_message};
+use repe::{
+    CallContext, HEADER_SIZE, Message, MessageView, QueryFormat, read_message, read_message_into,
+    write_message, write_message_streaming,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::hint::black_box;
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 
 #[derive(Serialize, Deserialize)]
 struct SumIn {
@@ -58,6 +61,23 @@ fn run_cycle(router: &Router, wire: &[u8], path: &str, out: &mut Vec<u8>) {
     write_message(out, &resp).expect("write");
 }
 
+/// The borrowing path: read into a reused buffer, parse a `MessageView`,
+/// dispatch via `handle_view`, and frame the response with the query echoed as
+/// a borrowed slice of the read buffer. No owned request `Message`.
+fn run_cycle_view(router: &Router, wire: &[u8], path: &str, buf: &mut Vec<u8>, out: &mut Vec<u8>) {
+    let mut reader = Cursor::new(wire);
+    read_message_into(&mut reader, buf).expect("read");
+    let view = MessageView::from_slice(buf).expect("view");
+    let handler = router.get(path).expect("handler");
+    let ctx = CallContext::detached(path);
+    let resp = handler.handle_view(&view, &ctx).expect("dispatch");
+    out.clear();
+    write_message_streaming(out, resp.header, view.query, resp.body.len() as u64, |w| {
+        w.write_all(&resp.body)
+    })
+    .expect("write");
+}
+
 fn bench_server_lifecycle(c: &mut Criterion) {
     let json_router = Router::new().with_json("/echo", |v: serde_json::Value| Ok(v));
     let typed_router = Router::new()
@@ -75,6 +95,33 @@ fn bench_server_lifecycle(c: &mut Criterion) {
         b.iter(|| run_cycle(black_box(&typed_router), black_box(&typed_wire), "/sum", &mut out))
     });
     group.finish();
+
+    // Borrowing path: same work, reusable read buffer + MessageView dispatch.
+    let mut buf = Vec::with_capacity(256);
+    let mut view_group = c.benchmark_group("server_lifecycle_view");
+    view_group.bench_function("json_echo", |b| {
+        b.iter(|| {
+            run_cycle_view(
+                black_box(&json_router),
+                black_box(&json_wire),
+                "/echo",
+                &mut buf,
+                &mut out,
+            )
+        })
+    });
+    view_group.bench_function("typed_sum", |b| {
+        b.iter(|| {
+            run_cycle_view(
+                black_box(&typed_router),
+                black_box(&typed_wire),
+                "/sum",
+                &mut buf,
+                &mut out,
+            )
+        })
+    });
+    view_group.finish();
 }
 
 criterion_group!(benches, bench_server_lifecycle);

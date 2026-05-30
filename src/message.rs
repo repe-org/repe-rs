@@ -248,6 +248,19 @@ impl<'a> MessageView<'a> {
     pub fn query_str(&self) -> Result<&'a str, std::str::Utf8Error> {
         std::str::from_utf8(self.query)
     }
+
+    /// Copy this borrowed view into an owned [`Message`], allocating the query
+    /// and body. Used as the fallback for [`HandlerErased::handle_view`] when a
+    /// handler has not overridden the borrowing path.
+    ///
+    /// [`HandlerErased::handle_view`]: crate::server::HandlerErased::handle_view
+    pub fn to_message(&self) -> Message {
+        Message {
+            header: self.header,
+            query: self.query.to_vec(),
+            body: self.body.to_vec(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -821,6 +834,33 @@ pub(crate) fn stamp_response_query(response: &mut Message, request_query: Vec<u8
     response.header.query_length = response.query.len() as u64;
     response.header.length =
         HEADER_SIZE as u64 + response.header.query_length + response.header.body_length;
+}
+
+/// Borrowing twin of [`create_response_unstamped`]: builds the same query-less
+/// success response from a [`MessageView`], without materializing an owned
+/// request. The view's query is echoed by the writer (e.g.
+/// [`write_message_streaming`] with the borrowed query), not by this builder.
+pub(crate) fn create_response_unstamped_view(
+    view: &MessageView,
+    result: impl serde::Serialize,
+    body_format: BodyFormat,
+) -> Result<Message, RepeError> {
+    let builder = response_header_builder(view.header.id, view.header.query_format);
+    finish_response(builder, result, body_format)
+}
+
+/// Borrowing, query-less error response from a [`MessageView`]. Mirrors
+/// [`create_error_response_like`] but leaves the query empty for the writer to
+/// supply from the borrowed view.
+pub(crate) fn create_error_response_unstamped_view(
+    view: &MessageView,
+    code: ErrorCode,
+    msg: impl AsRef<str>,
+) -> Message {
+    let mut err = create_error_message(code, msg.as_ref());
+    err.header.id = view.header.id;
+    err.header.query_format = view.header.query_format;
+    err
 }
 
 /// Shared response-builder prefix: echo the request id and query format with an

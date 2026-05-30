@@ -18,6 +18,28 @@ pub fn read_message<R: Read>(r: &mut R) -> Result<Message, RepeError> {
     Message::new(header, query, body)
 }
 
+/// Read a full REPE message frame into `buf`, reusing its allocation across
+/// calls.
+///
+/// On success `buf` holds the complete wire frame (header + query + body) and
+/// can be parsed with [`MessageView::from_slice`](crate::MessageView::from_slice)
+/// to dispatch without the per-request query and body `Vec` allocations that
+/// [`read_message`] makes. A server reading many requests on one connection
+/// keeps one `buf` and reuses it, so steady-state framing is allocation-free.
+///
+/// `buf` is cleared first; its capacity is retained, so once it has grown to the
+/// largest frame seen no further allocation occurs.
+pub fn read_message_into<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> Result<(), RepeError> {
+    buf.clear();
+    buf.resize(HEADER_SIZE, 0);
+    read_exact(r, &mut buf[..HEADER_SIZE])?;
+    let header = Header::decode(&buf[..HEADER_SIZE])?;
+    let total = HEADER_SIZE + header.query_length as usize + header.body_length as usize;
+    buf.resize(total, 0);
+    read_exact(r, &mut buf[HEADER_SIZE..total])?;
+    Ok(())
+}
+
 /// Write a full REPE message to a stream implementing `Write`.
 pub fn write_message<W: Write>(w: &mut W, msg: &Message) -> Result<(), RepeError> {
     let header_bytes = msg.header.encode();

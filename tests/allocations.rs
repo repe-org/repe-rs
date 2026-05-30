@@ -20,10 +20,13 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::hint::black_box;
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 
 use repe::server::Router;
-use repe::{CallContext, HEADER_SIZE, Message, QueryFormat, read_message, write_message};
+use repe::{
+    CallContext, HEADER_SIZE, Message, MessageView, QueryFormat, read_message, read_message_into,
+    write_message, write_message_streaming,
+};
 use serde_json::json;
 
 thread_local! {
@@ -94,6 +97,32 @@ fn dispatch_cycle(router: &Router, wire: &[u8], path: &str, out: &mut Vec<u8>) {
     write_message(out, &resp).expect("write");
 }
 
+/// The borrowing path: read into a reused buffer, parse a `MessageView`,
+/// dispatch via `handle_view`, and write the response framing the query as a
+/// borrowed slice of the read buffer (`write_message_streaming`). No owned
+/// request `Message`, so the read query/body `Vec`s never exist.
+fn dispatch_cycle_view(
+    router: &Router,
+    wire: &[u8],
+    path: &str,
+    buf: &mut Vec<u8>,
+    out: &mut Vec<u8>,
+) {
+    let mut reader = Cursor::new(wire);
+    read_message_into(&mut reader, buf).expect("read");
+    let view = MessageView::from_slice(buf).expect("view");
+    let handler = router.get(path).expect("handler");
+    let ctx = CallContext::detached(path);
+    let resp = handler.handle_view(&view, &ctx).expect("dispatch");
+    out.clear();
+    // The response is query-less; echo the query straight from the borrowed
+    // view, so no query buffer is allocated on the response side either.
+    write_message_streaming(out, resp.header, view.query, resp.body.len() as u64, |w| {
+        w.write_all(&resp.body)
+    })
+    .expect("write");
+}
+
 #[test]
 fn framing_round_trip_allocates_only_query_and_body() {
     // The pure framing path, no dispatch: `read_message` allocates exactly one
@@ -155,5 +184,37 @@ fn json_dispatch_allocation_budget() {
         allocs, EXPECTED,
         "per-request allocation budget changed (was {EXPECTED}, now {allocs}); \
          a reduction is good news — update EXPECTED; an increase is a regression"
+    );
+}
+
+#[test]
+fn json_dispatch_view_allocation_budget() {
+    // The borrowing read path for the same `{"x":1}` echo. The two read-side
+    // Vecs (query + body) are gone — the read buffer is reused and the response
+    // echoes the query as a borrowed slice — leaving only serde_json's payload
+    // work:
+    //
+    //   0  read_message_into (reuses `buf`) + MessageView (borrows)
+    //   2  serde_json decode of `{"x":1}` to Value
+    //   1  serde_json encode of the response body
+    //   0  query echo (borrowed from the view by the writer)
+    //   0  write_message_streaming (reuses `out`)
+    //   ----
+    //   3   (down from 5 on the owned path)
+    const EXPECTED: usize = 3;
+    let router = Router::new().with_json("/echo", |v: serde_json::Value| Ok(v));
+    let wire = request("/echo", json!({"x": 1}));
+    let mut buf = Vec::new();
+    let mut out = Vec::new();
+
+    // Warm up both reused buffers.
+    dispatch_cycle_view(&router, &wire, "/echo", &mut buf, &mut out);
+
+    let (_, allocs) =
+        count_allocs(|| dispatch_cycle_view(&router, &wire, "/echo", &mut buf, &mut out));
+
+    assert_eq!(
+        allocs, EXPECTED,
+        "borrowing-path allocation budget changed (was {EXPECTED}, now {allocs})"
     );
 }

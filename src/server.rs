@@ -2,7 +2,10 @@ use crate::constants::{BodyFormat, ErrorCode};
 use crate::error::RepeError;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::io::{read_message, write_message};
-use crate::message::{Message, create_error_response_like, create_response_unstamped};
+use crate::message::{
+    Message, MessageView, create_error_response_like, create_error_response_unstamped_view,
+    create_response_unstamped, create_response_unstamped_view,
+};
 use crate::peer::{CallContext, PeerHandle};
 use crate::registry::Registry;
 #[cfg(not(target_arch = "wasm32"))]
@@ -83,6 +86,26 @@ pub trait HandlerErased: Send + Sync {
     /// [`CallContext::detached`]).
     fn handle_with_ctx(&self, req: &Message, _ctx: &CallContext) -> Result<Message, RepeError> {
         self.handle(req)
+    }
+
+    /// Borrowing dispatch: handle a request given a borrowed [`MessageView`]
+    /// instead of an owned [`Message`].
+    ///
+    /// A server that reads each frame into a reusable per-connection buffer (see
+    /// [`read_message_into`](crate::read_message_into)) can dispatch through this
+    /// method without the per-request query and body `Vec` allocations that an
+    /// owned [`Message`] requires. As with [`handle_with_ctx`](Self::handle_with_ctx),
+    /// the returned response leaves its query empty; the writer supplies the
+    /// echoed query from the borrowed view.
+    ///
+    /// The default implementation materializes an owned [`Message`] from the view
+    /// (copying the query and body) and delegates to
+    /// [`handle_with_ctx`](Self::handle_with_ctx), so existing handlers work
+    /// unchanged. The built-in handlers override it to decode straight from the
+    /// borrowed body and skip those copies.
+    #[doc(hidden)]
+    fn handle_view(&self, view: &MessageView, ctx: &CallContext) -> Result<Message, RepeError> {
+        self.handle_with_ctx(&view.to_message(), ctx)
     }
 
     /// Where this handler should be dispatched. Defaults to
@@ -238,6 +261,24 @@ fn decode_json_param(req: &Message) -> Result<Result<Value, Message>, RepeError>
     Ok(Ok(value))
 }
 
+/// Borrowing twin of [`decode_json_param`]: decode the request body straight
+/// from the borrowed view, with no owned `Message`. The UTF-8 branch parses the
+/// bytes directly (`from_slice`) rather than via an intermediate `String`.
+fn decode_json_param_view(view: &MessageView) -> Result<Result<Value, Message>, RepeError> {
+    let value: Value = match BodyFormat::try_from(view.header.body_format) {
+        Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => serde_json::from_slice(view.body)?,
+        Ok(BodyFormat::Beve) => beve_from_slice(view.body)?,
+        _ => {
+            return Ok(Err(create_error_response_unstamped_view(
+                view,
+                ErrorCode::InvalidBody,
+                "Expected JSON body",
+            )));
+        }
+    };
+    Ok(Ok(value))
+}
+
 struct JsonHandler<F>(F)
 where
     F: Fn(Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static;
@@ -254,6 +295,17 @@ where
         match (self.0)(param) {
             Ok(value) => create_response_unstamped(req, value, BodyFormat::Json),
             Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
+        }
+    }
+
+    fn handle_view(&self, view: &MessageView, _ctx: &CallContext) -> Result<Message, RepeError> {
+        let param = match decode_json_param_view(view)? {
+            Ok(v) => v,
+            Err(err) => return Ok(err),
+        };
+        match (self.0)(param) {
+            Ok(value) => create_response_unstamped_view(view, value, BodyFormat::Json),
+            Err((code, msg)) => Ok(create_error_response_unstamped_view(view, code, msg)),
         }
     }
 }
@@ -371,6 +423,27 @@ where
     Ok(Ok(value))
 }
 
+/// Borrowing twin of [`decode_typed_param`]: deserialize `T` straight from the
+/// borrowed view body, with no owned `Message` and no intermediate `String` on
+/// the UTF-8 branch.
+fn decode_typed_param_view<T>(view: &MessageView) -> Result<Result<T, Message>, RepeError>
+where
+    T: DeserializeOwned,
+{
+    let value: T = match BodyFormat::try_from(view.header.body_format) {
+        Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => serde_json::from_slice(view.body)?,
+        Ok(BodyFormat::Beve) => beve_from_slice(view.body)?,
+        _ => {
+            return Ok(Err(create_error_response_unstamped_view(
+                view,
+                ErrorCode::InvalidBody,
+                "Expected JSON body",
+            )));
+        }
+    };
+    Ok(Ok(value))
+}
+
 struct TypedHandler<T, R, F>(F, std::marker::PhantomData<(T, R)>)
 where
     T: DeserializeOwned + Send + Sync + 'static,
@@ -394,6 +467,20 @@ where
                 create_response_unstamped(req, value, format)
             }
             Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
+        }
+    }
+
+    fn handle_view(&self, view: &MessageView, _ctx: &CallContext) -> Result<Message, RepeError> {
+        let t: T = match decode_typed_param_view(view)? {
+            Ok(v) => v,
+            Err(err) => return Ok(err),
+        };
+        match self.0.call(t) {
+            Ok(r) => {
+                let (value, format) = r.into_typed_response();
+                create_response_unstamped_view(view, value, format)
+            }
+            Err((code, msg)) => Ok(create_error_response_unstamped_view(view, code, msg)),
         }
     }
 }
