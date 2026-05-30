@@ -1,0 +1,159 @@
+//! Per-request allocation budget for the server hot path.
+//!
+//! These tests pin the number of heap allocations on the inbound→outbound
+//! request path so that a regression (an extra per-request allocation) fails
+//! loudly, and a deliberate reduction shows up as a test that must be updated
+//! downward. They are the regression guard behind the ongoing effort to drive
+//! repe toward fewer per-request allocations.
+//!
+//! A thread-local counting [`GlobalAlloc`] wraps the system allocator. The
+//! counter is per-thread, so the measured closure (which runs entirely on the
+//! test thread) is unaffected by allocations on other threads in the test
+//! binary. `dealloc` is intentionally not counted; we budget *allocation
+//! events* (`alloc` + `realloc`), which is what scales with request volume.
+//!
+//! The dispatch path is composed from public APIs because the internal
+//! `route_request` is `pub(crate)`. The query-echo move the servers perform at
+//! the dispatch boundary is replicated here via the public `Message`/`Header`
+//! fields so the budget matches what a real server pays.
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+use std::hint::black_box;
+use std::io::Cursor;
+
+use repe::server::Router;
+use repe::{CallContext, HEADER_SIZE, Message, QueryFormat, read_message, write_message};
+use serde_json::json;
+
+thread_local! {
+    static ALLOCS: Cell<usize> = const { Cell::new(0) };
+}
+
+struct CountingAllocator;
+
+// SAFETY: each method forwards to the system allocator unchanged and only
+// additionally bumps a thread-local `Cell<usize>`, whose access allocates
+// nothing (a `const`-initialized thread-local is a plain static read), so no
+// reentrancy into the allocator is introduced.
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        ALLOCS.with(|c| c.set(c.get() + 1));
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        ALLOCS.with(|c| c.set(c.get() + 1));
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static GLOBAL: CountingAllocator = CountingAllocator;
+
+/// Run `f` and return its result alongside the number of allocation events it
+/// made on the current thread.
+fn count_allocs<R>(f: impl FnOnce() -> R) -> (R, usize) {
+    let start = ALLOCS.with(Cell::get);
+    let out = f();
+    let end = ALLOCS.with(Cell::get);
+    (out, end - start)
+}
+
+fn request(path: &str, body: serde_json::Value) -> Vec<u8> {
+    Message::builder()
+        .id(1)
+        .query_str(path)
+        .query_format(QueryFormat::JsonPointer)
+        .body_json(&body)
+        .unwrap()
+        .build()
+        .to_vec()
+}
+
+/// Replicates the read → dispatch → query-echo-move → write cycle a server runs
+/// per request, using only public APIs. `out` is reused across calls so its
+/// allocation is paid once (at warm-up), matching a per-connection writer.
+fn dispatch_cycle(router: &Router, wire: &[u8], path: &str, out: &mut Vec<u8>) {
+    let mut reader = Cursor::new(wire);
+    let req = read_message(&mut reader).expect("read");
+    let handler = router.get(path).expect("handler");
+    let ctx = CallContext::detached(path);
+    let mut resp = handler.handle_with_ctx(&req, &ctx).expect("dispatch");
+    // The server moves the request query into the (query-less) handler response
+    // at the dispatch boundary; replicate that here.
+    resp.query = req.query;
+    resp.header.query_length = resp.query.len() as u64;
+    resp.header.length =
+        HEADER_SIZE as u64 + resp.header.query_length + resp.header.body_length;
+    out.clear();
+    write_message(out, &resp).expect("write");
+}
+
+#[test]
+fn framing_round_trip_allocates_only_query_and_body() {
+    // The pure framing path, no dispatch: `read_message` allocates exactly one
+    // `Vec` for the query and one for the body; the header is a stack array, and
+    // `write_message` reuses the warmed `out` buffer. This is the framing budget
+    // the zero-copy/borrowed-read work would later drive toward zero.
+    let wire = request("/echo", json!({"x": 1}));
+    let mut out = Vec::new();
+
+    // Warm up `out` so its growth isn't charged to the measured call.
+    {
+        let mut reader = Cursor::new(&wire);
+        let req = read_message(&mut reader).unwrap();
+        write_message(&mut out, &req).unwrap();
+    }
+
+    let (_, allocs) = count_allocs(|| {
+        let mut reader = Cursor::new(&wire);
+        let req = read_message(&mut reader).unwrap();
+        out.clear();
+        write_message(&mut out, &req).unwrap();
+        black_box(&out);
+    });
+
+    assert_eq!(
+        allocs, 2,
+        "read_message should allocate exactly the query + body Vecs; write reuses `out`"
+    );
+}
+
+#[test]
+fn json_dispatch_allocation_budget() {
+    // Full read → dispatch → write for a small JSON echo (`{"x":1}`). Budget:
+    //
+    //   2  read_message: the query Vec + the body Vec
+    //   2  serde_json decode of `{"x":1}` to Value: the map node + the "x" key
+    //   1  serde_json encode of the response body to a Vec
+    //   0  query echo (moved from the request, not cloned — PR #20)
+    //   0  write_message (reuses the warmed `out` buffer)
+    //   ----
+    //   5
+    //
+    // The count includes serde_json's payload (de)serialization, so it is
+    // payload-shaped and may shift if serde_json's allocation behavior changes;
+    // what this guards is that repe's *framework* contribution does not grow. If
+    // this fails after a serde_json update, re-baseline EXPECTED; if it fails
+    // after a repe change, investigate the new (or removed) allocation.
+    const EXPECTED: usize = 5;
+    let router = Router::new().with_json("/echo", |v: serde_json::Value| Ok(v));
+    let wire = request("/echo", json!({"x": 1}));
+    let mut out = Vec::new();
+
+    // Warm up the reused writer buffer.
+    dispatch_cycle(&router, &wire, "/echo", &mut out);
+
+    let (_, allocs) = count_allocs(|| dispatch_cycle(&router, &wire, "/echo", &mut out));
+
+    assert_eq!(
+        allocs, EXPECTED,
+        "per-request allocation budget changed (was {EXPECTED}, now {allocs}); \
+         a reduction is good news — update EXPECTED; an increase is a regression"
+    );
+}
