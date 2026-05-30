@@ -33,11 +33,14 @@ pub(crate) enum Resolution {
 /// the eventual response (and its query echo) is built. Shared by the owned
 /// path ([`resolve`]) and the borrowing path ([`route_request_view`]) so the
 /// two cannot drift on what counts as a valid request.
-enum RouteOutcome {
-    /// A handler resolved; dispatch it.
+enum RouteOutcome<'a> {
+    /// A handler resolved; dispatch it. `path` is the already-validated query
+    /// string (borrowed from the request), so the caller need not re-validate it
+    /// to build a [`CallContext`].
     Dispatch {
         handler: Arc<dyn HandlerErased>,
         notify: bool,
+        path: &'a str,
     },
     /// Validation failed or the method was not found: send an error response
     /// with this code and message for a non-notify, or nothing for a notify.
@@ -48,7 +51,7 @@ enum RouteOutcome {
     },
 }
 
-fn route(router: &Router, header: &Header, query: &[u8]) -> RouteOutcome {
+fn route<'a>(router: &Router, header: &Header, query: &'a [u8]) -> RouteOutcome<'a> {
     let notify = header.notify == 1;
 
     if header.version != REPE_VERSION {
@@ -81,7 +84,11 @@ fn route(router: &Router, header: &Header, query: &[u8]) -> RouteOutcome {
     };
 
     match router.get(path) {
-        Some(handler) => RouteOutcome::Dispatch { handler, notify },
+        Some(handler) => RouteOutcome::Dispatch {
+            handler,
+            notify,
+            path,
+        },
         None => RouteOutcome::Reject {
             notify,
             code: ErrorCode::MethodNotFound,
@@ -99,7 +106,9 @@ fn route(router: &Router, header: &Header, query: &[u8]) -> RouteOutcome {
 #[cfg_attr(not(feature = "websocket"), allow(dead_code))]
 pub(crate) fn resolve(router: &Router, req: &Message) -> Resolution {
     match route(router, &req.header, &req.query) {
-        RouteOutcome::Dispatch { handler, notify } => Resolution::Dispatch { handler, notify },
+        RouteOutcome::Dispatch { handler, notify, .. } => {
+            Resolution::Dispatch { handler, notify }
+        }
         RouteOutcome::Reject {
             notify,
             code,
@@ -116,8 +125,12 @@ pub(crate) fn resolve(router: &Router, req: &Message) -> Resolution {
 /// Returns `None` for a notify or a validation failure on a notify.
 pub(crate) fn route_request_view(router: &Router, view: &MessageView) -> Option<Message> {
     match route(router, &view.header, view.query) {
-        RouteOutcome::Dispatch { handler, notify } => {
-            let ctx = CallContext::detached(view.query_str().unwrap_or(""));
+        RouteOutcome::Dispatch {
+            handler,
+            notify,
+            path,
+        } => {
+            let ctx = CallContext::detached(path);
             dispatch_view(handler.as_ref(), view, &ctx, notify)
         }
         RouteOutcome::Reject {

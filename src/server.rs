@@ -251,8 +251,9 @@ impl<H: HandlerErased> HandlerErased for OffReaderHandler<H> {
 
 fn decode_json_param(req: &Message) -> Result<Result<Value, Message>, RepeError> {
     let value: Value = match BodyFormat::try_from(req.header.body_format) {
-        Ok(BodyFormat::Json) => serde_json::from_slice(&req.body)?,
-        Ok(BodyFormat::Utf8) => serde_json::from_str(&req.body_utf8()).map_err(RepeError::from)?,
+        // JSON requires UTF-8, so a Utf8-framed body parses straight from the
+        // bytes too — strict and allocation-free, matching the borrowing path.
+        Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => serde_json::from_slice(&req.body)?,
         Ok(BodyFormat::Beve) => beve_from_slice(&req.body)?,
         _ => {
             return Ok(Err(create_error_response_like(
@@ -413,8 +414,7 @@ where
     T: DeserializeOwned,
 {
     let value: T = match BodyFormat::try_from(req.header.body_format) {
-        Ok(BodyFormat::Json) => serde_json::from_slice(&req.body)?,
-        Ok(BodyFormat::Utf8) => serde_json::from_str(&req.body_utf8()).map_err(RepeError::from)?,
+        Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => serde_json::from_slice(&req.body)?,
         Ok(BodyFormat::Beve) => beve_from_slice(&req.body)?,
         _ => {
             return Ok(Err(create_error_response_like(
@@ -1275,11 +1275,8 @@ where
             None
         } else {
             match BodyFormat::try_from(req.header.body_format) {
-                Ok(BodyFormat::Json) => {
+                Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => {
                     Some(serde_json::from_slice::<Value>(&req.body).map_err(RepeError::from)?)
-                }
-                Ok(BodyFormat::Utf8) => {
-                    Some(serde_json::from_str::<Value>(&req.body_utf8()).map_err(RepeError::from)?)
                 }
                 Ok(BodyFormat::Beve) => Some(beve_from_slice(&req.body)?),
                 Ok(BodyFormat::RawBinary) | Err(_) => {
@@ -1403,10 +1400,7 @@ struct JsonTypedAdapter<H: JsonTypedHandler>(H);
 impl<H: JsonTypedHandler> HandlerErased for JsonTypedAdapter<H> {
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
         let t: H::In = match BodyFormat::try_from(req.header.body_format) {
-            Ok(BodyFormat::Json) => serde_json::from_slice(&req.body)?,
-            Ok(BodyFormat::Utf8) => {
-                serde_json::from_str(&req.body_utf8()).map_err(RepeError::from)?
-            }
+            Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => serde_json::from_slice(&req.body)?,
             Ok(BodyFormat::Beve) => beve_from_slice(&req.body)?,
             _ => {
                 return Ok(create_error_response_like(
