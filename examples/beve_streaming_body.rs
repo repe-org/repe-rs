@@ -69,14 +69,14 @@ fn send_zero_buffer(frames: &[SensorFrame]) -> Result<Vec<u8>, Box<dyn std::erro
 
     for frame in frames {
         let body_len = beve::serialized_size(frame)?;
+        // body_writer returns beve::Result directly: its error type only needs
+        // to be Into<RepeError>, so a beve encode error stays a RepeError::Beve.
         write_message_streaming(
             &mut sink,
             header_for(frame),
             b"/ingest/frame",
             body_len,
-            // beve owns the sink for the encode; a sink I/O error comes back as
-            // a beve::Error, mapped into io::Error for the body_writer contract.
-            |w| beve::to_writer_streaming(w, frame).map_err(std::io::Error::other),
+            |w| beve::to_writer_streaming(w, frame),
         )?;
         println!(
             "  zero-buffer: sent frame {} ({body_len} body bytes)",

@@ -44,6 +44,12 @@ pub fn write_message<W: Write>(w: &mut W, msg: &Message) -> Result<(), RepeError
 /// do so produces an unframed message on the wire and the receiving side will
 /// either block (short body) or misinterpret subsequent frames (long body).
 ///
+/// `body_writer`'s error type only has to be convertible into [`RepeError`], so
+/// a raw `w.write_all(..)` (yielding [`std::io::Error`] → [`RepeError::Io`]) and
+/// a streaming encode such as `beve::to_writer_streaming` (yielding
+/// [`beve::Error`] → [`RepeError::Beve`]) both work without wrapping, and the
+/// failure keeps its original error variant.
+///
 /// Because REPE frames are length-prefixed, `body_len` has to be known before
 /// the body is written. Three patterns supply a serialized body without
 /// building a full wire-frame `Vec`:
@@ -69,7 +75,7 @@ pub fn write_message<W: Write>(w: &mut W, msg: &Message) -> Result<(), RepeError
 ///   # fn frame<W: std::io::Write, T: Serialize>(w: &mut W, header: Header, query: &[u8], value: &T) -> Result<(), RepeError> {
 ///   let body_len = beve::serialized_size(value)?;
 ///   write_message_streaming(w, header, query, body_len, |w| {
-///       beve::to_writer_streaming(w, value).map_err(std::io::Error::other)
+///       beve::to_writer_streaming(w, value)
 ///   })
 ///   # }
 ///   ```
@@ -80,10 +86,12 @@ pub fn write_message<W: Write>(w: &mut W, msg: &Message) -> Result<(), RepeError
 /// O(payload) for a bare numeric `Vec<T>` or a nested structure, which beve
 /// walks element by element. Prefer it only when not holding the whole body at
 /// once outweighs that second traversal; otherwise the reusable scratch buffer
-/// is a single encode. Note that beve owns the sink during the write, so a sink
-/// I/O error surfaces as a `beve::Error` mapped back into [`std::io::Error`],
-/// losing its `ErrorKind` — a further reason the scratch buffer is the default.
-pub fn write_message_streaming<W, F>(
+/// is a single encode. One caveat on error fidelity: beve owns the sink during a
+/// streaming encode and folds any write failure into a `beve::Error`, so a
+/// mid-body sink error surfaces as [`RepeError::Beve`] rather than
+/// [`RepeError::Io`] — the scratch buffer keeps that distinction, since its
+/// `write_all` goes straight through repe.
+pub fn write_message_streaming<W, F, E>(
     w: &mut W,
     mut header: Header,
     query: &[u8],
@@ -92,7 +100,8 @@ pub fn write_message_streaming<W, F>(
 ) -> Result<(), RepeError>
 where
     W: Write,
-    F: FnOnce(&mut W) -> std::io::Result<()>,
+    F: FnOnce(&mut W) -> Result<(), E>,
+    E: Into<RepeError>,
 {
     header.query_length = query.len() as u64;
     header.body_length = body_len;
@@ -101,7 +110,7 @@ where
     if !query.is_empty() {
         w.write_all(query)?;
     }
-    body_writer(w)?;
+    body_writer(w).map_err(Into::into)?;
     Ok(())
 }
 
@@ -268,8 +277,10 @@ mod tests {
         header.query_format = QueryFormat::JsonPointer as u16;
         header.body_format = BodyFormat::Beve as u16;
         let mut streamed = Vec::new();
+        // The body_writer returns beve::Result directly -- its error type only
+        // needs to be Into<RepeError>, so no manual error mapping.
         write_message_streaming(&mut streamed, header, query, body_len, |w| {
-            beve::to_writer_streaming(w, &frame).map_err(std::io::Error::other)
+            beve::to_writer_streaming(w, &frame)
         })
         .unwrap();
 
@@ -291,10 +302,36 @@ mod tests {
     }
 
     #[test]
+    fn streaming_body_writer_error_keeps_repe_error_variant() {
+        // A beve error raised inside body_writer surfaces as RepeError::Beve,
+        // not a flattened RepeError::Io.
+        let mut sink = Vec::new();
+        let beve_err = write_message_streaming(&mut sink, Header::new(), b"/x", 3, |_w| {
+            Err(beve::Error::msg("encode failed"))
+        })
+        .unwrap_err();
+        assert!(
+            matches!(beve_err, RepeError::Beve(_)),
+            "expected RepeError::Beve, got {beve_err:?}"
+        );
+
+        // And an io::Error keeps RepeError::Io with its ErrorKind intact.
+        let mut sink = Vec::new();
+        let io_err = write_message_streaming(&mut sink, Header::new(), b"/x", 3, |_w| {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        })
+        .unwrap_err();
+        match io_err {
+            RepeError::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe),
+            other => panic!("expected RepeError::Io, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn write_message_streaming_with_empty_query_and_body() {
         let header = Header::new();
         let mut got = Vec::new();
-        write_message_streaming(&mut got, header, &[], 0, |_| Ok(())).unwrap();
+        write_message_streaming(&mut got, header, &[], 0, |w| w.write_all(b"")).unwrap();
 
         let parsed = Message::from_slice(&got).unwrap();
         assert_eq!(parsed.header.length, HEADER_SIZE as u64);
