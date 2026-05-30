@@ -45,8 +45,8 @@ pub fn write_message<W: Write>(w: &mut W, msg: &Message) -> Result<(), RepeError
 /// either block (short body) or misinterpret subsequent frames (long body).
 ///
 /// Because REPE frames are length-prefixed, `body_len` has to be known before
-/// the body is written. Two patterns supply a serialized body without building
-/// a full wire-frame `Vec`:
+/// the body is written. Three patterns supply a serialized body without
+/// building a full wire-frame `Vec`:
 ///
 /// * **Reusable scratch buffer** (recommended for a writer sending many
 ///   frames): serialize the body once into a caller-owned `Vec<u8>` with
@@ -58,12 +58,31 @@ pub fn write_message<W: Write>(w: &mut W, msg: &Message) -> Result<(), RepeError
 /// * **Known-length raw body**: when the length is already known (a file
 ///   chunk, a pre-sized buffer), pass it directly and have `body_writer` emit
 ///   the bytes with `w.write_all(..)` — no body buffer at all.
+/// * **Zero-buffer streaming** (for a body too large to hold in memory):
+///   measure the encoded length with [`beve::serialized_size`], then stream the
+///   body straight to the sink with [`beve::to_writer_streaming`] inside
+///   `body_writer` — the body is never materialized as a `Vec`:
 ///
-/// Truly streaming an unbounded body too large to hold in memory needs its
-/// encoded length without buffering. BEVE cannot compute that without a
-/// traversal, so `beve::to_writer_streaming` only avoids the in-memory body if
-/// paired with a separate size pass — worth it only when not holding the body
-/// matters more than the second traversal.
+///   ```no_run
+///   # use repe::{Header, RepeError, write_message_streaming};
+///   # use serde::Serialize;
+///   # fn frame<W: std::io::Write, T: Serialize>(w: &mut W, header: Header, query: &[u8], value: &T) -> Result<(), RepeError> {
+///   let body_len = beve::serialized_size(value)?;
+///   write_message_streaming(w, header, query, body_len, |w| {
+///       beve::to_writer_streaming(w, value).map_err(std::io::Error::other)
+///   })
+///   # }
+///   ```
+///
+/// The zero-buffer path costs a size pass over the value before the write pass.
+/// That pass allocates nothing and moves no bytes (each leaf is an integer add):
+/// it is O(1) for a `&[u8]`/`serde_bytes` blob or a `beve::TypedSlice<T>`, but
+/// O(payload) for a bare numeric `Vec<T>` or a nested structure, which beve
+/// walks element by element. Prefer it only when not holding the whole body at
+/// once outweighs that second traversal; otherwise the reusable scratch buffer
+/// is a single encode. Note that beve owns the sink during the write, so a sink
+/// I/O error surfaces as a `beve::Error` mapped back into [`std::io::Error`],
+/// losing its `ErrorKind` — a further reason the scratch buffer is the default.
 pub fn write_message_streaming<W, F>(
     w: &mut W,
     mut header: Header,
@@ -223,6 +242,52 @@ mod tests {
             "smaller body must reuse the scratch allocation, not grow it"
         );
         assert!(scratch.len() < cap_after_big);
+    }
+
+    #[test]
+    fn streaming_beve_body_zero_buffer_via_serialized_size() {
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct SensorFrame {
+            id: u64,
+            samples: Vec<f64>,
+        }
+
+        let query = b"/ingest/frame";
+        let frame = SensorFrame {
+            id: 7,
+            samples: vec![2.5; 4096],
+        };
+
+        // Measure the encoded length up front, then stream the body straight to
+        // the sink -- the body is never materialized as a `Vec`.
+        let body_len = beve::serialized_size(&frame).unwrap();
+        let mut header = Header::new();
+        header.id = frame.id;
+        header.query_format = QueryFormat::JsonPointer as u16;
+        header.body_format = BodyFormat::Beve as u16;
+        let mut streamed = Vec::new();
+        write_message_streaming(&mut streamed, header, query, body_len, |w| {
+            beve::to_writer_streaming(w, &frame).map_err(std::io::Error::other)
+        })
+        .unwrap();
+
+        // The core framing contract: serialized_size must predict exactly what
+        // to_writer_streaming emits, so the advertised body_length matches the
+        // bytes actually written. A wrong prediction would desync the wire.
+        let mut streamed_body = Vec::new();
+        beve::to_writer_streaming(&mut streamed_body, &frame).unwrap();
+        assert_eq!(body_len, streamed_body.len() as u64);
+
+        let parsed = Message::from_slice(&streamed).unwrap();
+        assert_eq!(parsed.header.body_length, body_len);
+        assert_eq!(parsed.body, streamed_body);
+
+        // Streaming-encoded bytes round-trip through the normal (non-streaming)
+        // decoder back to the original value.
+        let decoded: SensorFrame = parsed.beve_body().unwrap();
+        assert_eq!(decoded, frame);
     }
 
     #[test]
