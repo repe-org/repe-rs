@@ -17,9 +17,35 @@
 //! Body sizes span the small RPC response (64 B) through the multi-MiB
 //! streaming chunk (`repe::stream` documents 64 MiB windows; bench up to a
 //! representative 4 MiB chunk).
+//!
+//! A second group, `outbound_frame_beve`, asks whether the WebSocket server
+//! should build a response frame straight from a serializable value instead of
+//! serializing into a `Message` body first:
+//!
+//! * `via_message`: today's path -- `beve::to_vec(value)` into a tight buffer,
+//!   wrap in a `Message`, then `into_wire_bytes`. The BEVE buffer is tight
+//!   (cap == len), so the prefix never fits and `into_wire_bytes` falls to its
+//!   slow path: a second allocation plus a body copy.
+//! * `direct_frame`: reserve the header+query prefix in one buffer, stream the
+//!   body in behind it with `beve::to_writer_streaming`, then back-patch the
+//!   header with the now-known body length. One allocation, no body copy.
+//!
+//! Finding: the BEVE encode dominates and is identical in both paths, so
+//! direct-framing removes only the framing overhead -- a large relative win for
+//! tiny, allocation-bound bodies (~40% at 64 B) but single digits once the body
+//! grows (~4-8% from 4 KiB up). Crucially, the server's handlers return
+//! `serde_json::Value`, which BEVE encodes element-by-element (there is no
+//! bulk-bytes fast path to make the encode O(1)), so its real responses are
+//! encode-bound and the framing win is marginal. That does not justify
+//! reworking the outbound `Message` channel into a lazy-serialize-at-the-writer
+//! representation -- which would also have to keep encoding on the per-handler
+//! threads to avoid serializing the writer task. The earlier "~60%" estimate
+//! reflected a bulk-byte body (O(1) encode, copy-bound), which is not the shape
+//! the server actually produces.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use repe::{BodyFormat, HEADER_SIZE, Message, QueryFormat};
+use repe::{BodyFormat, HEADER_SIZE, Header, Message, QueryFormat};
+use serde::{Deserialize, Serialize};
 use std::hint::black_box;
 
 const QUERY: &str = "/collect/file_chunk";
@@ -89,5 +115,82 @@ fn bench_wire_serialization(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_wire_serialization);
+/// A handler-shaped response body: a small head plus a sized payload, encoded
+/// as BEVE (the case `into_wire_bytes` cannot fast-path, since `beve::to_vec`
+/// returns a tight buffer with no room for the wire prefix).
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct Payload {
+    id: u64,
+    data: Vec<u8>,
+}
+
+/// Current outbound path: serialize the value to a tight BEVE `Vec`, wrap it in
+/// a [`Message`], then frame it. Two allocations (body + wire) and one body
+/// copy, because the tight body buffer has no room for the header+query prefix.
+fn frame_via_message(value: &Payload) -> Vec<u8> {
+    let body = beve::to_vec(value).unwrap();
+    Message::builder()
+        .id(value.id)
+        .query_str(QUERY)
+        .query_format(QueryFormat::JsonPointer)
+        .body_bytes(body)
+        .body_format(BodyFormat::Beve)
+        .build()
+        .into_wire_bytes()
+}
+
+/// Direct-frame: reserve the header+query prefix in one buffer, stream the body
+/// in behind it with `beve::to_writer_streaming`, then back-patch the header
+/// with the now-known body length. One allocation, one encode pass, no separate
+/// body `Vec` and no body copy.
+fn frame_direct(value: &Payload) -> Vec<u8> {
+    let prefix_len = HEADER_SIZE + QUERY.len();
+    let mut buf = Vec::with_capacity(prefix_len + 64);
+    buf.resize(prefix_len, 0);
+    beve::to_writer_streaming(&mut buf, value).unwrap();
+    let body_len = (buf.len() - prefix_len) as u64;
+
+    let mut header = Header::new();
+    header.id = value.id;
+    header.query_format = QueryFormat::JsonPointer as u16;
+    header.body_format = BodyFormat::Beve as u16;
+    header.query_length = QUERY.len() as u64;
+    header.body_length = body_len;
+    header.length = buf.len() as u64;
+    buf[..HEADER_SIZE].copy_from_slice(&header.encode());
+    buf[HEADER_SIZE..prefix_len].copy_from_slice(QUERY.as_bytes());
+    buf
+}
+
+fn bench_outbound_frame_beve(c: &mut Criterion) {
+    // Guard: both framings must round-trip to the same value, so the benchmark
+    // compares equivalent work rather than a shortcut.
+    let probe = Payload {
+        id: 9,
+        data: vec![1, 2, 3, 4, 5],
+    };
+    let via = Message::from_slice(&frame_via_message(&probe)).unwrap();
+    let direct = Message::from_slice(&frame_direct(&probe)).unwrap();
+    assert_eq!(via.beve_body::<Payload>().unwrap(), probe);
+    assert_eq!(direct.beve_body::<Payload>().unwrap(), probe);
+
+    let mut group = c.benchmark_group("outbound_frame_beve");
+    for &size in BODY_SIZES {
+        let payload = Payload {
+            id: 1,
+            data: vec![0xAB; size],
+        };
+        group.throughput(Throughput::Bytes((HEADER_SIZE + QUERY.len() + size) as u64));
+
+        group.bench_with_input(BenchmarkId::new("via_message", size), &payload, |b, p| {
+            b.iter(|| black_box(frame_via_message(p)));
+        });
+        group.bench_with_input(BenchmarkId::new("direct_frame", size), &payload, |b, p| {
+            b.iter(|| black_box(frame_direct(p)));
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_wire_serialization, bench_outbound_frame_beve);
 criterion_main!(benches);
