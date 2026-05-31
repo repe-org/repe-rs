@@ -2,6 +2,7 @@ use crate::constants::{BodyFormat, ErrorCode, HEADER_SIZE, QueryFormat};
 use crate::error::RepeError;
 use crate::header::Header;
 use beve::{Error as BeveError, from_slice as beve_from_slice, to_vec as beve_to_vec};
+use std::borrow::Cow;
 use std::io::{self, Write};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -400,11 +401,13 @@ mod tests {
         // The echoing path.
         let echoed = create_response(&req, &value, BodyFormat::Json).unwrap();
 
-        // The boundary path: build query-less, then stamp the moved query.
+        // The boundary path: build query-less, then stamp the request query in.
+        // The off-reader boundary owns its request, so it moves the buffer in
+        // (`Cow::Owned`, no copy).
         let mut staged = create_response_unstamped(&req, &value, BodyFormat::Json).unwrap();
         assert!(staged.query.is_empty(), "handler leaves the query empty");
         assert_eq!(staged.header.query_length, 0);
-        stamp_response_query(&mut staged, req.query.clone());
+        stamp_response_query(&mut staged, Cow::Owned(req.query.clone()));
 
         // Byte-for-byte identical to the echoing path, including the header.
         assert_eq!(staged, echoed);
@@ -412,9 +415,9 @@ mod tests {
         assert_eq!(staged.header.length, echoed.header.length);
 
         // Stamp is a no-op once a query is present (e.g. an error response) and
-        // when the request query is empty.
+        // when the request query is empty; a borrowed query is then never copied.
         let before = staged.clone();
-        stamp_response_query(&mut staged, b"/other".to_vec());
+        stamp_response_query(&mut staged, Cow::Borrowed(&b"/other"[..]));
         assert_eq!(staged, before, "stamp must not overwrite an existing query");
     }
 
@@ -855,22 +858,27 @@ pub(crate) fn create_response_unstamped(
     finish_response(builder, result, body_format)
 }
 
-/// Move `request_query` into a response left query-less by
-/// [`create_response_unstamped`], fixing up the header lengths.
+/// Echo `request_query` into a response left query-less by
+/// [`create_response_unstamped`] / [`create_response_unstamped_view`], fixing up
+/// the header lengths.
 ///
 /// A no-op when the response already carries a query (an error response from
 /// [`create_error_response_like`], or a custom handler that set its own) or when
 /// the request query is empty, so it is safe to call on every dispatched
-/// response. Built-in handlers leave the query empty precisely so this stamp
-/// echoes it with a buffer move instead of a clone.
-// Used by the owned dispatch boundary, which the WebSocket server takes; the
-// TCP/async servers echo the query through the borrowing path instead.
+/// response. Takes a [`Cow`] so the owned/WebSocket off-reader boundary moves its
+/// request query buffer straight in (`Cow::Owned`, no copy), while the
+/// WebSocket-inline path passes a borrowed slice of the read buffer
+/// (`Cow::Borrowed`) that is copied only when the stamp actually commits -- so a
+/// custom-query handler that set its own response query pays no allocation.
+// Used only by the WebSocket server: the off-reader path moves its owned request
+// query in, the inline path copies the borrowed view query. The TCP/async servers
+// echo through `response_echo_query` (a pure borrow) instead.
 #[cfg_attr(not(feature = "websocket"), allow(dead_code))]
-pub(crate) fn stamp_response_query(response: &mut Message, request_query: Vec<u8>) {
+pub(crate) fn stamp_response_query(response: &mut Message, request_query: Cow<[u8]>) {
     if request_query.is_empty() || !response.query.is_empty() {
         return;
     }
-    response.query = request_query;
+    response.query = request_query.into_owned();
     response.header.query_length = response.query.len() as u64;
     response.header.length =
         HEADER_SIZE as u64 + response.header.query_length + response.header.body_length;
@@ -884,6 +892,9 @@ pub(crate) fn stamp_response_query(response: &mut Message, request_query: Vec<u8
 /// borrowing writers consistent with the owned/WebSocket path on the
 /// [`HandlerErased`](crate::server::HandlerErased) custom-response-query
 /// contract, instead of unconditionally overwriting with the request query.
+// Called only from the TCP and async servers' borrowing writers, both
+// `#[cfg(not(target_arch = "wasm32"))]`, so it is dead on a wasm build.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn response_echo_query<'a>(response: &'a Message, request_query: &'a [u8]) -> &'a [u8] {
     if response.query.is_empty() {
         request_query

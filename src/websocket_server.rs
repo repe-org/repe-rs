@@ -13,6 +13,7 @@ use crate::server::{Execution, HandlerErased, Router};
 use crate::server_request::{RouteOutcome, dispatch, dispatch_view, route};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
+use std::borrow::Cow;
 use std::future::Future;
 use std::io::ErrorKind;
 use std::pin::Pin;
@@ -1211,9 +1212,10 @@ async fn reader_task(
             } => {
                 if !notify {
                     let mut response = create_error_response_unstamped_view(&view, code, message);
-                    // The outbound channel carries owned messages written later
-                    // by the writer task, so copy the borrowed query in.
-                    stamp_response_query(&mut response, view.query.to_vec());
+                    // The outbound channel carries owned messages framed later by
+                    // the writer task, so stamp the borrowed query in (an error
+                    // response is always query-less, so it is copied here).
+                    stamp_response_query(&mut response, Cow::Borrowed(view.query));
                     if conn.outbound_tx.send(response).await.is_err() {
                         break;
                     }
@@ -1234,9 +1236,10 @@ async fn reader_task(
                     if let Some(mut response) = dispatch_view(handler.as_ref(), &view, &ctx, notify)
                     {
                         // The response is query-less and the writer task frames
-                        // it later, so copy the borrowed query into it rather
-                        // than referencing `payload`.
-                        stamp_response_query(&mut response, view.query.to_vec());
+                        // it later, so stamp the borrowed query in rather than
+                        // referencing `payload`. A handler that set its own
+                        // response query keeps it and pays no copy.
+                        stamp_response_query(&mut response, Cow::Borrowed(view.query));
                         if conn.outbound_tx.send(response).await.is_err() {
                             // Writer task exited (likely wire error);
                             // abandon reader. The disconnect guard still
@@ -1347,10 +1350,10 @@ async fn spawn_off_reader(
             }
         };
         if let Some(mut response) = response {
-            // Echo the request query by moving its buffer into the response
-            // (handlers leave it empty); a panic error response already carries
-            // its own query, so the stamp is a no-op there.
-            stamp_response_query(&mut response, request.query);
+            // Echo the request query by moving its owned buffer into the response
+            // (`Cow::Owned`, no copy -- handlers leave it empty); a panic error
+            // response already carries its own query, so the stamp is a no-op.
+            stamp_response_query(&mut response, Cow::Owned(request.query));
             // Best-effort: the writer may already be gone if the
             // connection closed while this handler ran.
             let _ = outbound_tx.blocking_send(response);
