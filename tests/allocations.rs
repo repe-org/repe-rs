@@ -91,8 +91,7 @@ fn dispatch_cycle(router: &Router, wire: &[u8], path: &str, out: &mut Vec<u8>) {
     // at the dispatch boundary; replicate that here.
     resp.query = req.query;
     resp.header.query_length = resp.query.len() as u64;
-    resp.header.length =
-        HEADER_SIZE as u64 + resp.header.query_length + resp.header.body_length;
+    resp.header.length = HEADER_SIZE as u64 + resp.header.query_length + resp.header.body_length;
     out.clear();
     write_message(out, &resp).expect("write");
 }
@@ -135,8 +134,7 @@ fn dispatch_cycle_ws_inline(router: &Router, wire: &[u8], path: &str) -> Message
     let mut resp = handler.handle_view(&view, &ctx).expect("dispatch");
     resp.query = view.query.to_vec();
     resp.header.query_length = resp.query.len() as u64;
-    resp.header.length =
-        HEADER_SIZE as u64 + resp.header.query_length + resp.header.body_length;
+    resp.header.length = HEADER_SIZE as u64 + resp.header.query_length + resp.header.body_length;
     resp
 }
 

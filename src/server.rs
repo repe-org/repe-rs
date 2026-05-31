@@ -1520,9 +1520,13 @@ fn handle_connection(
             // handler set its own — matching the owned path's stamp rule — so no
             // query buffer is copied into the response on the common path.
             let echo = crate::message::response_echo_query(&resp, view.query);
-            write_message_streaming(&mut writer, resp.header, echo, resp.body.len() as u64, |w| {
-                w.write_all(&resp.body)
-            })?;
+            write_message_streaming(
+                &mut writer,
+                resp.header,
+                echo,
+                resp.body.len() as u64,
+                |w| w.write_all(&resp.body),
+            )?;
             writer.flush()?;
         }
     }

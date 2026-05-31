@@ -89,10 +89,24 @@ fn bench_server_lifecycle(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("server_lifecycle");
     group.bench_function("json_echo", |b| {
-        b.iter(|| run_cycle(black_box(&json_router), black_box(&json_wire), "/echo", &mut out))
+        b.iter(|| {
+            run_cycle(
+                black_box(&json_router),
+                black_box(&json_wire),
+                "/echo",
+                &mut out,
+            )
+        })
     });
     group.bench_function("typed_sum", |b| {
-        b.iter(|| run_cycle(black_box(&typed_router), black_box(&typed_wire), "/sum", &mut out))
+        b.iter(|| {
+            run_cycle(
+                black_box(&typed_router),
+                black_box(&typed_wire),
+                "/sum",
+                &mut out,
+            )
+        })
     });
     group.finish();
 

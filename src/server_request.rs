@@ -116,7 +116,9 @@ pub(crate) fn dispatch_view(
     }
     Some(match handler.handle_view(view, ctx) {
         Ok(message) => message,
-        Err(err) => create_error_response_unstamped_view(view, err.to_error_code(), err.to_string()),
+        Err(err) => {
+            create_error_response_unstamped_view(view, err.to_error_code(), err.to_string())
+        }
     })
 }
 
@@ -179,9 +181,13 @@ mod tests {
 
         // Frame echoing the borrowed query, as the TCP/async servers do.
         let mut out = Vec::new();
-        write_message_streaming(&mut out, resp.header, view.query, resp.body.len() as u64, |w| {
-            w.write_all(&resp.body)
-        })
+        write_message_streaming(
+            &mut out,
+            resp.header,
+            view.query,
+            resp.body.len() as u64,
+            |w| w.write_all(&resp.body),
+        )
         .unwrap();
 
         let framed = Message::from_slice(&out).unwrap();
