@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [3.3.0] - 2026-05-30
 
 ### Added
 - Borrowing, zero-allocation read path for server dispatch. `read_message_into(reader, &mut Vec<u8>)` and `read_message_into_async` read a full frame into a reusable per-connection buffer; pair with `MessageView::from_slice`/`from_slice_exact` (the latter rejects trailing bytes, for one-message-per-frame transports) to dispatch via the new `HandlerErased::handle_view(&MessageView, &CallContext)` without the per-request query and body `Vec` allocations an owned `Message` requires. `handle_view`'s default materializes an owned `Message` (`MessageView::to_message`) and delegates to `handle_with_ctx`, so every existing handler works unchanged; the built-in JSON and typed handlers (`with_json` / `with_typed`) override it to decode straight from the borrowed body.
