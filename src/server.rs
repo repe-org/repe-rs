@@ -1,12 +1,15 @@
 use crate::constants::{BodyFormat, ErrorCode};
 use crate::error::RepeError;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::io::{read_message, write_message};
-use crate::message::{Message, create_error_response_like, create_response};
+use crate::io::{read_message_into, write_message_streaming};
+use crate::message::{
+    Message, MessageView, create_error_response_like, create_error_response_unstamped_view,
+    create_response_unstamped, create_response_unstamped_view,
+};
 use crate::peer::{CallContext, PeerHandle};
 use crate::registry::Registry;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::server_request::route_request;
+use crate::server_request::route_request_view;
 use crate::structs::RepeStruct;
 use beve::from_slice as beve_from_slice;
 use serde::Serialize;
@@ -43,6 +46,30 @@ pub enum Execution {
     OffReader,
 }
 
+/// A resolved request handler.
+///
+/// # Response query echo
+///
+/// REPE responses echo the request's query verbatim, but that echo is the
+/// **dispatch layer's** responsibility, not the handler's: the built-in
+/// handlers return responses with an *empty* query. The WebSocket server moves
+/// the request's query buffer into the response after the handler returns; the
+/// TCP ([`Server`]) and async ([`AsyncServer`](crate::AsyncServer)) servers
+/// take the borrowing [`handle_view`](Self::handle_view) path and frame the
+/// response with the query borrowed straight from their read buffer. Either way
+/// the per-response query echo costs no allocation.
+///
+/// Two consequences:
+///
+/// * Calling [`handle`](Self::handle) / [`handle_with_ctx`](Self::handle_with_ctx)
+///   directly (e.g. via [`Router::get`]) yields a response whose `query` is
+///   empty — it is only filled once dispatched through a server. Code that
+///   needs a complete, query-echoing response without a server should build
+///   it with [`create_response`](crate::message::create_response), which
+///   echoes the query itself.
+/// * A *custom* implementor may set the response query itself; both the owned
+///   and the borrowing dispatch paths only fill an empty one, so a hand-set
+///   echo is left untouched.
 pub trait HandlerErased: Send + Sync {
     fn handle(&self, req: &Message) -> Result<Message, RepeError>;
 
@@ -54,12 +81,35 @@ pub trait HandlerErased: Send + Sync {
     /// push notifies to the originator during request handling) or
     /// the dispatched method. The built-in
     /// `WebSocketServer` invokes this method per request with a
-    /// [`CallContext`] carrying the peer; the TCP servers invoke
-    /// `handle` directly, so context-aware handlers also need to
-    /// behave correctly when no peer is available (see
-    /// [`CallContext::detached`]).
+    /// [`CallContext`] carrying the peer; the TCP and async servers
+    /// reach it through [`handle_view`](Self::handle_view)'s default
+    /// with a peer-less [`CallContext::detached`] context, so
+    /// context-aware handlers must also behave correctly when no peer
+    /// is available.
     fn handle_with_ctx(&self, req: &Message, _ctx: &CallContext) -> Result<Message, RepeError> {
         self.handle(req)
+    }
+
+    /// Borrowing dispatch: handle a request given a borrowed [`MessageView`]
+    /// instead of an owned [`Message`].
+    ///
+    /// A server that reads each frame into a reusable per-connection buffer (see
+    /// [`read_message_into`]) can dispatch through this
+    /// method without the per-request query and body `Vec` allocations that an
+    /// owned [`Message`] requires. As with [`handle_with_ctx`](Self::handle_with_ctx),
+    /// the returned response leaves its query empty; the writer supplies the
+    /// echoed query from the borrowed view.
+    ///
+    /// The default implementation materializes an owned [`Message`] from the view
+    /// (copying the query and body) and delegates to
+    /// [`handle_with_ctx`](Self::handle_with_ctx), so existing handlers work
+    /// unchanged. The built-in JSON and typed handlers ([`Router::with_json`] /
+    /// [`Router::with_typed`]) override it to decode straight from the borrowed
+    /// body and skip those copies; the other built-ins (context-aware, struct,
+    /// registry, and any middleware-wrapped route) use the owning default until
+    /// they are likewise overridden.
+    fn handle_view(&self, view: &MessageView, ctx: &CallContext) -> Result<Message, RepeError> {
+        self.handle_with_ctx(&view.to_message(), ctx)
     }
 
     /// Where this handler should be dispatched. Defaults to
@@ -201,12 +251,31 @@ impl<H: HandlerErased> HandlerErased for OffReaderHandler<H> {
 
 fn decode_json_param(req: &Message) -> Result<Result<Value, Message>, RepeError> {
     let value: Value = match BodyFormat::try_from(req.header.body_format) {
-        Ok(BodyFormat::Json) => serde_json::from_slice(&req.body)?,
-        Ok(BodyFormat::Utf8) => serde_json::from_str(&req.body_utf8()).map_err(RepeError::from)?,
+        // JSON requires UTF-8, so a Utf8-framed body parses straight from the
+        // bytes too — strict and allocation-free, matching the borrowing path.
+        Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => serde_json::from_slice(&req.body)?,
         Ok(BodyFormat::Beve) => beve_from_slice(&req.body)?,
         _ => {
             return Ok(Err(create_error_response_like(
                 req,
+                ErrorCode::InvalidBody,
+                "Expected JSON body",
+            )));
+        }
+    };
+    Ok(Ok(value))
+}
+
+/// Borrowing twin of [`decode_json_param`]: decode the request body straight
+/// from the borrowed view, with no owned `Message`. The UTF-8 branch parses the
+/// bytes directly (`from_slice`) rather than via an intermediate `String`.
+fn decode_json_param_view(view: &MessageView) -> Result<Result<Value, Message>, RepeError> {
+    let value: Value = match BodyFormat::try_from(view.header.body_format) {
+        Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => serde_json::from_slice(view.body)?,
+        Ok(BodyFormat::Beve) => beve_from_slice(view.body)?,
+        _ => {
+            return Ok(Err(create_error_response_unstamped_view(
+                view,
                 ErrorCode::InvalidBody,
                 "Expected JSON body",
             )));
@@ -229,8 +298,19 @@ where
             Err(err) => return Ok(err),
         };
         match (self.0)(param) {
-            Ok(value) => create_response(req, value, BodyFormat::Json),
+            Ok(value) => create_response_unstamped(req, value, BodyFormat::Json),
             Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
+        }
+    }
+
+    fn handle_view(&self, view: &MessageView, _ctx: &CallContext) -> Result<Message, RepeError> {
+        let param = match decode_json_param_view(view)? {
+            Ok(v) => v,
+            Err(err) => return Ok(err),
+        };
+        match (self.0)(param) {
+            Ok(value) => create_response_unstamped_view(view, value, BodyFormat::Json),
+            Err((code, msg)) => Ok(create_error_response_unstamped_view(view, code, msg)),
         }
     }
 }
@@ -255,7 +335,7 @@ where
             Err(err) => return Ok(err),
         };
         match (self.0)(ctx, param) {
-            Ok(value) => create_response(req, value, BodyFormat::Json),
+            Ok(value) => create_response_unstamped(req, value, BodyFormat::Json),
             Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
         }
     }
@@ -334,12 +414,32 @@ where
     T: DeserializeOwned,
 {
     let value: T = match BodyFormat::try_from(req.header.body_format) {
-        Ok(BodyFormat::Json) => serde_json::from_slice(&req.body)?,
-        Ok(BodyFormat::Utf8) => serde_json::from_str(&req.body_utf8()).map_err(RepeError::from)?,
+        Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => serde_json::from_slice(&req.body)?,
         Ok(BodyFormat::Beve) => beve_from_slice(&req.body)?,
         _ => {
             return Ok(Err(create_error_response_like(
                 req,
+                ErrorCode::InvalidBody,
+                "Expected JSON body",
+            )));
+        }
+    };
+    Ok(Ok(value))
+}
+
+/// Borrowing twin of [`decode_typed_param`]: deserialize `T` straight from the
+/// borrowed view body, with no owned `Message` and no intermediate `String` on
+/// the UTF-8 branch.
+fn decode_typed_param_view<T>(view: &MessageView) -> Result<Result<T, Message>, RepeError>
+where
+    T: DeserializeOwned,
+{
+    let value: T = match BodyFormat::try_from(view.header.body_format) {
+        Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => serde_json::from_slice(view.body)?,
+        Ok(BodyFormat::Beve) => beve_from_slice(view.body)?,
+        _ => {
+            return Ok(Err(create_error_response_unstamped_view(
+                view,
                 ErrorCode::InvalidBody,
                 "Expected JSON body",
             )));
@@ -368,9 +468,23 @@ where
         match self.0.call(t) {
             Ok(r) => {
                 let (value, format) = r.into_typed_response();
-                create_response(req, value, format)
+                create_response_unstamped(req, value, format)
             }
             Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
+        }
+    }
+
+    fn handle_view(&self, view: &MessageView, _ctx: &CallContext) -> Result<Message, RepeError> {
+        let t: T = match decode_typed_param_view(view)? {
+            Ok(v) => v,
+            Err(err) => return Ok(err),
+        };
+        match self.0.call(t) {
+            Ok(r) => {
+                let (value, format) = r.into_typed_response();
+                create_response_unstamped_view(view, value, format)
+            }
+            Err((code, msg)) => Ok(create_error_response_unstamped_view(view, code, msg)),
         }
     }
 }
@@ -427,7 +541,7 @@ where
         match self.0.call(ctx, t) {
             Ok(r) => {
                 let (value, format) = r.into_typed_response();
-                create_response(req, value, format)
+                create_response_unstamped(req, value, format)
             }
             Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
         }
@@ -1079,7 +1193,7 @@ impl HandlerErased for RegisteredRegistry {
             Err(err) => return Ok(create_error_response_like(req, err.code(), err.to_string())),
         };
         match self.registry.dispatch(pointer, body) {
-            Ok(value) => create_response(req, value, BodyFormat::Json),
+            Ok(value) => create_response_unstamped(req, value, BodyFormat::Json),
             Err(err) => Ok(create_error_response_like(req, err.code(), err.to_string())),
         }
     }
@@ -1098,7 +1212,7 @@ impl HandlerErased for RegisteredRegistry {
             Err(err) => return Ok(create_error_response_like(req, err.code(), err.to_string())),
         };
         match self.registry.dispatch_with_ctx(pointer, body, ctx) {
-            Ok(value) => create_response(req, value, BodyFormat::Json),
+            Ok(value) => create_response_unstamped(req, value, BodyFormat::Json),
             Err(err) => Ok(create_error_response_like(req, err.code(), err.to_string())),
         }
     }
@@ -1161,11 +1275,8 @@ where
             None
         } else {
             match BodyFormat::try_from(req.header.body_format) {
-                Ok(BodyFormat::Json) => {
+                Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => {
                     Some(serde_json::from_slice::<Value>(&req.body).map_err(RepeError::from)?)
-                }
-                Ok(BodyFormat::Utf8) => {
-                    Some(serde_json::from_str::<Value>(&req.body_utf8()).map_err(RepeError::from)?)
                 }
                 Ok(BodyFormat::Beve) => Some(beve_from_slice(&req.body)?),
                 Ok(BodyFormat::RawBinary) | Err(_) => {
@@ -1271,7 +1382,7 @@ where
     };
 
     match result {
-        Ok(value) => create_response(req, value.unwrap_or(Value::Null), BodyFormat::Json),
+        Ok(value) => create_response_unstamped(req, value.unwrap_or(Value::Null), BodyFormat::Json),
         Err(err) => Ok(create_error_response_like(req, err.code(), err.to_string())),
     }
 }
@@ -1289,10 +1400,7 @@ struct JsonTypedAdapter<H: JsonTypedHandler>(H);
 impl<H: JsonTypedHandler> HandlerErased for JsonTypedAdapter<H> {
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
         let t: H::In = match BodyFormat::try_from(req.header.body_format) {
-            Ok(BodyFormat::Json) => serde_json::from_slice(&req.body)?,
-            Ok(BodyFormat::Utf8) => {
-                serde_json::from_str(&req.body_utf8()).map_err(RepeError::from)?
-            }
+            Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => serde_json::from_slice(&req.body)?,
             Ok(BodyFormat::Beve) => beve_from_slice(&req.body)?,
             _ => {
                 return Ok(create_error_response_like(
@@ -1303,7 +1411,7 @@ impl<H: JsonTypedHandler> HandlerErased for JsonTypedAdapter<H> {
             }
         };
         match self.0.call(t) {
-            Ok(r) => create_response(req, r, BodyFormat::Json),
+            Ok(r) => create_response_unstamped(req, r, BodyFormat::Json),
             Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
         }
     }
@@ -1396,14 +1504,29 @@ fn handle_connection(
     stream.set_write_timeout(write_timeout)?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = BufWriter::new(stream);
+    // One read buffer reused for every request on this connection, so steady-
+    // state request framing allocates nothing: the frame is parsed as a borrowed
+    // `MessageView` and the response echoes the query straight out of `buf`.
+    let mut buf = Vec::new();
     while running.load(Ordering::SeqCst) {
-        let req = match read_message(&mut reader) {
-            Ok(m) => m,
+        match read_message_into(&mut reader, &mut buf) {
+            Ok(()) => {}
             Err(RepeError::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e),
-        };
-        if let Some(resp) = route_request(&router, &req) {
-            write_message(&mut writer, &resp)?;
+        }
+        let view = MessageView::from_slice(&buf)?;
+        if let Some(resp) = route_request_view(&router, &view) {
+            // Echo the request query (a borrowed slice of `buf`) unless the
+            // handler set its own — matching the owned path's stamp rule — so no
+            // query buffer is copied into the response on the common path.
+            let echo = crate::message::response_echo_query(&resp, view.query);
+            write_message_streaming(
+                &mut writer,
+                resp.header,
+                echo,
+                resp.body.len() as u64,
+                |w| w.write_all(&resp.body),
+            )?;
             writer.flush()?;
         }
     }
@@ -1413,6 +1536,8 @@ fn handle_connection(
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    use crate::io::{read_message, write_message};
+    use crate::message::create_response;
     use crate::{QueryFormat, REPE_VERSION};
     use serde::{Deserialize, Serialize};
     use std::io::Read;

@@ -1,15 +1,19 @@
 use crate::async_client::AsyncClient;
 use crate::constants::{ErrorCode, QueryFormat};
 use crate::error::RepeError;
-use crate::message::{Message, create_error_response_like};
+use crate::message::{
+    Message, MessageView, create_error_response_like, create_error_response_unstamped_view,
+    stamp_response_query,
+};
 use crate::peer::{
     CallContext, CancelSignal, NotifyBody, PeerHandle, PeerId, PeerRegistry, PeerSendError,
     PeerSink,
 };
 use crate::server::{Execution, HandlerErased, Router};
-use crate::server_request::{Resolution, dispatch, resolve};
+use crate::server_request::{RouteOutcome, dispatch, dispatch_view, route};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
+use std::borrow::Cow;
 use std::future::Future;
 use std::io::ErrorKind;
 use std::pin::Pin;
@@ -994,10 +998,10 @@ where
             None => break,
         };
 
-        let request = match decode_request_frame(frame)? {
-            FrameAction::Message(message) => message,
-            FrameAction::Continue => continue,
-            FrameAction::Close => break,
+        let request = match decode_request_payload(frame)? {
+            FramePayload::Bytes(payload) => Message::from_slice_exact(&payload)?,
+            FramePayload::Continue => continue,
+            FramePayload::Close => break,
         };
 
         if let Some(response) = upstream.forward_message(&request).await? {
@@ -1187,34 +1191,55 @@ async fn reader_task(
             None => break,
         };
 
-        let request = match decode_request_frame(frame)? {
-            FrameAction::Message(message) => message,
-            FrameAction::Continue => continue,
-            FrameAction::Close => break,
+        let payload = match decode_request_payload(frame)? {
+            FramePayload::Bytes(payload) => payload,
+            FramePayload::Continue => continue,
+            FramePayload::Close => break,
         };
+        // Borrow the frame rather than copying its query and body into an owned
+        // Message; only the off-reader path (whose spawned task outlives
+        // `payload`) materializes one.
+        let view = MessageView::from_slice_exact(&payload)?;
 
-        // Resolve the route (version/query validation + handler lookup)
-        // here, on the reader, so the early error responses and the
-        // execution mode are computed identically for the inline and
-        // off-reader paths; only where dispatch runs differs.
-        match resolve(router, &request) {
-            Resolution::Respond(maybe_response) => {
-                if let Some(response) = maybe_response {
+        // Validate + look up the handler here, on the reader, so early error
+        // responses and the execution mode are computed identically for the
+        // inline and off-reader paths; only where dispatch runs differs.
+        match route(router, &view.header, view.query) {
+            RouteOutcome::Reject {
+                notify,
+                code,
+                message,
+            } => {
+                if !notify {
+                    let mut response = create_error_response_unstamped_view(&view, code, message);
+                    // The outbound channel carries owned messages framed later by
+                    // the writer task, so stamp the borrowed query in (an error
+                    // response is always query-less, so it is copied here).
+                    stamp_response_query(&mut response, Cow::Borrowed(view.query));
                     if conn.outbound_tx.send(response).await.is_err() {
                         break;
                     }
                 }
             }
-            Resolution::Dispatch { handler, notify } => match handler.execution() {
+            RouteOutcome::Dispatch {
+                handler,
+                notify,
+                path,
+            } => match handler.execution() {
                 Execution::Inline => {
                     // Thread the calling peer and the connection's
                     // cancellation signal to handlers so `with_json_ctx` /
                     // `with_typed_ctx` (and registry-backed callables) can
                     // push notifies back through this connection during
                     // request handling and observe disconnect/shutdown.
-                    let path = request.query_str().unwrap_or("");
                     let ctx = CallContext::with_cancel(path, &conn.peer, &inline_signal);
-                    if let Some(response) = dispatch(handler.as_ref(), &request, &ctx, notify) {
+                    if let Some(mut response) = dispatch_view(handler.as_ref(), &view, &ctx, notify)
+                    {
+                        // The response is query-less and the writer task frames
+                        // it later, so stamp the borrowed query in rather than
+                        // referencing `payload`. A handler that set its own
+                        // response query keeps it and pays no copy.
+                        stamp_response_query(&mut response, Cow::Borrowed(view.query));
                         if conn.outbound_tx.send(response).await.is_err() {
                             // Writer task exited (likely wire error);
                             // abandon reader. The disconnect guard still
@@ -1224,6 +1249,9 @@ async fn reader_task(
                     }
                 }
                 Execution::OffReader => {
+                    // The spawned blocking task outlives `payload`, so it needs
+                    // an owned request.
+                    let request = view.to_message();
                     if !spawn_off_reader(&offreader_sem, &conn, handler, request, notify).await {
                         break;
                     }
@@ -1321,7 +1349,11 @@ async fn spawn_off_reader(
                 })
             }
         };
-        if let Some(response) = response {
+        if let Some(mut response) = response {
+            // Echo the request query by moving its owned buffer into the response
+            // (`Cow::Owned`, no copy -- handlers leave it empty); a panic error
+            // response already carries its own query, so the stamp is a no-op.
+            stamp_response_query(&mut response, Cow::Owned(request.query));
             // Best-effort: the writer may already be gone if the
             // connection closed while this handler ran.
             let _ = outbound_tx.blocking_send(response);
@@ -1430,17 +1462,19 @@ impl Drop for DisconnectGuard {
     }
 }
 
-enum FrameAction {
-    Message(Message),
+enum FramePayload {
+    /// A binary frame's raw bytes, to be parsed as a [`MessageView`] (reader) or
+    /// an owned [`Message`] (proxy) by the caller.
+    Bytes(Vec<u8>),
     Continue,
     Close,
 }
 
-fn decode_request_frame(frame: WsMessage) -> Result<FrameAction, RepeError> {
+fn decode_request_payload(frame: WsMessage) -> Result<FramePayload, RepeError> {
     match frame {
-        WsMessage::Binary(payload) => Message::from_slice_exact(&payload).map(FrameAction::Message),
-        WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_) => Ok(FrameAction::Continue),
-        WsMessage::Close(_) => Ok(FrameAction::Close),
+        WsMessage::Binary(payload) => Ok(FramePayload::Bytes(payload)),
+        WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_) => Ok(FramePayload::Continue),
+        WsMessage::Close(_) => Ok(FramePayload::Close),
         WsMessage::Text(_) => Err(websocket_invalid_data_error(
             "websocket transport requires binary messages",
         )),

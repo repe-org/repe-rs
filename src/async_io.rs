@@ -16,6 +16,25 @@ pub async fn read_message_async<R: AsyncRead + Unpin>(r: &mut R) -> Result<Messa
     Message::new(header, query, body)
 }
 
+/// Async counterpart of [`read_message_into`](crate::read_message_into): read a
+/// full REPE frame into `buf`, reusing its allocation across calls. On success
+/// `buf` holds the complete wire frame; parse it with
+/// [`MessageView::from_slice`](crate::MessageView::from_slice) to dispatch
+/// without per-request query/body allocations.
+pub async fn read_message_into_async<R: AsyncRead + Unpin>(
+    r: &mut R,
+    buf: &mut Vec<u8>,
+) -> Result<(), RepeError> {
+    buf.clear();
+    buf.resize(HEADER_SIZE, 0);
+    r.read_exact(&mut buf[..HEADER_SIZE]).await?;
+    let header = Header::decode(&buf[..HEADER_SIZE])?;
+    let total = HEADER_SIZE + header.query_length as usize + header.body_length as usize;
+    buf.resize(total, 0);
+    r.read_exact(&mut buf[HEADER_SIZE..total]).await?;
+    Ok(())
+}
+
 pub async fn write_message_async<W: AsyncWrite + Unpin>(
     w: &mut W,
     msg: &Message,

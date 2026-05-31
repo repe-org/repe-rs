@@ -351,10 +351,17 @@ fn parse_registration_path(path: &str) -> Result<Vec<String>, RegistryError> {
     if path.is_empty() {
         return Ok(Vec::new());
     }
-    if path.starts_with('/') {
-        return parse_pointer(path);
-    }
-    parse_pointer(&format!("/{path}"))
+    // Registration is not on the hot path; own the segments so they outlive the
+    // (possibly synthesized) normalized pointer and slot into the value tree.
+    let normalized: Cow<'_, str> = if path.starts_with('/') {
+        Cow::Borrowed(path)
+    } else {
+        Cow::Owned(format!("/{path}"))
+    };
+    Ok(parse_pointer(&normalized)?
+        .into_iter()
+        .map(Cow::into_owned)
+        .collect())
 }
 
 /// Compute the canonical JSON-Pointer key used to probe `RegistryState::functions`,
@@ -390,7 +397,12 @@ fn canonical_key(pointer: &str) -> Result<Cow<'_, str>, RegistryError> {
     Ok(Cow::Owned(canonical_pointer(&parse_pointer(pointer)?)))
 }
 
-fn parse_pointer(pointer: &str) -> Result<Vec<String>, RegistryError> {
+/// Parse a JSON Pointer into its reference tokens, borrowing each token from
+/// `pointer` when it needs no unescaping (the common case) and allocating only
+/// for tokens that contain a `~` escape. The returned tokens borrow `pointer`,
+/// so the value-tree walk in `resolve_ref`/`resolve_mut`/`set_pointer` resolves
+/// without a per-segment `String` allocation.
+fn parse_pointer(pointer: &str) -> Result<Vec<Cow<'_, str>>, RegistryError> {
     if pointer.is_empty() || pointer == "/" {
         return Ok(Vec::new());
     }
@@ -409,7 +421,12 @@ fn parse_pointer(pointer: &str) -> Result<Vec<String>, RegistryError> {
         })
 }
 
-fn unescape_token(token: &str) -> Result<String, ()> {
+fn unescape_token(token: &str) -> Result<Cow<'_, str>, ()> {
+    // Escape-free tokens are already their own unescaped form: borrow them
+    // rather than allocating a fresh `String` per segment.
+    if !token.contains('~') {
+        return Ok(Cow::Borrowed(token));
+    }
     let mut out = String::with_capacity(token.len());
     let mut chars = token.chars();
     while let Some(c) = chars.next() {
@@ -426,25 +443,23 @@ fn unescape_token(token: &str) -> Result<String, ()> {
             _ => return Err(()),
         }
     }
-    Ok(out)
+    Ok(Cow::Owned(out))
 }
 
 fn escape_token(token: &str) -> String {
     token.replace('~', "~0").replace('/', "~1")
 }
 
-fn canonical_pointer(segments: &[String]) -> String {
+fn canonical_pointer<S: AsRef<str>>(segments: &[S]) -> String {
     if segments.is_empty() {
         "/".to_string()
     } else {
-        format!(
-            "/{}",
-            segments
-                .iter()
-                .map(|segment| escape_token(segment))
-                .collect::<Vec<_>>()
-                .join("/")
-        )
+        let mut out = String::new();
+        for segment in segments {
+            out.push('/');
+            out.push_str(&escape_token(segment.as_ref()));
+        }
+        out
     }
 }
 
@@ -483,17 +498,21 @@ fn ensure_object_parent<'a>(
     Ok(current)
 }
 
-fn resolve_ref<'a>(root: &'a Value, segments: &[String]) -> Result<&'a Value, RegistryError> {
+fn resolve_ref<'a, S: AsRef<str>>(
+    root: &'a Value,
+    segments: &[S],
+) -> Result<&'a Value, RegistryError> {
     let mut current = root;
-    let mut walked: Vec<String> = Vec::new();
-    for segment in segments {
-        walked.push(segment.clone());
+    for (i, segment) in segments.iter().enumerate() {
+        // Error paths are computed lazily from `segments[..=i]`, so the success
+        // path neither clones segments nor grows a `walked` vector.
+        let segment = segment.as_ref();
         match current {
             Value::Object(map) => {
                 current = map
                     .get(segment)
                     .ok_or_else(|| RegistryError::PathNotFound {
-                        path: canonical_pointer(&walked),
+                        path: canonical_pointer(&segments[..=i]),
                     })?;
             }
             Value::Array(array) => {
@@ -501,19 +520,19 @@ fn resolve_ref<'a>(root: &'a Value, segments: &[String]) -> Result<&'a Value, Re
                     segment
                         .parse::<usize>()
                         .map_err(|_| RegistryError::InvalidArrayIndex {
-                            path: canonical_pointer(&walked),
-                            segment: segment.clone(),
+                            path: canonical_pointer(&segments[..=i]),
+                            segment: segment.to_string(),
                         })?;
                 current = array
                     .get(index)
                     .ok_or_else(|| RegistryError::ArrayIndexOutOfBounds {
-                        path: canonical_pointer(&walked),
-                        segment: segment.clone(),
+                        path: canonical_pointer(&segments[..=i]),
+                        segment: segment.to_string(),
                     })?;
             }
             _ => {
                 return Err(RegistryError::PathNotFound {
-                    path: canonical_pointer(&walked),
+                    path: canonical_pointer(&segments[..=i]),
                 });
             }
         }
@@ -521,20 +540,19 @@ fn resolve_ref<'a>(root: &'a Value, segments: &[String]) -> Result<&'a Value, Re
     Ok(current)
 }
 
-fn resolve_mut<'a>(
+fn resolve_mut<'a, S: AsRef<str>>(
     root: &'a mut Value,
-    segments: &[String],
+    segments: &[S],
 ) -> Result<&'a mut Value, RegistryError> {
     let mut current = root;
-    let mut walked: Vec<String> = Vec::new();
-    for segment in segments {
-        walked.push(segment.clone());
+    for (i, segment) in segments.iter().enumerate() {
+        let segment = segment.as_ref();
         match current {
             Value::Object(map) => {
                 current = map
                     .get_mut(segment)
                     .ok_or_else(|| RegistryError::PathNotFound {
-                        path: canonical_pointer(&walked),
+                        path: canonical_pointer(&segments[..=i]),
                     })?;
             }
             Value::Array(array) => {
@@ -542,20 +560,20 @@ fn resolve_mut<'a>(
                     segment
                         .parse::<usize>()
                         .map_err(|_| RegistryError::InvalidArrayIndex {
-                            path: canonical_pointer(&walked),
-                            segment: segment.clone(),
+                            path: canonical_pointer(&segments[..=i]),
+                            segment: segment.to_string(),
                         })?;
                 current =
                     array
                         .get_mut(index)
                         .ok_or_else(|| RegistryError::ArrayIndexOutOfBounds {
-                            path: canonical_pointer(&walked),
-                            segment: segment.clone(),
+                            path: canonical_pointer(&segments[..=i]),
+                            segment: segment.to_string(),
                         })?;
             }
             _ => {
                 return Err(RegistryError::PathNotFound {
-                    path: canonical_pointer(&walked),
+                    path: canonical_pointer(&segments[..=i]),
                 });
             }
         }
@@ -563,22 +581,26 @@ fn resolve_mut<'a>(
     Ok(current)
 }
 
-fn set_pointer(root: &mut Value, segments: &[String], value: Value) -> Result<(), RegistryError> {
+fn set_pointer<S: AsRef<str>>(
+    root: &mut Value,
+    segments: &[S],
+    value: Value,
+) -> Result<(), RegistryError> {
     if segments.is_empty() {
         *root = value;
         return Ok(());
     }
 
-    let mut parent_path = Vec::new();
+    let parent_len = segments.len() - 1;
     let mut current = root;
-    for segment in &segments[..segments.len() - 1] {
-        parent_path.push(segment.clone());
+    for (i, segment) in segments[..parent_len].iter().enumerate() {
+        let segment = segment.as_ref();
         match current {
             Value::Object(map) => {
                 current = map
                     .get_mut(segment)
                     .ok_or_else(|| RegistryError::PathNotFound {
-                        path: canonical_pointer(&parent_path),
+                        path: canonical_pointer(&segments[..=i]),
                     })?;
             }
             Value::Array(array) => {
@@ -586,29 +608,29 @@ fn set_pointer(root: &mut Value, segments: &[String], value: Value) -> Result<()
                     segment
                         .parse::<usize>()
                         .map_err(|_| RegistryError::InvalidArrayIndex {
-                            path: canonical_pointer(&parent_path),
-                            segment: segment.clone(),
+                            path: canonical_pointer(&segments[..=i]),
+                            segment: segment.to_string(),
                         })?;
                 current =
                     array
                         .get_mut(index)
                         .ok_or_else(|| RegistryError::ArrayIndexOutOfBounds {
-                            path: canonical_pointer(&parent_path),
-                            segment: segment.clone(),
+                            path: canonical_pointer(&segments[..=i]),
+                            segment: segment.to_string(),
                         })?;
             }
             _ => {
                 return Err(RegistryError::PathNotFound {
-                    path: canonical_pointer(&parent_path),
+                    path: canonical_pointer(&segments[..=i]),
                 });
             }
         }
     }
 
-    let last = segments.last().unwrap();
+    let last = segments[parent_len].as_ref();
     match current {
         Value::Object(map) => {
-            map.insert(last.clone(), value);
+            map.insert(last.to_string(), value);
             Ok(())
         }
         Value::Array(array) => {
@@ -616,7 +638,7 @@ fn set_pointer(root: &mut Value, segments: &[String], value: Value) -> Result<()
                 .parse::<usize>()
                 .map_err(|_| RegistryError::InvalidArrayIndex {
                     path: canonical_pointer(segments),
-                    segment: last.clone(),
+                    segment: last.to_string(),
                 })?;
             if let Some(slot) = array.get_mut(index) {
                 *slot = value;
@@ -624,7 +646,7 @@ fn set_pointer(root: &mut Value, segments: &[String], value: Value) -> Result<()
             } else {
                 Err(RegistryError::ArrayIndexOutOfBounds {
                     path: canonical_pointer(segments),
-                    segment: last.clone(),
+                    segment: last.to_string(),
                 })
             }
         }

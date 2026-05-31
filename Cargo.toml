@@ -113,3 +113,10 @@ harness = false
 # middleware pipeline so the hoisted middleware wrap is visible.
 name = "route_dispatch"
 harness = false
+
+[[bench]]
+# End-to-end server request lifecycle (read -> route -> dispatch -> echo ->
+# write) over an in-memory transport, for JSON and typed handlers. Pairs with
+# `tests/allocations.rs`, which pins the allocation count of the same cycle.
+name = "server_lifecycle"
+harness = false
