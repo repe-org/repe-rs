@@ -7,7 +7,7 @@
 - `benches/wire_serialization.rs` gains `typed_numeric_framing_f64`, comparing serde streaming framing against the typed-slice fast path across body sizes (~14x at 64 elements rising to ~25-33x once memory-bandwidth bound).
 
 ### Changed
-- Minimum `beve` version raised from 1.4 to 1.6 (for `read_typed_slice` / `read_complex_slice`, the bulk decoders backing the new numeric body path).
+- Depend on `beve = "2"` (raised from 1.4) and drop `default-features = false`. beve 2.0's default feature set is already lean -- its heavy MATLAB/HDF5 `mat` interop is now opt-in -- so repe no longer needs to disable default features, and 2.0 carries the `read_typed_slice` / `read_complex_slice` bulk decoders backing the new numeric body path.
 
 ## [3.3.0] - 2026-05-30
 
