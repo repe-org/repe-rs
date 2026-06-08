@@ -776,6 +776,10 @@ fn clone_fatal_error_for_waiter(err: &RepeError, request_id: u64) -> RepeError {
             "request {request_id}: {beve_err}"
         ))),
         RepeError::UnknownEnumValue(value) => RepeError::UnknownEnumValue(*value),
+        RepeError::UnexpectedBodyFormat { expected, got } => RepeError::UnexpectedBodyFormat {
+            expected: *expected,
+            got: *got,
+        },
         RepeError::ServerError { code, message } => RepeError::ServerError {
             code: *code,
             message: message.clone(),

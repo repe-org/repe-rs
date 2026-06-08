@@ -25,6 +25,11 @@ pub enum RepeError {
     Beve(#[from] beve::Error),
     #[error("unknown value for enum conversion: {0}")]
     UnknownEnumValue(u64),
+    #[error("unexpected body format: expected {expected:?}, got format code {got}")]
+    UnexpectedBodyFormat {
+        expected: crate::constants::BodyFormat,
+        got: u16,
+    },
     #[error("server error {code}: {message}")]
     ServerError { code: ErrorCode, message: String },
 }
@@ -43,6 +48,7 @@ impl RepeError {
             RepeError::Json(_) => ErrorCode::ParseError,
             RepeError::Beve(_) => ErrorCode::ParseError,
             RepeError::UnknownEnumValue(_) => ErrorCode::ParseError,
+            RepeError::UnexpectedBodyFormat { .. } => ErrorCode::InvalidBody,
             RepeError::ServerError { code, .. } => *code,
         }
     }
@@ -109,6 +115,13 @@ mod tests {
                 ErrorCode::ParseError,
             ),
             (RepeError::UnknownEnumValue(9), ErrorCode::ParseError),
+            (
+                RepeError::UnexpectedBodyFormat {
+                    expected: crate::constants::BodyFormat::Beve,
+                    got: 2,
+                },
+                ErrorCode::InvalidBody,
+            ),
             (
                 RepeError::ServerError {
                     code: ErrorCode::Timeout,

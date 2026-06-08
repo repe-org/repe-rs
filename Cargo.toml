@@ -56,12 +56,12 @@ name = "websocket_cohosting"
 required-features = ["websocket"]
 
 [dependencies]
-# beve 1.x enables the `mat` (MATLAB/HDF5 matrix interop) feature by default,
-# which pulls in hdf5-pure + flate2/miniz_oxide/crc32fast. repe only needs
-# beve's core ser/de (to_vec, from_slice, Error), streaming serializer, and
-# serialized_size, none of which are gated behind `mat`, so the heavy interop
-# deps are turned off. 1.4 is the floor for serialized_size (zero-buffer framing).
-beve = { version = "1.4", default-features = false }
+# beve 2.0's default feature set is already lean (core ser/de + streaming +
+# typed/complex bulk slice helpers); the heavy MATLAB/HDF5 `mat` interop is opt-in
+# there, so repe no longer needs `default-features = false`. 2.0 is the floor for
+# `read_typed_slice` / `read_complex_slice`, the bulk decoders behind the
+# typed-numeric body fast path.
+beve = "2"
 serde = { version = "1", features = ["derive" ] }
 serde_json = "1"
 thiserror = "1"
@@ -99,6 +99,9 @@ web-sys = { version = "0.3", optional = true, features = [
 [dev-dependencies]
 rand = "0.8"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# Only for tests: construct f16/bf16 values to exercise the half-float element
+# types of the typed-numeric body path (the runtime dep on half comes via beve).
+half = "2.4"
 
 [[bench]]
 # Wire-serialization throughput: `Message::to_vec` vs the new

@@ -116,9 +116,9 @@ dependencies = [
 
 [[package]]
 name = "beve"
-version = "1.5.0"
+version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b44e159c2f21e26710d447d86d373fc711408c2fc51ed010e2f92957a03f4b4a"
+checksum = "8bf7f737013edb35b09159f6845b0a6acee54521857279d36e5d5bb8668aa36c"
 dependencies = [
  "half",
  "serde",
@@ -906,6 +906,7 @@ dependencies = [
  "criterion",
  "futures-channel",
  "futures-util",
+ "half",
  "js-sys",
  "parking_lot 0.12.5",
  "rand 0.8.5",

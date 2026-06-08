@@ -1,7 +1,7 @@
 use crate::constants::{BodyFormat, ErrorCode, HEADER_SIZE, QueryFormat};
 use crate::error::RepeError;
 use crate::header::Header;
-use beve::{Error as BeveError, from_slice as beve_from_slice, to_vec as beve_to_vec};
+use beve::{from_slice as beve_from_slice, to_vec as beve_to_vec};
 use std::borrow::Cow;
 use std::io::{self, Write};
 
@@ -184,22 +184,57 @@ impl Message {
     }
 
     pub fn json_body<T: serde::de::DeserializeOwned>(&self) -> Result<T, RepeError> {
-        match BodyFormat::try_from(self.header.body_format) {
-            Ok(BodyFormat::Json) => Ok(serde_json::from_slice(&self.body)?),
-            Ok(BodyFormat::Utf8) | Ok(BodyFormat::RawBinary) | Ok(BodyFormat::Beve) | Err(_) => {
-                let io_err =
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, "body_format is not JSON");
-                Err(RepeError::Json(serde_json::Error::io(io_err)))
-            }
-        }
+        self.require_body_format(BodyFormat::Json)?;
+        Ok(serde_json::from_slice(&self.body)?)
     }
 
     pub fn beve_body<T: serde::de::DeserializeOwned>(&self) -> Result<T, RepeError> {
-        match BodyFormat::try_from(self.header.body_format) {
-            Ok(BodyFormat::Beve) => Ok(beve_from_slice(&self.body)?),
-            Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) | Ok(BodyFormat::RawBinary) | Err(_) => {
-                Err(RepeError::from(BeveError::msg("body_format is not BEVE")))
-            }
+        self.require_body_format(BodyFormat::Beve)?;
+        Ok(beve_from_slice(&self.body)?)
+    }
+
+    /// Decode a BEVE typed-numeric-array body into a `Vec<T>` via a single
+    /// bounds-checked bulk read, bypassing serde.
+    ///
+    /// The decode counterpart of [`MessageBuilder::body_typed_slice`], and the
+    /// whole-body fast path for a high-throughput numeric payload. Errors with
+    /// [`RepeError::UnexpectedBodyFormat`] if the body is not
+    /// [`BodyFormat::Beve`], or [`RepeError::Beve`] if the bytes are not a typed
+    /// numeric array of `T` (wrong element class/width, or a truncated payload).
+    /// Works on any BEVE typed numeric array, including one produced by serde via
+    /// [`body_beve`](MessageBuilder::body_beve) over a `Vec<T>`.
+    pub fn decode_typed_slice<T: beve::BeveTypedSlice>(&self) -> Result<Vec<T>, RepeError> {
+        self.require_body_format(BodyFormat::Beve)?;
+        Ok(beve::read_typed_slice(&self.body)?)
+    }
+
+    /// Decode a BEVE complex-array body into a `Vec<Complex<T>>` via a single
+    /// bounds-checked bulk read, bypassing serde.
+    ///
+    /// The complex counterpart of [`decode_typed_slice`](Self::decode_typed_slice)
+    /// and the decode counterpart of
+    /// [`MessageBuilder::body_complex_slice`]. Same error contract.
+    pub fn decode_complex_slice<T: beve::BeveTypedSlice>(
+        &self,
+    ) -> Result<Vec<beve::Complex<T>>, RepeError> {
+        self.require_body_format(BodyFormat::Beve)?;
+        Ok(beve::read_complex_slice(&self.body)?)
+    }
+
+    /// `Ok(())` if the body's format matches `expected`, else
+    /// [`RepeError::UnexpectedBodyFormat`]. The shared format guard for the
+    /// body decoders ([`json_body`](Self::json_body), [`beve_body`](Self::beve_body),
+    /// [`decode_typed_slice`](Self::decode_typed_slice), and
+    /// [`decode_complex_slice`](Self::decode_complex_slice)), so a wrong-format
+    /// body produces one structured error shape across all of them.
+    fn require_body_format(&self, expected: BodyFormat) -> Result<(), RepeError> {
+        if self.header.body_format == expected as u16 {
+            Ok(())
+        } else {
+            Err(RepeError::UnexpectedBodyFormat {
+                expected,
+                got: self.header.body_format,
+            })
         }
     }
 }
@@ -294,7 +329,16 @@ mod tests {
             .body_utf8("not json")
             .build();
         let err = msg.json_body::<serde_json::Value>().unwrap_err();
-        matches!(err, RepeError::Json(_));
+        assert!(
+            matches!(
+                err,
+                RepeError::UnexpectedBodyFormat {
+                    expected: BodyFormat::Json,
+                    ..
+                }
+            ),
+            "expected UnexpectedBodyFormat, got {err:?}"
+        );
     }
 
     #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -692,7 +736,16 @@ mod tests {
             .build();
 
         let err = msg.beve_body::<serde_json::Value>().unwrap_err();
-        matches!(err, RepeError::Beve(_));
+        assert!(
+            matches!(
+                err,
+                RepeError::UnexpectedBodyFormat {
+                    expected: BodyFormat::Beve,
+                    ..
+                }
+            ),
+            "expected UnexpectedBodyFormat, got {err:?}"
+        );
     }
 
     #[test]
@@ -777,6 +830,42 @@ impl MessageBuilder {
         self.body = beve_to_vec(v)?;
         self.body_format = BodyFormat::Beve as u16;
         Ok(self)
+    }
+
+    /// Encode a contiguous numeric slice as a BEVE typed array via a single bulk
+    /// write, bypassing serde, and set [`BodyFormat::Beve`].
+    ///
+    /// This is the whole-body fast path for a high-throughput numeric payload
+    /// (`&[f64]`, `&[i32]`, ...). The body bytes are identical to
+    /// `body_beve(&slice.to_vec())`, but the encode is O(1) in the element count
+    /// on little-endian targets (one `copy_nonoverlapping`) rather than the
+    /// per-element serde walk. Decode the result with
+    /// [`Message::decode_typed_slice`].
+    ///
+    /// Infallible: the bulk encoder cannot fail (contrast [`body_beve`], whose
+    /// serde encode returns a `Result`).
+    ///
+    /// [`body_beve`]: Self::body_beve
+    pub fn body_typed_slice<T: beve::BeveTypedSlice>(mut self, slice: &[T]) -> Self {
+        self.body = beve::to_vec_typed_slice(slice);
+        self.body_format = BodyFormat::Beve as u16;
+        self
+    }
+
+    /// Encode a contiguous complex slice as a BEVE complex array via a single
+    /// bulk write, bypassing serde, and set [`BodyFormat::Beve`].
+    ///
+    /// The complex counterpart of [`body_typed_slice`]; same O(1)-encode
+    /// property. Decode with [`Message::decode_complex_slice`].
+    ///
+    /// [`body_typed_slice`]: Self::body_typed_slice
+    pub fn body_complex_slice<T: beve::BeveTypedSlice>(
+        mut self,
+        slice: &[beve::Complex<T>],
+    ) -> Self {
+        self.body = beve::to_vec_complex_slice(slice);
+        self.body_format = BodyFormat::Beve as u16;
+        self
     }
 
     pub fn build(self) -> Message {

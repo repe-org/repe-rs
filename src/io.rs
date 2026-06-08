@@ -136,6 +136,48 @@ where
     Ok(())
 }
 
+/// Frame a REPE message whose body is a contiguous numeric slice, encoded as a
+/// BEVE typed array straight to the sink with no intermediate body buffer.
+///
+/// This is the whole-body streaming fast path for a large numeric payload: the
+/// body length is computed in closed form with [`beve::typed_slice_size`] (O(1),
+/// no traversal) and the payload is written by [`beve::to_writer_typed_slice`]
+/// (a single `write_all` of the slice's bytes on little-endian targets). So
+/// framing a multi-MiB `&[f64]` costs a header write plus one bulk write, versus
+/// the two element-by-element walks (size, then encode) a serde body would take.
+///
+/// `header.body_format` is set to [`BodyFormat::Beve`]; `query_length`,
+/// `body_length`, and `length` are filled in from `query` and the slice (as in
+/// [`write_message_streaming`]). The bytes on the wire are identical to a
+/// [`MessageBuilder::body_typed_slice`] message written with [`write_message`];
+/// decode them with [`Message::decode_typed_slice`].
+///
+/// For an owned message, or for a complex body (beve has no streaming complex
+/// writer yet), build a [`Message`] with
+/// [`body_typed_slice`](crate::message::MessageBuilder::body_typed_slice) /
+/// [`body_complex_slice`](crate::message::MessageBuilder::body_complex_slice) and
+/// frame it with [`write_message`].
+///
+/// [`BodyFormat::Beve`]: crate::constants::BodyFormat::Beve
+/// [`MessageBuilder::body_typed_slice`]: crate::message::MessageBuilder::body_typed_slice
+/// [`MessageBuilder`]: crate::message::MessageBuilder
+pub fn write_message_typed_slice<W, T>(
+    w: &mut W,
+    mut header: Header,
+    query: &[u8],
+    slice: &[T],
+) -> Result<(), RepeError>
+where
+    W: Write,
+    T: beve::BeveTypedSlice,
+{
+    header.body_format = crate::constants::BodyFormat::Beve as u16;
+    let body_len = beve::typed_slice_size(slice);
+    write_message_streaming(w, header, query, body_len, |w| {
+        beve::to_writer_typed_slice(w, slice)
+    })
+}
+
 fn read_exact<R: Read>(r: &mut R, mut buf: &mut [u8]) -> Result<(), RepeError> {
     while !buf.is_empty() {
         let n = r.read(buf)?;
