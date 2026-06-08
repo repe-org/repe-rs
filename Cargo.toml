@@ -58,10 +58,12 @@ required-features = ["websocket"]
 [dependencies]
 # beve 1.x enables the `mat` (MATLAB/HDF5 matrix interop) feature by default,
 # which pulls in hdf5-pure + flate2/miniz_oxide/crc32fast. repe only needs
-# beve's core ser/de (to_vec, from_slice, Error), streaming serializer, and
-# serialized_size, none of which are gated behind `mat`, so the heavy interop
-# deps are turned off. 1.4 is the floor for serialized_size (zero-buffer framing).
-beve = { version = "1.4", default-features = false }
+# beve's core ser/de (to_vec, from_slice, Error), streaming serializer,
+# serialized_size, and the typed/complex bulk slice helpers, none of which are
+# gated behind `mat`, so the heavy interop deps are turned off. 1.6 is the floor:
+# 1.4 for serialized_size (zero-buffer framing), 1.6 for read_typed_slice /
+# read_complex_slice (the typed-numeric body fast path).
+beve = { version = "1.6", default-features = false }
 serde = { version = "1", features = ["derive" ] }
 serde_json = "1"
 thiserror = "1"

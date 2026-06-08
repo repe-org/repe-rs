@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- A whole-body fast path for high-throughput numeric payloads (typed numeric and complex arrays), bypassing serde's per-element walk. `MessageBuilder::body_typed_slice(&[T])` / `body_complex_slice(&[Complex<T>])` encode a contiguous slice as a BEVE typed/complex array in one bulk write; `Message::decode_typed_slice::<T>()` / `decode_complex_slice::<T>()` read it back in a single bounds-checked bulk copy. The bytes are byte-for-byte identical to the serde `body_beve(&Vec<T>)` path, so the bulk and serde paths interoperate; the decoders also read serde-produced bodies and vice versa. `write_message_typed_slice` frames a numeric body straight to a sink with no intermediate body buffer, sizing it in closed form (`beve::typed_slice_size`, O(1)) and writing the payload in one bulk write. New `RepeError::UnexpectedBodyFormat { expected, got }` (maps to `ErrorCode::InvalidBody`) reported by the decoders when the body is not `BodyFormat::Beve`. `beve::{BeveTypedSlice, Complex}` re-exported at the crate root. See `docs/numeric-bodies.md` and `examples/typed_numeric_body.rs`.
+- `benches/wire_serialization.rs` gains `typed_numeric_framing_f64`, comparing serde streaming framing against the typed-slice fast path across body sizes (~14x at 64 elements rising to ~25-33x once memory-bandwidth bound).
+
+### Changed
+- Minimum `beve` version raised from 1.4 to 1.6 (for `read_typed_slice` / `read_complex_slice`, the bulk decoders backing the new numeric body path).
+
 ## [3.3.0] - 2026-05-30
 
 ### Added

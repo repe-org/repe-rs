@@ -202,6 +202,46 @@ impl Message {
             }
         }
     }
+
+    /// Decode a BEVE typed-numeric-array body into a `Vec<T>` via a single
+    /// bounds-checked bulk read, bypassing serde.
+    ///
+    /// The decode counterpart of [`MessageBuilder::body_typed_slice`], and the
+    /// whole-body fast path for a high-throughput numeric payload. Errors with
+    /// [`RepeError::UnexpectedBodyFormat`] if the body is not
+    /// [`BodyFormat::Beve`], or [`RepeError::Beve`] if the bytes are not a typed
+    /// numeric array of `T` (wrong element class/width, or a truncated payload).
+    /// Works on any BEVE typed numeric array, including one produced by serde via
+    /// [`body_beve`](MessageBuilder::body_beve) over a `Vec<T>`.
+    pub fn decode_typed_slice<T: beve::BeveTypedSlice>(&self) -> Result<Vec<T>, RepeError> {
+        self.require_beve_body()?;
+        Ok(beve::read_typed_slice(&self.body)?)
+    }
+
+    /// Decode a BEVE complex-array body into a `Vec<Complex<T>>` via a single
+    /// bounds-checked bulk read, bypassing serde.
+    ///
+    /// The complex counterpart of [`decode_typed_slice`](Self::decode_typed_slice)
+    /// and the decode counterpart of
+    /// [`MessageBuilder::body_complex_slice`]. Same error contract.
+    pub fn decode_complex_slice<T: beve::BeveTypedSlice>(
+        &self,
+    ) -> Result<Vec<beve::Complex<T>>, RepeError> {
+        self.require_beve_body()?;
+        Ok(beve::read_complex_slice(&self.body)?)
+    }
+
+    /// `Ok(())` if the body is `BodyFormat::Beve`, else
+    /// [`RepeError::UnexpectedBodyFormat`]. Shared guard for the bulk decoders.
+    fn require_beve_body(&self) -> Result<(), RepeError> {
+        match BodyFormat::try_from(self.header.body_format) {
+            Ok(BodyFormat::Beve) => Ok(()),
+            _ => Err(RepeError::UnexpectedBodyFormat {
+                expected: BodyFormat::Beve,
+                got: self.header.body_format,
+            }),
+        }
+    }
 }
 
 /// Borrowing view over a serialized REPE message.
@@ -777,6 +817,42 @@ impl MessageBuilder {
         self.body = beve_to_vec(v)?;
         self.body_format = BodyFormat::Beve as u16;
         Ok(self)
+    }
+
+    /// Encode a contiguous numeric slice as a BEVE typed array via a single bulk
+    /// write, bypassing serde, and set [`BodyFormat::Beve`].
+    ///
+    /// This is the whole-body fast path for a high-throughput numeric payload
+    /// (`&[f64]`, `&[i32]`, ...). The body bytes are identical to
+    /// `body_beve(&slice.to_vec())`, but the encode is O(1) in the element count
+    /// on little-endian targets (one `copy_nonoverlapping`) rather than the
+    /// per-element serde walk. Decode the result with
+    /// [`Message::decode_typed_slice`].
+    ///
+    /// Infallible: the bulk encoder cannot fail (contrast [`body_beve`], whose
+    /// serde encode returns a `Result`).
+    ///
+    /// [`body_beve`]: Self::body_beve
+    pub fn body_typed_slice<T: beve::BeveTypedSlice>(mut self, slice: &[T]) -> Self {
+        self.body = beve::to_vec_typed_slice(slice);
+        self.body_format = BodyFormat::Beve as u16;
+        self
+    }
+
+    /// Encode a contiguous complex slice as a BEVE complex array via a single
+    /// bulk write, bypassing serde, and set [`BodyFormat::Beve`].
+    ///
+    /// The complex counterpart of [`body_typed_slice`]; same O(1)-encode
+    /// property. Decode with [`Message::decode_complex_slice`].
+    ///
+    /// [`body_typed_slice`]: Self::body_typed_slice
+    pub fn body_complex_slice<T: beve::BeveTypedSlice>(
+        mut self,
+        slice: &[beve::Complex<T>],
+    ) -> Self {
+        self.body = beve::to_vec_complex_slice(slice);
+        self.body_format = BodyFormat::Beve as u16;
+        self
     }
 
     pub fn build(self) -> Message {

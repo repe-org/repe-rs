@@ -192,5 +192,72 @@ fn bench_outbound_frame_beve(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_wire_serialization, bench_outbound_frame_beve);
+/// Framing a whole-body numeric `Vec<f64>`: the serde streaming path
+/// (`serialized_size` + `to_writer_streaming`, two O(payload) element walks) vs
+/// the typed-slice fast path (`write_message_typed_slice`: O(1) `typed_slice_size`
+/// plus one bulk `to_writer_typed_slice`). Both emit identical wire bytes, so the
+/// difference is exactly the two per-element traversals the bulk path skips.
+fn bench_typed_numeric_framing(c: &mut Criterion) {
+    const ELEM_COUNTS: &[usize] = &[64, 4096, 64 * 1024, 1024 * 1024];
+
+    fn frame_serde(sink: &mut Vec<u8>, data: &[f64]) {
+        sink.clear();
+        let mut header = Header::new();
+        header.query_format = QueryFormat::JsonPointer as u16;
+        header.body_format = BodyFormat::Beve as u16;
+        let body_len = beve::serialized_size(&data).unwrap();
+        repe::write_message_streaming(sink, header, QUERY.as_bytes(), body_len, |w| {
+            beve::to_writer_streaming(w, &data)
+        })
+        .unwrap();
+    }
+    fn frame_typed(sink: &mut Vec<u8>, data: &[f64]) {
+        sink.clear();
+        let mut header = Header::new();
+        header.query_format = QueryFormat::JsonPointer as u16;
+        repe::write_message_typed_slice(sink, header, QUERY.as_bytes(), data).unwrap();
+    }
+
+    // Guard: both framings must produce identical wire bytes, so the benchmark
+    // compares equivalent work rather than a shortcut.
+    let probe: Vec<f64> = (0..100).map(|i| i as f64 * 0.5).collect();
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    frame_serde(&mut a, &probe);
+    frame_typed(&mut b, &probe);
+    assert_eq!(
+        a, b,
+        "serde and typed-slice framings must agree byte-for-byte"
+    );
+
+    let mut group = c.benchmark_group("typed_numeric_framing_f64");
+    for &n in ELEM_COUNTS {
+        let data: Vec<f64> = (0..n).map(|i| i as f64 * 0.5).collect();
+        group.throughput(Throughput::Bytes(
+            (HEADER_SIZE + QUERY.len() + n * 8) as u64,
+        ));
+        let mut serde_sink = Vec::new();
+        let mut typed_sink = Vec::new();
+
+        group.bench_with_input(BenchmarkId::new("serde_stream", n), &data, |bn, d| {
+            bn.iter(|| {
+                frame_serde(&mut serde_sink, d);
+                black_box(&serde_sink);
+            });
+        });
+        group.bench_with_input(BenchmarkId::new("typed_slice", n), &data, |bn, d| {
+            bn.iter(|| {
+                frame_typed(&mut typed_sink, d);
+                black_box(&typed_sink);
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_wire_serialization,
+    bench_outbound_frame_beve,
+    bench_typed_numeric_framing
+);
 criterion_main!(benches);
