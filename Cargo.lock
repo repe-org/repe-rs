@@ -906,6 +906,7 @@ dependencies = [
  "criterion",
  "futures-channel",
  "futures-util",
+ "half",
  "js-sys",
  "parking_lot 0.12.5",
  "rand 0.8.5",

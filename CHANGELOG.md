@@ -8,6 +8,7 @@
 
 ### Changed
 - Depend on `beve = "2"` (raised from 1.4) and drop `default-features = false`. beve 2.0's default feature set is already lean -- its heavy MATLAB/HDF5 `mat` interop is now opt-in -- so repe no longer needs to disable default features, and 2.0 carries the `read_typed_slice` / `read_complex_slice` bulk decoders backing the new numeric body path.
+- `Message::json_body` and `beve_body` now report a wrong-format body as `RepeError::UnexpectedBodyFormat` (→ `ErrorCode::InvalidBody`), the same structured error the new bulk decoders use, instead of synthesizing a `serde_json` / BEVE error tagged `ParseError`. One error shape for "wrong body format" across all four body decoders. Code matching on the previous `RepeError::Json(_)` / `RepeError::Beve(_)` for that specific case should match `UnexpectedBodyFormat`; a successful decode is unaffected.
 
 ## [3.3.0] - 2026-05-30
 

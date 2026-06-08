@@ -116,6 +116,13 @@ mod tests {
             ),
             (RepeError::UnknownEnumValue(9), ErrorCode::ParseError),
             (
+                RepeError::UnexpectedBodyFormat {
+                    expected: crate::constants::BodyFormat::Beve,
+                    got: 2,
+                },
+                ErrorCode::InvalidBody,
+            ),
+            (
                 RepeError::ServerError {
                     code: ErrorCode::Timeout,
                     message: "timeout".into(),

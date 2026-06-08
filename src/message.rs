@@ -1,7 +1,7 @@
 use crate::constants::{BodyFormat, ErrorCode, HEADER_SIZE, QueryFormat};
 use crate::error::RepeError;
 use crate::header::Header;
-use beve::{Error as BeveError, from_slice as beve_from_slice, to_vec as beve_to_vec};
+use beve::{from_slice as beve_from_slice, to_vec as beve_to_vec};
 use std::borrow::Cow;
 use std::io::{self, Write};
 
@@ -184,23 +184,13 @@ impl Message {
     }
 
     pub fn json_body<T: serde::de::DeserializeOwned>(&self) -> Result<T, RepeError> {
-        match BodyFormat::try_from(self.header.body_format) {
-            Ok(BodyFormat::Json) => Ok(serde_json::from_slice(&self.body)?),
-            Ok(BodyFormat::Utf8) | Ok(BodyFormat::RawBinary) | Ok(BodyFormat::Beve) | Err(_) => {
-                let io_err =
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, "body_format is not JSON");
-                Err(RepeError::Json(serde_json::Error::io(io_err)))
-            }
-        }
+        self.require_body_format(BodyFormat::Json)?;
+        Ok(serde_json::from_slice(&self.body)?)
     }
 
     pub fn beve_body<T: serde::de::DeserializeOwned>(&self) -> Result<T, RepeError> {
-        match BodyFormat::try_from(self.header.body_format) {
-            Ok(BodyFormat::Beve) => Ok(beve_from_slice(&self.body)?),
-            Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) | Ok(BodyFormat::RawBinary) | Err(_) => {
-                Err(RepeError::from(BeveError::msg("body_format is not BEVE")))
-            }
-        }
+        self.require_body_format(BodyFormat::Beve)?;
+        Ok(beve_from_slice(&self.body)?)
     }
 
     /// Decode a BEVE typed-numeric-array body into a `Vec<T>` via a single
@@ -214,7 +204,7 @@ impl Message {
     /// Works on any BEVE typed numeric array, including one produced by serde via
     /// [`body_beve`](MessageBuilder::body_beve) over a `Vec<T>`.
     pub fn decode_typed_slice<T: beve::BeveTypedSlice>(&self) -> Result<Vec<T>, RepeError> {
-        self.require_beve_body()?;
+        self.require_body_format(BodyFormat::Beve)?;
         Ok(beve::read_typed_slice(&self.body)?)
     }
 
@@ -227,19 +217,24 @@ impl Message {
     pub fn decode_complex_slice<T: beve::BeveTypedSlice>(
         &self,
     ) -> Result<Vec<beve::Complex<T>>, RepeError> {
-        self.require_beve_body()?;
+        self.require_body_format(BodyFormat::Beve)?;
         Ok(beve::read_complex_slice(&self.body)?)
     }
 
-    /// `Ok(())` if the body is `BodyFormat::Beve`, else
-    /// [`RepeError::UnexpectedBodyFormat`]. Shared guard for the bulk decoders.
-    fn require_beve_body(&self) -> Result<(), RepeError> {
-        match BodyFormat::try_from(self.header.body_format) {
-            Ok(BodyFormat::Beve) => Ok(()),
-            _ => Err(RepeError::UnexpectedBodyFormat {
-                expected: BodyFormat::Beve,
+    /// `Ok(())` if the body's format matches `expected`, else
+    /// [`RepeError::UnexpectedBodyFormat`]. The shared format guard for the
+    /// body decoders ([`json_body`](Self::json_body), [`beve_body`](Self::beve_body),
+    /// [`decode_typed_slice`](Self::decode_typed_slice), and
+    /// [`decode_complex_slice`](Self::decode_complex_slice)), so a wrong-format
+    /// body produces one structured error shape across all of them.
+    fn require_body_format(&self, expected: BodyFormat) -> Result<(), RepeError> {
+        if self.header.body_format == expected as u16 {
+            Ok(())
+        } else {
+            Err(RepeError::UnexpectedBodyFormat {
+                expected,
                 got: self.header.body_format,
-            }),
+            })
         }
     }
 }
@@ -334,7 +329,16 @@ mod tests {
             .body_utf8("not json")
             .build();
         let err = msg.json_body::<serde_json::Value>().unwrap_err();
-        matches!(err, RepeError::Json(_));
+        assert!(
+            matches!(
+                err,
+                RepeError::UnexpectedBodyFormat {
+                    expected: BodyFormat::Json,
+                    ..
+                }
+            ),
+            "expected UnexpectedBodyFormat, got {err:?}"
+        );
     }
 
     #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -732,7 +736,16 @@ mod tests {
             .build();
 
         let err = msg.beve_body::<serde_json::Value>().unwrap_err();
-        matches!(err, RepeError::Beve(_));
+        assert!(
+            matches!(
+                err,
+                RepeError::UnexpectedBodyFormat {
+                    expected: BodyFormat::Beve,
+                    ..
+                }
+            ),
+            "expected UnexpectedBodyFormat, got {err:?}"
+        );
     }
 
     #[test]

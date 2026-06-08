@@ -99,6 +99,9 @@ web-sys = { version = "0.3", optional = true, features = [
 [dev-dependencies]
 rand = "0.8"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# Only for tests: construct f16/bf16 values to exercise the half-float element
+# types of the typed-numeric body path (the runtime dep on half comes via beve).
+half = "2.4"
 
 [[bench]]
 # Wire-serialization throughput: `Message::to_vec` vs the new

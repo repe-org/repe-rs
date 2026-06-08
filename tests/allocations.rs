@@ -24,8 +24,8 @@ use std::io::{Cursor, Write};
 
 use repe::server::Router;
 use repe::{
-    CallContext, HEADER_SIZE, Message, MessageView, QueryFormat, read_message, read_message_into,
-    write_message, write_message_streaming,
+    CallContext, HEADER_SIZE, Header, Message, MessageView, QueryFormat, read_message,
+    read_message_into, write_message, write_message_streaming, write_message_typed_slice,
 };
 use serde_json::json;
 
@@ -237,6 +237,59 @@ fn json_dispatch_view_allocation_budget() {
     assert_eq!(
         allocs, EXPECTED,
         "borrowing-path allocation budget changed (was {EXPECTED}, now {allocs})"
+    );
+}
+
+#[test]
+fn typed_slice_body_is_single_allocation() {
+    // The typed-numeric body fast path: building a message with a bulk
+    // `body_typed_slice` body allocates exactly once. `to_vec_typed_slice`
+    // reserves the exact wire size up front (header byte + SIZE prefix + payload)
+    // and fills it with one `copy_nonoverlapping`, so there are no growth
+    // reallocs; the builder's unset query is an empty (heap-free) `Vec` and
+    // `build()`'s `Header` is a stack value. This is the single-allocation claim
+    // behind the fast path — the serde `body_beve` path reallocs as its encode
+    // buffer grows.
+    let data: Vec<f64> = (0..4096).map(|i| i as f64).collect();
+
+    // Touch the path once so any one-time lazy initialization is unmeasured.
+    let _ = black_box(Message::builder().body_typed_slice(&data).build());
+
+    let (_, allocs) = count_allocs(|| {
+        black_box(Message::builder().body_typed_slice(&data).build());
+    });
+
+    assert_eq!(
+        allocs, 1,
+        "body_typed_slice should allocate exactly the body Vec once (no growth reallocs)"
+    );
+}
+
+#[test]
+fn write_message_typed_slice_uses_no_body_buffer() {
+    // Streaming a typed-slice body frames it with no intermediate body `Vec`: the
+    // header is a stack array, the query a borrowed slice, and the payload the
+    // slice reinterpreted as bytes (little-endian) written straight to the sink.
+    // So once the reused sink is warmed, framing allocates nothing — the
+    // zero-buffer property of `write_message_typed_slice`. (On big-endian targets
+    // beve uses one small reused scratch buffer for per-element conversion; this
+    // budget is the little-endian path that CI runs on.)
+    let data: Vec<f64> = (0..4096).map(|i| i as f64).collect();
+    let query = b"/sensors/raw";
+    let mut out = Vec::new();
+
+    // Warm the sink so its growth isn't charged to the measured call.
+    write_message_typed_slice(&mut out, Header::new(), query, &data).unwrap();
+
+    let (_, allocs) = count_allocs(|| {
+        out.clear();
+        write_message_typed_slice(&mut out, Header::new(), query, &data).unwrap();
+        black_box(&out);
+    });
+
+    assert_eq!(
+        allocs, 0,
+        "streaming a typed-slice body should allocate no intermediate buffer"
     );
 }
 

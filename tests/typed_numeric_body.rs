@@ -4,6 +4,7 @@
 //! convenience. The central guarantees are that the bulk path is byte-for-byte
 //! interchangeable with the serde (`body_beve`) path and that it round-trips.
 
+use half::{bf16, f16};
 use repe::constants::BodyFormat;
 use repe::message::Message;
 use repe::{Complex, Header, write_message, write_message_typed_slice};
@@ -51,6 +52,21 @@ fn typed_slice_bytes_identical_to_serde_body() {
     check!(i64, vec![i64::MIN, -1, 0, i64::MAX]);
     check!(f32, vec![1.0, -2.5, 3.25, -0.0]);
     check!(f64, vec![1.0, -2.5, 3.25, 1e9]);
+    // Half floats are part of the exposed surface (`T: BeveTypedSlice`); they are
+    // 2-byte and distinguished only by byte_code (bf16 = 0, f16 = 1), so exercise
+    // both through the repe layer.
+    check!(
+        f16,
+        vec![f16::from_f32(1.0), f16::from_f32(-2.5), f16::from_f32(3.25)]
+    );
+    check!(
+        bf16,
+        vec![
+            bf16::from_f32(1.0),
+            bf16::from_f32(-2.5),
+            bf16::from_f32(3.25)
+        ]
+    );
 }
 
 #[test]
