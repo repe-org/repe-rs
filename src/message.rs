@@ -727,6 +727,59 @@ mod tests {
     }
 
     #[test]
+    fn typed_slice_body_reserves_wire_prefix_headroom() {
+        // With the query set before the body, `body_typed_slice` must reserve
+        // `HEADER_SIZE + query.len()` of spare capacity after the encoded
+        // payload so `into_wire_bytes` reuses the body allocation (no fresh
+        // frame buffer). Verified by pointer identity across the framing.
+        let query = b"/sensors/raw";
+        let data: Vec<f64> = (0..512).map(|i| i as f64 * 0.25).collect();
+        let msg = Message::builder()
+            .query_bytes(query.to_vec())
+            .query_format(QueryFormat::JsonPointer)
+            .body_typed_slice(&data)
+            .build();
+        let total = HEADER_SIZE + query.len() + msg.body.len();
+        let body_ptr = msg.body.as_ptr();
+        let expected = msg.clone().to_vec();
+        let wire = msg.into_wire_bytes();
+        assert_eq!(wire, expected, "wire bytes must equal to_vec");
+        assert_eq!(wire.len(), total);
+        assert_eq!(
+            wire.as_ptr(),
+            body_ptr,
+            "typed-slice body headroom should let into_wire_bytes reuse the body buffer"
+        );
+    }
+
+    #[test]
+    fn complex_slice_body_reserves_wire_prefix_headroom() {
+        let query = b"/spectra/iq";
+        let data: Vec<beve::Complex<f64>> = (0..256)
+            .map(|i| beve::Complex {
+                re: i as f64,
+                im: -(i as f64) * 0.5,
+            })
+            .collect();
+        let msg = Message::builder()
+            .query_bytes(query.to_vec())
+            .query_format(QueryFormat::JsonPointer)
+            .body_complex_slice(&data)
+            .build();
+        let total = HEADER_SIZE + query.len() + msg.body.len();
+        let body_ptr = msg.body.as_ptr();
+        let expected = msg.clone().to_vec();
+        let wire = msg.into_wire_bytes();
+        assert_eq!(wire, expected, "wire bytes must equal to_vec");
+        assert_eq!(wire.len(), total);
+        assert_eq!(
+            wire.as_ptr(),
+            body_ptr,
+            "complex-slice body headroom should let into_wire_bytes reuse the body buffer"
+        );
+    }
+
+    #[test]
     fn beve_body_non_beve_errors() {
         let msg = Message::builder()
             .id(2)
@@ -845,9 +898,22 @@ impl MessageBuilder {
     /// Infallible: the bulk encoder cannot fail (contrast [`body_beve`], whose
     /// serde encode returns a `Result`).
     ///
+    /// The body buffer is allocated with `HEADER_SIZE + query.len()` of spare
+    /// capacity reserved after the encoded payload, so that shipping the built
+    /// message through [`Message::into_wire_bytes`] reuses this allocation
+    /// instead of allocating a fresh frame buffer. This headroom is only
+    /// effective when the query is already set on the builder (the common
+    /// `.query_*(..).body_typed_slice(..)` order); with the query set afterward
+    /// the reserved prefix covers only the header and a non-empty query falls
+    /// back to a fresh frame, exactly as before.
+    ///
     /// [`body_beve`]: Self::body_beve
     pub fn body_typed_slice<T: beve::BeveTypedSlice>(mut self, slice: &[T]) -> Self {
-        self.body = beve::to_vec_typed_slice(slice);
+        let body_len = beve::typed_slice_size(slice) as usize;
+        let mut body = Vec::with_capacity(body_len + HEADER_SIZE + self.query.len());
+        beve::to_writer_typed_slice(&mut body, slice)
+            .expect("writing a typed slice into a Vec is infallible");
+        self.body = body;
         self.body_format = BodyFormat::Beve as u16;
         self
     }
@@ -856,14 +922,20 @@ impl MessageBuilder {
     /// bulk write, bypassing serde, and set [`BodyFormat::Beve`].
     ///
     /// The complex counterpart of [`body_typed_slice`]; same O(1)-encode
-    /// property. Decode with [`Message::decode_complex_slice`].
+    /// property, and the same `HEADER_SIZE + query.len()` wire-prefix headroom
+    /// for the [`Message::into_wire_bytes`] fast path. Decode with
+    /// [`Message::decode_complex_slice`].
     ///
     /// [`body_typed_slice`]: Self::body_typed_slice
     pub fn body_complex_slice<T: beve::BeveTypedSlice>(
         mut self,
         slice: &[beve::Complex<T>],
     ) -> Self {
-        self.body = beve::to_vec_complex_slice(slice);
+        let body_len = beve::complex_slice_size(slice) as usize;
+        let mut body = Vec::with_capacity(body_len + HEADER_SIZE + self.query.len());
+        beve::to_writer_complex_slice(&mut body, slice)
+            .expect("writing a complex slice into a Vec is infallible");
+        self.body = body;
         self.body_format = BodyFormat::Beve as u16;
         self
     }
