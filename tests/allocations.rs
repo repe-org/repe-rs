@@ -24,8 +24,9 @@ use std::io::{Cursor, Write};
 
 use repe::server::Router;
 use repe::{
-    CallContext, HEADER_SIZE, Header, Message, MessageView, QueryFormat, read_message,
-    read_message_into, write_message, write_message_streaming, write_message_typed_slice,
+    CallContext, Complex, HEADER_SIZE, Header, Message, MessageView, QueryFormat, read_message,
+    read_message_into, write_message, write_message_complex_slice, write_message_streaming,
+    write_message_typed_slice,
 };
 use serde_json::json;
 
@@ -290,6 +291,38 @@ fn write_message_typed_slice_uses_no_body_buffer() {
     assert_eq!(
         allocs, 0,
         "streaming a typed-slice body should allocate no intermediate buffer"
+    );
+}
+
+#[test]
+fn write_message_complex_slice_uses_no_body_buffer() {
+    // The complex counterpart of `write_message_typed_slice_uses_no_body_buffer`:
+    // streaming a complex-slice body frames it with no intermediate body `Vec`.
+    // The interleaved (re, im) payload is the slice reinterpreted as bytes
+    // (little-endian) written straight to the sink, so once the reused sink is
+    // warmed, framing allocates nothing. (On big-endian targets beve uses one small
+    // reused scratch buffer; this budget is the little-endian path CI runs on.)
+    let data: Vec<Complex<f64>> = (0..4096)
+        .map(|i| Complex {
+            re: i as f64,
+            im: -(i as f64),
+        })
+        .collect();
+    let query = b"/spectra/iq";
+    let mut out = Vec::new();
+
+    // Warm the sink so its growth isn't charged to the measured call.
+    write_message_complex_slice(&mut out, Header::new(), query, &data).unwrap();
+
+    let (_, allocs) = count_allocs(|| {
+        out.clear();
+        write_message_complex_slice(&mut out, Header::new(), query, &data).unwrap();
+        black_box(&out);
+    });
+
+    assert_eq!(
+        allocs, 0,
+        "streaming a complex-slice body should allocate no intermediate buffer"
     );
 }
 

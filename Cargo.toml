@@ -1,6 +1,6 @@
 [package]
 name = "repe"
-version = "3.4.0"
+version = "3.5.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Rust implementation of the REPE RPC protocol (JSON-focused)"
@@ -56,12 +56,14 @@ name = "websocket_cohosting"
 required-features = ["websocket"]
 
 [dependencies]
-# beve 2.0's default feature set is already lean (core ser/de + streaming +
+# beve's default feature set is already lean (core ser/de + streaming +
 # typed/complex bulk slice helpers); the heavy MATLAB/HDF5 `mat` interop is opt-in
-# there, so repe no longer needs `default-features = false`. 2.0 is the floor for
-# `read_typed_slice` / `read_complex_slice`, the bulk decoders behind the
-# typed-numeric body fast path.
-beve = "2"
+# there, so repe no longer needs `default-features = false`. 2.1 is the floor for
+# `to_writer_complex_slice` / `complex_slice_size`, the streaming complex
+# primitives behind `write_message_complex_slice` (and carries the
+# `read_typed_slice` / `read_complex_slice` bulk decoders behind the
+# typed-numeric body fast path).
+beve = "2.1"
 serde = { version = "1", features = ["derive" ] }
 serde_json = "1"
 thiserror = "1"

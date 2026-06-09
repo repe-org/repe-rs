@@ -8,11 +8,9 @@ This file now tracks only what was deliberately left out, with the context neede
 
 ## Future work
 
-### Complex streaming writer (`write_message_typed_slice` for complex)
+### Complex streaming writer — shipped in 3.5.0
 
-`write_message_typed_slice` is zero-buffer for numeric slices, but there is **no streaming complex equivalent** because beve has no `to_writer_complex_slice` — only `to_vec_complex_slice` (which allocates the whole body). A complex body must therefore be built as a `Message` (`body_complex_slice`) and framed with `write_message`.
-
-- **Blocked on beve.** Land `to_writer_complex_slice<W, T>` in beve (the streaming counterpart of `to_vec_complex_slice`, mirroring `to_writer_typed_slice`), plus a `complex_slice_size` for the O(1) length. Then add `write_message_complex_slice` to `src/io.rs`, sized by `complex_slice_size` and written by `to_writer_complex_slice` — symmetric with the numeric path.
+`write_message_typed_slice` was zero-buffer for numeric slices but had no streaming complex equivalent, because beve had only `to_vec_complex_slice` (allocates the whole body) and no streaming writer. Closed: beve 2.1.0 added `to_writer_complex_slice<W, T>` + `complex_slice_size` (the streaming counterpart of `to_vec_complex_slice`, mirroring `to_writer_typed_slice` / `typed_slice_size`), and repe 3.5.0 added `write_message_complex_slice` in `src/io.rs`, sized by `complex_slice_size` and written by `to_writer_complex_slice` — symmetric with the numeric path. Retained here as the record of the gap.
 
 ### `with_typed_slice` handler route
 

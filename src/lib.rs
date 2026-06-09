@@ -67,8 +67,8 @@ pub use fleet::{
 pub use header::Header;
 #[cfg(not(target_arch = "wasm32"))]
 pub use io::{
-    read_message, read_message_into, write_message, write_message_streaming,
-    write_message_typed_slice,
+    read_message, read_message_into, write_message, write_message_complex_slice,
+    write_message_streaming, write_message_typed_slice,
 };
 pub use json_pointer::{evaluate as eval_json_pointer, parse as parse_json_pointer};
 
