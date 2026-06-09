@@ -76,6 +76,26 @@ assert_eq!(pong["pong"], true);
 
 The async (`tokio`) variant uses `AsyncServer` and `AsyncClient` and exposes the same shape. See the [Server guide](https://repe-org.github.io/repe-rs/server/) for routers, typed handlers, middleware, struct registration, and peer-aware handlers, and the [Client guide](https://repe-org.github.io/repe-rs/client/) for the full client surface (typed and BEVE helpers, multiplexing, timeouts, batches, notifies, error handling).
 
+### Bulk numeric arrays
+
+When a request and response are whole contiguous numeric arrays (`f32`, `f64`, integer widths), `Router::with_slice` and `Client::call_slice` (also `AsyncClient::call_slice`) carry them on BEVE's typed-slice fast path: one bulk copy each way, skipping serde's per-element walk. The wire bytes are identical to the serde path, so a `with_slice` route and a `with_typed` / `call_typed_beve` peer interoperate freely.
+
+```rust
+use repe::{Client, Router, Server};
+
+let router = Router::new()
+    .with_slice::<f64, f64, _>("/scale", |xs| Ok(xs.iter().map(|x| x * 2.0).collect()));
+let server = Server::new(router);
+let listener = server.listen("127.0.0.1:0")?;
+let addr = listener.local_addr()?;
+std::thread::spawn(move || { let _ = server.serve(listener); });
+
+let client = Client::connect(addr)?;
+let out: Vec<f64> = client.call_slice("/scale", &[1.0, 2.0, 3.0])?;
+assert_eq!(out, vec![2.0, 4.0, 6.0]);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
 ## Feature Flags
 
 | Flag | Effect |
@@ -109,6 +129,7 @@ cargo run --example registry_server
 cargo run --example registry_roundtrip
 cargo run --example async_server
 cargo run --example async_client
+cargo run --example typed_numeric_body
 ```
 
 ## Testing
