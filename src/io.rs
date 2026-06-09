@@ -152,8 +152,8 @@ where
 /// [`MessageBuilder::body_typed_slice`] message written with [`write_message`];
 /// decode them with [`Message::decode_typed_slice`].
 ///
-/// For an owned message, or for a complex body (beve has no streaming complex
-/// writer yet), build a [`Message`] with
+/// For a complex body use the sibling [`write_message_complex_slice`]. For an
+/// owned message, build a [`Message`] with
 /// [`body_typed_slice`](crate::message::MessageBuilder::body_typed_slice) /
 /// [`body_complex_slice`](crate::message::MessageBuilder::body_complex_slice) and
 /// frame it with [`write_message`].
@@ -175,6 +175,44 @@ where
     let body_len = beve::typed_slice_size(slice);
     write_message_streaming(w, header, query, body_len, |w| {
         beve::to_writer_typed_slice(w, slice)
+    })
+}
+
+/// Frame a REPE message whose entire body is a complex numeric array, writing the
+/// BEVE complex extension array straight to the sink with no intermediate body
+/// buffer — the complex counterpart of [`write_message_typed_slice`].
+///
+/// The body length is computed in closed form with [`beve::complex_slice_size`]
+/// (O(1), no traversal) and the payload is written by
+/// [`beve::to_writer_complex_slice`] (a single `write_all` of the interleaved
+/// `(re, im)` bytes on little-endian targets). So framing a large
+/// `&[Complex<f64>]` costs a header write plus one bulk write, versus building and
+/// allocating the whole body up front via
+/// [`body_complex_slice`](crate::message::MessageBuilder::body_complex_slice).
+///
+/// `header.body_format` is set to [`BodyFormat::Beve`]; `query_length`,
+/// `body_length`, and `length` are filled in from `query` and the slice (as in
+/// [`write_message_streaming`]). The bytes on the wire are identical to a
+/// [`MessageBuilder::body_complex_slice`] message written with [`write_message`];
+/// decode them with [`Message::decode_complex_slice`].
+///
+/// [`BodyFormat::Beve`]: crate::constants::BodyFormat::Beve
+/// [`MessageBuilder::body_complex_slice`]: crate::message::MessageBuilder::body_complex_slice
+/// [`Message::decode_complex_slice`]: crate::message::Message::decode_complex_slice
+pub fn write_message_complex_slice<W, T>(
+    w: &mut W,
+    mut header: Header,
+    query: &[u8],
+    slice: &[beve::Complex<T>],
+) -> Result<(), RepeError>
+where
+    W: Write,
+    T: beve::BeveTypedSlice,
+{
+    header.body_format = crate::constants::BodyFormat::Beve as u16;
+    let body_len = beve::complex_slice_size(slice);
+    write_message_streaming(w, header, query, body_len, |w| {
+        beve::to_writer_complex_slice(w, slice)
     })
 }
 

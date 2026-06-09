@@ -1,5 +1,13 @@
 # Changelog
 
+## [3.5.0] - 2026-06-09
+
+### Added
+- `write_message_complex_slice`, the complex counterpart of `write_message_typed_slice`: it frames a REPE message whose entire body is a complex numeric array (`&[Complex<T>]`) straight to a sink with no intermediate body buffer, sizing it in closed form (`beve::complex_slice_size`, O(1)) and writing the interleaved `(re, im)` payload in one bulk write. The wire bytes are identical to a `MessageBuilder::body_complex_slice` message framed with `write_message`; decode with `Message::decode_complex_slice`. This closes the streaming-framing gap left in 3.4.0, where complex bodies had no zero-buffer path and had to be built and allocated whole via `body_complex_slice`.
+
+### Changed
+- Depend on `beve = "2.1"` (raised from `"2"`), which adds the `to_writer_complex_slice` / `complex_slice_size` streaming primitives backing the new framing helper.
+
 ## [3.4.0] - 2026-06-08
 
 ### Added
