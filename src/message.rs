@@ -844,6 +844,8 @@ mod tests {
     /// return it, so a test can validate the zero-copy borrow at a known-aligned
     /// base address.
     fn into_aligned_buffer(frame: &[u8]) -> Vec<u64> {
+        // `+ 1` word guarantees room even when `frame.len()` is a multiple of 8
+        // (then `words * 8 == frame.len() + 8`), so the byte view always fits.
         let words = frame.len() / 8 + 1;
         let mut backing: Vec<u64> = vec![0; words];
         // SAFETY: `backing` is 8-aligned and large enough to hold `frame`.

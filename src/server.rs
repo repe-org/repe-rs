@@ -1852,6 +1852,41 @@ mod tests {
         assert_eq!(encoded.first(), Some(&BEVE_ALIGNED_TYPED_ARRAY_MARKER));
     }
 
+    /// The borrowing decoder's owned fallback: a well-formed aligned body whose
+    /// payload is not aligned in this buffer (here, forced by placing it at an odd
+    /// offset) must refuse the zero-copy borrow and bulk-copy instead, still
+    /// returning the correct data. This is the path a `body_aligned_typed_slice`
+    /// body padded for the wrong frame offset (e.g. query set after the body) takes
+    /// on the server, so the documented graceful degradation is correctness-safe.
+    #[test]
+    fn ref_decode_falls_back_to_owned_when_payload_unaligned() {
+        let data: Vec<f64> = (0..16).map(|i| i as f64 * 3.0).collect();
+        let aligned = beve::to_vec_aligned_typed_slice(&data);
+
+        // Place the aligned body at offset 1 in a genuinely 8-aligned backing
+        // buffer (`Vec<u64>`), so its DATA pointer is deterministically odd and the
+        // zero-copy borrow must refuse regardless of allocator behavior.
+        let words = aligned.len() / 8 + 2;
+        let mut backing: Vec<u64> = vec![0; words];
+        // SAFETY: `backing` is 8-aligned and large enough to hold `aligned` at +1.
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(backing.as_mut_ptr() as *mut u8, words * 8) };
+        bytes[1..1 + aligned.len()].copy_from_slice(&aligned);
+        let body = &bytes[1..1 + aligned.len()];
+
+        let decoded = decode_typed_slice_ref_body::<f64>(body).expect("decode");
+        assert!(
+            matches!(decoded, SliceInput::Owned(_)),
+            "unaligned aligned body must take the owned fallback"
+        );
+        assert_eq!(decoded.as_slice(), data.as_slice());
+
+        // And the regular (unaligned wire) typed array always decodes owned too.
+        let regular = beve::to_vec_typed_slice(&data);
+        let decoded = decode_typed_slice_ref_body::<f64>(&regular).expect("decode regular");
+        assert_eq!(decoded.as_slice(), data.as_slice());
+    }
+
     #[test]
     fn middleware_runs_for_registered_handlers() {
         let hits = Arc::new(AtomicUsize::new(0));
