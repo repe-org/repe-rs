@@ -840,10 +840,32 @@ mod tests {
         assert_eq!(msg.header.body_format, 0x8888);
     }
 
+    /// Copy `frame` into a genuinely 8-aligned backing buffer (via `Vec<u64>`) and
+    /// return it, so a test can validate the zero-copy borrow at a known-aligned
+    /// base address.
+    fn into_aligned_buffer(frame: &[u8]) -> Vec<u64> {
+        let words = frame.len() / 8 + 1;
+        let mut backing: Vec<u64> = vec![0; words];
+        // SAFETY: `backing` is 8-aligned and large enough to hold `frame`.
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(backing.as_mut_ptr() as *mut u8, words * 8) };
+        bytes[..frame.len()].copy_from_slice(frame);
+        backing
+    }
+
+    fn aligned_request(id: u64, path: &str, data: &[f64]) -> Message {
+        Message::builder()
+            .id(id)
+            .query_str(path)
+            .query_format(QueryFormat::JsonPointer)
+            .body_aligned_typed_slice(data)
+            .build()
+    }
+
     #[test]
-    fn aligned_frame_header_and_payload_round_trip() {
+    fn aligned_body_builder_header_and_payload_round_trip() {
         let data: Vec<f64> = (0..300).map(|i| i as f64 * 0.5).collect();
-        let frame = build_aligned_typed_slice_frame(42, "/scale", &data);
+        let frame = aligned_request(42, "/scale", &data).to_vec();
 
         // The header parses, the lengths add up, and the body is a valid aligned
         // typed array that decodes (owned, always works) back to the input.
@@ -858,25 +880,41 @@ mod tests {
     }
 
     #[test]
-    fn aligned_frame_payload_is_borrowable_when_buffer_is_aligned() {
+    fn aligned_body_payload_is_borrowable_when_buffer_is_aligned() {
         // Validate the padding math end to end: when the whole frame sits at an
         // 8-aligned base address, the f64 payload is aligned in memory and the
-        // zero-copy borrow succeeds. We force an 8-aligned backing buffer via a
-        // `Vec<u64>` and copy the frame in at offset 0.
+        // zero-copy borrow succeeds. A 7-byte query makes the unpadded payload
+        // offset odd, so a correct borrow can only come from the inserted padding.
         let data: Vec<f64> = (0..257).map(|i| 1.0 / (i as f64 + 1.0)).collect();
-        // A 7-byte query makes the unpadded payload offset odd, so a correct
-        // borrow can only come from the inserted alignment padding.
-        let frame = build_aligned_typed_slice_frame(1, "/abcdef", &data);
+        let frame = aligned_request(1, "/abcdef", &data).to_vec();
 
-        let words = frame.len() / 8 + 1;
-        let mut backing: Vec<u64> = vec![0; words];
-        // SAFETY: `backing` is 8-aligned and large enough to hold `frame`.
+        let backing = into_aligned_buffer(&frame);
         let bytes =
-            unsafe { std::slice::from_raw_parts_mut(backing.as_mut_ptr() as *mut u8, words * 8) };
-        bytes[..frame.len()].copy_from_slice(&frame);
-        let aligned_frame = &bytes[..frame.len()];
+            unsafe { std::slice::from_raw_parts(backing.as_ptr() as *const u8, frame.len()) };
 
-        let view = MessageView::from_slice(aligned_frame).expect("frame parses");
+        let view = MessageView::from_slice(bytes).expect("frame parses");
+        let borrowed: &[f64] =
+            beve::read_aligned_typed_slice_ref::<f64>(view.body).expect("zero-copy borrow");
+        assert_eq!(borrowed, data.as_slice());
+    }
+
+    #[test]
+    fn aligned_body_survives_into_wire_bytes() {
+        // `into_wire_bytes` shifts the body to `HEADER_SIZE + query.len()`, which is
+        // exactly the offset `body_aligned_typed_slice` padded for, so the alignment
+        // is preserved through that outbound path too (not just `to_vec`).
+        let data: Vec<f64> = (0..130).map(|i| i as f64 - 64.0).collect();
+        let frame = aligned_request(7, "/abcdef", &data).into_wire_bytes();
+        assert_eq!(
+            beve::read_aligned_typed_slice::<f64>(MessageView::from_slice(&frame).unwrap().body)
+                .unwrap(),
+            data
+        );
+
+        let backing = into_aligned_buffer(&frame);
+        let bytes =
+            unsafe { std::slice::from_raw_parts(backing.as_ptr() as *const u8, frame.len()) };
+        let view = MessageView::from_slice(bytes).expect("frame parses");
         let borrowed: &[f64] =
             beve::read_aligned_typed_slice_ref::<f64>(view.body).expect("zero-copy borrow");
         assert_eq!(borrowed, data.as_slice());
@@ -1002,6 +1040,48 @@ impl MessageBuilder {
         let mut body = Vec::with_capacity(body_len + HEADER_SIZE + self.query.len());
         beve::to_writer_complex_slice(&mut body, slice)
             .expect("writing a complex slice into a Vec is infallible");
+        self.body = body;
+        self.body_format = BodyFormat::Beve as u16;
+        self
+    }
+
+    /// Encode a contiguous numeric slice as a BEVE *aligned* typed array, padded so
+    /// the element block lands on an `align_of::<T>()` boundary within the final
+    /// wire frame, and set [`BodyFormat::Beve`].
+    ///
+    /// The zero-copy counterpart of [`body_typed_slice`]: it emits BEVE's aligned
+    /// typed-array form (an explicit padding run before the payload) so a
+    /// [`Router::with_typed_slice_ref`] server reading the frame into an aligned
+    /// buffer can borrow the body as `&[T]` with no element copy. Decode the owned
+    /// view with [`Message::decode_typed_slice`] as usual; the borrow happens
+    /// server-side.
+    ///
+    /// The padding is sized for the payload's absolute offset in the frame
+    /// (`HEADER_SIZE + query.len()`), so **the query must already be set** when this
+    /// is called (the common `.query_*(..).body_aligned_typed_slice(..)` order, and
+    /// what the `call_typed_slice_aligned` client helpers do). If the query is set
+    /// *after* the body, the padding is computed for the wrong offset and the
+    /// payload will not be borrowable in the frame — the server then falls back to a
+    /// bulk copy, so the result is still correct, just not zero-copy. The body
+    /// buffer carries the same `HEADER_SIZE + query.len()` wire-prefix headroom as
+    /// [`body_typed_slice`], and [`Message::into_wire_bytes`] shifts the body to
+    /// exactly that offset, so the alignment is preserved through that path too.
+    ///
+    /// Unlike [`body_typed_slice`], the bytes are a distinct BEVE type and are *not*
+    /// interchangeable with the serde / regular typed-array path; they pair
+    /// specifically with a `with_typed_slice_ref` route.
+    ///
+    /// [`body_typed_slice`]: Self::body_typed_slice
+    /// [`Router::with_typed_slice_ref`]: crate::server::Router::with_typed_slice_ref
+    pub fn body_aligned_typed_slice<T: beve::BeveTypedSlice>(mut self, slice: &[T]) -> Self {
+        let base_offset = HEADER_SIZE + self.query.len();
+        let body_len = beve::aligned_typed_slice_size(slice, base_offset);
+        // Reserve the `HEADER_SIZE + query.len()` wire-prefix headroom (== base_offset)
+        // so `into_wire_bytes` reuses this allocation; its body shift lands the
+        // payload at exactly `base_offset`, which is what the padding was sized for.
+        let mut body = Vec::with_capacity(body_len + base_offset);
+        beve::write_aligned_typed_slice_at(&mut body, slice, base_offset);
+        debug_assert_eq!(body.len(), body_len);
         self.body = body;
         self.body_format = BodyFormat::Beve as u16;
         self
@@ -1156,55 +1236,6 @@ pub(crate) fn create_typed_slice_response_unstamped_view<T: beve::BeveTypedSlice
     response_header_builder(view.header.id, view.header.query_format)
         .body_typed_slice(result)
         .build()
-}
-
-/// Build a complete request frame whose body is a BEVE *aligned* typed numeric
-/// array, padded so the element block (`DATA`) lands on an `align_of::<T>()`
-/// boundary measured from the start of the frame.
-///
-/// This is the wire form that enables a zero-copy borrow on the receiving server
-/// ([`Router::with_typed_slice_ref`]): the server reads the whole frame into one
-/// buffer and, when that buffer's base address is aligned, hands the handler a
-/// `&[T]` borrowed straight out of it with no element copy. The regular
-/// [`MessageBuilder::body_typed_slice`] path cannot offer this because its payload
-/// sits at an arbitrary offset; the aligned form inserts an explicit padding run
-/// to fix that.
-///
-/// The padding depends on the payload's absolute offset within the frame, which is
-/// why this frames in place rather than going through [`MessageBuilder`]: the
-/// aligned body is appended directly after the `HEADER_SIZE + query` prefix, so
-/// [`beve::write_aligned_typed_slice`] (which pads relative to the current buffer
-/// length) sees the true offset. The header is written last, once the body length
-/// is known. The bytes are otherwise an ordinary REPE request:
-/// [`QueryFormat::JsonPointer`] query, [`BodyFormat::Beve`] body.
-///
-/// [`Router::with_typed_slice_ref`]: crate::server::Router::with_typed_slice_ref
-pub(crate) fn build_aligned_typed_slice_frame<T: beve::BeveTypedSlice>(
-    id: u64,
-    path: &str,
-    slice: &[T],
-) -> Vec<u8> {
-    let query = path.as_bytes();
-    let prefix = HEADER_SIZE + query.len();
-    let mut frame = Vec::with_capacity(prefix + beve::aligned_typed_slice_size(slice, prefix));
-
-    // Reserve the header (backfilled below), then the query, so that the aligned
-    // body is appended at absolute offset `prefix` and padded for that offset.
-    frame.resize(HEADER_SIZE, 0);
-    frame.extend_from_slice(query);
-    debug_assert_eq!(frame.len(), prefix);
-    beve::write_aligned_typed_slice(&mut frame, slice);
-
-    let body_length = (frame.len() - prefix) as u64;
-    let mut header = Header::new();
-    header.id = id;
-    header.query_format = QueryFormat::JsonPointer as u16;
-    header.body_format = BodyFormat::Beve as u16;
-    header.query_length = query.len() as u64;
-    header.body_length = body_length;
-    header.length = frame.len() as u64;
-    frame[..HEADER_SIZE].copy_from_slice(&header.encode());
-    frame
 }
 
 /// Borrowing twin of [`create_response_unstamped`]: builds the same query-less

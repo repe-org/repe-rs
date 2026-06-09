@@ -574,8 +574,8 @@ where
 /// BEVE aligned-typed-array marker byte (`0x5C`): a typed array (type 4) in the
 /// bool/string/aligned sub-category (3) with the aligned discriminator (2), per
 /// BEVE spec §4. It opens the aligned wire form that
-/// [`crate::message::build_aligned_typed_slice_frame`] emits and the borrowing
-/// route decodes. Kept as a local constant rather than reaching into BEVE's
+/// [`MessageBuilder::body_aligned_typed_slice`](crate::message::MessageBuilder::body_aligned_typed_slice)
+/// emits and the borrowing route decodes. Kept as a local constant rather than reaching into BEVE's
 /// header internals; [`aligned_marker_matches_beve`] pins it to BEVE's actual
 /// output so a future BEVE change cannot drift past us silently.
 const BEVE_ALIGNED_TYPED_ARRAY_MARKER: u8 = 0x5C;

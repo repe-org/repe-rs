@@ -1,5 +1,14 @@
 # Changelog
 
+## [3.8.0] - 2026-06-09
+
+### Added
+- `MessageBuilder::body_aligned_typed_slice(&[T])`, the zero-copy counterpart of `body_typed_slice`: it encodes a contiguous numeric slice as BEVE's *aligned* typed array, padded (via `beve::write_aligned_typed_slice_at`) so the payload lands on an `align_of::<T>()` boundary at its eventual `HEADER_SIZE + query.len()` frame offset. This makes the body borrowable as `&[T]` by a `Router::with_typed_slice_ref` server. The query must be set before this is called (so the offset is known); if it is set afterward the padding is for the wrong offset and the server falls back to a bulk copy (still correct, just not zero-copy). The body carries the same `into_wire_bytes` wire-prefix headroom as `body_typed_slice`, and the alignment survives that shift.
+
+### Changed
+- `AsyncClient::call_typed_slice_aligned` / `Client::call_typed_slice_aligned` now frame their request through `MessageBuilder::body_aligned_typed_slice` and the ordinary `call_with_body_and_timeout` path, replacing the dedicated in-place frame builder and raw-frame dispatch helpers introduced in 3.7.0. The wire bytes are byte-for-byte identical, so this is an internal simplification with no observable behavior change; it removes the parallel send path now that `beve = "2.3"` can pad a standalone body for an arbitrary frame offset.
+- Depend on `beve = "2.3"` (raised from `"2.2"`), the floor for `write_aligned_typed_slice_at` (the offset-aware aligned writer).
+
 ## [3.7.0] - 2026-06-09
 
 ### Added

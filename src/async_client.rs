@@ -1,7 +1,7 @@
 use crate::async_io::{read_message_async, write_message_async};
 use crate::constants::{BodyFormat, ErrorCode, QueryFormat, REPE_VERSION};
 use crate::error::RepeError;
-use crate::message::{Message, MessageBuilder, build_aligned_typed_slice_frame};
+use crate::message::{Message, MessageBuilder};
 use beve::from_slice as beve_from_slice;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -604,47 +604,15 @@ impl AsyncClient {
         T: beve::BeveTypedSlice,
         R: beve::BeveTypedSlice,
     {
-        let id = self.next_request_id();
-        let frame = build_aligned_typed_slice_frame(id, path.as_ref(), body);
-        let resp = self.dispatch_raw_frame(id, frame, timeout_duration).await?;
+        let resp = self
+            .call_with_body_and_timeout(
+                path,
+                QueryFormat::JsonPointer as u16,
+                timeout_duration,
+                |builder| Ok(builder.body_aligned_typed_slice(body)),
+            )
+            .await?;
         resp.decode_typed_slice()
-    }
-
-    /// Send a fully-built request frame (header + query + body already serialized)
-    /// under request id `id`, correlate the response, and validate it. The raw-frame
-    /// twin of [`call_with_body_and_timeout`](Self::call_with_body_and_timeout) for
-    /// the in-place aligned framing path, which cannot go through [`MessageBuilder`]
-    /// because its padding depends on the payload's absolute offset in the frame.
-    async fn dispatch_raw_frame(
-        &self,
-        id: u64,
-        frame: Vec<u8>,
-        timeout_duration: Option<Duration>,
-    ) -> Result<Message, RepeError> {
-        let (sender, receiver) = oneshot::channel();
-        let mut pending_guard = PendingRequestGuard::register(&self.inner, id, sender)?;
-
-        {
-            let mut writer = self.inner.writer.lock().await;
-            writer.write_all(&frame).await?;
-            writer.flush().await?;
-        }
-
-        let received = match timeout_duration {
-            Some(duration) => match timeout(duration, receiver).await {
-                Ok(Ok(value)) => value,
-                Ok(Err(_)) => return Err(response_channel_closed_error(id)),
-                Err(_) => return Err(request_timeout_error(id, duration)),
-            },
-            None => match receiver.await {
-                Ok(value) => value,
-                Err(_) => return Err(response_channel_closed_error(id)),
-            },
-        };
-
-        let resp = received?;
-        pending_guard.disarm();
-        Self::validate_response(id, resp)
     }
 
     async fn call_with_body_and_timeout<P, F>(
