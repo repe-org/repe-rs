@@ -4,8 +4,8 @@ use crate::error::RepeError;
 use crate::io::{read_message_into, write_message_streaming};
 use crate::message::{
     Message, MessageView, create_error_response_like, create_error_response_unstamped_view,
-    create_response_unstamped, create_response_unstamped_view, create_slice_response_unstamped,
-    create_slice_response_unstamped_view,
+    create_response_unstamped, create_response_unstamped_view,
+    create_typed_slice_response_unstamped, create_typed_slice_response_unstamped_view,
 };
 use crate::peer::{CallContext, PeerHandle};
 use crate::registry::Registry;
@@ -500,7 +500,7 @@ where
 /// typed array of `T` (wrong element class/width, or truncated) surfaces as a
 /// [`RepeError::Beve`], matching how [`decode_typed_param`] propagates a serde
 /// parse failure.
-fn decode_slice_param<T>(req: &Message) -> Result<Result<Vec<T>, Message>, RepeError>
+fn decode_typed_slice_param<T>(req: &Message) -> Result<Result<Vec<T>, Message>, RepeError>
 where
     T: beve::BeveTypedSlice,
 {
@@ -514,9 +514,11 @@ where
     }
 }
 
-/// Borrowing twin of [`decode_slice_param`]: bulk-decode straight from the
+/// Borrowing twin of [`decode_typed_slice_param`]: bulk-decode straight from the
 /// borrowed view body, with no owned `Message`.
-fn decode_slice_param_view<T>(view: &MessageView) -> Result<Result<Vec<T>, Message>, RepeError>
+fn decode_typed_slice_param_view<T>(
+    view: &MessageView,
+) -> Result<Result<Vec<T>, Message>, RepeError>
 where
     T: beve::BeveTypedSlice,
 {
@@ -530,40 +532,40 @@ where
     }
 }
 
-/// Bulk numeric handler registered by [`Router::with_slice`]: decodes a
+/// Bulk numeric handler registered by [`Router::with_typed_slice`]: decodes a
 /// contiguous `Vec<T>` request and frames a contiguous `Vec<R>` response, both
 /// through BEVE's typed-slice fast path, bypassing serde's per-element walk on
 /// the hot numeric path.
-struct SliceHandler<T, R, F>(F, std::marker::PhantomData<(T, R)>)
+struct TypedSliceHandler<T, R, F>(F, std::marker::PhantomData<(T, R)>)
 where
     T: beve::BeveTypedSlice + Send + Sync + 'static,
     R: beve::BeveTypedSlice + Send + Sync + 'static,
     F: Fn(Vec<T>) -> Result<Vec<R>, (ErrorCode, String)> + Send + Sync + 'static;
 
-impl<T, R, F> HandlerErased for SliceHandler<T, R, F>
+impl<T, R, F> HandlerErased for TypedSliceHandler<T, R, F>
 where
     T: beve::BeveTypedSlice + Send + Sync + 'static,
     R: beve::BeveTypedSlice + Send + Sync + 'static,
     F: Fn(Vec<T>) -> Result<Vec<R>, (ErrorCode, String)> + Send + Sync + 'static,
 {
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
-        let input: Vec<T> = match decode_slice_param(req)? {
+        let input: Vec<T> = match decode_typed_slice_param(req)? {
             Ok(v) => v,
             Err(err) => return Ok(err),
         };
         match (self.0)(input) {
-            Ok(out) => Ok(create_slice_response_unstamped(req, &out)),
+            Ok(out) => Ok(create_typed_slice_response_unstamped(req, &out)),
             Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
         }
     }
 
     fn handle_view(&self, view: &MessageView, _ctx: &CallContext) -> Result<Message, RepeError> {
-        let input: Vec<T> = match decode_slice_param_view(view)? {
+        let input: Vec<T> = match decode_typed_slice_param_view(view)? {
             Ok(v) => v,
             Err(err) => return Ok(err),
         };
         match (self.0)(input) {
-            Ok(out) => Ok(create_slice_response_unstamped_view(view, &out)),
+            Ok(out) => Ok(create_typed_slice_response_unstamped_view(view, &out)),
             Err((code, msg)) => Ok(create_error_response_unstamped_view(view, code, msg)),
         }
     }
@@ -971,13 +973,13 @@ impl Router {
     ///
     /// This is the high-throughput counterpart to [`with_typed`](Self::with_typed)
     /// for whole-body numeric arrays. `with_typed` routes `Vec<f64>` through
-    /// serde, which visits every element on both decode and encode; `with_slice`
+    /// serde, which visits every element on both decode and encode; `with_typed_slice`
     /// moves the whole contiguous block in a single bounds-checked
     /// `copy_nonoverlapping` each way (on little-endian targets), bypassing the
-    /// per-element walk. The bytes on the wire are identical, so a `with_slice`
+    /// per-element walk. The bytes on the wire are identical, so a `with_typed_slice`
     /// route interoperates freely with a serde peer and with
-    /// [`AsyncClient::call_slice`](crate::AsyncClient::call_slice) /
-    /// [`Client::call_slice`](crate::Client::call_slice).
+    /// [`AsyncClient::call_typed_slice`](crate::AsyncClient::call_typed_slice) /
+    /// [`Client::call_typed_slice`](crate::Client::call_typed_slice).
     ///
     /// The request body must be a BEVE typed numeric array of `T` (what those
     /// client helpers and [`MessageBuilder::body_typed_slice`] produce); any
@@ -987,12 +989,12 @@ impl Router {
     /// use repe::server::Router;
     /// // Scale every sample by 2.0, fully on the bulk path.
     /// let router = Router::new()
-    ///     .with_slice::<f64, f64, _>("/scale", |xs| Ok(xs.iter().map(|x| x * 2.0).collect()));
+    ///     .with_typed_slice::<f64, f64, _>("/scale", |xs| Ok(xs.iter().map(|x| x * 2.0).collect()));
     /// ```
     ///
     /// [`with_typed`]: Self::with_typed
     /// [`MessageBuilder::body_typed_slice`]: crate::message::MessageBuilder::body_typed_slice
-    pub fn with_slice<T, R, F>(mut self, path: &str, f: F) -> Self
+    pub fn with_typed_slice<T, R, F>(mut self, path: &str, f: F) -> Self
     where
         T: beve::BeveTypedSlice + Send + Sync + 'static,
         R: beve::BeveTypedSlice + Send + Sync + 'static,
@@ -1000,7 +1002,7 @@ impl Router {
     {
         self.insert_route(
             path,
-            Arc::new(SliceHandler::<T, R, F>(f, std::marker::PhantomData)),
+            Arc::new(TypedSliceHandler::<T, R, F>(f, std::marker::PhantomData)),
         );
         self
     }

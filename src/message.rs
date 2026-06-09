@@ -1092,11 +1092,11 @@ pub(crate) fn response_echo_query<'a>(response: &'a Message, request_query: &'a 
 /// Query-less success response whose entire body is a BEVE typed numeric array,
 /// written via the bulk [`MessageBuilder::body_typed_slice`] path (one
 /// `copy_nonoverlapping`, no per-element serde walk). The typed-slice twin of
-/// [`create_response_unstamped`], used by [`Router::with_slice`] so a numeric
+/// [`create_response_unstamped`], used by [`Router::with_typed_slice`] so a numeric
 /// `Vec<R>` result is framed without serializing element by element.
 ///
-/// [`Router::with_slice`]: crate::server::Router::with_slice
-pub(crate) fn create_slice_response_unstamped<T: beve::BeveTypedSlice>(
+/// [`Router::with_typed_slice`]: crate::server::Router::with_typed_slice
+pub(crate) fn create_typed_slice_response_unstamped<T: beve::BeveTypedSlice>(
     request: &Message,
     result: &[T],
 ) -> Message {
@@ -1105,9 +1105,9 @@ pub(crate) fn create_slice_response_unstamped<T: beve::BeveTypedSlice>(
         .build()
 }
 
-/// Borrowing twin of [`create_slice_response_unstamped`]: same bulk typed-array
+/// Borrowing twin of [`create_typed_slice_response_unstamped`]: same bulk typed-array
 /// framing, built from a [`MessageView`] for the allocation-free dispatch path.
-pub(crate) fn create_slice_response_unstamped_view<T: beve::BeveTypedSlice>(
+pub(crate) fn create_typed_slice_response_unstamped_view<T: beve::BeveTypedSlice>(
     view: &MessageView,
     result: &[T],
 ) -> Message {

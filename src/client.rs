@@ -151,22 +151,22 @@ impl Client {
 
     /// Send a contiguous numeric slice and decode a contiguous numeric `Vec<R>`
     /// response, both through BEVE's typed-slice fast path. The synchronous twin
-    /// of [`AsyncClient::call_slice`](crate::AsyncClient::call_slice); see it for
-    /// the full contract. Pairs with a [`Router::with_slice`] route.
+    /// of [`AsyncClient::call_typed_slice`](crate::AsyncClient::call_typed_slice); see it for
+    /// the full contract. Pairs with a [`Router::with_typed_slice`] route.
     ///
-    /// [`Router::with_slice`]: crate::server::Router::with_slice
-    pub fn call_slice<P, T, R>(&self, path: P, body: &[T]) -> Result<Vec<R>, RepeError>
+    /// [`Router::with_typed_slice`]: crate::server::Router::with_typed_slice
+    pub fn call_typed_slice<P, T, R>(&self, path: P, body: &[T]) -> Result<Vec<R>, RepeError>
     where
         P: AsRef<str>,
         T: beve::BeveTypedSlice,
         R: beve::BeveTypedSlice,
     {
-        self.call_slice_with_optional_timeout(path, body, None)
+        self.call_typed_slice_with_optional_timeout(path, body, None)
     }
 
     /// Numeric-slice request that fails if no response arrives before `timeout`.
-    /// Timeout-bearing twin of [`call_slice`](Self::call_slice).
-    pub fn call_slice_with_timeout<P, T, R>(
+    /// Timeout-bearing twin of [`call_typed_slice`](Self::call_typed_slice).
+    pub fn call_typed_slice_with_timeout<P, T, R>(
         &self,
         path: P,
         body: &[T],
@@ -177,7 +177,7 @@ impl Client {
         T: beve::BeveTypedSlice,
         R: beve::BeveTypedSlice,
     {
-        self.call_slice_with_optional_timeout(path, body, Some(timeout))
+        self.call_typed_slice_with_optional_timeout(path, body, Some(timeout))
     }
 
     /// Send a JSON-pointer request with an empty body and return the full response message.
@@ -475,7 +475,7 @@ impl Client {
         Self::decode_typed_response(&resp)
     }
 
-    fn call_slice_with_optional_timeout<P, T, R>(
+    fn call_typed_slice_with_optional_timeout<P, T, R>(
         &self,
         path: P,
         body: &[T],

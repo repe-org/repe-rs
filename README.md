@@ -78,20 +78,20 @@ The async (`tokio`) variant uses `AsyncServer` and `AsyncClient` and exposes the
 
 ### Bulk numeric arrays
 
-When a request and response are whole contiguous numeric arrays (`f32`, `f64`, integer widths), `Router::with_slice` and `Client::call_slice` (also `AsyncClient::call_slice`) carry them on BEVE's typed-slice fast path: one bulk copy each way, skipping serde's per-element walk. The wire bytes are identical to the serde path, so a `with_slice` route and a `with_typed` / `call_typed_beve` peer interoperate freely.
+When a request and response are whole contiguous numeric arrays (`f32`, `f64`, integer widths), `Router::with_typed_slice` and `Client::call_typed_slice` (also `AsyncClient::call_typed_slice`) carry them on BEVE's typed-slice fast path: one bulk copy each way, skipping serde's per-element walk. The wire bytes are identical to the serde path, so a `with_typed_slice` route and a `with_typed` / `call_typed_beve` peer interoperate freely.
 
 ```rust
 use repe::{Client, Router, Server};
 
 let router = Router::new()
-    .with_slice::<f64, f64, _>("/scale", |xs| Ok(xs.iter().map(|x| x * 2.0).collect()));
+    .with_typed_slice::<f64, f64, _>("/scale", |xs| Ok(xs.iter().map(|x| x * 2.0).collect()));
 let server = Server::new(router);
 let listener = server.listen("127.0.0.1:0")?;
 let addr = listener.local_addr()?;
 std::thread::spawn(move || { let _ = server.serve(listener); });
 
 let client = Client::connect(addr)?;
-let out: Vec<f64> = client.call_slice("/scale", &[1.0, 2.0, 3.0])?;
+let out: Vec<f64> = client.call_typed_slice("/scale", &[1.0, 2.0, 3.0])?;
 assert_eq!(out, vec![2.0, 4.0, 6.0]);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```

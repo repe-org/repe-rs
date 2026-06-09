@@ -189,7 +189,7 @@ impl AsyncClient {
     /// `copy_nonoverlapping` ([`MessageBuilder::body_typed_slice`]) instead of a
     /// serde walk, and the response is read back with
     /// [`Message::decode_typed_slice`] (one bulk copy). Pairs with a server route
-    /// registered via [`Router::with_slice`], and the wire bytes are identical to
+    /// registered via [`Router::with_typed_slice`], and the wire bytes are identical to
     /// the serde path, so it also interoperates with a `with_typed`/serde peer.
     ///
     /// `T` and `R` are scalar numeric types ([`f32`], [`f64`], integer widths,
@@ -198,21 +198,21 @@ impl AsyncClient {
     /// [`RepeError::Beve`].
     ///
     /// [`call_typed_beve`]: Self::call_typed_beve
-    /// [`Router::with_slice`]: crate::server::Router::with_slice
+    /// [`Router::with_typed_slice`]: crate::server::Router::with_typed_slice
     /// [`MessageBuilder::body_typed_slice`]: crate::message::MessageBuilder::body_typed_slice
-    pub async fn call_slice<P, T, R>(&self, path: P, body: &[T]) -> Result<Vec<R>, RepeError>
+    pub async fn call_typed_slice<P, T, R>(&self, path: P, body: &[T]) -> Result<Vec<R>, RepeError>
     where
         P: AsRef<str>,
         T: beve::BeveTypedSlice,
         R: beve::BeveTypedSlice,
     {
-        self.call_slice_with_optional_timeout(path, body, None)
+        self.call_typed_slice_with_optional_timeout(path, body, None)
             .await
     }
 
     /// Send a numeric-slice request and fail if no response arrives before
-    /// `timeout_duration`. Timeout-bearing twin of [`call_slice`](Self::call_slice).
-    pub async fn call_slice_with_timeout<P, T, R>(
+    /// `timeout_duration`. Timeout-bearing twin of [`call_typed_slice`](Self::call_typed_slice).
+    pub async fn call_typed_slice_with_timeout<P, T, R>(
         &self,
         path: P,
         body: &[T],
@@ -223,7 +223,7 @@ impl AsyncClient {
         T: beve::BeveTypedSlice,
         R: beve::BeveTypedSlice,
     {
-        self.call_slice_with_optional_timeout(path, body, Some(timeout_duration))
+        self.call_typed_slice_with_optional_timeout(path, body, Some(timeout_duration))
             .await
     }
 
@@ -521,7 +521,7 @@ impl AsyncClient {
         Self::decode_typed_response(&resp)
     }
 
-    async fn call_slice_with_optional_timeout<P, T, R>(
+    async fn call_typed_slice_with_optional_timeout<P, T, R>(
         &self,
         path: P,
         body: &[T],

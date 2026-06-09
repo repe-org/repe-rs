@@ -88,14 +88,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         streamed_back.len()
     );
 
-    // --- High-level fast path: with_slice + call_slice --------------------
-    // The same bulk path through the server/client API: a `with_slice` route
+    // --- High-level fast path: with_typed_slice + call_typed_slice --------------------
+    // The same bulk path through the server/client API: a `with_typed_slice` route
     // decodes the request and frames the response as a typed numeric array (one
-    // bulk copy each way), and `call_slice` does the mirror on the client. No
+    // bulk copy each way), and `call_typed_slice` does the mirror on the client. No
     // per-element serde walk on either side, and the wire bytes are identical to
     // the serde path, so this interoperates with a `with_typed` peer.
     let router = Router::new()
-        .with_slice::<f64, f64, _>("/scale", |xs| Ok(xs.iter().map(|x| x * 2.0).collect()));
+        .with_typed_slice::<f64, f64, _>("/scale", |xs| Ok(xs.iter().map(|x| x * 2.0).collect()));
     let server = Server::new(router);
     let listener = server.listen("127.0.0.1:0")?;
     let addr = listener.local_addr()?;
@@ -104,10 +104,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let client = Client::connect(addr)?;
-    let scaled: Vec<f64> = client.call_slice("/scale", &samples)?;
+    let scaled: Vec<f64> = client.call_typed_slice("/scale", &samples)?;
     assert_eq!(scaled, samples.iter().map(|x| x * 2.0).collect::<Vec<_>>());
     println!(
-        "call_slice /scale: {} elements scaled over the wire via the bulk fast path",
+        "call_typed_slice /scale: {} elements scaled over the wire via the bulk fast path",
         scaled.len()
     );
 

@@ -1,0 +1,32 @@
+syntax = "proto3";
+package shootout;
+
+// Numeric payloads -- the case where the encodings diverge most.
+//
+// `double` is wire-type fixed64: 8 raw bytes per element, so protobuf is
+// copy-bound here (still per-element, with a tag, but no varint math). This is
+// protobuf's *best* numeric case and the fairest comparison for BEVE's bulk
+// typed-array path, which is also 8 raw bytes per element.
+message NumericF64 { repeated double values = 1; }
+
+// `sint64` is zig-zag varint: 1-10 bytes per element, decoded with a
+// branch-heavy varint loop into a Vec. This is protobuf's *worst* numeric case
+// and the clearest demonstration of why BEVE's contiguous typed array wins on
+// integer-heavy data.
+message NumericI64 { repeated sint64 values = 1; }
+
+// A small structured message: a few scalar fields. Here the structural
+// advantage shrinks and you are comparing two competent binary encoders, plus
+// whatever per-call transport overhead each stack carries.
+message Small {
+  uint64 id = 1;
+  string name = 2;
+  bool ok = 3;
+  double score = 4;
+}
+
+service Shootout {
+  rpc EchoF64(NumericF64) returns (NumericF64);
+  rpc EchoI64(NumericI64) returns (NumericI64);
+  rpc EchoSmall(Small) returns (Small);
+}
