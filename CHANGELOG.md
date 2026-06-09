@@ -1,5 +1,13 @@
 # Changelog
 
+## [3.7.0] - 2026-06-09
+
+### Added
+- A zero-copy borrowing route for bulk numeric requests, realizing the aligned-typed-array path noted as future work in 3.6.0 (now that `beve = "2.2"` implements it). `Router::with_typed_slice_ref::<T, R, _>(path, |&[T]| -> Result<Vec<R>, _>)` hands its handler a `&[T]` borrowed straight out of the connection's receive buffer, with no allocation and no element copy on decode, when the request arrives in BEVE's *aligned* typed-array wire form and the buffer base is aligned to `align_of::<T>()` (the common case for the reused per-connection buffer on little-endian targets). The client opts into that wire form with `AsyncClient::call_typed_slice_aligned` / `Client::call_typed_slice_aligned` (with `_with_timeout` variants), which frame the request in place so the padding run places the payload on a `T` boundary within the frame. The aligned body is a distinct BEVE type from the regular typed array, so it pairs specifically with a `with_typed_slice_ref` route; a plain `with_typed_slice` / serde route rejects it with `ErrorCode::InvalidBody` rather than misreading. Conversely a `with_typed_slice_ref` route is a drop-in *superset* of `with_typed_slice`: it transparently accepts the regular (unaligned) typed array sent by `call_typed_slice` and the serde (`call_typed_beve`) path, bulk-copying those into the borrowed `&[T]`, and it falls back to a bulk copy for an aligned body whenever the buffer is not aligned, so correctness never depends on the alignment landing. The response is framed exactly as `with_typed_slice` frames it (a regular typed array), so it interoperates with every client on the way back out. A wrong element class/width surfaces as `RepeError::Beve` rather than being misread. See `tests/typed_slice_zero_copy.rs`.
+
+### Changed
+- Depend on `beve = "2.2"` (raised from `"2.1"`), which adds the aligned typed-array primitives (`write_aligned_typed_slice` / `aligned_typed_slice_size` / `read_aligned_typed_slice` / `read_aligned_typed_slice_ref`) backing the new borrowing route.
+
 ## [3.6.0] - 2026-06-09
 
 ### Added

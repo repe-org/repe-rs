@@ -571,6 +571,140 @@ where
     }
 }
 
+/// BEVE aligned-typed-array marker byte (`0x5C`): a typed array (type 4) in the
+/// bool/string/aligned sub-category (3) with the aligned discriminator (2), per
+/// BEVE spec §4. It opens the aligned wire form that
+/// [`crate::message::build_aligned_typed_slice_frame`] emits and the borrowing
+/// route decodes. Kept as a local constant rather than reaching into BEVE's
+/// header internals; [`aligned_marker_matches_beve`] pins it to BEVE's actual
+/// output so a future BEVE change cannot drift past us silently.
+const BEVE_ALIGNED_TYPED_ARRAY_MARKER: u8 = 0x5C;
+
+/// A decoded typed-slice request body: either borrowed straight from the receive
+/// buffer (the zero-copy win) or owned after a bulk copy (the fallback). Both
+/// expose the payload as `&[T]`, so the handler closure is oblivious to which
+/// path produced it.
+enum SliceInput<'a, T> {
+    Borrowed(&'a [T]),
+    Owned(Vec<T>),
+}
+
+impl<T> SliceInput<'_, T> {
+    #[inline]
+    fn as_slice(&self) -> &[T] {
+        match self {
+            SliceInput::Borrowed(s) => s,
+            SliceInput::Owned(v) => v,
+        }
+    }
+}
+
+/// Decode a typed-slice request body for the borrowing route, preferring a
+/// zero-copy borrow and degrading gracefully.
+///
+/// Accepts both wire forms so a [`Router::with_typed_slice_ref`] route is a
+/// drop-in superset of [`Router::with_typed_slice`]:
+///
+/// * An *aligned* typed array (marker `0x5C`, what `call_typed_slice_aligned`
+///   sends) is borrowed as `&[T]` when the buffer permits, else bulk-copied (the
+///   aligned payload is unaligned in this particular buffer). A genuine
+///   element-type mismatch or truncation surfaces as an error from the owned
+///   re-read.
+/// * A *regular* typed array (what `call_typed_slice` / the serde path send) has
+///   no padding to borrow through, so it is always bulk-copied via
+///   [`beve::read_typed_slice`].
+fn decode_typed_slice_ref_body<T>(body: &[u8]) -> Result<SliceInput<'_, T>, RepeError>
+where
+    T: beve::BeveTypedSlice,
+{
+    if body.first() == Some(&BEVE_ALIGNED_TYPED_ARRAY_MARKER) {
+        match beve::read_aligned_typed_slice_ref::<T>(body) {
+            Ok(slice) => Ok(SliceInput::Borrowed(slice)),
+            // Borrow refused (buffer base not aligned, or big-endian target) or a
+            // real decode error: re-read owned, which copies and either succeeds
+            // or reports the definitive error.
+            Err(_) => Ok(SliceInput::Owned(beve::read_aligned_typed_slice::<T>(
+                body,
+            )?)),
+        }
+    } else {
+        Ok(SliceInput::Owned(beve::read_typed_slice::<T>(body)?))
+    }
+}
+
+/// Body-format gate shared by the borrowing handler's owned and view paths: a
+/// typed numeric array is only ever [`BodyFormat::Beve`], so any other format is
+/// a client error rather than something to coerce (mirrors
+/// [`decode_typed_slice_param`]). On the happy path it returns the decoded
+/// [`SliceInput`]; on a wrong format it returns the prebuilt error `Message`.
+fn decode_typed_slice_ref_param<'a, T>(
+    body_format: u16,
+    body: &'a [u8],
+    on_bad_format: impl FnOnce() -> Message,
+) -> Result<Result<SliceInput<'a, T>, Message>, RepeError>
+where
+    T: beve::BeveTypedSlice,
+{
+    match BodyFormat::try_from(body_format) {
+        Ok(BodyFormat::Beve) => Ok(Ok(decode_typed_slice_ref_body::<T>(body)?)),
+        _ => Ok(Err(on_bad_format())),
+    }
+}
+
+/// Borrowing bulk numeric handler registered by [`Router::with_typed_slice_ref`].
+/// Identical to [`TypedSliceHandler`] except the closure receives a borrowed
+/// `&[T]` request, which on the view (server) path comes straight out of the
+/// connection's receive buffer with no element copy when the aligned wire form
+/// and buffer alignment allow it.
+struct TypedSliceRefHandler<T, R, F>(F, std::marker::PhantomData<(T, R)>)
+where
+    T: beve::BeveTypedSlice + Send + Sync + 'static,
+    R: beve::BeveTypedSlice + Send + Sync + 'static,
+    F: Fn(&[T]) -> Result<Vec<R>, (ErrorCode, String)> + Send + Sync + 'static;
+
+impl<T, R, F> HandlerErased for TypedSliceRefHandler<T, R, F>
+where
+    T: beve::BeveTypedSlice + Send + Sync + 'static,
+    R: beve::BeveTypedSlice + Send + Sync + 'static,
+    F: Fn(&[T]) -> Result<Vec<R>, (ErrorCode, String)> + Send + Sync + 'static,
+{
+    fn handle(&self, req: &Message) -> Result<Message, RepeError> {
+        let input =
+            match decode_typed_slice_ref_param::<T>(req.header.body_format, &req.body, || {
+                create_error_response_like(
+                    req,
+                    ErrorCode::InvalidBody,
+                    "Expected BEVE typed-numeric body",
+                )
+            })? {
+                Ok(v) => v,
+                Err(err) => return Ok(err),
+            };
+        match (self.0)(input.as_slice()) {
+            Ok(out) => Ok(create_typed_slice_response_unstamped(req, &out)),
+            Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
+        }
+    }
+
+    fn handle_view(&self, view: &MessageView, _ctx: &CallContext) -> Result<Message, RepeError> {
+        let input =
+            match decode_typed_slice_ref_param::<T>(view.header.body_format, view.body, || {
+                create_error_response_unstamped_view(
+                    view,
+                    ErrorCode::InvalidBody,
+                    "Expected BEVE typed-numeric body",
+                )
+            })? {
+                Ok(v) => v,
+                Err(err) => return Ok(err),
+            };
+        match (self.0)(input.as_slice()) {
+            Ok(out) => Ok(create_typed_slice_response_unstamped_view(view, &out)),
+            Err((code, msg)) => Ok(create_error_response_unstamped_view(view, code, msg)),
+        }
+    }
+}
+
 /// Trait shape mirroring [`TypedHandlerFn`] for context-aware typed
 /// handlers. Implemented by closures of the form
 /// `Fn(&CallContext, T) -> Result<R, (ErrorCode, String)>`.
@@ -1003,6 +1137,49 @@ impl Router {
         self.insert_route(
             path,
             Arc::new(TypedSliceHandler::<T, R, F>(f, std::marker::PhantomData)),
+        );
+        self
+    }
+
+    /// Add a bulk numeric handler whose closure *borrows* its request as `&[T]`,
+    /// the zero-copy counterpart of [`with_typed_slice`](Self::with_typed_slice).
+    ///
+    /// When the client sends the request through the aligned wire form
+    /// ([`AsyncClient::call_typed_slice_aligned`] / [`Client::call_typed_slice_aligned`])
+    /// and the connection's receive buffer happens to be aligned to
+    /// `align_of::<T>()` (the common case for the reused per-connection buffer on
+    /// little-endian targets), the handler receives a `&[T]` pointing straight
+    /// into that buffer: no allocation and no element copy on the way in. When the
+    /// buffer is not aligned, or the client used the regular
+    /// [`call_typed_slice`](crate::AsyncClient::call_typed_slice) / serde path, the
+    /// body is bulk-copied into an owned buffer first and the handler sees a `&[T]`
+    /// over that. Either way the closure is identical, so a `with_typed_slice_ref`
+    /// route is a drop-in superset of `with_typed_slice`: it accepts every client
+    /// the latter does, and additionally borrows when it can.
+    ///
+    /// The response is framed exactly as [`with_typed_slice`](Self::with_typed_slice)
+    /// frames it (a regular typed array), so it interoperates with every client on
+    /// the way back out.
+    ///
+    /// ```ignore
+    /// use repe::server::Router;
+    /// // Sum each request without ever copying it into a `Vec<f64>`.
+    /// let router = Router::new()
+    ///     .with_typed_slice_ref::<f64, f64, _>("/stats", |xs| Ok(vec![xs.iter().sum()]));
+    /// ```
+    ///
+    /// [`with_typed_slice`]: Self::with_typed_slice
+    /// [`AsyncClient::call_typed_slice_aligned`]: crate::AsyncClient::call_typed_slice_aligned
+    /// [`Client::call_typed_slice_aligned`]: crate::Client::call_typed_slice_aligned
+    pub fn with_typed_slice_ref<T, R, F>(mut self, path: &str, f: F) -> Self
+    where
+        T: beve::BeveTypedSlice + Send + Sync + 'static,
+        R: beve::BeveTypedSlice + Send + Sync + 'static,
+        F: Fn(&[T]) -> Result<Vec<R>, (ErrorCode, String)> + Send + Sync + 'static,
+    {
+        self.insert_route(
+            path,
+            Arc::new(TypedSliceRefHandler::<T, R, F>(f, std::marker::PhantomData)),
         );
         self
     }
@@ -1665,6 +1842,15 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use std::io::Read;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    /// Pin [`BEVE_ALIGNED_TYPED_ARRAY_MARKER`] to BEVE's actual aligned-array
+    /// output, so the borrowing route's marker dispatch can never silently drift
+    /// from the format BEVE emits.
+    #[test]
+    fn aligned_marker_matches_beve() {
+        let encoded = beve::to_vec_aligned_typed_slice(&[1.0_f64]);
+        assert_eq!(encoded.first(), Some(&BEVE_ALIGNED_TYPED_ARRAY_MARKER));
+    }
 
     #[test]
     fn middleware_runs_for_registered_handlers() {

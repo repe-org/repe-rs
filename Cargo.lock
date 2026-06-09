@@ -116,9 +116,9 @@ dependencies = [
 
 [[package]]
 name = "beve"
-version = "2.1.0"
+version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1172527f0f50aedb1a656406adb4fc50071f70fea7012e9baa71580a939bbbc3"
+checksum = "c2b7bcce9a3b058d77a9c93d5168b28e4dc4ca5a2d0f41b51bae5ec50c7f5153"
 dependencies = [
  "half",
  "serde",
@@ -898,7 +898,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "repe"
-version = "3.6.0"
+version = "3.7.0"
 dependencies = [
  "beve",
  "clap",
