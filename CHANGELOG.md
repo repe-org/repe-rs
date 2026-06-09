@@ -1,5 +1,10 @@
 # Changelog
 
+## [3.5.1] - 2026-06-09
+
+### Changed
+- `MessageBuilder::body_typed_slice` / `body_complex_slice` now allocate their body buffer with `HEADER_SIZE + query.len()` of spare capacity reserved after the encoded payload, so shipping the built message through `Message::into_wire_bytes` reuses that allocation in place instead of allocating a fresh frame buffer. The encode itself stays a single allocation (the slice is written into the pre-sized buffer via `beve::to_writer_*_slice` rather than `to_vec_*_slice`), and the wire bytes are unchanged. The headroom is effective whenever the body is encoded with the final query already in place — the common `.query_*(..).body_typed_slice(..)` order, and also the query-less case (the reserved prefix is then just the header). Only setting a non-empty query *after* the body misses it, falling back to a fresh frame exactly as before. Only affects the build-a-Message-then-`into_wire_bytes` outbound pattern; the streaming `write_message_typed_slice` / `write_message_complex_slice` path was already zero-buffer.
+
 ## [3.5.0] - 2026-06-09
 
 ### Added
