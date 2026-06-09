@@ -1,0 +1,57 @@
+name: Interop (C++ / Glaze)
+
+# Pins REPE wire compatibility with the canonical C++ implementation (Glaze).
+# Kept separate from the main Rust CI so that workflow stays toolchain-light;
+# this one needs CMake and a C++23 compiler to build the fixture generator.
+#
+# It rebuilds the generator from the same pinned Glaze tag the committed
+# fixtures were generated against, regenerates them, and fails if anything
+# drifted (a Glaze change or a repe-rs change that breaks parity), then runs the
+# Rust interop tests against the committed fixtures.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+env:
+  GLAZE_TAG: v7.7.1
+
+jobs:
+  interop:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install C++23 toolchain and CMake
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++-14 cmake ninja-build
+
+      - name: Build fixture generator (fetches Glaze ${{ env.GLAZE_TAG }})
+        run: |
+          cmake -S interop/cpp -B interop/cpp/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DGLAZE_GIT_TAG=${{ env.GLAZE_TAG }}
+          cmake --build interop/cpp/build
+
+      - name: Regenerate fixtures
+        run: ./interop/cpp/build/generate_fixtures interop/fixtures ${{ env.GLAZE_TAG }}
+
+      - name: Assert committed fixtures still match Glaze output
+        run: git diff --exit-code -- interop/fixtures
+
+      - name: Run interop tests
+        run: cargo test --test interop

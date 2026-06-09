@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- Cross-language wire-compatibility test suite against the canonical C++ REPE implementation (Glaze). A committed C++ generator (`interop/cpp/`) links Glaze and emits authentic REPE v1 frames; those bytes and a manifest live under `interop/fixtures/`; `tests/interop.rs` asserts parse parity, body decode (JSON / BEVE object / BEVE typed numeric / UTF-8 error), byte-identity round-trip, and — for protocol-defined layouts — from-scratch encoder parity. Notably, repe-rs's `body_typed_slice` BEVE numeric arrays and its error frames are byte-identical to Glaze's. A gated `interop` CI workflow rebuilds the generator from the pinned Glaze tag, regenerates, and fails on drift. No library code or public API changed; `interop/` is excluded from the published crate. See `docs/interop.md`. Both implementations are REPE v1 (48-byte header), the shipping spec; a v2 (32-byte header) exists only as an unreleased work-in-progress branch of the spec, so adopting it is separate future work.
+
 ## [3.5.1] - 2026-06-09
 
 ### Changed

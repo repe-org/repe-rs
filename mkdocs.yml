@@ -61,6 +61,7 @@ plugins:
 nav:
   - Overview: index.md
   - Wire Format: protocol.md
+  - C++ Interoperability: interop.md
   - Server: server.md
   - Client: client.md
   - Registry: registry.md
