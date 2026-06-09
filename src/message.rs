@@ -780,6 +780,31 @@ mod tests {
     }
 
     #[test]
+    fn typed_slice_body_query_after_body_falls_back_to_fresh_frame() {
+        // The headroom is sized from the query length known at `body_typed_slice`
+        // time. With the query set *afterward*, the reserved prefix covers only
+        // the header, so a non-empty query no longer fits and `into_wire_bytes`
+        // takes the slow path (fresh frame). This pins the documented fallback:
+        // bytes still equal `to_vec`, but the body allocation is not reused.
+        let query = b"/sensors/raw";
+        let data: Vec<f64> = (0..512).map(|i| i as f64 * 0.25).collect();
+        let msg = Message::builder()
+            .body_typed_slice(&data)
+            .query_bytes(query.to_vec())
+            .query_format(QueryFormat::JsonPointer)
+            .build();
+        let body_ptr = msg.body.as_ptr();
+        let expected = msg.clone().to_vec();
+        let wire = msg.into_wire_bytes();
+        assert_eq!(wire, expected, "wire bytes must equal to_vec");
+        assert_ne!(
+            wire.as_ptr(),
+            body_ptr,
+            "query set after body should not fit the reserved prefix; expected a fresh frame"
+        );
+    }
+
+    #[test]
     fn beve_body_non_beve_errors() {
         let msg = Message::builder()
             .id(2)
