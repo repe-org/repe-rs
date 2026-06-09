@@ -7,7 +7,7 @@ Delivered. All four tracked items have shipped:
 - **Shipped:** generic call/notify APIs (`call_with_formats` / `notify_with_formats`), Fleet orchestration (`fleet` / `async_fleet`), and the UniUDP transport stack (`udp_client` / `uniudp_fleet`).
 - **Shipped:** the Glaze/C++ interoperability test suite (item 1). A C++ fixture generator (`interop/cpp/`) links the canonical Glaze REPE implementation and emits authentic REPE v1 frames; those bytes and a manifest are committed under `interop/fixtures/`; `tests/interop.rs` asserts parse parity, body decode, byte-identity round-trip, and (for protocol-defined layouts) from-scratch encoder parity; and a gated `interop` CI workflow rebuilds the generator from the pinned Glaze tag, regenerates, and fails on drift. See `docs/interop.md`. The rest of this doc is retained as the record of how the work was staged.
 
-Note (cross-library): both repe-rs and the released Glaze implement REPE **v1** (48-byte header), so the suite pins their mutual compatibility. The REPE spec has since defined **v2** (32-byte header); migrating both implementations is separate, coordinated future work.
+Note (cross-library): both repe-rs and the released Glaze implement REPE **v1** (48-byte header), so the suite pins their mutual compatibility. v1 is the shipping spec; a **v2** (32-byte header) exists only as a not-yet-released work-in-progress branch of the REPE spec. Adopting v2 once it lands is separate, coordinated future work.
 
 ## Purpose
 Registry parity has been merged. This document tracks the remaining expansion work:

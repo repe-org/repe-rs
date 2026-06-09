@@ -57,9 +57,10 @@ compatibility unnoticed. To regenerate locally, see
 
 ## Versioning note (v1 vs v2)
 
-The [REPE specification](https://github.com/repe-org/REPE) has since defined a
-**version 2** with a 32-byte header (the `spec` magic moved to the front, no
-leading `length` field). Both this crate (`REPE_VERSION = 1`) and the released
-Glaze implementation are still on **version 1**, so they remain wire-compatible
-with each other. Migrating to v2 is coordinated future work across the spec,
-Glaze, and this crate; this interop suite pins the v1 reality that ships today.
+The [REPE specification](https://github.com/repe-org/REPE) has a work-in-progress
+**version 2** (a 32-byte header with the `spec` magic moved to the front and no
+leading `length` field), but it lives on a branch and has not been released.
+Version 1 is the shipping spec: this crate (`REPE_VERSION = 1`) and the released
+Glaze implementation both target it and are wire-compatible with each other.
+Adopting v2 once it lands is coordinated future work across the spec, Glaze, and
+this crate; this interop suite pins the v1 reality that ships today.
