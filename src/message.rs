@@ -1089,6 +1089,33 @@ pub(crate) fn response_echo_query<'a>(response: &'a Message, request_query: &'a 
     }
 }
 
+/// Query-less success response whose entire body is a BEVE typed numeric array,
+/// written via the bulk [`MessageBuilder::body_typed_slice`] path (one
+/// `copy_nonoverlapping`, no per-element serde walk). The typed-slice twin of
+/// [`create_response_unstamped`], used by [`Router::with_typed_slice`] so a numeric
+/// `Vec<R>` result is framed without serializing element by element.
+///
+/// [`Router::with_typed_slice`]: crate::server::Router::with_typed_slice
+pub(crate) fn create_typed_slice_response_unstamped<T: beve::BeveTypedSlice>(
+    request: &Message,
+    result: &[T],
+) -> Message {
+    response_header_builder(request.header.id, request.header.query_format)
+        .body_typed_slice(result)
+        .build()
+}
+
+/// Borrowing twin of [`create_typed_slice_response_unstamped`]: same bulk typed-array
+/// framing, built from a [`MessageView`] for the allocation-free dispatch path.
+pub(crate) fn create_typed_slice_response_unstamped_view<T: beve::BeveTypedSlice>(
+    view: &MessageView,
+    result: &[T],
+) -> Message {
+    response_header_builder(view.header.id, view.header.query_format)
+        .body_typed_slice(result)
+        .build()
+}
+
 /// Borrowing twin of [`create_response_unstamped`]: builds the same query-less
 /// success response from a [`MessageView`], without materializing an owned
 /// request. The view's query is echoed by the writer (e.g.

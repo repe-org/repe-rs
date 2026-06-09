@@ -19,7 +19,9 @@
 //!
 //! Run with: `cargo run --example typed_numeric_body`
 
-use repe::{Complex, Header, Message, read_message, write_message_typed_slice};
+use repe::{
+    Client, Complex, Header, Message, Router, Server, read_message, write_message_typed_slice,
+};
 use std::io::Cursor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -84,6 +86,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "streamed body round-tripped: {} elements",
         streamed_back.len()
+    );
+
+    // --- High-level fast path: with_typed_slice + call_typed_slice --------------------
+    // The same bulk path through the server/client API: a `with_typed_slice` route
+    // decodes the request and frames the response as a typed numeric array (one
+    // bulk copy each way), and `call_typed_slice` does the mirror on the client. No
+    // per-element serde walk on either side, and the wire bytes are identical to
+    // the serde path, so this interoperates with a `with_typed` peer.
+    let router = Router::new()
+        .with_typed_slice::<f64, f64, _>("/scale", |xs| Ok(xs.iter().map(|x| x * 2.0).collect()));
+    let server = Server::new(router);
+    let listener = server.listen("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    std::thread::spawn(move || {
+        let _ = server.serve(listener);
+    });
+
+    let client = Client::connect(addr)?;
+    let scaled: Vec<f64> = client.call_typed_slice("/scale", &samples)?;
+    assert_eq!(scaled, samples.iter().map(|x| x * 2.0).collect::<Vec<_>>());
+    println!(
+        "call_typed_slice /scale: {} elements scaled over the wire via the bulk fast path",
+        scaled.len()
     );
 
     Ok(())
