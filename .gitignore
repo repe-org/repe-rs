@@ -15,3 +15,8 @@ dev/.claude/
 # Interop fixture generator build tree (the generated fixtures under
 # interop/fixtures/ are committed; the C++ build output is not).
 /interop/cpp/build/
+
+# Local-only gRPC-vs-repe benchmark crate (heavy tonic/prost/protoc stack with a
+# path dep on repe; informs perf work but is not part of the published crate).
+# Kept out of the tree deliberately so it can't be swept into a commit.
+/bench/
