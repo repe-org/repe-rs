@@ -11,3 +11,7 @@ dev/.claude/
 # MkDocs build output and local virtualenv
 /site/
 /.mkdocs-venv/
+
+# Interop fixture generator build tree (the generated fixtures under
+# interop/fixtures/ are committed; the C++ build output is not).
+/interop/cpp/build/

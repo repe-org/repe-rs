@@ -16,6 +16,7 @@ Rust implementation of the [REPE RPC protocol](https://github.com/repe-org/REPE)
 - Optional [WebSocket transport](websocket.md), including a wasm browser client and server-pushed notify subscriptions.
 - Optional [`stream`](streaming.md) module for backpressure-controlled bulk transfers with reconnect-resume.
 - Optional [`repe` CLI](cli.md) for talking to any REPE server over TCP or WebSocket.
+- [Wire compatibility](interop.md) with the canonical C++ implementation (Glaze), pinned by an automated interop fixture suite.
 
 ## Install
 
@@ -58,6 +59,7 @@ Replace `body_json` with `body_beve` to encode the body with BEVE; everything el
 - Pushing through firewalls or browsers? See [WebSocket](websocket.md).
 - Moving large payloads with flow control? See [Streaming](streaming.md).
 - Debugging from a terminal? See the [CLI](cli.md).
+- Interoperating with C++ (Glaze) or another REPE implementation? See [Interoperability](interop.md).
 
 ## Feature flags
 
