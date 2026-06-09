@@ -1,7 +1,7 @@
 use crate::async_io::{read_message_async, write_message_async};
 use crate::constants::{BodyFormat, ErrorCode, QueryFormat, REPE_VERSION};
 use crate::error::RepeError;
-use crate::message::{Message, MessageBuilder};
+use crate::message::{Message, MessageBuilder, build_aligned_typed_slice_frame};
 use beve::from_slice as beve_from_slice;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -224,6 +224,56 @@ impl AsyncClient {
         R: beve::BeveTypedSlice,
     {
         self.call_typed_slice_with_optional_timeout(path, body, Some(timeout_duration))
+            .await
+    }
+
+    /// Send a contiguous numeric slice through the *aligned* wire form, enabling a
+    /// zero-copy borrow of the request on a [`Router::with_typed_slice_ref`] server.
+    ///
+    /// Identical in result to [`call_typed_slice`](Self::call_typed_slice) (send
+    /// `&[T]`, decode a `Vec<R>` response), but the request body is framed as a
+    /// BEVE *aligned* typed array: an explicit padding run places the element block
+    /// on an `align_of::<T>()` boundary within the frame, so a `with_typed_slice_ref`
+    /// server reading the frame into an aligned buffer can hand its handler a
+    /// `&[T]` borrowed straight out of that buffer, with no allocation and no
+    /// element copy on decode. The server transparently falls back to a bulk copy
+    /// when its buffer is not aligned, so correctness never depends on the
+    /// alignment landing.
+    ///
+    /// The aligned body is a distinct BEVE type from the regular typed array, so
+    /// this pairs specifically with a `with_typed_slice_ref` route. A plain
+    /// [`with_typed_slice`](crate::server::Router::with_typed_slice) or serde route
+    /// does not understand the aligned form and rejects it; use
+    /// [`call_typed_slice`](Self::call_typed_slice) for those.
+    ///
+    /// [`Router::with_typed_slice_ref`]: crate::server::Router::with_typed_slice_ref
+    pub async fn call_typed_slice_aligned<P, T, R>(
+        &self,
+        path: P,
+        body: &[T],
+    ) -> Result<Vec<R>, RepeError>
+    where
+        P: AsRef<str>,
+        T: beve::BeveTypedSlice,
+        R: beve::BeveTypedSlice,
+    {
+        self.call_typed_slice_aligned_with_optional_timeout(path, body, None)
+            .await
+    }
+
+    /// Timeout-bearing twin of [`call_typed_slice_aligned`](Self::call_typed_slice_aligned).
+    pub async fn call_typed_slice_aligned_with_timeout<P, T, R>(
+        &self,
+        path: P,
+        body: &[T],
+        timeout_duration: Duration,
+    ) -> Result<Vec<R>, RepeError>
+    where
+        P: AsRef<str>,
+        T: beve::BeveTypedSlice,
+        R: beve::BeveTypedSlice,
+    {
+        self.call_typed_slice_aligned_with_optional_timeout(path, body, Some(timeout_duration))
             .await
     }
 
@@ -541,6 +591,60 @@ impl AsyncClient {
             )
             .await?;
         resp.decode_typed_slice()
+    }
+
+    async fn call_typed_slice_aligned_with_optional_timeout<P, T, R>(
+        &self,
+        path: P,
+        body: &[T],
+        timeout_duration: Option<Duration>,
+    ) -> Result<Vec<R>, RepeError>
+    where
+        P: AsRef<str>,
+        T: beve::BeveTypedSlice,
+        R: beve::BeveTypedSlice,
+    {
+        let id = self.next_request_id();
+        let frame = build_aligned_typed_slice_frame(id, path.as_ref(), body);
+        let resp = self.dispatch_raw_frame(id, frame, timeout_duration).await?;
+        resp.decode_typed_slice()
+    }
+
+    /// Send a fully-built request frame (header + query + body already serialized)
+    /// under request id `id`, correlate the response, and validate it. The raw-frame
+    /// twin of [`call_with_body_and_timeout`](Self::call_with_body_and_timeout) for
+    /// the in-place aligned framing path, which cannot go through [`MessageBuilder`]
+    /// because its padding depends on the payload's absolute offset in the frame.
+    async fn dispatch_raw_frame(
+        &self,
+        id: u64,
+        frame: Vec<u8>,
+        timeout_duration: Option<Duration>,
+    ) -> Result<Message, RepeError> {
+        let (sender, receiver) = oneshot::channel();
+        let mut pending_guard = PendingRequestGuard::register(&self.inner, id, sender)?;
+
+        {
+            let mut writer = self.inner.writer.lock().await;
+            writer.write_all(&frame).await?;
+            writer.flush().await?;
+        }
+
+        let received = match timeout_duration {
+            Some(duration) => match timeout(duration, receiver).await {
+                Ok(Ok(value)) => value,
+                Ok(Err(_)) => return Err(response_channel_closed_error(id)),
+                Err(_) => return Err(request_timeout_error(id, duration)),
+            },
+            None => match receiver.await {
+                Ok(value) => value,
+                Err(_) => return Err(response_channel_closed_error(id)),
+            },
+        };
+
+        let resp = received?;
+        pending_guard.disarm();
+        Self::validate_response(id, resp)
     }
 
     async fn call_with_body_and_timeout<P, F>(

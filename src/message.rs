@@ -839,6 +839,48 @@ mod tests {
         assert_eq!(msg.header.query_format, 0x7777);
         assert_eq!(msg.header.body_format, 0x8888);
     }
+
+    #[test]
+    fn aligned_frame_header_and_payload_round_trip() {
+        let data: Vec<f64> = (0..300).map(|i| i as f64 * 0.5).collect();
+        let frame = build_aligned_typed_slice_frame(42, "/scale", &data);
+
+        // The header parses, the lengths add up, and the body is a valid aligned
+        // typed array that decodes (owned, always works) back to the input.
+        let view = MessageView::from_slice(&frame).expect("frame parses");
+        assert_eq!(view.header.id, 42);
+        assert_eq!(view.header.query_format, QueryFormat::JsonPointer as u16);
+        assert_eq!(view.header.body_format, BodyFormat::Beve as u16);
+        assert_eq!(view.query, b"/scale");
+        assert_eq!(view.header.length as usize, frame.len());
+        let back = beve::read_aligned_typed_slice::<f64>(view.body).expect("owned decode");
+        assert_eq!(back, data);
+    }
+
+    #[test]
+    fn aligned_frame_payload_is_borrowable_when_buffer_is_aligned() {
+        // Validate the padding math end to end: when the whole frame sits at an
+        // 8-aligned base address, the f64 payload is aligned in memory and the
+        // zero-copy borrow succeeds. We force an 8-aligned backing buffer via a
+        // `Vec<u64>` and copy the frame in at offset 0.
+        let data: Vec<f64> = (0..257).map(|i| 1.0 / (i as f64 + 1.0)).collect();
+        // A 7-byte query makes the unpadded payload offset odd, so a correct
+        // borrow can only come from the inserted alignment padding.
+        let frame = build_aligned_typed_slice_frame(1, "/abcdef", &data);
+
+        let words = frame.len() / 8 + 1;
+        let mut backing: Vec<u64> = vec![0; words];
+        // SAFETY: `backing` is 8-aligned and large enough to hold `frame`.
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(backing.as_mut_ptr() as *mut u8, words * 8) };
+        bytes[..frame.len()].copy_from_slice(&frame);
+        let aligned_frame = &bytes[..frame.len()];
+
+        let view = MessageView::from_slice(aligned_frame).expect("frame parses");
+        let borrowed: &[f64] =
+            beve::read_aligned_typed_slice_ref::<f64>(view.body).expect("zero-copy borrow");
+        assert_eq!(borrowed, data.as_slice());
+    }
 }
 
 #[derive(Default)]
@@ -1114,6 +1156,55 @@ pub(crate) fn create_typed_slice_response_unstamped_view<T: beve::BeveTypedSlice
     response_header_builder(view.header.id, view.header.query_format)
         .body_typed_slice(result)
         .build()
+}
+
+/// Build a complete request frame whose body is a BEVE *aligned* typed numeric
+/// array, padded so the element block (`DATA`) lands on an `align_of::<T>()`
+/// boundary measured from the start of the frame.
+///
+/// This is the wire form that enables a zero-copy borrow on the receiving server
+/// ([`Router::with_typed_slice_ref`]): the server reads the whole frame into one
+/// buffer and, when that buffer's base address is aligned, hands the handler a
+/// `&[T]` borrowed straight out of it with no element copy. The regular
+/// [`MessageBuilder::body_typed_slice`] path cannot offer this because its payload
+/// sits at an arbitrary offset; the aligned form inserts an explicit padding run
+/// to fix that.
+///
+/// The padding depends on the payload's absolute offset within the frame, which is
+/// why this frames in place rather than going through [`MessageBuilder`]: the
+/// aligned body is appended directly after the `HEADER_SIZE + query` prefix, so
+/// [`beve::write_aligned_typed_slice`] (which pads relative to the current buffer
+/// length) sees the true offset. The header is written last, once the body length
+/// is known. The bytes are otherwise an ordinary REPE request:
+/// [`QueryFormat::JsonPointer`] query, [`BodyFormat::Beve`] body.
+///
+/// [`Router::with_typed_slice_ref`]: crate::server::Router::with_typed_slice_ref
+pub(crate) fn build_aligned_typed_slice_frame<T: beve::BeveTypedSlice>(
+    id: u64,
+    path: &str,
+    slice: &[T],
+) -> Vec<u8> {
+    let query = path.as_bytes();
+    let prefix = HEADER_SIZE + query.len();
+    let mut frame = Vec::with_capacity(prefix + beve::aligned_typed_slice_size(slice, prefix));
+
+    // Reserve the header (backfilled below), then the query, so that the aligned
+    // body is appended at absolute offset `prefix` and padded for that offset.
+    frame.resize(HEADER_SIZE, 0);
+    frame.extend_from_slice(query);
+    debug_assert_eq!(frame.len(), prefix);
+    beve::write_aligned_typed_slice(&mut frame, slice);
+
+    let body_length = (frame.len() - prefix) as u64;
+    let mut header = Header::new();
+    header.id = id;
+    header.query_format = QueryFormat::JsonPointer as u16;
+    header.body_format = BodyFormat::Beve as u16;
+    header.query_length = query.len() as u64;
+    header.body_length = body_length;
+    header.length = frame.len() as u64;
+    frame[..HEADER_SIZE].copy_from_slice(&header.encode());
+    frame
 }
 
 /// Borrowing twin of [`create_response_unstamped`]: builds the same query-less

@@ -1,7 +1,7 @@
 use crate::constants::{BodyFormat, ErrorCode, QueryFormat, REPE_VERSION};
 use crate::error::RepeError;
 use crate::io::{read_message, write_message};
-use crate::message::{Message, MessageBuilder};
+use crate::message::{Message, MessageBuilder, build_aligned_typed_slice_frame};
 use beve::from_slice as beve_from_slice;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -178,6 +178,43 @@ impl Client {
         R: beve::BeveTypedSlice,
     {
         self.call_typed_slice_with_optional_timeout(path, body, Some(timeout))
+    }
+
+    /// Send a contiguous numeric slice through the *aligned* wire form, enabling a
+    /// zero-copy borrow of the request on a [`Router::with_typed_slice_ref`] server.
+    /// The synchronous twin of
+    /// [`AsyncClient::call_typed_slice_aligned`](crate::AsyncClient::call_typed_slice_aligned);
+    /// see it for the full contract. Pairs specifically with a
+    /// [`Router::with_typed_slice_ref`] route (a plain `with_typed_slice` / serde
+    /// route does not understand the aligned form).
+    ///
+    /// [`Router::with_typed_slice_ref`]: crate::server::Router::with_typed_slice_ref
+    pub fn call_typed_slice_aligned<P, T, R>(
+        &self,
+        path: P,
+        body: &[T],
+    ) -> Result<Vec<R>, RepeError>
+    where
+        P: AsRef<str>,
+        T: beve::BeveTypedSlice,
+        R: beve::BeveTypedSlice,
+    {
+        self.call_typed_slice_aligned_with_optional_timeout(path, body, None)
+    }
+
+    /// Timeout-bearing twin of [`call_typed_slice_aligned`](Self::call_typed_slice_aligned).
+    pub fn call_typed_slice_aligned_with_timeout<P, T, R>(
+        &self,
+        path: P,
+        body: &[T],
+        timeout: Duration,
+    ) -> Result<Vec<R>, RepeError>
+    where
+        P: AsRef<str>,
+        T: beve::BeveTypedSlice,
+        R: beve::BeveTypedSlice,
+    {
+        self.call_typed_slice_aligned_with_optional_timeout(path, body, Some(timeout))
     }
 
     /// Send a JSON-pointer request with an empty body and return the full response message.
@@ -493,6 +530,64 @@ impl Client {
             |builder| Ok(builder.body_typed_slice(body)),
         )?;
         resp.decode_typed_slice()
+    }
+
+    fn call_typed_slice_aligned_with_optional_timeout<P, T, R>(
+        &self,
+        path: P,
+        body: &[T],
+        timeout: Option<Duration>,
+    ) -> Result<Vec<R>, RepeError>
+    where
+        P: AsRef<str>,
+        T: beve::BeveTypedSlice,
+        R: beve::BeveTypedSlice,
+    {
+        let id = self.next_request_id();
+        let frame = build_aligned_typed_slice_frame(id, path.as_ref(), body);
+        let resp = self.dispatch_raw_frame(id, frame, timeout)?;
+        resp.decode_typed_slice()
+    }
+
+    /// Send a fully-built request frame under request id `id`, correlate the
+    /// response, and validate it. The raw-frame twin of
+    /// [`call_with_body_and_timeout`](Self::call_with_body_and_timeout) for the
+    /// in-place aligned framing path (whose padding depends on the payload's
+    /// absolute frame offset, so it cannot go through [`MessageBuilder`]).
+    fn dispatch_raw_frame(
+        &self,
+        id: u64,
+        frame: Vec<u8>,
+        timeout: Option<Duration>,
+    ) -> Result<Message, RepeError> {
+        let (sender, receiver) = mpsc::channel();
+        {
+            let mut pending = self
+                .inner
+                .pending
+                .lock()
+                .map_err(|_| poisoned_lock_error("client pending map"))?;
+            pending.insert(id, sender);
+        }
+
+        if let Err(err) = self.write_raw_frame(&frame) {
+            self.remove_pending(id);
+            return Err(err);
+        }
+
+        let resp = self.wait_for_response(id, receiver, timeout)?;
+        Self::validate_response(id, resp)
+    }
+
+    fn write_raw_frame(&self, frame: &[u8]) -> Result<(), RepeError> {
+        let mut writer = self
+            .inner
+            .writer
+            .lock()
+            .map_err(|_| poisoned_lock_error("client writer"))?;
+        writer.write_all(frame)?;
+        writer.flush()?;
+        Ok(())
     }
 
     fn call_with_body_and_timeout<P, F>(

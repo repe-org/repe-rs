@@ -96,6 +96,26 @@ assert_eq!(out, vec![2.0, 4.0, 6.0]);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+For the request decode, `Router::with_typed_slice_ref` goes one step further and hands the handler a `&[T]` borrowed straight out of the receive buffer, with no allocation or element copy, when the client sends the *aligned* wire form via `call_typed_slice_aligned`:
+
+```rust
+use repe::{Client, Router, Server};
+
+let router = Router::new()
+    .with_typed_slice_ref::<f64, f64, _>("/sum", |xs| Ok(vec![xs.iter().sum()]));
+let server = Server::new(router);
+let listener = server.listen("127.0.0.1:0")?;
+let addr = listener.local_addr()?;
+std::thread::spawn(move || { let _ = server.serve(listener); });
+
+let client = Client::connect(addr)?;
+let out: Vec<f64> = client.call_typed_slice_aligned("/sum", &[1.0, 2.0, 3.0])?;
+assert_eq!(out, vec![6.0]);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+A `with_typed_slice_ref` route is a drop-in superset of `with_typed_slice`: it still accepts the regular `call_typed_slice` / serde clients (bulk-copying those), and falls back to a bulk copy whenever a borrow isn't possible, so correctness never depends on the alignment landing.
+
 ## Feature Flags
 
 | Flag | Effect |
