@@ -1,7 +1,7 @@
 use crate::constants::{BodyFormat, ErrorCode, QueryFormat, REPE_VERSION};
 use crate::error::RepeError;
 use crate::io::{read_message, write_message};
-use crate::message::{Message, MessageBuilder, build_aligned_typed_slice_frame};
+use crate::message::{Message, MessageBuilder};
 use beve::from_slice as beve_from_slice;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -543,51 +543,13 @@ impl Client {
         T: beve::BeveTypedSlice,
         R: beve::BeveTypedSlice,
     {
-        let id = self.next_request_id();
-        let frame = build_aligned_typed_slice_frame(id, path.as_ref(), body);
-        let resp = self.dispatch_raw_frame(id, frame, timeout)?;
+        let resp = self.call_with_body_and_timeout(
+            path,
+            QueryFormat::JsonPointer as u16,
+            timeout,
+            |builder| Ok(builder.body_aligned_typed_slice(body)),
+        )?;
         resp.decode_typed_slice()
-    }
-
-    /// Send a fully-built request frame under request id `id`, correlate the
-    /// response, and validate it. The raw-frame twin of
-    /// [`call_with_body_and_timeout`](Self::call_with_body_and_timeout) for the
-    /// in-place aligned framing path (whose padding depends on the payload's
-    /// absolute frame offset, so it cannot go through [`MessageBuilder`]).
-    fn dispatch_raw_frame(
-        &self,
-        id: u64,
-        frame: Vec<u8>,
-        timeout: Option<Duration>,
-    ) -> Result<Message, RepeError> {
-        let (sender, receiver) = mpsc::channel();
-        {
-            let mut pending = self
-                .inner
-                .pending
-                .lock()
-                .map_err(|_| poisoned_lock_error("client pending map"))?;
-            pending.insert(id, sender);
-        }
-
-        if let Err(err) = self.write_raw_frame(&frame) {
-            self.remove_pending(id);
-            return Err(err);
-        }
-
-        let resp = self.wait_for_response(id, receiver, timeout)?;
-        Self::validate_response(id, resp)
-    }
-
-    fn write_raw_frame(&self, frame: &[u8]) -> Result<(), RepeError> {
-        let mut writer = self
-            .inner
-            .writer
-            .lock()
-            .map_err(|_| poisoned_lock_error("client writer"))?;
-        writer.write_all(frame)?;
-        writer.flush()?;
-        Ok(())
     }
 
     fn call_with_body_and_timeout<P, F>(

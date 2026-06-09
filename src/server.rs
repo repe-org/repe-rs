@@ -574,8 +574,8 @@ where
 /// BEVE aligned-typed-array marker byte (`0x5C`): a typed array (type 4) in the
 /// bool/string/aligned sub-category (3) with the aligned discriminator (2), per
 /// BEVE spec §4. It opens the aligned wire form that
-/// [`crate::message::build_aligned_typed_slice_frame`] emits and the borrowing
-/// route decodes. Kept as a local constant rather than reaching into BEVE's
+/// [`MessageBuilder::body_aligned_typed_slice`](crate::message::MessageBuilder::body_aligned_typed_slice)
+/// emits and the borrowing route decodes. Kept as a local constant rather than reaching into BEVE's
 /// header internals; [`aligned_marker_matches_beve`] pins it to BEVE's actual
 /// output so a future BEVE change cannot drift past us silently.
 const BEVE_ALIGNED_TYPED_ARRAY_MARKER: u8 = 0x5C;
@@ -1850,6 +1850,41 @@ mod tests {
     fn aligned_marker_matches_beve() {
         let encoded = beve::to_vec_aligned_typed_slice(&[1.0_f64]);
         assert_eq!(encoded.first(), Some(&BEVE_ALIGNED_TYPED_ARRAY_MARKER));
+    }
+
+    /// The borrowing decoder's owned fallback: a well-formed aligned body whose
+    /// payload is not aligned in this buffer (here, forced by placing it at an odd
+    /// offset) must refuse the zero-copy borrow and bulk-copy instead, still
+    /// returning the correct data. This is the path a `body_aligned_typed_slice`
+    /// body padded for the wrong frame offset (e.g. query set after the body) takes
+    /// on the server, so the documented graceful degradation is correctness-safe.
+    #[test]
+    fn ref_decode_falls_back_to_owned_when_payload_unaligned() {
+        let data: Vec<f64> = (0..16).map(|i| i as f64 * 3.0).collect();
+        let aligned = beve::to_vec_aligned_typed_slice(&data);
+
+        // Place the aligned body at offset 1 in a genuinely 8-aligned backing
+        // buffer (`Vec<u64>`), so its DATA pointer is deterministically odd and the
+        // zero-copy borrow must refuse regardless of allocator behavior.
+        let words = aligned.len() / 8 + 2;
+        let mut backing: Vec<u64> = vec![0; words];
+        // SAFETY: `backing` is 8-aligned and large enough to hold `aligned` at +1.
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(backing.as_mut_ptr() as *mut u8, words * 8) };
+        bytes[1..1 + aligned.len()].copy_from_slice(&aligned);
+        let body = &bytes[1..1 + aligned.len()];
+
+        let decoded = decode_typed_slice_ref_body::<f64>(body).expect("decode");
+        assert!(
+            matches!(decoded, SliceInput::Owned(_)),
+            "unaligned aligned body must take the owned fallback"
+        );
+        assert_eq!(decoded.as_slice(), data.as_slice());
+
+        // And the regular (unaligned wire) typed array always decodes owned too.
+        let regular = beve::to_vec_typed_slice(&data);
+        let decoded = decode_typed_slice_ref_body::<f64>(&regular).expect("decode regular");
+        assert_eq!(decoded.as_slice(), data.as_slice());
     }
 
     #[test]
