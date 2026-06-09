@@ -39,6 +39,13 @@ impl AsyncServer {
     pub async fn serve(self, listener: TcpListener) -> std::io::Result<()> {
         loop {
             let (stream, _addr) = listener.accept().await?;
+            // Disable Nagle on the response path: a buffered response is flushed
+            // as one write, so coalescing it with delayed-ACK only adds latency,
+            // most visibly on large multi-segment numeric bodies. The async
+            // client already sets this on its side (`AsyncClient::connect`); this
+            // matches it on the accept side. A failure here is non-fatal (the
+            // socket still works, just with Nagle on), so it is not propagated.
+            let _ = stream.set_nodelay(true);
             let router = self.router.clone();
             let rt = self.read_timeout;
             let wt = self.write_timeout;

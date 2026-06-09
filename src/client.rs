@@ -149,6 +149,37 @@ impl Client {
         self.call_typed_beve_with_optional_timeout(path, body, Some(timeout))
     }
 
+    /// Send a contiguous numeric slice and decode a contiguous numeric `Vec<R>`
+    /// response, both through BEVE's typed-slice fast path. The synchronous twin
+    /// of [`AsyncClient::call_slice`](crate::AsyncClient::call_slice); see it for
+    /// the full contract. Pairs with a [`Router::with_slice`] route.
+    ///
+    /// [`Router::with_slice`]: crate::server::Router::with_slice
+    pub fn call_slice<P, T, R>(&self, path: P, body: &[T]) -> Result<Vec<R>, RepeError>
+    where
+        P: AsRef<str>,
+        T: beve::BeveTypedSlice,
+        R: beve::BeveTypedSlice,
+    {
+        self.call_slice_with_optional_timeout(path, body, None)
+    }
+
+    /// Numeric-slice request that fails if no response arrives before `timeout`.
+    /// Timeout-bearing twin of [`call_slice`](Self::call_slice).
+    pub fn call_slice_with_timeout<P, T, R>(
+        &self,
+        path: P,
+        body: &[T],
+        timeout: Duration,
+    ) -> Result<Vec<R>, RepeError>
+    where
+        P: AsRef<str>,
+        T: beve::BeveTypedSlice,
+        R: beve::BeveTypedSlice,
+    {
+        self.call_slice_with_optional_timeout(path, body, Some(timeout))
+    }
+
     /// Send a JSON-pointer request with an empty body and return the full response message.
     ///
     /// This is useful for protocols that use empty-body semantics (for example, registry READs).
@@ -442,6 +473,26 @@ impl Client {
             |builder| builder.body_beve(body),
         )?;
         Self::decode_typed_response(&resp)
+    }
+
+    fn call_slice_with_optional_timeout<P, T, R>(
+        &self,
+        path: P,
+        body: &[T],
+        timeout: Option<Duration>,
+    ) -> Result<Vec<R>, RepeError>
+    where
+        P: AsRef<str>,
+        T: beve::BeveTypedSlice,
+        R: beve::BeveTypedSlice,
+    {
+        let resp = self.call_with_body_and_timeout(
+            path,
+            QueryFormat::JsonPointer as u16,
+            timeout,
+            |builder| Ok(builder.body_typed_slice(body)),
+        )?;
+        resp.decode_typed_slice()
     }
 
     fn call_with_body_and_timeout<P, F>(

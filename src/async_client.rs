@@ -181,6 +181,51 @@ impl AsyncClient {
             .await
     }
 
+    /// Send a contiguous numeric slice and decode a contiguous numeric `Vec<R>`
+    /// response, both through BEVE's typed-slice fast path.
+    ///
+    /// The bulk counterpart of [`call_typed_beve`](Self::call_typed_beve) for
+    /// whole-body numeric arrays: the request `&[T]` is framed with a single
+    /// `copy_nonoverlapping` ([`MessageBuilder::body_typed_slice`]) instead of a
+    /// serde walk, and the response is read back with
+    /// [`Message::decode_typed_slice`] (one bulk copy). Pairs with a server route
+    /// registered via [`Router::with_slice`], and the wire bytes are identical to
+    /// the serde path, so it also interoperates with a `with_typed`/serde peer.
+    ///
+    /// `T` and `R` are scalar numeric types ([`f32`], [`f64`], integer widths,
+    /// ...) and need not match. The response must be a BEVE typed array of `R`;
+    /// a mismatched element type or non-typed-array body surfaces as a
+    /// [`RepeError::Beve`].
+    ///
+    /// [`call_typed_beve`]: Self::call_typed_beve
+    /// [`Router::with_slice`]: crate::server::Router::with_slice
+    /// [`MessageBuilder::body_typed_slice`]: crate::message::MessageBuilder::body_typed_slice
+    pub async fn call_slice<P, T, R>(&self, path: P, body: &[T]) -> Result<Vec<R>, RepeError>
+    where
+        P: AsRef<str>,
+        T: beve::BeveTypedSlice,
+        R: beve::BeveTypedSlice,
+    {
+        self.call_slice_with_optional_timeout(path, body, None).await
+    }
+
+    /// Send a numeric-slice request and fail if no response arrives before
+    /// `timeout_duration`. Timeout-bearing twin of [`call_slice`](Self::call_slice).
+    pub async fn call_slice_with_timeout<P, T, R>(
+        &self,
+        path: P,
+        body: &[T],
+        timeout_duration: Duration,
+    ) -> Result<Vec<R>, RepeError>
+    where
+        P: AsRef<str>,
+        T: beve::BeveTypedSlice,
+        R: beve::BeveTypedSlice,
+    {
+        self.call_slice_with_optional_timeout(path, body, Some(timeout_duration))
+            .await
+    }
+
     /// Send a JSON-pointer request with an empty body and return the full response message.
     ///
     /// This is useful for protocols that use empty-body semantics (for example, registry READs).
@@ -473,6 +518,28 @@ impl AsyncClient {
             )
             .await?;
         Self::decode_typed_response(&resp)
+    }
+
+    async fn call_slice_with_optional_timeout<P, T, R>(
+        &self,
+        path: P,
+        body: &[T],
+        timeout_duration: Option<Duration>,
+    ) -> Result<Vec<R>, RepeError>
+    where
+        P: AsRef<str>,
+        T: beve::BeveTypedSlice,
+        R: beve::BeveTypedSlice,
+    {
+        let resp = self
+            .call_with_body_and_timeout(
+                path,
+                QueryFormat::JsonPointer as u16,
+                timeout_duration,
+                |builder| Ok(builder.body_typed_slice(body)),
+            )
+            .await?;
+        resp.decode_typed_slice()
     }
 
     async fn call_with_body_and_timeout<P, F>(
