@@ -206,7 +206,8 @@ impl AsyncClient {
         T: beve::BeveTypedSlice,
         R: beve::BeveTypedSlice,
     {
-        self.call_slice_with_optional_timeout(path, body, None).await
+        self.call_slice_with_optional_timeout(path, body, None)
+            .await
     }
 
     /// Send a numeric-slice request and fail if no response arrives before
