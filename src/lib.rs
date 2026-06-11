@@ -34,6 +34,8 @@ pub mod structs;
 pub mod udp_client;
 #[cfg(all(feature = "fleet-udp", not(target_arch = "wasm32")))]
 pub mod uniudp_fleet;
+#[cfg(all(feature = "value-stream", not(target_arch = "wasm32")))]
+pub mod value_stream;
 #[cfg(all(feature = "websocket-wasm", target_arch = "wasm32"))]
 pub mod wasm_client;
 #[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]
@@ -102,6 +104,12 @@ pub use structs::{RepeStruct, StructError};
 pub use udp_client::UniUdpClient;
 #[cfg(all(feature = "fleet-udp", not(target_arch = "wasm32")))]
 pub use uniudp_fleet::{SendResult, UniUdpFleet, UniUdpNode, UniUdpNodeConfig};
+#[cfg(all(feature = "value-stream", not(target_arch = "wasm32")))]
+pub use value_stream::{
+    AsyncSvsClient, Compression, RouterValueStreamExt, StreamOpts, StreamOutput,
+    pull_complex_slice, pull_complex_slice_async, pull_stream, pull_to_beve_file,
+    pull_to_beve_zst_file, pull_typed_slice, pull_typed_slice_async, pull_value, pull_value_async,
+};
 #[cfg(all(feature = "websocket-wasm", target_arch = "wasm32"))]
 pub use wasm_client::WasmClient;
 #[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]

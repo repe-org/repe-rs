@@ -1,6 +1,6 @@
 [package]
 name = "repe"
-version = "3.8.0"
+version = "3.9.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Rust implementation of the REPE RPC protocol (JSON-focused)"
@@ -41,6 +41,10 @@ websocket-wasm = [
     "dep:web-sys",
 ]
 cli = ["websocket", "dep:clap", "dep:clap_complete"]
+# Streaming transfer of a serialized, optionally zstd-compressed in-memory value
+# over ordinary REPE request/response (the SVS wire contract). Pulls in `zstd`
+# for the compressed path; the engine itself is plain `std` threads + channels.
+value-stream = ["dep:zstd"]
 
 [[bin]]
 name = "repe"
@@ -55,6 +59,10 @@ required-features = ["websocket"]
 name = "websocket_cohosting"
 required-features = ["websocket"]
 
+[[example]]
+name = "value_stream"
+required-features = ["value-stream"]
+
 [dependencies]
 # beve's default feature set is already lean (core ser/de + streaming +
 # typed/complex bulk slice helpers); the heavy MATLAB/HDF5 `mat` interop is opt-in
@@ -68,7 +76,7 @@ required-features = ["websocket"]
 # `to_writer_complex_slice` / `complex_slice_size` (the streaming complex
 # primitives behind `write_message_complex_slice`) and the `read_typed_slice` /
 # `read_complex_slice` bulk decoders behind the typed-numeric body fast path.
-beve = "2.3"
+beve = "2.5"
 serde = { version = "1", features = ["derive" ] }
 serde_json = "1"
 thiserror = "1"
@@ -79,6 +87,9 @@ futures-channel = { version = "0.3", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
 clap = { version = "4", features = ["derive", "env"], optional = true }
 clap_complete = { version = "4", optional = true }
+# Streaming zstd codec for the `value-stream` feature (SVS `compression = 1`).
+# Optional so the core crate stays free of the libzstd C dependency.
+zstd = { version = "0.13", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "io-util", "sync"] }
@@ -109,6 +120,10 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 # Only for tests: construct f16/bf16 values to exercise the half-float element
 # types of the typed-numeric body path (the runtime dep on half comes via beve).
 half = "2.4"
+# Only for the `value-stream` integration tests: independently decompress a
+# pulled `.beve.zst` file to assert its contents. Matches the optional runtime
+# dep version.
+zstd = "0.13"
 
 [[bench]]
 # Wire-serialization throughput: `Message::to_vec` vs the new

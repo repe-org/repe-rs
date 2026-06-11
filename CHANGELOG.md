@@ -1,5 +1,17 @@
 # Changelog
 
+## [3.9.0] - 2026-06-11
+
+### Added
+- A **Serialized Value Stream (SVS)** download path behind the optional `value-stream` feature: stream a large (multi-GB even compressed) BEVE-serialized, optionally zstd-compressed in-memory value over an ordinary REPE request/response connection. Flow control is the round trip itself (no ACK window, no unbounded queue), and the producer never materializes a full serialized or compressed copy. Implements the cross-language [SVS spec](https://github.com/repe-org/REPE/blob/main/serialized-stream-protocol.md).
+  - **Producer** (via `RouterValueStreamExt` on `Router`): `with_value_stream::<T: Serialize>` (arbitrary serde value), `with_typed_value_stream::<T: BeveTypedSlice>` (a `Vec<T>` bulk typed array), and `with_complex_value_stream::<T>` (a `Vec<Complex<T>>`, e.g. IQ buffers). Each registers `/_svs/{open,next,cancel}` backed by a bounded per-stream session (serialize → optional zstd → chunk into a bounded channel). The `next` handler reports `Execution::OffReader` and blocks for backpressure on the sync `Server` and the WebSocket server; it is not for the inline async server (documented in the module).
+  - **Sync consumer**: `pull_value::<T>` / `pull_to_beve_file` / `pull_to_beve_zst_file` / general `pull_stream` (in-memory value, decompressed `.beve` file, raw `.beve.zst` file — file modes commit atomically via temp-then-rename only after the terminating chunk), plus the bulk `pull_typed_slice::<T>` / `pull_complex_slice::<T>` (memcpy decode straight into the result `Vec`).
+  - **Async consumer**: `pull_value_async` / `pull_typed_slice_async` / `pull_complex_slice_async`, generic over a sealed `AsyncSvsClient` transport — they drive either the async-TCP `AsyncClient` or (with the `websocket` feature) the `WebSocketClient`. The blocking `Read`-based decoders run on a `spawn_blocking` task draining a bounded channel fed by an async `next`-issuing task, so the runtime is never parked and the channel bound is the backpressure.
+- `Router::with_erased_handler` — the low-level escape hatch (register a raw `HandlerErased` returning a fully custom `Message`) the SVS handlers are built on; broadly useful beyond SVS.
+
+### Changed
+- Depend on `beve = "2.5"` (raised from `"2.3"`), the floor for the `read_typed_slice_from_reader` / `read_complex_slice_from_reader` streaming bulk decoders backing the bulk pull receivers.
+
 ## [3.8.0] - 2026-06-09
 
 ### Added
