@@ -1004,6 +1004,31 @@ impl Router {
         self
     }
 
+    /// Register a custom [`HandlerErased`] at `path`, the low-level escape hatch
+    /// beneath the typed/JSON registrars.
+    ///
+    /// The built-in `with_*` constructors decode the request body into a value
+    /// and frame the response for you; this one hands you the raw request and
+    /// lets you return any [`Message`], so you control the response query bytes,
+    /// query format, and body format directly. That is what a protocol carried
+    /// over REPE but not shaped like a single value-in/value-out call needs — for
+    /// example a handler that returns a raw-binary body with a flag byte in the
+    /// response query (see the `value-stream` feature, which is built entirely on
+    /// this method).
+    ///
+    /// The handler participates in the middleware pipeline and the response
+    /// query-echo rule exactly like the built-ins: a response left with an empty
+    /// query has the request query echoed in by the dispatch layer, while a
+    /// query the handler sets itself is preserved (see [`HandlerErased`]).
+    ///
+    /// Distinct from [`with_handler`](Self::with_handler), which adapts a
+    /// [`JsonTypedHandler`] (value-in/value-out); this takes an already-erased
+    /// [`HandlerErased`] for full control of the response frame.
+    pub fn with_erased_handler(mut self, path: &str, handler: Arc<dyn HandlerErased>) -> Self {
+        self.insert_route(path, handler);
+        self
+    }
+
     /// Attach a middleware that runs before handlers and can short-circuit requests.
     pub fn with_middleware(mut self, middleware: impl Middleware + 'static) -> Self {
         self.register_middleware(middleware);

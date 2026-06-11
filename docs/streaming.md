@@ -8,6 +8,8 @@ When you need to push multi-GB blobs (capture files, log streams, paginated quer
 
 The wire shape (`transfer_begin`, chunk body fields, ACK / cancel / resume bodies) is up to the embedder. This module deals only in offsets, ACKs, and opaque body bytes. See `TransferControl`, `TransferRegistry<K>`, and `spawn_watchdog` for the full surface.
 
+> **Before reaching for this module:** if your payload is a **serialized + compressed in-memory value** of unknown compressed length (BEVE + zstd), the [Streaming Serialized Values](streaming-serialized-values.md) proposal is a lightweight **client-pull** transfer that bounds memory on both ends (file or in-memory value output) using request/response as the flow control — no credit window or replay ring. `repe::stream` earns its full machinery specifically when you need **pipelined push throughput with backpressure** or **resume across a dropped connection**, which client-pull defers.
+
 ## Sketch
 
 ```rust

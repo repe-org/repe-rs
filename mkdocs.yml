@@ -68,6 +68,7 @@ nav:
   - Fleet: fleet.md
   - WebSocket Transport: websocket.md
   - Streaming: streaming.md
+  - Streaming Serialized Values: streaming-serialized-values.md
   - Command-Line Client: cli.md
 
 extra:
