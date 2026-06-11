@@ -142,6 +142,69 @@ async fn unknown_resource_errors() {
         small_chunks(Compression::None),
     ));
     let client = AsyncClient::connect(addr).await.expect("connect");
-    let got = pull_value_async::<Payload>(&client, "does-not-exist").await;
+    let got = pull_value_async::<Payload, _>(&client, "does-not-exist").await;
     assert!(got.is_err(), "unknown resource must error");
+}
+
+// The same async pullers drive a `WebSocketClient`. The WebSocket server runs
+// the SVS `next` handler off the reader task (it honours `Execution::OffReader`),
+// so blocking for backpressure there is fine.
+#[cfg(feature = "websocket")]
+mod websocket {
+    use super::*;
+    use repe::{WebSocketClient, WebSocketServer};
+
+    /// Spawn a detached WebSocket server for `router` on path `/repe` and return a
+    /// connected client.
+    async fn ws_client(router: Router) -> WebSocketClient {
+        let listener = WebSocketServer::listen("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = WebSocketServer::new(router)
+                .serve_listener(listener, "/repe")
+                .await;
+        });
+        WebSocketClient::connect(&format!("ws://{addr}/repe"))
+            .await
+            .expect("connect")
+    }
+
+    #[tokio::test]
+    async fn value_mode_over_websocket() {
+        let payload = sample_payload();
+        let p = payload.clone();
+        let client = ws_client(Router::new().with_value_stream(
+            move |resource: &str| (resource == "payload").then(|| p.clone()),
+            small_chunks(Compression::Zstd),
+        ))
+        .await;
+        let got: Payload = pull_value_async(&client, "payload").await.expect("pull");
+        assert_eq!(got, payload);
+    }
+
+    #[tokio::test]
+    async fn typed_slice_over_websocket() {
+        let v = f64_samples();
+        let vc = v.clone();
+        let client = ws_client(Router::new().with_typed_value_stream(
+            move |resource: &str| (resource == "buf").then(|| vc.clone()),
+            small_chunks(Compression::None),
+        ))
+        .await;
+        let got: Vec<f64> = pull_typed_slice_async(&client, "buf").await.expect("pull");
+        assert_eq!(got, v);
+    }
+
+    #[tokio::test]
+    async fn complex_slice_over_websocket() {
+        let v = iq_samples();
+        let vc = v.clone();
+        let client = ws_client(Router::new().with_complex_value_stream(
+            move |resource: &str| (resource == "iq").then(|| vc.clone()),
+            small_chunks(Compression::Zstd),
+        ))
+        .await;
+        let got: Vec<Complex<f32>> = pull_complex_slice_async(&client, "iq").await.expect("pull");
+        assert_eq!(got, v);
+    }
 }

@@ -1067,6 +1067,93 @@ fn cancel_stream(client: &Client, stream_id: u64, reason: &str) -> Result<(), Re
 // `Read` that drains that channel. The bound supplies backpressure (the SVS
 // round trip itself), so neither side runs ahead of the other.
 
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for crate::async_client::AsyncClient {}
+    #[cfg(feature = "websocket")]
+    impl Sealed for crate::websocket_client::WebSocketClient {}
+}
+
+/// The async REPE transport an SVS pull is driven over. Implemented for the
+/// async-TCP [`AsyncClient`] and, with the `websocket` feature, the
+/// [`WebSocketClient`](crate::WebSocketClient) — both expose the same
+/// request/notify-with-formats calls the pull loop needs, so the async pullers
+/// accept either. Sealed: it abstracts over the in-crate async clients and is not
+/// meant to be implemented downstream.
+//
+// `async fn` in a public trait normally warns (callers can't name/bound the
+// returned future), but every use here `.await`s it inline on the caller's task
+// — never spawned — so no `Send` bound is needed and the warning does not apply.
+#[allow(async_fn_in_trait)]
+pub trait AsyncSvsClient: sealed::Sealed {
+    /// Request/response with explicit query/body formats (drives `open` / `next`).
+    async fn svs_call(
+        &self,
+        path: &str,
+        query_format: u16,
+        body: Option<&[u8]>,
+        body_format: u16,
+    ) -> Result<Message, RepeError>;
+
+    /// Fire-and-forget notify with explicit formats (drives best-effort `cancel`).
+    async fn svs_notify(
+        &self,
+        path: &str,
+        query_format: u16,
+        body: Option<&[u8]>,
+        body_format: u16,
+    ) -> Result<(), RepeError>;
+}
+
+impl AsyncSvsClient for AsyncClient {
+    async fn svs_call(
+        &self,
+        path: &str,
+        query_format: u16,
+        body: Option<&[u8]>,
+        body_format: u16,
+    ) -> Result<Message, RepeError> {
+        self.call_with_formats(path, query_format, body, body_format)
+            .await
+    }
+
+    async fn svs_notify(
+        &self,
+        path: &str,
+        query_format: u16,
+        body: Option<&[u8]>,
+        body_format: u16,
+    ) -> Result<(), RepeError> {
+        self.notify_with_formats(path, query_format, body, body_format)
+            .await
+    }
+}
+
+#[cfg(feature = "websocket")]
+impl AsyncSvsClient for crate::websocket_client::WebSocketClient {
+    async fn svs_call(
+        &self,
+        path: &str,
+        query_format: u16,
+        body: Option<&[u8]>,
+        body_format: u16,
+    ) -> Result<Message, RepeError> {
+        self.call_with_formats(path, query_format, body, body_format)
+            .await
+    }
+
+    async fn svs_notify(
+        &self,
+        path: &str,
+        query_format: u16,
+        body: Option<&[u8]>,
+        body_format: u16,
+    ) -> Result<(), RepeError> {
+        self.notify_with_formats(path, query_format, body, body_format)
+            .await
+    }
+}
+
 /// Chunks held in flight between the async pull task and the blocking decoder.
 /// Small: the SVS round trip already paces the producer, so this only needs to
 /// cover the gap between a `next` completing and the decoder consuming it.
@@ -1116,15 +1203,15 @@ impl Read for ChannelReader {
 /// Issue `next` requests over `client` and feed each non-empty chunk into `tx`
 /// until the `last` flag. Returns early (without error) if the decoder finished
 /// and dropped its receiver. `tx` drops on return, signalling EOF to the reader.
-async fn pull_loop_async(
-    client: &AsyncClient,
+async fn pull_loop_async<C: AsyncSvsClient>(
+    client: &C,
     stream_id: u64,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 ) -> Result<(), RepeError> {
     let body = next_request_body(stream_id)?;
     loop {
         let resp = client
-            .call_with_formats(
+            .svs_call(
                 ROUTE_NEXT,
                 QueryFormat::JsonPointer as u16,
                 Some(&body),
@@ -1143,14 +1230,14 @@ async fn pull_loop_async(
 }
 
 /// Best-effort async `cancel` (notify form, no reply awaited; SVS §2.3).
-async fn cancel_stream_async(
-    client: &AsyncClient,
+async fn cancel_stream_async<C: AsyncSvsClient>(
+    client: &C,
     stream_id: u64,
     reason: &str,
 ) -> Result<(), RepeError> {
     let body = cancel_request_body(stream_id, reason)?;
     client
-        .notify_with_formats(
+        .svs_notify(
             ROUTE_CANCEL,
             QueryFormat::JsonPointer as u16,
             Some(&body),
@@ -1163,8 +1250,8 @@ async fn cancel_stream_async(
 /// `decode` run concurrently across the channel, with `decode` receiving a `Read`
 /// over the (optionally zstd-decompressed) chunk stream. Shared by the async
 /// value and bulk-slice pullers.
-async fn pull_decode_async<V, F>(
-    client: &AsyncClient,
+async fn pull_decode_async<V, F, C: AsyncSvsClient>(
+    client: &C,
     resource: &str,
     decode: F,
 ) -> Result<V, RepeError>
@@ -1174,7 +1261,7 @@ where
 {
     let body = open_request_body(resource)?;
     let resp = client
-        .call_with_formats(
+        .svs_call(
             ROUTE_OPEN,
             QueryFormat::JsonPointer as u16,
             Some(&body),
@@ -1219,11 +1306,13 @@ where
 /// Async counterpart of [`pull_value`]: pull `resource` and decode the whole
 /// stream into a `T` via BEVE (streaming, optionally zstd-decompressed).
 ///
-/// Drives an [`AsyncClient`]; the producer must run on a server that honours
+/// `client` is any [`AsyncSvsClient`] — the async-TCP [`AsyncClient`] or, with
+/// the `websocket` feature, the [`WebSocketClient`](crate::WebSocketClient). The
+/// producer must run on a server that honours
 /// [`Execution::OffReader`](crate::Execution) (the sync [`Server`](crate::Server)
 /// or the WebSocket server), not the inline async server.
-pub async fn pull_value_async<T: DeserializeOwned + Send + 'static>(
-    client: &AsyncClient,
+pub async fn pull_value_async<T: DeserializeOwned + Send + 'static, C: AsyncSvsClient>(
+    client: &C,
     resource: &str,
 ) -> Result<T, RepeError> {
     pull_decode_async(client, resource, |reader| {
@@ -1233,9 +1322,10 @@ pub async fn pull_value_async<T: DeserializeOwned + Send + 'static>(
 }
 
 /// Async counterpart of [`pull_typed_slice`]: bulk-decode a streamed numeric
-/// array straight into a `Vec<T>` (memcpy of the little-endian payload).
-pub async fn pull_typed_slice_async<T: beve::BeveTypedSlice + Send + 'static>(
-    client: &AsyncClient,
+/// array straight into a `Vec<T>` (memcpy of the little-endian payload). Accepts
+/// any [`AsyncSvsClient`].
+pub async fn pull_typed_slice_async<T: beve::BeveTypedSlice + Send + 'static, C: AsyncSvsClient>(
+    client: &C,
     resource: &str,
 ) -> Result<Vec<T>, RepeError> {
     pull_decode_async(client, resource, |reader| {
@@ -1245,9 +1335,12 @@ pub async fn pull_typed_slice_async<T: beve::BeveTypedSlice + Send + 'static>(
 }
 
 /// Async counterpart of [`pull_complex_slice`]: bulk-decode a streamed complex
-/// array straight into a `Vec<Complex<T>>`.
-pub async fn pull_complex_slice_async<T: beve::BeveTypedSlice + Send + 'static>(
-    client: &AsyncClient,
+/// array straight into a `Vec<Complex<T>>`. Accepts any [`AsyncSvsClient`].
+pub async fn pull_complex_slice_async<
+    T: beve::BeveTypedSlice + Send + 'static,
+    C: AsyncSvsClient,
+>(
+    client: &C,
     resource: &str,
 ) -> Result<Vec<Complex<T>>, RepeError> {
     pull_decode_async(client, resource, |reader| {

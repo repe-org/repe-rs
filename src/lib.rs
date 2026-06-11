@@ -106,9 +106,9 @@ pub use udp_client::UniUdpClient;
 pub use uniudp_fleet::{SendResult, UniUdpFleet, UniUdpNode, UniUdpNodeConfig};
 #[cfg(all(feature = "value-stream", not(target_arch = "wasm32")))]
 pub use value_stream::{
-    Compression, RouterValueStreamExt, StreamOpts, StreamOutput, pull_complex_slice,
-    pull_complex_slice_async, pull_stream, pull_to_beve_file, pull_to_beve_zst_file,
-    pull_typed_slice, pull_typed_slice_async, pull_value, pull_value_async,
+    AsyncSvsClient, Compression, RouterValueStreamExt, StreamOpts, StreamOutput,
+    pull_complex_slice, pull_complex_slice_async, pull_stream, pull_to_beve_file,
+    pull_to_beve_zst_file, pull_typed_slice, pull_typed_slice_async, pull_value, pull_value_async,
 };
 #[cfg(all(feature = "websocket-wasm", target_arch = "wasm32"))]
 pub use wasm_client::WasmClient;
