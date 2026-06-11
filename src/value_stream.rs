@@ -23,7 +23,11 @@
 //! * **Download** (server produces, client pulls) — the primary direction.
 //!   Register a producer with [`RouterValueStreamExt::with_value_stream`] and
 //!   pull with [`pull_value`] / [`pull_to_beve_file`] / [`pull_to_beve_zst_file`]
-//!   (or the general [`pull_stream`]).
+//!   (or the general [`pull_stream`]) over the synchronous [`Client`]. From async
+//!   code, drive an [`AsyncClient`] with [`pull_value_async`] /
+//!   [`pull_typed_slice_async`] / [`pull_complex_slice_async`]: these run the
+//!   blocking decoder on a `spawn_blocking` thread fed by an async pull loop, so
+//!   they never park the runtime.
 //!
 //! # Where the producer may run
 //!
@@ -37,6 +41,7 @@
 //! registered there would park a runtime worker; use the sync or WebSocket server
 //! for SVS producers.
 
+use crate::async_client::AsyncClient;
 use crate::client::Client;
 use crate::constants::{BodyFormat, ErrorCode, QueryFormat};
 use crate::error::RepeError;
@@ -787,16 +792,29 @@ struct OpenInfo {
     compression: Compression,
 }
 
-fn open_stream(client: &Client, resource: &str) -> Result<OpenInfo, RepeError> {
-    let body = beve::to_vec(&OpenRequest {
+/// BEVE body of an `open` request for `resource`.
+fn open_request_body(resource: &str) -> Result<Vec<u8>, RepeError> {
+    Ok(beve::to_vec(&OpenRequest {
         resource: resource.to_string(),
-    })?;
-    let resp = client.call_with_formats(
-        ROUTE_OPEN,
-        QueryFormat::JsonPointer as u16,
-        Some(&body),
-        BodyFormat::Beve as u16,
-    )?;
+    })?)
+}
+
+/// BEVE body of a `next` request for `stream_id`.
+fn next_request_body(stream_id: u64) -> Result<Vec<u8>, RepeError> {
+    Ok(beve::to_vec(&NextRequest { stream_id })?)
+}
+
+/// BEVE body of a `cancel` request for `stream_id` carrying a human `reason`.
+fn cancel_request_body(stream_id: u64, reason: &str) -> Result<Vec<u8>, RepeError> {
+    Ok(beve::to_vec(&CancelRequest {
+        stream_id,
+        reason: reason.to_string(),
+    })?)
+}
+
+/// Validate and parse an `open` response into the stream's [`OpenInfo`]. Shared
+/// by the sync and async pull drivers.
+fn parse_open_response(resp: &Message) -> Result<OpenInfo, RepeError> {
     let open: OpenResponse = resp.beve_body()?;
     if open.version != SVS_VERSION {
         return Err(RepeError::Io(io::Error::new(
@@ -818,6 +836,17 @@ fn open_stream(client: &Client, resource: &str) -> Result<OpenInfo, RepeError> {
         format: open.format,
         compression,
     })
+}
+
+fn open_stream(client: &Client, resource: &str) -> Result<OpenInfo, RepeError> {
+    let body = open_request_body(resource)?;
+    let resp = client.call_with_formats(
+        ROUTE_OPEN,
+        QueryFormat::JsonPointer as u16,
+        Some(&body),
+        BodyFormat::Beve as u16,
+    )?;
+    parse_open_response(&resp)
 }
 
 fn check_output(out: StreamOutput<'_>, open: &OpenInfo) -> Result<(), RepeError> {
@@ -1017,10 +1046,7 @@ impl Read for ChunkReader<'_> {
 }
 
 fn cancel_stream(client: &Client, stream_id: u64, reason: &str) -> Result<(), RepeError> {
-    let body = beve::to_vec(&CancelRequest {
-        stream_id,
-        reason: reason.to_string(),
-    })?;
+    let body = cancel_request_body(stream_id, reason)?;
     // Notify form: best-effort, no reply awaited (SVS §2.3).
     client.notify_with_formats(
         ROUTE_CANCEL,
@@ -1028,6 +1054,206 @@ fn cancel_stream(client: &Client, stream_id: u64, reason: &str) -> Result<(), Re
         Some(&body),
         BodyFormat::Beve as u16,
     )
+}
+
+// ---- client: async pull driver (over `AsyncClient`) ---------------------------
+//
+// The SVS receiver is a blocking pull loop feeding a blocking decoder
+// (`beve::from_reader_streaming` / the bulk slice readers / `zstd`'s `Read`
+// decoder) — none of which are `async`. To drive a pull from async code without
+// blocking the runtime, we split the two halves across the async/blocking
+// boundary: an async task issues `next` requests and feeds each chunk into a
+// bounded channel, while a `spawn_blocking` task runs the decoder over a blocking
+// `Read` that drains that channel. The bound supplies backpressure (the SVS
+// round trip itself), so neither side runs ahead of the other.
+
+/// Chunks held in flight between the async pull task and the blocking decoder.
+/// Small: the SVS round trip already paces the producer, so this only needs to
+/// cover the gap between a `next` completing and the decoder consuming it.
+const ASYNC_PULL_DEPTH: usize = 4;
+
+/// A blocking [`Read`] over a channel of chunks. Lives on the `spawn_blocking`
+/// thread and is fed by [`pull_loop_async`]; `blocking_recv` parks that thread
+/// (never the runtime) until the next chunk or end-of-stream arrives.
+struct ChannelReader {
+    rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl ChannelReader {
+    fn new(rx: tokio::sync::mpsc::Receiver<Vec<u8>>) -> Self {
+        Self {
+            rx,
+            buf: Vec::new(),
+            pos: 0,
+        }
+    }
+}
+
+impl Read for ChannelReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if self.pos < self.buf.len() {
+                let n = out.len().min(self.buf.len() - self.pos);
+                out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+                self.pos += n;
+                return Ok(n);
+            }
+            match self.rx.blocking_recv() {
+                Some(chunk) => {
+                    self.buf = chunk;
+                    self.pos = 0;
+                }
+                // Sender dropped: the pull loop reached `last` (or errored). The
+                // decoder sees a clean EOF; a short read surfaces as its own error.
+                None => return Ok(0),
+            }
+        }
+    }
+}
+
+/// Issue `next` requests over `client` and feed each non-empty chunk into `tx`
+/// until the `last` flag. Returns early (without error) if the decoder finished
+/// and dropped its receiver. `tx` drops on return, signalling EOF to the reader.
+async fn pull_loop_async(
+    client: &AsyncClient,
+    stream_id: u64,
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+) -> Result<(), RepeError> {
+    let body = next_request_body(stream_id)?;
+    loop {
+        let resp = client
+            .call_with_formats(
+                ROUTE_NEXT,
+                QueryFormat::JsonPointer as u16,
+                Some(&body),
+                BodyFormat::Beve as u16,
+            )
+            .await?;
+        let last = resp.query.first().copied() == Some(1);
+        if !resp.body.is_empty() && tx.send(resp.body).await.is_err() {
+            // Decoder is done and dropped the receiver; nothing left to feed.
+            return Ok(());
+        }
+        if last {
+            return Ok(());
+        }
+    }
+}
+
+/// Best-effort async `cancel` (notify form, no reply awaited; SVS §2.3).
+async fn cancel_stream_async(
+    client: &AsyncClient,
+    stream_id: u64,
+    reason: &str,
+) -> Result<(), RepeError> {
+    let body = cancel_request_body(stream_id, reason)?;
+    client
+        .notify_with_formats(
+            ROUTE_CANCEL,
+            QueryFormat::JsonPointer as u16,
+            Some(&body),
+            BodyFormat::Beve as u16,
+        )
+        .await
+}
+
+/// Open `resource`, then pull and decode it: the async pull loop and the blocking
+/// `decode` run concurrently across the channel, with `decode` receiving a `Read`
+/// over the (optionally zstd-decompressed) chunk stream. Shared by the async
+/// value and bulk-slice pullers.
+async fn pull_decode_async<V, F>(
+    client: &AsyncClient,
+    resource: &str,
+    decode: F,
+) -> Result<V, RepeError>
+where
+    V: Send + 'static,
+    F: FnOnce(Box<dyn Read>) -> Result<V, RepeError> + Send + 'static,
+{
+    let body = open_request_body(resource)?;
+    let resp = client
+        .call_with_formats(
+            ROUTE_OPEN,
+            QueryFormat::JsonPointer as u16,
+            Some(&body),
+            BodyFormat::Beve as u16,
+        )
+        .await?;
+    let open = parse_open_response(&resp)?;
+    if let Err(e) = require_beve(&open) {
+        let _ = cancel_stream_async(client, open.stream_id, "format incompatible").await;
+        return Err(e);
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(ASYNC_PULL_DEPTH);
+    let compression = open.compression;
+    // Starts immediately on a blocking thread; runs concurrently with the pull
+    // loop below, the two paced by the channel bound.
+    let decode_task = tokio::task::spawn_blocking(move || -> Result<V, RepeError> {
+        let reader: Box<dyn Read> = match compression {
+            Compression::None => Box::new(ChannelReader::new(rx)),
+            Compression::Zstd => Box::new(
+                zstd::stream::read::Decoder::new(ChannelReader::new(rx)).map_err(RepeError::Io)?,
+            ),
+        };
+        decode(reader)
+    });
+
+    let pull_res = pull_loop_async(client, open.stream_id, tx).await;
+    let decode_res = decode_task.await;
+    // Best-effort release; the stream is spent (or the pull failed) either way.
+    let _ = cancel_stream_async(client, open.stream_id, "pull complete").await;
+
+    // A pull/network error explains any decode-side EOF, so surface it first.
+    pull_res?;
+    match decode_res {
+        Ok(v) => v,
+        Err(join_err) => Err(RepeError::Io(io::Error::other(format!(
+            "svs decode task failed: {join_err}"
+        )))),
+    }
+}
+
+/// Async counterpart of [`pull_value`]: pull `resource` and decode the whole
+/// stream into a `T` via BEVE (streaming, optionally zstd-decompressed).
+///
+/// Drives an [`AsyncClient`]; the producer must run on a server that honours
+/// [`Execution::OffReader`](crate::Execution) (the sync [`Server`](crate::Server)
+/// or the WebSocket server), not the inline async server.
+pub async fn pull_value_async<T: DeserializeOwned + Send + 'static>(
+    client: &AsyncClient,
+    resource: &str,
+) -> Result<T, RepeError> {
+    pull_decode_async(client, resource, |reader| {
+        beve::from_reader_streaming::<_, T>(reader).map_err(RepeError::from)
+    })
+    .await
+}
+
+/// Async counterpart of [`pull_typed_slice`]: bulk-decode a streamed numeric
+/// array straight into a `Vec<T>` (memcpy of the little-endian payload).
+pub async fn pull_typed_slice_async<T: beve::BeveTypedSlice + Send + 'static>(
+    client: &AsyncClient,
+    resource: &str,
+) -> Result<Vec<T>, RepeError> {
+    pull_decode_async(client, resource, |reader| {
+        beve::read_typed_slice_from_reader::<T, _>(reader).map_err(RepeError::from)
+    })
+    .await
+}
+
+/// Async counterpart of [`pull_complex_slice`]: bulk-decode a streamed complex
+/// array straight into a `Vec<Complex<T>>`.
+pub async fn pull_complex_slice_async<T: beve::BeveTypedSlice + Send + 'static>(
+    client: &AsyncClient,
+    resource: &str,
+) -> Result<Vec<Complex<T>>, RepeError> {
+    pull_decode_async(client, resource, |reader| {
+        beve::read_complex_slice_from_reader::<T, _>(reader).map_err(RepeError::from)
+    })
+    .await
 }
 
 #[cfg(test)]
