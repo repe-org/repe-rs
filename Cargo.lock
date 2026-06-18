@@ -939,7 +939,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "repe"
-version = "3.9.0"
+version = "3.10.0"
 dependencies = [
  "beve",
  "clap",
