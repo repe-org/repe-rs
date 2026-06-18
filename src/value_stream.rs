@@ -11,6 +11,17 @@
 //! transfer, to write the compressed bytes to a file, decompress them to a file,
 //! or stream-decode them straight into a `T`.
 //!
+//! A producer may also stream **opaque, already-serialized bytes** verbatim from
+//! any [`Read`] ([`RouterValueStreamExt::with_reader_stream`]) rather than
+//! re-serializing a value. That is the fit when the bytes already exist in their
+//! final on-disk form: the consumer pulls them with [`pull_to_file`] /
+//! [`pull_to_file_async`] (or the format-agnostic [`pull_consume_async`]) and,
+//! with [`Compression::None`], writes a byte-identical copy. SVS does not commit
+//! a content digest on the wire, so when end-to-end integrity matters the
+//! producer and consumer agree on one out of band and the consumer recomputes it
+//! over the streamed bytes with [`pull_to_file_verified_async`], which vetoes the
+//! atomic rename on a mismatch.
+//!
 //! This module is the repe-rs **reference implementation** of the SVS contract.
 //! The normative wire definition (routes, `stream_id` encoding, the `last`-flag
 //! placement, the `format`/`compression` tags) lives in the REPE org repository
@@ -21,13 +32,22 @@
 //! # Directions
 //!
 //! * **Download** (server produces, client pulls) — the primary direction.
-//!   Register a producer with [`RouterValueStreamExt::with_value_stream`] and
-//!   pull with [`pull_value`] / [`pull_to_beve_file`] / [`pull_to_beve_zst_file`]
-//!   (or the general [`pull_stream`]) over the synchronous [`Client`]. From async
-//!   code, drive an [`AsyncClient`] with [`pull_value_async`] /
-//!   [`pull_typed_slice_async`] / [`pull_complex_slice_async`]: these run the
-//!   blocking decoder on a `spawn_blocking` thread fed by an async pull loop, so
-//!   they never park the runtime.
+//!   Register a producer with [`RouterValueStreamExt::with_value_stream`] (a
+//!   serde value), [`with_typed_value_stream`] / [`with_complex_value_stream`] (a
+//!   bulk numeric / complex array), or [`with_reader_stream`] (opaque bytes from
+//!   a [`Read`]). Pull with [`pull_value`] / [`pull_to_beve_file`] /
+//!   [`pull_to_beve_zst_file`] / [`pull_to_file`] (or the general
+//!   [`pull_stream`]) over the synchronous [`Client`]. From async code, drive an
+//!   [`AsyncClient`] (or a `WebSocketClient`) with [`pull_value_async`] /
+//!   [`pull_typed_slice_async`] / [`pull_complex_slice_async`] /
+//!   [`pull_to_file_async`] / [`pull_to_file_verified_async`], or the
+//!   format-agnostic [`pull_consume_async`]: these run the blocking decoder on a
+//!   `spawn_blocking` thread fed by an async pull loop, so they never park the
+//!   runtime.
+//!
+//! [`with_typed_value_stream`]: RouterValueStreamExt::with_typed_value_stream
+//! [`with_complex_value_stream`]: RouterValueStreamExt::with_complex_value_stream
+//! [`with_reader_stream`]: RouterValueStreamExt::with_reader_stream
 //!
 //! # Where the producer may run
 //!
@@ -328,6 +348,10 @@ struct OpenHandler<F> {
     table: Arc<SessionTable>,
     make_body: F,
     opts: StreamOpts,
+    /// The logical content's serialization format, reported in the `open`
+    /// response so the consumer can reject an incompatible output. BEVE for the
+    /// value/typed/complex producers, raw-binary for the opaque byte producer.
+    format: u16,
 }
 
 impl<F> HandlerErased for OpenHandler<F>
@@ -370,7 +394,7 @@ where
         let resp = OpenResponse {
             version: SVS_VERSION,
             stream_id,
-            format: BodyFormat::Beve as u16,
+            format: self.format,
             compression: self.opts.compression as u8,
         };
         beve_response(req, &resp)
@@ -463,7 +487,10 @@ struct CancelAck {
 
 /// Register the three SVS routes onto `router` backed by `make_body`, the
 /// producer-side factory mapping a resource to a [`BodyWriter`] (or `None`).
-fn register_svs<F>(router: Router, make_body: F, opts: StreamOpts) -> Router
+/// `format` is the logical content's serialization format reported in the `open`
+/// response (BEVE for the serde/typed/complex producers, raw-binary for the
+/// opaque byte producer).
+fn register_svs<F>(router: Router, make_body: F, format: u16, opts: StreamOpts) -> Router
 where
     F: Fn(&str) -> Option<BodyWriter> + Send + Sync + 'static,
 {
@@ -472,6 +499,7 @@ where
         table: Arc::clone(&table),
         make_body,
         opts,
+        format,
     });
     let next: Arc<dyn HandlerErased> = Arc::new(NextHandler {
         table: Arc::clone(&table),
@@ -519,6 +547,31 @@ pub trait RouterValueStreamExt: Sized {
     where
         T: beve::BeveTypedSlice + Send + 'static,
         F: Fn(&str) -> Option<Vec<Complex<T>>> + Send + Sync + 'static;
+
+    /// Stream **opaque, already-serialized bytes** verbatim from a producer-side
+    /// [`Read`] — no re-serialization. The stream is tagged
+    /// `format = RawBinary`, so the consumer pulls it with [`pull_to_file`] /
+    /// [`pull_to_file_async`] / [`pull_consume_async`] (the BEVE-typed pullers
+    /// reject it).
+    ///
+    /// This is the right producer when the bytes already exist in their final
+    /// on-disk form and must cross the wire unchanged: a file the server already
+    /// wrote, a buffer it already encoded with its own serializer. With
+    /// [`Compression::None`] the chunk stream is those exact bytes, so the
+    /// consumer can write a byte-identical copy and verify it with its own
+    /// digest. The element-type coupling of [`with_value_stream`] (the consumer
+    /// must decode through *this* crate's serializer) does not apply.
+    ///
+    /// `resolve` maps a resource key to the byte source, or `None` if there is no
+    /// such resource. Use `R = Box<dyn Read + Send>` to serve more than one
+    /// concrete source type (e.g. a `File` for one resource, a `Cursor` for
+    /// another) from a single registration.
+    ///
+    /// [`with_value_stream`]: Self::with_value_stream
+    fn with_reader_stream<R, F>(self, resolve: F, opts: StreamOpts) -> Self
+    where
+        R: Read + Send + 'static,
+        F: Fn(&str) -> Option<R> + Send + Sync + 'static;
 }
 
 impl RouterValueStreamExt for Router {
@@ -536,6 +589,7 @@ impl RouterValueStreamExt for Router {
                     }) as BodyWriter
                 })
             },
+            BodyFormat::Beve as u16,
             opts,
         )
     }
@@ -554,6 +608,7 @@ impl RouterValueStreamExt for Router {
                     }) as BodyWriter
                 })
             },
+            BodyFormat::Beve as u16,
             opts,
         )
     }
@@ -572,6 +627,25 @@ impl RouterValueStreamExt for Router {
                     }) as BodyWriter
                 })
             },
+            BodyFormat::Beve as u16,
+            opts,
+        )
+    }
+
+    fn with_reader_stream<R, F>(self, resolve: F, opts: StreamOpts) -> Self
+    where
+        R: Read + Send + 'static,
+        F: Fn(&str) -> Option<R> + Send + Sync + 'static,
+    {
+        register_svs(
+            self,
+            move |resource| {
+                resolve(resource).map(|mut reader| {
+                    Box::new(move |w: &mut dyn Write| io::copy(&mut reader, w).map(|_| ()))
+                        as BodyWriter
+                })
+            },
+            BodyFormat::RawBinary as u16,
             opts,
         )
     }
@@ -622,6 +696,15 @@ pub enum StreamOutput<'a> {
     /// Stream-decode the value into a `T`. Requires `format = BEVE`; a compressed
     /// stream is decompressed on the way in. Returns `Some(T)`.
     Value,
+    /// Write the logical content to a file, format-agnostic: a `compression =
+    /// none` stream is copied verbatim (a byte-identical copy of an opaque
+    /// [`with_reader_stream`](RouterValueStreamExt::with_reader_stream) source), a
+    /// `compression = zstd` stream is decompressed on the way in. No `format`
+    /// constraint, so it accepts a raw-binary stream the [`BeveFile`] mode would
+    /// reject.
+    ///
+    /// [`BeveFile`]: StreamOutput::BeveFile
+    RawFile(&'a Path),
 }
 
 /// Pull `resource` from an SVS producer reachable through `client` into `out`.
@@ -678,6 +761,23 @@ pub fn pull_stream<T: DeserializeOwned>(
             let _ = cancel_stream(client, open.stream_id, "value fully decoded");
             Ok(Some(value))
         }
+        StreamOutput::RawFile(path) => {
+            let compression = open.compression;
+            write_file(client, open.stream_id, path, |reader, file| {
+                match compression {
+                    Compression::None => {
+                        io::copy(reader, file)?;
+                    }
+                    Compression::Zstd => {
+                        let mut dec =
+                            zstd::stream::read::Decoder::new(reader).map_err(RepeError::Io)?;
+                        io::copy(&mut dec, file)?;
+                    }
+                }
+                Ok(())
+            })?;
+            Ok(None)
+        }
     }
 }
 
@@ -701,6 +801,15 @@ pub fn pull_to_beve_zst_file(
 /// ([`StreamOutput::BeveFile`]).
 pub fn pull_to_beve_file(client: &Client, resource: &str, path: &Path) -> Result<(), RepeError> {
     pull_stream::<()>(client, resource, StreamOutput::BeveFile(path)).map(|_| ())
+}
+
+/// Convenience: pull `resource` and write its logical content to `path`,
+/// format-agnostic ([`StreamOutput::RawFile`]). For a `compression = none`
+/// opaque byte stream this writes a byte-identical copy of the producer's source;
+/// a compressed stream is decompressed first. The file is committed atomically
+/// (temp sibling, renamed only after the terminating chunk and an fsync).
+pub fn pull_to_file(client: &Client, resource: &str, path: &Path) -> Result<(), RepeError> {
+    pull_stream::<()>(client, resource, StreamOutput::RawFile(path)).map(|_| ())
 }
 
 /// Pull `resource` as a bulk numeric array decoded straight into a `Vec<T>` at
@@ -884,6 +993,8 @@ fn check_output(out: StreamOutput<'_>, open: &OpenInfo) -> Result<(), RepeError>
                 ));
             }
         }
+        // Format-agnostic: any stream's logical content can land in a raw file.
+        StreamOutput::RawFile(_) => {}
     }
     Ok(())
 }
@@ -1246,19 +1357,10 @@ async fn cancel_stream_async<C: AsyncSvsClient>(
         .await
 }
 
-/// Open `resource`, then pull and decode it: the async pull loop and the blocking
-/// `decode` run concurrently across the channel, with `decode` receiving a `Read`
-/// over the (optionally zstd-decompressed) chunk stream. Shared by the async
-/// value and bulk-slice pullers.
-async fn pull_decode_async<V, F, C: AsyncSvsClient>(
-    client: &C,
-    resource: &str,
-    decode: F,
-) -> Result<V, RepeError>
-where
-    V: Send + 'static,
-    F: FnOnce(Box<dyn Read>) -> Result<V, RepeError> + Send + 'static,
-{
+/// Send the `open` request over an async client and parse the response into an
+/// [`OpenInfo`]. Shared by every async puller; the per-puller format check (if
+/// any) runs on the returned `OpenInfo`.
+async fn open_async<C: AsyncSvsClient>(client: &C, resource: &str) -> Result<OpenInfo, RepeError> {
     let body = open_request_body(resource)?;
     let resp = client
         .svs_call(
@@ -1268,39 +1370,71 @@ where
             BodyFormat::Beve as u16,
         )
         .await?;
-    let open = parse_open_response(&resp)?;
-    if let Err(e) = require_beve(&open) {
-        let _ = cancel_stream_async(client, open.stream_id, "format incompatible").await;
-        return Err(e);
-    }
+    parse_open_response(&resp)
+}
 
+/// Pull an already-opened stream and consume it: the async pull loop and the
+/// blocking `consume` run concurrently across the channel, with `consume`
+/// receiving a `Read` over the (optionally zstd-decompressed) chunk stream.
+///
+/// A pull/network error is surfaced *before* `consume`'s value, so a truncated
+/// transfer never returns a value built from a short read: the value (and
+/// anything it owns, e.g. an uncommitted temp file) is dropped on that path.
+async fn run_pull<V, F, C: AsyncSvsClient>(
+    client: &C,
+    open: OpenInfo,
+    consume: F,
+) -> Result<V, RepeError>
+where
+    V: Send + 'static,
+    F: FnOnce(Box<dyn Read>) -> Result<V, RepeError> + Send + 'static,
+{
     let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(ASYNC_PULL_DEPTH);
     let compression = open.compression;
     // Starts immediately on a blocking thread; runs concurrently with the pull
     // loop below, the two paced by the channel bound.
-    let decode_task = tokio::task::spawn_blocking(move || -> Result<V, RepeError> {
+    let consume_task = tokio::task::spawn_blocking(move || -> Result<V, RepeError> {
         let reader: Box<dyn Read> = match compression {
             Compression::None => Box::new(ChannelReader::new(rx)),
             Compression::Zstd => Box::new(
                 zstd::stream::read::Decoder::new(ChannelReader::new(rx)).map_err(RepeError::Io)?,
             ),
         };
-        decode(reader)
+        consume(reader)
     });
 
     let pull_res = pull_loop_async(client, open.stream_id, tx).await;
-    let decode_res = decode_task.await;
+    let consume_res = consume_task.await;
     // Best-effort release; the stream is spent (or the pull failed) either way.
     let _ = cancel_stream_async(client, open.stream_id, "pull complete").await;
 
-    // A pull/network error explains any decode-side EOF, so surface it first.
+    // A pull/network error explains any consume-side EOF, so surface it first.
     pull_res?;
-    match decode_res {
+    match consume_res {
         Ok(v) => v,
         Err(join_err) => Err(RepeError::Io(io::Error::other(format!(
-            "svs decode task failed: {join_err}"
+            "svs consume task failed: {join_err}"
         )))),
     }
+}
+
+/// Open `resource`, require it be BEVE, and `run_pull` it. Shared by the async
+/// value and bulk-slice pullers (which all decode BEVE).
+async fn pull_beve_async<V, F, C: AsyncSvsClient>(
+    client: &C,
+    resource: &str,
+    decode: F,
+) -> Result<V, RepeError>
+where
+    V: Send + 'static,
+    F: FnOnce(Box<dyn Read>) -> Result<V, RepeError> + Send + 'static,
+{
+    let open = open_async(client, resource).await?;
+    if let Err(e) = require_beve(&open) {
+        let _ = cancel_stream_async(client, open.stream_id, "format incompatible").await;
+        return Err(e);
+    }
+    run_pull(client, open, decode).await
 }
 
 /// Async counterpart of [`pull_value`]: pull `resource` and decode the whole
@@ -1315,7 +1449,7 @@ pub async fn pull_value_async<T: DeserializeOwned + Send + 'static, C: AsyncSvsC
     client: &C,
     resource: &str,
 ) -> Result<T, RepeError> {
-    pull_decode_async(client, resource, |reader| {
+    pull_beve_async(client, resource, |reader| {
         beve::from_reader_streaming::<_, T>(reader).map_err(RepeError::from)
     })
     .await
@@ -1328,7 +1462,7 @@ pub async fn pull_typed_slice_async<T: beve::BeveTypedSlice + Send + 'static, C:
     client: &C,
     resource: &str,
 ) -> Result<Vec<T>, RepeError> {
-    pull_decode_async(client, resource, |reader| {
+    pull_beve_async(client, resource, |reader| {
         beve::read_typed_slice_from_reader::<T, _>(reader).map_err(RepeError::from)
     })
     .await
@@ -1343,10 +1477,129 @@ pub async fn pull_complex_slice_async<
     client: &C,
     resource: &str,
 ) -> Result<Vec<Complex<T>>, RepeError> {
-    pull_decode_async(client, resource, |reader| {
+    pull_beve_async(client, resource, |reader| {
         beve::read_complex_slice_from_reader::<T, _>(reader).map_err(RepeError::from)
     })
     .await
+}
+
+/// Async, format-agnostic escape hatch: pull `resource` and hand its logical
+/// content to `consume` as a blocking [`Read`] (a `compression = zstd` stream is
+/// decompressed on the way in; `none` is delivered verbatim). Unlike
+/// [`pull_value_async`] this places no `format` constraint, so it drives an
+/// opaque [`with_reader_stream`](RouterValueStreamExt::with_reader_stream)
+/// producer as well as a BEVE one.
+///
+/// `consume` runs on a `spawn_blocking` thread and may block freely. The value it
+/// returns is delivered only if the pull completed cleanly; on a truncated /
+/// dropped transfer this returns the pull error and the value is dropped (so a
+/// temp file `consume` opened is discarded rather than committed — see
+/// [`pull_to_file_async`] / [`pull_to_file_verified_async`], which build on this).
+pub async fn pull_consume_async<V, F, C: AsyncSvsClient>(
+    client: &C,
+    resource: &str,
+    consume: F,
+) -> Result<V, RepeError>
+where
+    V: Send + 'static,
+    F: FnOnce(Box<dyn Read>) -> Result<V, RepeError> + Send + 'static,
+{
+    let open = open_async(client, resource).await?;
+    run_pull(client, open, consume).await
+}
+
+/// A [`Write`] that forwards every byte to two sinks. Used to write a file while
+/// feeding the same bytes to a digest in a single pass.
+struct TeeWriter<'a, A: Write, B: Write> {
+    file: &'a mut A,
+    digest: &'a mut B,
+}
+
+impl<A: Write, B: Write> Write for TeeWriter<'_, A, B> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.file.write_all(buf)?;
+        self.digest.write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()?;
+        self.digest.flush()
+    }
+}
+
+/// Async counterpart of [`pull_to_file`]: pull `resource` and write its logical
+/// content to `path`, committed atomically (temp sibling, renamed only after the
+/// terminating chunk and an fsync). A `compression = none` opaque byte stream is
+/// written verbatim; a compressed stream is decompressed first. Returns the
+/// number of content bytes written.
+///
+/// To verify content integrity before the file is published, use
+/// [`pull_to_file_verified_async`].
+pub async fn pull_to_file_async<C: AsyncSvsClient>(
+    client: &C,
+    resource: &str,
+    path: &Path,
+) -> Result<u64, RepeError> {
+    let tmp_path = temp_sibling(path);
+    let (guard, bytes) = pull_consume_async(client, resource, move |mut reader| {
+        let mut guard = TempFile::create(&tmp_path)?;
+        let bytes = io::copy(&mut reader, guard.file_mut())?;
+        guard.file_mut().flush()?;
+        guard.file_mut().sync_all()?;
+        Ok((guard, bytes))
+    })
+    .await?;
+    guard.commit(path)?;
+    Ok(bytes)
+}
+
+/// Async file pull with a caller-supplied integrity gate. As content bytes are
+/// written to the temp file they are also fed to `digest` (any [`Write`] — a
+/// hasher, a CRC accumulator); after the stream completes cleanly and before the
+/// temp file is renamed into place, `verify(digest)` is called. If it returns
+/// `Err`, the temp file is discarded and nothing is committed at `path`; if it
+/// returns `Ok`, the file is renamed in atomically.
+///
+/// This is the integrity seam SVS itself does not commit on the wire: the
+/// producer and consumer agree on a content digest out of band (e.g. carried in
+/// an application manifest), the consumer recomputes it here in one pass over the
+/// streamed bytes, and a mismatch vetoes publication. A truncated transfer is
+/// caught upstream of `verify` (it surfaces as the pull error) and likewise
+/// commits nothing.
+pub async fn pull_to_file_verified_async<C, D, V>(
+    client: &C,
+    resource: &str,
+    path: &Path,
+    digest: D,
+    verify: V,
+) -> Result<(), RepeError>
+where
+    C: AsyncSvsClient,
+    D: Write + Send + 'static,
+    V: FnOnce(D) -> Result<(), RepeError>,
+{
+    let tmp_path = temp_sibling(path);
+    let (guard, digest) = pull_consume_async(client, resource, move |mut reader| {
+        let mut guard = TempFile::create(&tmp_path)?;
+        let mut digest = digest;
+        {
+            let mut tee = TeeWriter {
+                file: guard.file_mut(),
+                digest: &mut digest,
+            };
+            io::copy(&mut reader, &mut tee)?;
+        }
+        guard.file_mut().flush()?;
+        guard.file_mut().sync_all()?;
+        Ok((guard, digest))
+    })
+    .await?;
+    // The stream terminated cleanly (a truncation would have surfaced as the pull
+    // error above, before this point, discarding `guard`). Let the caller accept
+    // or reject the content; only an accept commits the file.
+    verify(digest)?;
+    guard.commit(path)
 }
 
 #[cfg(test)]
