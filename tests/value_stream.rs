@@ -4,8 +4,11 @@
 #![cfg(feature = "value-stream")]
 
 use repe::value_stream::{Compression, RouterValueStreamExt, StreamOpts, StreamOutput};
-use repe::{Client, RepeError, Router, Server, pull_stream, pull_to_beve_file, pull_value};
+use repe::{
+    Client, RepeError, Router, Server, pull_stream, pull_to_beve_file, pull_to_file, pull_value,
+};
 use serde::{Deserialize, Serialize};
+use std::io::Cursor;
 use std::net::TcpListener;
 use std::path::Path;
 use std::thread;
@@ -163,6 +166,87 @@ fn many_small_payloads_each_terminate_cleanly() {
         let got: Payload = pull_value(&client, "payload").expect("pull");
         assert_eq!(got, payload);
     }
+}
+
+// ---- opaque byte (reader) streams --------------------------------------------
+
+/// ~1 MiB of a non-trivial byte pattern, large enough to span many 16 KiB chunks
+/// so reassembly and the lookahead/last logic are exercised; any truncation or
+/// off-by-one would corrupt the verbatim compare.
+fn raw_blob() -> Vec<u8> {
+    (0..1_000_000u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect()
+}
+
+/// Start a sync `Server` whose router streams `blob` verbatim (opaque bytes) for
+/// the resource key `"blob"`, with the given options. Returns a connected client.
+fn serve_reader(blob: Vec<u8>, opts: StreamOpts) -> Client {
+    let router = Router::new().with_reader_stream(
+        move |resource: &str| (resource == "blob").then(|| Cursor::new(blob.clone())),
+        opts,
+    );
+    let server = Server::new(router);
+    let listener: TcpListener = server.listen("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    thread::spawn(move || {
+        let _ = server.serve(listener);
+    });
+    Client::connect(addr).expect("connect")
+}
+
+#[test]
+fn reader_stream_writes_a_byte_identical_file_uncompressed() {
+    let blob = raw_blob();
+    let client = serve_reader(blob.clone(), small_chunks(Compression::None));
+
+    let dir = std::env::temp_dir().join(format!("svs-raw-none-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("blob.bin");
+
+    pull_to_file(&client, "blob", &path).expect("pull raw file");
+
+    let got = std::fs::read(&path).expect("read file");
+    assert_eq!(
+        got, blob,
+        "uncompressed reader stream must be byte-identical"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn reader_stream_roundtrips_through_compression() {
+    // Even tagged for zstd, the logical content the consumer writes must equal
+    // the producer's source bytes (compression is transparent end to end).
+    let blob = raw_blob();
+    let client = serve_reader(blob.clone(), small_chunks(Compression::Zstd));
+
+    let dir = std::env::temp_dir().join(format!("svs-raw-zstd-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("blob.bin");
+
+    pull_to_file(&client, "blob", &path).expect("pull raw file");
+
+    let got = std::fs::read(&path).expect("read file");
+    assert_eq!(
+        got, blob,
+        "decompressed content must equal the source bytes"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn value_puller_rejects_a_raw_binary_stream() {
+    // A raw-binary stream is tagged `format != BEVE`; the value decoder must
+    // refuse it up front rather than feed raw bytes to BEVE.
+    let client = serve_reader(raw_blob(), small_chunks(Compression::None));
+    let err = pull_value::<Payload>(&client, "blob").unwrap_err();
+    assert!(
+        matches!(err, RepeError::Io(_)),
+        "expected a format-mismatch error, got {err:?}"
+    );
 }
 
 #[test]
