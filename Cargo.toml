@@ -1,8 +1,8 @@
 [package]
 name = "repe"
-version = "3.10.0"
+version = "4.0.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 description = "Rust implementation of the REPE RPC protocol (JSON-focused)"
 license = "MIT"
 repository = "https://github.com/repe-org/repe-rs"
@@ -66,17 +66,18 @@ required-features = ["value-stream"]
 [dependencies]
 # beve's default feature set is already lean (core ser/de + streaming +
 # typed/complex bulk slice helpers); the heavy MATLAB/HDF5 `mat` interop is opt-in
-# there, so repe no longer needs `default-features = false`. 2.3 is the floor for
-# `write_aligned_typed_slice_at`, the offset-aware aligned writer that
-# `MessageBuilder::body_aligned_typed_slice` uses to pad a standalone body for its
-# eventual frame offset; 2.2 added the rest of the aligned typed-array primitives
-# (`aligned_typed_slice_size` / `read_aligned_typed_slice` /
-# `read_aligned_typed_slice_ref`) behind the zero-copy borrowing route
-# (`Router::with_typed_slice_ref` / `*::call_typed_slice_aligned`). beve also carries
-# `to_writer_complex_slice` / `complex_slice_size` (the streaming complex
-# primitives behind `write_message_complex_slice`) and the `read_typed_slice` /
-# `read_complex_slice` bulk decoders behind the typed-numeric body fast path.
-beve = "2.5"
+# there, so repe never needs `default-features = false`. repe uses beve's aligned
+# typed-array primitives (`write_aligned_typed_slice_at` /
+# `aligned_typed_slice_size` / `read_aligned_typed_slice` /
+# `read_aligned_typed_slice_ref`) behind `MessageBuilder::body_aligned_typed_slice`
+# and the zero-copy borrowing route (`Router::with_typed_slice_ref` /
+# `*::call_typed_slice_aligned`), the streaming complex primitives
+# (`to_writer_complex_slice` / `complex_slice_size` behind
+# `write_message_complex_slice`), and the `read_typed_slice` / `read_complex_slice`
+# bulk decoders behind the typed-numeric body fast path. Pinned to beve 3: its core
+# ser/de API is unchanged from 2.x, so the major bump only reflects beve's optional
+# `mat` dependency moving forward, which repe does not enable.
+beve = "3"
 serde = { version = "1", features = ["derive" ] }
 serde_json = "1"
 thiserror = "1"
