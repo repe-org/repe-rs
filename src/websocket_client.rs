@@ -193,10 +193,10 @@ impl WebSocketClient {
             .notify_tx
             .lock()
             .expect("repe websocket notify_tx mutex poisoned");
-        if let Some(existing) = slot.as_ref() {
-            if !existing.is_closed() {
-                return Err(AlreadySubscribed);
-            }
+        if let Some(existing) = slot.as_ref()
+            && !existing.is_closed()
+        {
+            return Err(AlreadySubscribed);
         }
         let (tx, rx) = mpsc::unbounded_channel();
         *slot = Some(tx);
@@ -753,19 +753,19 @@ fn spawn_response_loop(mut reader: WsReader, inner: std::sync::Weak<WebSocketCli
                     // have replaced the slot between our send attempt
                     // and the lock reacquire; clearing unconditionally
                     // would null out that fresh subscription.
-                    if sender.send(response).is_err() {
-                        if let Some(inner_ref) = inner.upgrade() {
-                            let mut slot = inner_ref
-                                .notify_tx
-                                .lock()
-                                .expect("repe websocket notify_tx mutex poisoned");
-                            let stale = slot
-                                .as_ref()
-                                .map(|cur| cur.same_channel(&sender))
-                                .unwrap_or(false);
-                            if stale {
-                                *slot = None;
-                            }
+                    if sender.send(response).is_err()
+                        && let Some(inner_ref) = inner.upgrade()
+                    {
+                        let mut slot = inner_ref
+                            .notify_tx
+                            .lock()
+                            .expect("repe websocket notify_tx mutex poisoned");
+                        let stale = slot
+                            .as_ref()
+                            .map(|cur| cur.same_channel(&sender))
+                            .unwrap_or(false);
+                        if stale {
+                            *slot = None;
                         }
                     }
                 }

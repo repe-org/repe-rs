@@ -2990,12 +2990,12 @@ mod tests {
         let token_for_loop = token.clone();
 
         let accept_task = tokio::spawn(async move {
-            if let Ok((stream, _)) = listener.accept().await {
-                if let Ok(ws) = WebSocketServer::accept(stream, "/repe").await {
-                    let _ = shared
-                        .serve_connection_with_cancel(ws, &token_for_loop)
-                        .await;
-                }
+            if let Ok((stream, _)) = listener.accept().await
+                && let Ok(ws) = WebSocketServer::accept(stream, "/repe").await
+            {
+                let _ = shared
+                    .serve_connection_with_cancel(ws, &token_for_loop)
+                    .await;
             }
         });
 

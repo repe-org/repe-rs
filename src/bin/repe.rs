@@ -271,12 +271,12 @@ async fn run(cli: Cli) -> Result<(), CliError> {
     // Pre-flight: any flag-combination check that doesn't need a live server
     // runs before connect(), so a misconfigured invocation against a down
     // server still surfaces the usage error instead of the connect failure.
-    if let Command::Get(_) = &cli.command {
-        if cli.body_file.is_some() {
-            return Err(CliError::Usage(
-                "--body-file is not valid with `get`".into(),
-            ));
-        }
+    if let Command::Get(_) = &cli.command
+        && cli.body_file.is_some()
+    {
+        return Err(CliError::Usage(
+            "--body-file is not valid with `get`".into(),
+        ));
     }
 
     let transport = connect(&cli.url).await?;

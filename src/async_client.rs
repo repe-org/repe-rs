@@ -35,10 +35,10 @@ struct AsyncClientInner {
 
 impl Drop for AsyncClientInner {
     fn drop(&mut self) {
-        if let Ok(mut tx) = self.shutdown.lock() {
-            if let Some(sender) = tx.take() {
-                let _ = sender.send(());
-            }
+        if let Ok(mut tx) = self.shutdown.lock()
+            && let Some(sender) = tx.take()
+        {
+            let _ = sender.send(());
         }
     }
 }
