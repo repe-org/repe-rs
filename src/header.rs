@@ -86,9 +86,11 @@ impl Header {
             return Err(RepeError::InvalidSpec(spec));
         }
 
-        if reserved != 0 {
-            return Err(RepeError::ReservedNonZero);
-        }
+        // Per the REPE spec the `reserved` field is "Must be zero, receivers
+        // must ignore this field." We parse it (to advance past the bytes and
+        // preserve it for round-trip fidelity) but do not reject a non-zero
+        // value, so a future REPE revision can assign meaning to these bits
+        // without breaking this receiver.
 
         let expected = HEADER_SIZE as u64 + query_length + body_length;
         if length != expected {
@@ -119,7 +121,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decode_rejects_invalid_spec_and_reserved_non_zero() {
+    fn decode_rejects_invalid_spec_but_ignores_reserved() {
         let mut header = Header::new();
         header.length = HEADER_SIZE as u64;
         let mut bytes = header.encode();
@@ -131,13 +133,14 @@ mod tests {
             other => panic!("unexpected error: {other:?}"),
         }
 
-        // Reserved field must be zero
+        // Per the REPE spec, receivers must ignore the `reserved` field: a
+        // non-zero value decodes successfully (and is preserved) rather than
+        // being rejected.
         let mut bytes = header.encode();
         bytes[12..16].copy_from_slice(&1u32.to_le_bytes());
-        match Header::decode(&bytes).unwrap_err() {
-            RepeError::ReservedNonZero => {}
-            other => panic!("unexpected error: {other:?}"),
-        }
+        let decoded =
+            Header::decode(&bytes).expect("non-zero reserved must be ignored, not rejected");
+        assert_eq!(decoded.reserved, 1);
     }
 
     #[test]

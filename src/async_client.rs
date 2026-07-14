@@ -891,7 +891,6 @@ fn clone_fatal_error_for_waiter(err: &RepeError, request_id: u64) -> RepeError {
         RepeError::VersionMismatch(version) => RepeError::VersionMismatch(*version),
         RepeError::InvalidSpec(spec) => RepeError::InvalidSpec(*spec),
         RepeError::InvalidHeaderLength(length) => RepeError::InvalidHeaderLength(*length),
-        RepeError::ReservedNonZero => RepeError::ReservedNonZero,
         RepeError::LengthMismatch { expected, got } => RepeError::LengthMismatch {
             expected: *expected,
             got: *got,
