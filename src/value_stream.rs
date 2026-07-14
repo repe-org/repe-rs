@@ -20,7 +20,12 @@
 //! a content digest on the wire, so when end-to-end integrity matters the
 //! producer and consumer agree on one out of band and the consumer recomputes it
 //! over the streamed bytes with [`pull_to_file_verified_async`], which vetoes the
-//! atomic rename on a mismatch.
+//! atomic rename on a mismatch. A producer that would rather commit that digest
+//! *in* the single streaming pass than agree on one out of band can instead emit
+//! the body through [`with_writer_stream`], teeing its bytes through a hasher as
+//! it encodes and appending the digest as a trailer; it produces an app-framed
+//! `payload || digest` stream tagged [`BodyFormat::RawBinary`], covering the
+//! logical (pre-compression) bytes.
 //!
 //! This module is the repe-rs **reference implementation** of the SVS contract.
 //! The normative wire definition (routes, `stream_id` encoding, the `last`-flag
@@ -34,8 +39,10 @@
 //! * **Download** (server produces, client pulls) — the primary direction.
 //!   Register a producer with [`RouterValueStreamExt::with_value_stream`] (a
 //!   serde value), [`with_typed_value_stream`] / [`with_complex_value_stream`] (a
-//!   bulk numeric / complex array), or [`with_reader_stream`] (opaque bytes from
-//!   a [`Read`]). Pull with [`pull_value`] / [`pull_to_beve_file`] /
+//!   bulk numeric / complex array), [`with_reader_stream`] (opaque bytes from a
+//!   [`Read`]), or [`with_writer_stream`] (bytes the app writes straight into the
+//!   stream sink in one pass, e.g. teeing through a hasher to append a trailing
+//!   content digest). Pull with [`pull_value`] / [`pull_to_beve_file`] /
 //!   [`pull_to_beve_zst_file`] / [`pull_to_file`] (or the general
 //!   [`pull_stream`]) over the synchronous [`Client`]. From async code, drive an
 //!   [`AsyncClient`] (or a `WebSocketClient`) with [`pull_value_async`] /
@@ -48,6 +55,7 @@
 //! [`with_typed_value_stream`]: RouterValueStreamExt::with_typed_value_stream
 //! [`with_complex_value_stream`]: RouterValueStreamExt::with_complex_value_stream
 //! [`with_reader_stream`]: RouterValueStreamExt::with_reader_stream
+//! [`with_writer_stream`]: RouterValueStreamExt::with_writer_stream
 //!
 //! # Where the producer may run
 //!
@@ -572,6 +580,39 @@ pub trait RouterValueStreamExt: Sized {
     where
         R: Read + Send + 'static,
         F: Fn(&str) -> Option<R> + Send + Sync + 'static;
+
+    /// Stream **app-written bytes** from a producer-side closure that writes the
+    /// full logical body directly into the stream sink, tagged with the caller's
+    /// `format`. This is the write-side counterpart to
+    /// [`with_reader_stream`](Self::with_reader_stream): the closure *owns the
+    /// `Write`*, so it can serialize (or otherwise emit) the body **in a single
+    /// pass** rather than materializing it first.
+    ///
+    /// The capability this adds over
+    /// [`with_value_stream`](Self::with_value_stream) — where the engine owns the
+    /// encode and the application never sees the sink — is a **single-pass digest
+    /// seam**: the closure can tee its bytes through a hasher as it encodes and
+    /// append a trailing digest, computing an end-to-end content digest as a
+    /// by-product of the one streaming pass, with no second serialization pass.
+    /// Frame it as `payload || digest` and tag it [`BodyFormat::RawBinary`] so a
+    /// consumer pulls it with [`pull_to_file`] / [`pull_consume_async`] and strips
+    /// the trailer itself, rather than mistaking `payload || digest` for a bare
+    /// decodable value. (Tagging a plain, trailer-free write as
+    /// [`BodyFormat::Beve`] and pulling it with [`pull_value`] is also valid.)
+    ///
+    /// The digest such a closure computes covers the **logical** (pre-compression)
+    /// bytes it writes; `opts.compression` is applied by the engine afterward and
+    /// is transparent end to end, so the consumer recovers the same
+    /// `payload || digest` after decompressing.
+    ///
+    /// `resolve` maps a resource key to the writer closure, or `None` if there is
+    /// no such resource. Use
+    /// `W = Box<dyn FnOnce(&mut dyn Write) -> std::io::Result<()> + Send>` to serve
+    /// more than one concrete closure type from a single registration.
+    fn with_writer_stream<W, F>(self, format: BodyFormat, resolve: F, opts: StreamOpts) -> Self
+    where
+        W: FnOnce(&mut dyn Write) -> io::Result<()> + Send + 'static,
+        F: Fn(&str) -> Option<W> + Send + Sync + 'static;
 }
 
 impl RouterValueStreamExt for Router {
@@ -646,6 +687,19 @@ impl RouterValueStreamExt for Router {
                 })
             },
             BodyFormat::RawBinary as u16,
+            opts,
+        )
+    }
+
+    fn with_writer_stream<W, F>(self, format: BodyFormat, resolve: F, opts: StreamOpts) -> Self
+    where
+        W: FnOnce(&mut dyn Write) -> io::Result<()> + Send + 'static,
+        F: Fn(&str) -> Option<W> + Send + Sync + 'static,
+    {
+        register_svs(
+            self,
+            move |resource| resolve(resource).map(|writer| Box::new(writer) as BodyWriter),
+            format as u16,
             opts,
         )
     }

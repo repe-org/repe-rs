@@ -63,6 +63,10 @@ required-features = ["websocket"]
 name = "value_stream"
 required-features = ["value-stream"]
 
+[[example]]
+name = "writer_stream_digest"
+required-features = ["value-stream"]
+
 [dependencies]
 # beve's default feature set is already lean (core ser/de + streaming +
 # typed/complex bulk slice helpers); the heavy MATLAB/HDF5 `mat` interop is opt-in

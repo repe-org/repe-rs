@@ -1,5 +1,21 @@
 # Changelog
 
+## [4.0.0] - 2026-07-13
+
+### Added
+- `RouterValueStreamExt::with_writer_stream::<W, F>(format, resolve, opts)` — the write-side SVS producer, the counterpart to `with_reader_stream`'s opaque `Read`. `resolve` hands back a closure `W: FnOnce(&mut dyn Write)` that *owns* the stream sink, so the app serializes/emits the body in a **single pass** rather than materializing it first. Its headline over `with_value_stream` (where the engine owns the encode and the app never sees the sink) is a **single-pass digest seam**: the closure can tee its bytes through a hasher while it encodes and append a trailing digest, so end-to-end content integrity falls out of the one streaming pass with no double-encode. Such a stream is app-framed `payload || digest` tagged `BodyFormat::RawBinary` (pull with `pull_to_file` / `pull_consume_async`, then strip the trailer), not a standard BEVE/JSON tag with a trailer; a plain trailer-free write can instead be tagged `BodyFormat::Beve` and pulled with `pull_value`. The digest covers the **logical** (pre-compression) bytes; `opts.compression` is transparent end to end. Demonstrated in `examples/writer_stream_digest.rs`; tested in `tests/value_stream.rs`.
+
+### Changed
+- **BREAKING:** upgraded the `beve` dependency from `2.5` to `3`. beve's core ser/de API is unchanged from 2.x, so this introduces no repe API change of its own; the major bump is required because beve types appear in repe's public API (e.g. `RepeError::Beve(beve::Error)` and the `T: beve::BeveTypedSlice` bounds on the typed/complex stream and bulk-body routes), so a beve major is a repe major. Downstreams that also depend on `beve` directly must move to `beve 3`.
+- **BREAKING:** the fixed header's `reserved` field is now ignored on decode per the REPE spec ("Must be zero, receivers must ignore this field") rather than rejected when non-zero, so a future REPE revision can assign meaning to those bits without breaking this receiver. The now-unproducible `RepeError::ReservedNonZero` variant is removed.
+
+## [3.10.0] - 2026-06-18
+
+### Added
+- Producer `RouterValueStreamExt::with_reader_stream::<R: Read + Send>` — stream **opaque, already-serialized bytes** verbatim from any `Read` without re-serializing a value. Tags the stream `format = RawBinary`; with `Compression::None` the chunk stream is the source bytes verbatim, so a consumer can write a byte-identical copy. Use `R = Box<dyn Read + Send>` to serve several concrete sources from one registration. (The `open`-response `format` tag is now set per registration rather than hardcoded to BEVE.)
+- Async consumers: `pull_to_file_async` (async atomic file pull — temp sibling, fsync, rename only after the terminating chunk), `pull_consume_async` (format-agnostic async escape hatch that hands the logical content to a caller closure as a blocking `Read`; a truncated transfer surfaces before the closure's value is returned), and `pull_to_file_verified_async` (tees content bytes into a caller-supplied `digest` and runs a `verify` closure after a clean EOF and before the rename, so an integrity check recomputed over the streamed bytes — compared against an out-of-band digest — can veto publication). SVS commits no digest on the wire; this is the integrity seam for callers that need one.
+- Sync `StreamOutput::RawFile` and `pull_to_file`, for symmetry with the async file pull.
+
 ## [3.9.0] - 2026-06-11
 
 ### Added
