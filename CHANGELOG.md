@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- `RouterValueStreamExt::with_writer_stream::<W, F>(format, resolve, opts)` — the write-side SVS producer, the counterpart to `with_reader_stream`'s opaque `Read`. `resolve` hands back a closure `W: FnOnce(&mut dyn Write)` that *owns* the stream sink, so the app serializes/emits the body in a **single pass** rather than materializing it first. Its headline over `with_value_stream` (where the engine owns the encode and the app never sees the sink) is a **single-pass digest seam**: the closure can tee its bytes through a hasher while it encodes and append a trailing digest, so end-to-end content integrity falls out of the one streaming pass with no double-encode. Such a stream is app-framed `payload || digest` tagged `BodyFormat::RawBinary` (pull with `pull_to_file` / `pull_consume_async`, then strip the trailer), not a standard BEVE/JSON tag with a trailer; a plain trailer-free write can instead be tagged `BodyFormat::Beve` and pulled with `pull_value`. The digest covers the **logical** (pre-compression) bytes; `opts.compression` is transparent end to end. Demonstrated in `examples/writer_stream_digest.rs`; tested in `tests/value_stream.rs`.
+
 ## [3.9.0] - 2026-06-11
 
 ### Added
