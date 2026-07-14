@@ -3040,11 +3040,11 @@ mod tests {
             Some(ErrorCode::ResourceExhausted)
         );
         assert_eq!(
-            ConnectionError::Connection(RepeError::ReservedNonZero).error_code(),
+            ConnectionError::Connection(RepeError::InvalidSpec(0)).error_code(),
             None
         );
         assert_eq!(
-            ConnectionError::Handshake(RepeError::ReservedNonZero).error_code(),
+            ConnectionError::Handshake(RepeError::InvalidSpec(0)).error_code(),
             None
         );
     }

@@ -18,8 +18,8 @@ pub enum ErrorCode {
     Ok = 0,
     /// The request's REPE version is not supported by this server.
     VersionMismatch = 1,
-    /// The fixed header was malformed: bad spec magic, wrong length, a
-    /// non-zero reserved field, or a length that disagrees with the body.
+    /// The fixed header was malformed: bad spec magic, wrong length, or a
+    /// length that disagrees with the body.
     InvalidHeader = 2,
     /// The query was malformed or used a query format this server does not
     /// accept (e.g. a raw-binary query against a JSON-pointer router).

@@ -9,8 +9,6 @@ pub enum RepeError {
     InvalidSpec(u16),
     #[error("invalid header length: expected 48, got {0}")]
     InvalidHeaderLength(usize),
-    #[error("header reserved field must be zero")]
-    ReservedNonZero,
     #[error("header length mismatch: expected {expected}, got {got}")]
     LengthMismatch { expected: u64, got: u64 },
     #[error("buffer too small: need {need} bytes, have {have}")]
@@ -40,7 +38,6 @@ impl RepeError {
             RepeError::VersionMismatch(_) => ErrorCode::VersionMismatch,
             RepeError::InvalidSpec(_) => ErrorCode::InvalidHeader,
             RepeError::InvalidHeaderLength(_) => ErrorCode::InvalidHeader,
-            RepeError::ReservedNonZero => ErrorCode::InvalidHeader,
             RepeError::LengthMismatch { .. } => ErrorCode::InvalidHeader,
             RepeError::BufferTooSmall { .. } => ErrorCode::ParseError,
             RepeError::ResponseIdMismatch { .. } => ErrorCode::InvalidHeader,
@@ -83,7 +80,6 @@ mod tests {
             (RepeError::VersionMismatch(2), ErrorCode::VersionMismatch),
             (RepeError::InvalidSpec(0x1234), ErrorCode::InvalidHeader),
             (RepeError::InvalidHeaderLength(10), ErrorCode::InvalidHeader),
-            (RepeError::ReservedNonZero, ErrorCode::InvalidHeader),
             (
                 RepeError::LengthMismatch {
                     expected: 5,
