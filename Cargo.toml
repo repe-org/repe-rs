@@ -67,6 +67,10 @@ required-features = ["value-stream"]
 name = "writer_stream_digest"
 required-features = ["value-stream"]
 
+[[example]]
+name = "stream_pull_vs_push"
+required-features = ["value-stream"]
+
 [dependencies]
 # beve's default feature set is already lean (core ser/de + streaming +
 # typed/complex bulk slice helpers); the heavy MATLAB/HDF5 `mat` interop is opt-in
