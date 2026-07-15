@@ -5,8 +5,8 @@
 
 use repe::value_stream::{Compression, RouterValueStreamExt, StreamOpts, StreamOutput};
 use repe::{
-    BodyFormat, Client, RepeError, Router, Server, pull_stream, pull_to_beve_file, pull_to_file,
-    pull_value,
+    BodyFormat, Client, RepeError, Router, Server, pull_consume, pull_stream, pull_to_beve_file,
+    pull_to_file, pull_to_file_trailer_verified, pull_to_vec, pull_value,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Write};
@@ -432,4 +432,259 @@ fn writer_stream_single_pass_digest_roundtrips_through_compression() {
     assert_eq!(decoded, payload);
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---- consumer ergonomics: the verified-trailer / vec / consume hatches --------
+
+/// A `Write` that folds received bytes into an FNV-1a hash (no inner sink) — the
+/// consumer-side digest accumulator handed to `pull_to_file_trailer_verified`.
+struct FnvDigest(u64);
+
+impl FnvDigest {
+    fn new() -> Self {
+        Self(FNV_OFFSET)
+    }
+    fn finish(self) -> u64 {
+        self.0
+    }
+}
+
+impl Write for FnvDigest {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        for &b in buf {
+            self.0 ^= b as u64;
+            self.0 = self.0.wrapping_mul(FNV_PRIME);
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `verify` for `pull_to_file_trailer_verified`: finalize the FNV digest and
+/// compare it to the little-endian trailer, rejecting on a mismatch.
+fn check_fnv(digest: FnvDigest, trailer: &[u8]) -> Result<(), RepeError> {
+    let claimed = u64::from_le_bytes(trailer.try_into().expect("8-byte trailer"));
+    if digest.finish() == claimed {
+        Ok(())
+    } else {
+        Err(RepeError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "svs: trailer digest mismatch",
+        )))
+    }
+}
+
+/// The exact bytes `beve::to_writer_streaming` produces for `payload` — what the
+/// committed file must equal once the 8-byte trailer is stripped.
+fn streamed_payload_bytes(payload: &Payload) -> Vec<u8> {
+    let mut buf = Vec::new();
+    beve::to_writer_streaming(&mut buf, payload).expect("stream-encode payload");
+    buf
+}
+
+#[test]
+fn trailer_verified_commits_payload_only_uncompressed() {
+    let payload = sample_payload();
+    let client = serve_writer_digest(payload.clone(), small_chunks(Compression::None));
+
+    let dir = std::env::temp_dir().join(format!("svs-tv-none-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("payload.beve");
+
+    pull_to_file_trailer_verified(&client, "payload", &path, 8, FnvDigest::new(), check_fnv)
+        .expect("verified trailer pull");
+
+    // The committed file is the payload with the trailer stripped — decodable
+    // directly, with no hand split/re-truncate.
+    let bytes = std::fs::read(&path).expect("read committed file");
+    assert_eq!(
+        bytes,
+        streamed_payload_bytes(&payload),
+        "committed file must be the payload with the 8-byte trailer stripped"
+    );
+    let decoded: Payload = beve::from_slice(&bytes).expect("decode payload-only file");
+    assert_eq!(decoded, payload);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn trailer_verified_commits_payload_only_through_compression() {
+    // Trailer stripping happens on the logical (decompressed) byte stream, so the
+    // zstd path yields the same payload-only file and the digest still matches.
+    let payload = sample_payload();
+    let client = serve_writer_digest(payload.clone(), small_chunks(Compression::Zstd));
+
+    let dir = std::env::temp_dir().join(format!("svs-tv-zstd-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("payload.beve");
+
+    pull_to_file_trailer_verified(&client, "payload", &path, 8, FnvDigest::new(), check_fnv)
+        .expect("verified trailer pull");
+
+    let bytes = std::fs::read(&path).expect("read committed file");
+    assert_eq!(bytes, streamed_payload_bytes(&payload));
+    let decoded: Payload = beve::from_slice(&bytes).expect("decode payload-only file");
+    assert_eq!(decoded, payload);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Serve `payload || (~digest)` — a correct single-pass stream whose trailer is
+/// bit-inverted, so a consumer's honest recompute must reject it.
+fn serve_writer_bad_digest(payload: Payload, opts: StreamOpts) -> Client {
+    let router = Router::new().with_writer_stream(
+        BodyFormat::RawBinary,
+        move |resource: &str| {
+            (resource == "payload").then(|| {
+                let value = payload.clone();
+                move |w: &mut dyn Write| -> std::io::Result<()> {
+                    let mut tee = HashTee::new(w);
+                    beve::to_writer_streaming(&mut tee, &value)
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    let corrupt = tee.finish() ^ u64::MAX;
+                    w.write_all(&corrupt.to_le_bytes())?;
+                    Ok(())
+                }
+            })
+        },
+        opts,
+    );
+    serve_router(router)
+}
+
+#[test]
+fn trailer_verified_rejects_a_tampered_trailer_and_commits_nothing() {
+    let payload = sample_payload();
+    let client = serve_writer_bad_digest(payload, small_chunks(Compression::None));
+
+    let dir = std::env::temp_dir().join(format!("svs-tv-bad-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("payload.beve");
+
+    let err =
+        pull_to_file_trailer_verified(&client, "payload", &path, 8, FnvDigest::new(), check_fnv)
+            .unwrap_err();
+    assert!(
+        matches!(err, RepeError::Io(_)),
+        "a digest mismatch must surface as an error, got {err:?}"
+    );
+    assert!(
+        !path.exists(),
+        "a rejected digest must not commit a file at the final path"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn trailer_verified_rejects_a_stream_shorter_than_the_trailer() {
+    // A stream of fewer than `trailer_len` logical bytes cannot carry the claimed
+    // trailer: it must error (before `verify`) and commit nothing.
+    let router = Router::new().with_writer_stream(
+        BodyFormat::RawBinary,
+        move |resource: &str| {
+            (resource == "tiny")
+                .then_some(|w: &mut dyn Write| -> std::io::Result<()> { w.write_all(&[1, 2, 3]) })
+        },
+        small_chunks(Compression::None),
+    );
+    let client = serve_router(router);
+
+    let dir = std::env::temp_dir().join(format!("svs-tv-short-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("tiny.bin");
+
+    let err = pull_to_file_trailer_verified(&client, "tiny", &path, 8, FnvDigest::new(), check_fnv)
+        .unwrap_err();
+    assert!(
+        matches!(err, RepeError::Io(_)),
+        "a too-short stream must error, got {err:?}"
+    );
+    assert!(!path.exists(), "a malformed frame must not commit a file");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Serve a stream that emits several real chunks and then aborts the producer
+/// *before* the terminating chunk — a genuine mid-stream failure (the `Msg::Fail`
+/// path), distinct from a clean-but-short stream and from a failure at `open`. The
+/// 64 KiB write flushes past the 16 KiB chunk size and the one-chunk lookahead, so
+/// real payload reaches the consumer's temp file before the abort surfaces.
+fn serve_writer_aborts_midstream() -> Client {
+    let router = Router::new().with_writer_stream(
+        BodyFormat::RawBinary,
+        move |resource: &str| {
+            (resource == "aborts").then_some(|w: &mut dyn Write| -> std::io::Result<()> {
+                w.write_all(&vec![0xA5u8; 64 * 1024])?;
+                Err(std::io::Error::other("svs: producer aborted mid-stream"))
+            })
+        },
+        // Uncompressed keeps the chunk flow deterministic: a zstd encoder buffers,
+        // so an abort mid-frame might not have emitted any chunk yet.
+        small_chunks(Compression::None),
+    );
+    serve_router(router)
+}
+
+#[test]
+fn trailer_verified_rejects_a_midstream_abort_and_commits_nothing() {
+    // Chunks flow, then the producer fails before `last`. The consumer must surface
+    // the failure (never mistake a truncated transfer for a clean terminating
+    // chunk) and commit neither the final file nor the `.svspart` temp sibling.
+    let client = serve_writer_aborts_midstream();
+
+    let dir = std::env::temp_dir().join(format!("svs-tv-abort-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("payload.beve");
+
+    let err =
+        pull_to_file_trailer_verified(&client, "aborts", &path, 8, FnvDigest::new(), check_fnv)
+            .unwrap_err();
+    assert!(
+        matches!(err, RepeError::Io(_)),
+        "a mid-stream abort must surface as an error, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("aborted mid-stream"),
+        "the error must be the producer's mid-stream abort, not an open failure: {err:?}"
+    );
+    assert!(
+        !path.exists(),
+        "a truncated transfer must not commit a file at the final path"
+    );
+    assert!(
+        !dir.join("payload.beve.svspart").exists(),
+        "the temp sibling must be cleaned up after a mid-stream abort"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn pull_to_vec_returns_the_whole_decompressed_payload() {
+    // The buffer hatch over a compressed opaque stream returns the decompressed
+    // source bytes verbatim.
+    let blob = raw_blob();
+    let client = serve_reader(blob.clone(), small_chunks(Compression::Zstd));
+    let got = pull_to_vec(&client, "blob").expect("pull to vec");
+    assert_eq!(
+        got, blob,
+        "pull_to_vec must return the full logical content"
+    );
+}
+
+#[test]
+fn pull_consume_decodes_a_value_through_the_reader_hatch() {
+    // The sync, format-agnostic hatch hands a decompressed `Read` to the caller,
+    // who can drive any decoder over it (here a streaming BEVE decode).
+    let payload = sample_payload();
+    let client = serve(payload.clone(), small_chunks(Compression::Zstd));
+    let got: Payload = pull_consume(&client, "payload", |reader| {
+        beve::from_reader_streaming(reader).map_err(RepeError::from)
+    })
+    .expect("consume decode");
+    assert_eq!(got, payload);
 }

@@ -5,22 +5,23 @@
 //! `with_value_stream` (see `value_stream.rs`) hands the engine the value and the
 //! app never sees the encode. `with_writer_stream` instead gives the app the
 //! `Write` sink, so it can serialize the value straight into the stream while
-//! teeing the bytes through a hasher and appending the digest as a trailer. The
-//! consumer pulls `payload || digest`, splits the trailer, and verifies it — the
+//! teeing the bytes through a hasher and appending the digest as a trailer — the
 //! value is proven intact end to end without ever encoding it twice.
 //!
 //! The stream is tagged [`BodyFormat::RawBinary`] (it is `payload || digest`, not
-//! a bare BEVE value), so the consumer pulls it with [`pull_to_file`] and strips
-//! the trailer itself. The digest covers the logical, pre-compression bytes;
-//! `opts.compression` is applied by the engine afterward and is transparent end
-//! to end.
+//! a bare BEVE value). The consumer pulls it with [`pull_to_file_trailer_verified`]:
+//! one call holds the trailer back, hashes only the payload prefix, verifies the
+//! digest, and commits the payload ALONE — no hand split, no re-truncate — so the
+//! committed file is a bare, directly-decodable BEVE value. The digest covers the
+//! logical, pre-compression bytes; `opts.compression` is applied by the engine
+//! afterward and is transparent end to end.
 //!
 //! Run with: `cargo run --example writer_stream_digest --features value-stream`
 
 use repe::value_stream::{RouterValueStreamExt, StreamOpts};
-use repe::{BodyFormat, Client, Router, Server, pull_to_file};
+use repe::{BodyFormat, Client, RepeError, Router, Server, pull_to_file_trailer_verified};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::io::{self, Write};
 use std::net::TcpListener;
 use std::thread;
 
@@ -36,13 +37,32 @@ struct Dataset {
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut h = FNV_OFFSET;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(FNV_PRIME);
+/// A `Write` that folds the bytes it receives into an FNV-1a hash and nothing else
+/// — the consumer-side digest accumulator handed to `pull_to_file_trailer_verified`,
+/// which feeds it the payload prefix (the trailer is held back) and then calls the
+/// `verify` closure with the finalized hash.
+struct FnvHasher(u64);
+
+impl FnvHasher {
+    fn new() -> Self {
+        Self(FNV_OFFSET)
     }
-    h
+    fn finish(self) -> u64 {
+        self.0
+    }
+}
+
+impl Write for FnvHasher {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        for &b in buf {
+            self.0 ^= b as u64;
+            self.0 = self.0.wrapping_mul(FNV_PRIME);
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// A `Write` that hashes the bytes it forwards — the app-side tee the producer
@@ -114,27 +134,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = server.serve(listener);
     });
 
-    // Pull the `payload || digest` stream to a file (a RawBinary stream cannot be
-    // decoded as a bare value), then split off the trailer and verify it BEFORE
-    // trusting the payload.
+    // One call pulls the `payload || digest` stream, holds the 8-byte trailer back,
+    // feeds only the payload to the FNV hasher, and calls `verify` with the
+    // finalized hash and the claimed trailer. A match commits the payload ALONE
+    // (trailer stripped) at `path`; a mismatch commits nothing and returns Err. No
+    // hand split, no re-truncate — the committed file is a bare BEVE value.
     let client = Client::connect(addr)?;
-    let path =
-        std::env::temp_dir().join(format!("svs-writer-digest-{}.beve.fnv", std::process::id()));
-    pull_to_file(&client, "demo", &path)?;
+    let path = std::env::temp_dir().join(format!("svs-writer-digest-{}.beve", std::process::id()));
+    pull_to_file_trailer_verified(
+        &client,
+        "demo",
+        &path,
+        8,
+        FnvHasher::new(),
+        |hasher, trailer| {
+            let claimed = u64::from_le_bytes(trailer.try_into().unwrap());
+            if hasher.finish() == claimed {
+                Ok(())
+            } else {
+                Err(RepeError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "content digest mismatch",
+                )))
+            }
+        },
+    )?;
 
-    let bytes = std::fs::read(&path)?;
-    let (payload, trailer) = bytes.split_at(bytes.len() - 8);
-    let claimed = u64::from_le_bytes(trailer.try_into().unwrap());
-    let integrity_ok = fnv1a(payload) == claimed;
-
-    let decoded: Dataset = beve::from_slice(payload)?;
+    // Reaching here means the trailer verified and the payload-only file committed.
+    let decoded: Dataset = beve::from_slice(&std::fs::read(&path)?)?;
     std::fs::remove_file(&path).ok();
 
     println!(
-        "pulled '{}' with {} samples; integrity verified: {}; matches source: {}",
+        "pulled '{}' with {} samples; integrity verified (trailer stripped, payload committed); \
+         matches source: {}",
         decoded.name,
         decoded.samples.len(),
-        integrity_ok,
         decoded == dataset
     );
     Ok(())

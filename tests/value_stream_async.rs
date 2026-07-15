@@ -7,11 +7,12 @@
 
 use repe::value_stream::{Compression, RouterValueStreamExt, StreamOpts};
 use repe::{
-    AsyncClient, Complex, RepeError, Router, Server, pull_complex_slice_async, pull_consume_async,
-    pull_to_file_async, pull_to_file_verified_async, pull_typed_slice_async, pull_value_async,
+    AsyncClient, BodyFormat, Complex, RepeError, Router, Server, pull_complex_slice_async,
+    pull_consume_async, pull_to_file_async, pull_to_file_trailer_verified_async,
+    pull_to_file_verified_async, pull_to_vec_async, pull_typed_slice_async, pull_value_async,
 };
 use serde::{Deserialize, Serialize};
-use std::io::{self, Cursor, Read};
+use std::io::{self, Cursor, Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::thread;
 
@@ -260,6 +261,229 @@ async fn verified_pull_commits_nothing_when_rejected() {
     assert!(
         !dir.join("blob.bin.svspart").exists(),
         "the temp sibling must be cleaned up on rejection"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn pull_to_vec_async_returns_the_whole_decompressed_payload() {
+    let blob = raw_blob();
+    let addr = spawn(reader_router(blob.clone(), Compression::Zstd));
+    let client = AsyncClient::connect(addr).await.expect("connect");
+    let got = pull_to_vec_async(&client, "blob")
+        .await
+        .expect("pull to vec");
+    assert_eq!(
+        got, blob,
+        "pull_to_vec_async must return the full logical content"
+    );
+}
+
+// ---- app-written (writer) digest streams: the in-stream trailer hatch --------
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// A `Write` that folds forwarded bytes into an FNV-1a hash — used as the producer
+/// tee (wrapping the sink) and, over `io::sink()`, as the consumer digest sink.
+struct FnvHash<W> {
+    inner: W,
+    hash: u64,
+}
+
+impl<W> FnvHash<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hash: FNV_OFFSET,
+        }
+    }
+    fn finish(self) -> u64 {
+        self.hash
+    }
+}
+
+impl<W: Write> Write for FnvHash<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        for &b in &buf[..n] {
+            self.hash ^= b as u64;
+            self.hash = self.hash.wrapping_mul(FNV_PRIME);
+        }
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// `verify` for the trailer puller: finalize the FNV digest and compare it to the
+/// little-endian trailer.
+fn check_fnv(digest: FnvHash<io::Sink>, trailer: &[u8]) -> Result<(), RepeError> {
+    let claimed = u64::from_le_bytes(trailer.try_into().expect("8-byte trailer"));
+    if digest.finish() == claimed {
+        Ok(())
+    } else {
+        Err(RepeError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "svs: trailer digest mismatch",
+        )))
+    }
+}
+
+/// A router that streams `payload || fnv8(payload)` for the key `"payload"` in one
+/// pass. With `corrupt`, the appended digest is bit-inverted so an honest consumer
+/// recompute rejects it.
+fn writer_digest_router(payload: Payload, corrupt: bool, compression: Compression) -> Router {
+    Router::new().with_writer_stream(
+        BodyFormat::RawBinary,
+        move |resource: &str| {
+            (resource == "payload").then(|| {
+                let value = payload.clone();
+                move |w: &mut dyn Write| -> io::Result<()> {
+                    let mut tee = FnvHash::new(&mut *w);
+                    beve::to_writer_streaming(&mut tee, &value)
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    let mut digest = tee.finish();
+                    if corrupt {
+                        digest ^= u64::MAX;
+                    }
+                    w.write_all(&digest.to_le_bytes())?;
+                    Ok(())
+                }
+            })
+        },
+        small_chunks(compression),
+    )
+}
+
+/// The exact bytes `beve::to_writer_streaming` produces for `payload`.
+fn streamed_payload_bytes(payload: &Payload) -> Vec<u8> {
+    let mut buf = Vec::new();
+    beve::to_writer_streaming(&mut buf, payload).expect("stream-encode payload");
+    buf
+}
+
+#[tokio::test]
+async fn trailer_verified_async_commits_payload_only() {
+    let payload = sample_payload();
+    let addr = spawn(writer_digest_router(
+        payload.clone(),
+        false,
+        Compression::Zstd,
+    ));
+    let client = AsyncClient::connect(addr).await.expect("connect");
+
+    let dir = temp_dir("tv-ok");
+    let path = dir.join("payload.beve");
+    pull_to_file_trailer_verified_async(
+        &client,
+        "payload",
+        &path,
+        8,
+        FnvHash::new(io::sink()),
+        check_fnv,
+    )
+    .await
+    .expect("verified trailer pull");
+
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(
+        bytes,
+        streamed_payload_bytes(&payload),
+        "committed file must be the payload with the 8-byte trailer stripped"
+    );
+    let decoded: Payload = beve::from_slice(&bytes).unwrap();
+    assert_eq!(decoded, payload);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn trailer_verified_async_rejects_a_tampered_trailer_and_commits_nothing() {
+    let payload = sample_payload();
+    let addr = spawn(writer_digest_router(payload, true, Compression::None));
+    let client = AsyncClient::connect(addr).await.expect("connect");
+
+    let dir = temp_dir("tv-bad");
+    let path = dir.join("payload.beve");
+    let err = pull_to_file_trailer_verified_async(
+        &client,
+        "payload",
+        &path,
+        8,
+        FnvHash::new(io::sink()),
+        check_fnv,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, RepeError::Io(_)));
+    assert!(!path.exists(), "a digest mismatch must not commit a file");
+    assert!(
+        !dir.join("payload.beve.svspart").exists(),
+        "the temp sibling must be cleaned up on rejection"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A router that streams several real chunks and then aborts the producer before
+/// the terminating chunk — the async twin of the sync mid-stream-abort test,
+/// exercising the `Msg::Fail` path (a genuine mid-stream failure, not a clean-short
+/// stream and not a failure at `open`). The 64 KiB write flushes past the 16 KiB
+/// chunk size and the one-chunk lookahead, so real payload reaches the consumer's
+/// temp file before the abort surfaces. Uncompressed keeps the chunk flow
+/// deterministic (a zstd encoder buffers, so an abort mid-frame might emit nothing).
+fn writer_aborts_midstream_router() -> Router {
+    Router::new().with_writer_stream(
+        BodyFormat::RawBinary,
+        move |resource: &str| {
+            (resource == "aborts").then_some(|w: &mut dyn Write| -> io::Result<()> {
+                w.write_all(&vec![0xA5u8; 64 * 1024])?;
+                Err(io::Error::other("svs: producer aborted mid-stream"))
+            })
+        },
+        small_chunks(Compression::None),
+    )
+}
+
+#[tokio::test]
+async fn trailer_verified_async_rejects_a_midstream_abort_and_commits_nothing() {
+    // Chunks flow, then the producer fails before `last`. `run_pull` surfaces the
+    // pull error *before* the consume result, so the otherwise-`Ok` temp guard is
+    // dropped and removed and nothing is committed. The surfaced error is the raw
+    // server error (`ServerError`), not the sync path's `io`-wrapped form.
+    let addr = spawn(writer_aborts_midstream_router());
+    let client = AsyncClient::connect(addr).await.expect("connect");
+
+    let dir = temp_dir("tv-abort");
+    let path = dir.join("payload.beve");
+    let err = pull_to_file_trailer_verified_async(
+        &client,
+        "aborts",
+        &path,
+        8,
+        FnvHash::new(io::sink()),
+        check_fnv,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, RepeError::ServerError { .. }),
+        "a mid-stream abort must surface as an error, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("aborted mid-stream"),
+        "the error must be the producer's mid-stream abort, not an open failure: {err:?}"
+    );
+    assert!(
+        !path.exists(),
+        "a truncated transfer must not commit a file"
+    );
+    assert!(
+        !dir.join("payload.beve.svspart").exists(),
+        "the temp sibling must be cleaned up after a mid-stream abort"
     );
 
     std::fs::remove_dir_all(&dir).ok();

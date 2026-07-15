@@ -25,7 +25,10 @@
 //! the body through [`with_writer_stream`], teeing its bytes through a hasher as
 //! it encodes and appending the digest as a trailer; it produces an app-framed
 //! `payload || digest` stream tagged [`BodyFormat::RawBinary`], covering the
-//! logical (pre-compression) bytes.
+//! logical (pre-compression) bytes. The consumer of such a stream lifts the
+//! trailer off and checks it in one pass with [`pull_to_file_trailer_verified`]
+//! (or its async form): it holds the last N bytes back, hashes only the payload
+//! prefix, and commits the payload — trailer stripped — only if the check passes.
 //!
 //! This module is the repe-rs **reference implementation** of the SVS contract.
 //! The normative wire definition (routes, `stream_id` encoding, the `last`-flag
@@ -43,14 +46,17 @@
 //!   [`Read`]), or [`with_writer_stream`] (bytes the app writes straight into the
 //!   stream sink in one pass, e.g. teeing through a hasher to append a trailing
 //!   content digest). Pull with [`pull_value`] / [`pull_to_beve_file`] /
-//!   [`pull_to_beve_zst_file`] / [`pull_to_file`] (or the general
-//!   [`pull_stream`]) over the synchronous [`Client`]. From async code, drive an
-//!   [`AsyncClient`] (or a `WebSocketClient`) with [`pull_value_async`] /
-//!   [`pull_typed_slice_async`] / [`pull_complex_slice_async`] /
-//!   [`pull_to_file_async`] / [`pull_to_file_verified_async`], or the
-//!   format-agnostic [`pull_consume_async`]: these run the blocking decoder on a
-//!   `spawn_blocking` thread fed by an async pull loop, so they never park the
-//!   runtime.
+//!   [`pull_to_beve_zst_file`] / [`pull_to_file`] / [`pull_to_vec`] (or the
+//!   general [`pull_stream`]) over the synchronous [`Client`], with the
+//!   format-agnostic [`pull_consume`] hatch and [`pull_to_file_trailer_verified`]
+//!   (strip + verify an in-stream digest trailer, commit payload-only) alongside
+//!   them. From async code, drive an [`AsyncClient`] (or a `WebSocketClient`) with
+//!   [`pull_value_async`] / [`pull_typed_slice_async`] /
+//!   [`pull_complex_slice_async`] / [`pull_to_file_async`] / [`pull_to_vec_async`]
+//!   / [`pull_to_file_verified_async`] / [`pull_to_file_trailer_verified_async`],
+//!   or the format-agnostic [`pull_consume_async`]: these run the blocking decoder
+//!   on a `spawn_blocking` thread fed by an async pull loop, so they never park
+//!   the runtime.
 //!
 //! [`with_typed_value_stream`]: RouterValueStreamExt::with_typed_value_stream
 //! [`with_complex_value_stream`]: RouterValueStreamExt::with_complex_value_stream
@@ -595,10 +601,13 @@ pub trait RouterValueStreamExt: Sized {
     /// append a trailing digest, computing an end-to-end content digest as a
     /// by-product of the one streaming pass, with no second serialization pass.
     /// Frame it as `payload || digest` and tag it [`BodyFormat::RawBinary`] so a
-    /// consumer pulls it with [`pull_to_file`] / [`pull_consume_async`] and strips
-    /// the trailer itself, rather than mistaking `payload || digest` for a bare
-    /// decodable value. (Tagging a plain, trailer-free write as
-    /// [`BodyFormat::Beve`] and pulling it with [`pull_value`] is also valid.)
+    /// consumer pulls it with [`pull_to_file_trailer_verified`] — which holds the
+    /// trailer back, hashes only the payload, and commits the payload alone on a
+    /// match — rather than mistaking `payload || digest` for a bare decodable
+    /// value. (A consumer that wants the raw `payload || digest` bytes can still
+    /// pull them whole with [`pull_to_file`] / [`pull_consume_async`] and split the
+    /// trailer by hand. Tagging a plain, trailer-free write as [`BodyFormat::Beve`]
+    /// and pulling it with [`pull_value`] is also valid.)
     ///
     /// The digest such a closure computes covers the **logical** (pre-compression)
     /// bytes it writes; `opts.compression` is applied by the engine afterward and
@@ -866,6 +875,113 @@ pub fn pull_to_file(client: &Client, resource: &str, path: &Path) -> Result<(), 
     pull_stream::<()>(client, resource, StreamOutput::RawFile(path)).map(|_| ())
 }
 
+/// Sync, format-agnostic escape hatch: pull `resource` and hand its logical
+/// content to `consume` as a blocking [`Read`] on the calling thread (a
+/// `compression = zstd` stream is decompressed on the way in; `none` is delivered
+/// verbatim). This is the synchronous counterpart of [`pull_consume_async`] and,
+/// like it, places no `format` constraint, so it drives an opaque
+/// [`with_reader_stream`](RouterValueStreamExt::with_reader_stream) producer as
+/// well as a BEVE one.
+///
+/// A truncated / dropped transfer surfaces as a read error inside `consume` (the
+/// underlying `next` request fails), so a value built from a short read is
+/// `consume` returning `Err`, never a silent success. The stream is released
+/// (best-effort `cancel`) after `consume` returns, whether or not it drained every
+/// chunk — so a `consume` that stops early (like [`pull_value`]'s partial decode)
+/// still frees the server session.
+pub fn pull_consume<V, F>(client: &Client, resource: &str, consume: F) -> Result<V, RepeError>
+where
+    F: FnOnce(&mut dyn Read) -> Result<V, RepeError>,
+{
+    let open = open_stream(client, resource)?;
+    let reader = ChunkReader::new(client, open.stream_id);
+    let result = match open.compression {
+        Compression::None => {
+            let mut reader = reader;
+            consume(&mut reader)
+        }
+        Compression::Zstd => match zstd::stream::read::Decoder::new(reader) {
+            Ok(mut dec) => consume(&mut dec),
+            Err(e) => Err(RepeError::Io(e)),
+        },
+    };
+    let _ = cancel_stream(client, open.stream_id, "consume complete");
+    result
+}
+
+/// Convenience: pull `resource` and return its entire logical content as a
+/// `Vec<u8>` (a `compression = zstd` stream is decompressed first). Sync
+/// counterpart of [`pull_to_vec_async`].
+///
+/// This materializes the whole payload in memory, so it defeats the streaming
+/// bound — use it only for payloads known to be small; for large transfers pull to
+/// a file ([`pull_to_file`]) or decode straight into a value ([`pull_value`])
+/// instead.
+pub fn pull_to_vec(client: &Client, resource: &str) -> Result<Vec<u8>, RepeError> {
+    pull_consume(client, resource, |reader| {
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf)?;
+        Ok(buf)
+    })
+}
+
+/// Pull an app-framed `payload || trailer` stream, verify the trailer against a
+/// digest computed over the payload, and commit **the payload only** to `path`
+/// (the trailer is stripped). This removes the plain-pull + split + verify +
+/// re-truncate boilerplate an in-stream digest — the
+/// [`with_writer_stream`](RouterValueStreamExt::with_writer_stream) single-pass
+/// seam — otherwise forces on the consumer.
+///
+/// The last `trailer_len` bytes of the logical content are held back as the
+/// claimed trailer; every earlier byte is written to a temp file *and* fed to
+/// `digest`. After the stream terminates cleanly, `verify(digest, &trailer)` is
+/// called with the finalized `digest` accumulator and the held trailer bytes: on
+/// `Ok`, the payload-only file is renamed into place atomically (temp sibling,
+/// fsync, rename); on `Err`, the temp file is discarded and nothing is committed
+/// at `path`. A truncated transfer is caught upstream of `verify` (it surfaces as
+/// the pull error) and likewise commits nothing; a stream shorter than
+/// `trailer_len` is a malformed frame and errors.
+///
+/// The digest covers the logical (pre-compression) bytes, matching what a
+/// [`with_writer_stream`](RouterValueStreamExt::with_writer_stream) producer
+/// hashes through its tee, so producer-side `opts.compression` is transparent
+/// here. Sync counterpart of [`pull_to_file_trailer_verified_async`].
+pub fn pull_to_file_trailer_verified<D, F>(
+    client: &Client,
+    resource: &str,
+    path: &Path,
+    trailer_len: usize,
+    digest: D,
+    verify: F,
+) -> Result<(), RepeError>
+where
+    D: Write,
+    F: FnOnce(D, &[u8]) -> Result<(), RepeError>,
+{
+    let tmp_path = temp_sibling(path);
+    let (guard, digest, trailer) = pull_consume(client, resource, |reader| {
+        let mut digest = digest;
+        let mut guard = TempFile::create(&tmp_path)?;
+        let trailer = {
+            let tee = TeeWriter {
+                file: guard.file_mut(),
+                digest: &mut digest,
+            };
+            let mut hold = TrailerHold::new(tee, trailer_len);
+            io::copy(reader, &mut hold)?;
+            hold.into_trailer()?
+        };
+        guard.file_mut().flush()?;
+        guard.file_mut().sync_all()?;
+        Ok((guard, digest, trailer))
+    })?;
+    // The stream terminated cleanly (a truncation would have surfaced as the pull
+    // error above, discarding `guard`). Let the caller finalize the digest and
+    // compare it to the held trailer; only an `Ok` commits the payload-only file.
+    verify(digest, &trailer)?;
+    guard.commit(path)
+}
+
 /// Pull `resource` as a bulk numeric array decoded straight into a `Vec<T>` at
 /// memcpy speed (beve's `read_typed_slice_from_reader`), skipping the per-element
 /// serde walk [`pull_value`] would do for a `Vec<T>`.
@@ -1125,10 +1241,20 @@ impl TempFile {
     }
 
     fn commit(mut self, final_path: &Path) -> Result<(), RepeError> {
-        self.file = None; // close before rename
-        std::fs::rename(&self.path, final_path)?;
-        self.path = final_path.to_path_buf(); // committed; Drop must not remove it
-        Ok(())
+        self.file = None; // close before rename (Windows cannot rename an open file)
+        match std::fs::rename(&self.path, final_path) {
+            Ok(()) => {
+                self.path = final_path.to_path_buf(); // committed; Drop must not remove it
+                Ok(())
+            }
+            Err(e) => {
+                // The handle is already closed, so `Drop` (file == None) will not
+                // clean up: remove the orphaned temp file here before surfacing the
+                // error, or a failed rename would leak a complete `.svspart`.
+                let _ = std::fs::remove_file(&self.path);
+                Err(RepeError::Io(e))
+            }
+        }
     }
 }
 
@@ -1582,6 +1708,77 @@ impl<A: Write, B: Write> Write for TeeWriter<'_, A, B> {
     }
 }
 
+/// A [`Write`] that forwards all but the last `trailer_len` bytes to `inner`,
+/// holding the most recent `trailer_len` bytes back so they can be lifted off as a
+/// trailer once the whole stream has been written. Used to strip and recover an
+/// app-appended digest trailer (`payload || digest`) in a single pass, feeding the
+/// held-back bytes to neither the file nor the digest, and without buffering more
+/// than `trailer_len` bytes at a time.
+struct TrailerHold<W: Write> {
+    inner: W,
+    hold: Vec<u8>,
+    trailer_len: usize,
+}
+
+impl<W: Write> TrailerHold<W> {
+    fn new(inner: W, trailer_len: usize) -> Self {
+        Self {
+            inner,
+            hold: Vec::with_capacity(trailer_len),
+            trailer_len,
+        }
+    }
+
+    /// Consume the adapter and return the held trailer (exactly `trailer_len`
+    /// bytes). Errors if fewer than `trailer_len` bytes were ever written — the
+    /// stream was too short to carry the claimed trailer.
+    fn into_trailer(self) -> io::Result<Vec<u8>> {
+        if self.hold.len() < self.trailer_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "svs: stream of {} logical byte(s) is shorter than the {}-byte trailer",
+                    self.hold.len(),
+                    self.trailer_len
+                ),
+            ));
+        }
+        Ok(self.hold)
+    }
+}
+
+impl<W: Write> Write for TrailerHold<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.trailer_len;
+        if buf.len() >= n {
+            // Every held byte is now older than the last `n` bytes of the stream,
+            // so it is committed payload: flush it, then flush `buf`'s prefix, and
+            // hold `buf`'s final `n` bytes as the new tail.
+            if !self.hold.is_empty() {
+                self.inner.write_all(&self.hold)?;
+                self.hold.clear();
+            }
+            let split = buf.len() - n;
+            self.inner.write_all(&buf[..split])?;
+            self.hold.extend_from_slice(&buf[split..]);
+        } else {
+            // A short write cannot displace the whole tail; append and shed only
+            // the overflow beyond the last `n` bytes.
+            self.hold.extend_from_slice(buf);
+            if self.hold.len() > n {
+                let overflow = self.hold.len() - n;
+                self.inner.write_all(&self.hold[..overflow])?;
+                self.hold.drain(..overflow);
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Async counterpart of [`pull_to_file`]: pull `resource` and write its logical
 /// content to `path`, committed atomically (temp sibling, renamed only after the
 /// terminating chunk and an fsync). A `compression = none` opaque byte stream is
@@ -1653,6 +1850,77 @@ where
     // error above, before this point, discarding `guard`). Let the caller accept
     // or reject the content; only an accept commits the file.
     verify(digest)?;
+    guard.commit(path)
+}
+
+/// Async counterpart of [`pull_to_vec`]: pull `resource` and return its entire
+/// logical content as a `Vec<u8>` (a `compression = zstd` stream is decompressed
+/// first). Accepts any [`AsyncSvsClient`].
+///
+/// Like the sync version this buffers the whole payload in memory and so defeats
+/// the streaming bound — use it only for small payloads; for large transfers use
+/// [`pull_to_file_async`] or [`pull_value_async`].
+pub async fn pull_to_vec_async<C: AsyncSvsClient>(
+    client: &C,
+    resource: &str,
+) -> Result<Vec<u8>, RepeError> {
+    pull_consume_async(client, resource, |mut reader| {
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf)?;
+        Ok(buf)
+    })
+    .await
+}
+
+/// Async counterpart of [`pull_to_file_trailer_verified`]: pull an app-framed
+/// `payload || trailer` stream, verify the trailer against a digest computed over
+/// the payload, and commit **the payload only** to `path` (the trailer is
+/// stripped).
+///
+/// The last `trailer_len` bytes are held back as the claimed trailer; every
+/// earlier byte is written to a temp file and fed to `digest`. After a clean EOF,
+/// `verify(digest, &trailer)` decides the commit: `Ok` renames the payload-only
+/// file into place atomically; `Err` discards it. A truncated transfer surfaces as
+/// the pull error before `verify` runs and commits nothing; a stream shorter than
+/// `trailer_len` errors. This is the in-stream-digest parallel to
+/// [`pull_to_file_verified_async`] (which instead hashes the *whole* stream against
+/// an out-of-band digest and keeps every byte). The digest covers the logical
+/// (pre-compression) bytes, so producer-side `opts.compression` is transparent.
+///
+/// `digest` runs on the `spawn_blocking` decode thread (hence `Send + 'static`);
+/// `verify` runs on the caller's task after the pull completes.
+pub async fn pull_to_file_trailer_verified_async<C, D, F>(
+    client: &C,
+    resource: &str,
+    path: &Path,
+    trailer_len: usize,
+    digest: D,
+    verify: F,
+) -> Result<(), RepeError>
+where
+    C: AsyncSvsClient,
+    D: Write + Send + 'static,
+    F: FnOnce(D, &[u8]) -> Result<(), RepeError>,
+{
+    let tmp_path = temp_sibling(path);
+    let (guard, digest, trailer) = pull_consume_async(client, resource, move |mut reader| {
+        let mut digest = digest;
+        let mut guard = TempFile::create(&tmp_path)?;
+        let trailer = {
+            let tee = TeeWriter {
+                file: guard.file_mut(),
+                digest: &mut digest,
+            };
+            let mut hold = TrailerHold::new(tee, trailer_len);
+            io::copy(&mut reader, &mut hold)?;
+            hold.into_trailer()?
+        };
+        guard.file_mut().flush()?;
+        guard.file_mut().sync_all()?;
+        Ok((guard, digest, trailer))
+    })
+    .await?;
+    verify(digest, &trailer)?;
     guard.commit(path)
 }
 
@@ -1762,5 +2030,83 @@ mod tests {
         };
         // First pull yields the buffered chunk, peek sees the bare close -> error.
         assert!(s.pull().is_err());
+    }
+
+    #[test]
+    fn trailer_hold_splits_payload_from_trailer_one_byte_at_a_time() {
+        let mut sink = Vec::new();
+        {
+            let mut hold = TrailerHold::new(&mut sink, 4);
+            for b in 0u8..10 {
+                hold.write_all(&[b]).unwrap();
+            }
+            assert_eq!(hold.into_trailer().unwrap(), vec![6, 7, 8, 9]);
+        }
+        assert_eq!(sink, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn trailer_hold_splits_across_mixed_write_sizes() {
+        // A big write, then single-byte writes, then another big write: the last
+        // `trailer_len` bytes overall are the trailer regardless of write alignment.
+        let mut sink = Vec::new();
+        {
+            let mut hold = TrailerHold::new(&mut sink, 4);
+            hold.write_all(&[0, 1, 2, 3, 4, 5]).unwrap();
+            hold.write_all(&[6]).unwrap();
+            hold.write_all(&[7]).unwrap();
+            hold.write_all(&[8, 9, 10, 11, 12]).unwrap();
+            assert_eq!(hold.into_trailer().unwrap(), vec![9, 10, 11, 12]);
+        }
+        assert_eq!(sink, (0u8..=8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn trailer_hold_exact_length_yields_empty_payload() {
+        let mut sink = Vec::new();
+        {
+            let mut hold = TrailerHold::new(&mut sink, 4);
+            hold.write_all(&[1, 2, 3, 4]).unwrap();
+            assert_eq!(hold.into_trailer().unwrap(), vec![1, 2, 3, 4]);
+        }
+        assert!(sink.is_empty(), "an all-trailer stream leaves no payload");
+    }
+
+    #[test]
+    fn trailer_hold_shorter_than_trailer_errors() {
+        let mut sink = Vec::new();
+        let mut hold = TrailerHold::new(&mut sink, 8);
+        hold.write_all(&[1, 2, 3]).unwrap();
+        assert_eq!(
+            hold.into_trailer().unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn tempfile_commit_cleans_up_on_rename_failure() {
+        // `commit` closes the file handle before renaming (Windows requires it),
+        // which disarms the `Drop` cleanup — so its own failure path must remove the
+        // temp file explicitly, or a failed rename leaks a complete `.svspart`.
+        let base = std::env::temp_dir().join(format!("svs-tf-commit-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let tmp = base.join("payload.svspart");
+        // Target is a NON-EMPTY directory: renaming a file onto it fails on both
+        // Unix (EISDIR/ENOTEMPTY) and Windows.
+        let target = base.join("target");
+        std::fs::create_dir_all(target.join("occupant")).unwrap();
+
+        let mut guard = TempFile::create(&tmp).unwrap();
+        guard.file_mut().write_all(b"complete payload").unwrap();
+        assert!(
+            guard.commit(&target).is_err(),
+            "renaming onto a non-empty directory must fail"
+        );
+        assert!(
+            !tmp.exists(),
+            "a rename failure must not orphan the temp file"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }
