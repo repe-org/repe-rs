@@ -55,6 +55,24 @@ fails on any diff — so neither a Glaze change nor a repe-rs change can break
 compatibility unnoticed. To regenerate locally, see
 [`interop/README.md`](https://github.com/repe-org/repe-rs/blob/main/interop/README.md).
 
+## Schema evolution (unknown body keys)
+
+REPE recommends that a server ignore unknown object keys in a structured request
+body and decode the rest, so a newer client's optional field degrades gracefully
+against an older server (see [Schema Evolution](protocol.md#schema-evolution)).
+repe-rs does this by default on every request-decode path; the guarantee is
+pinned by `tests/unknown_fields.rs`, which sends a body carrying an extra,
+undeclared key to a handler built against the older struct and asserts it
+decodes.
+
+Pinning this *across* implementations — a Glaze-produced body with an extra key
+decoding on the Rust server, and this crate's extra key decoding on a Glaze
+server under its default policy — is tracked follow-up. It depends on the C++
+side defaulting its REPE server to ignore unknown keys (Glaze's
+`error_on_unknown_keys` is strict by default today), which is the ecosystem-level
+half of the same recommendation. That fixture is not yet generated, so the
+interop suite does not currently assert the cross-implementation case.
+
 ## Versioning note (v1 vs v2)
 
 The [REPE specification](https://github.com/repe-org/REPE) has a work-in-progress
