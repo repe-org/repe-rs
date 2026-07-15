@@ -608,6 +608,61 @@ fn trailer_verified_rejects_a_stream_shorter_than_the_trailer() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Serve a stream that emits several real chunks and then aborts the producer
+/// *before* the terminating chunk — a genuine mid-stream failure (the `Msg::Fail`
+/// path), distinct from a clean-but-short stream and from a failure at `open`. The
+/// 64 KiB write flushes past the 16 KiB chunk size and the one-chunk lookahead, so
+/// real payload reaches the consumer's temp file before the abort surfaces.
+fn serve_writer_aborts_midstream() -> Client {
+    let router = Router::new().with_writer_stream(
+        BodyFormat::RawBinary,
+        move |resource: &str| {
+            (resource == "aborts").then_some(|w: &mut dyn Write| -> std::io::Result<()> {
+                w.write_all(&vec![0xA5u8; 64 * 1024])?;
+                Err(std::io::Error::other("svs: producer aborted mid-stream"))
+            })
+        },
+        // Uncompressed keeps the chunk flow deterministic: a zstd encoder buffers,
+        // so an abort mid-frame might not have emitted any chunk yet.
+        small_chunks(Compression::None),
+    );
+    serve_router(router)
+}
+
+#[test]
+fn trailer_verified_rejects_a_midstream_abort_and_commits_nothing() {
+    // Chunks flow, then the producer fails before `last`. The consumer must surface
+    // the failure (never mistake a truncated transfer for a clean terminating
+    // chunk) and commit neither the final file nor the `.svspart` temp sibling.
+    let client = serve_writer_aborts_midstream();
+
+    let dir = std::env::temp_dir().join(format!("svs-tv-abort-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("payload.beve");
+
+    let err =
+        pull_to_file_trailer_verified(&client, "aborts", &path, 8, FnvDigest::new(), check_fnv)
+            .unwrap_err();
+    assert!(
+        matches!(err, RepeError::Io(_)),
+        "a mid-stream abort must surface as an error, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("aborted mid-stream"),
+        "the error must be the producer's mid-stream abort, not an open failure: {err:?}"
+    );
+    assert!(
+        !path.exists(),
+        "a truncated transfer must not commit a file at the final path"
+    );
+    assert!(
+        !dir.join("payload.beve.svspart").exists(),
+        "the temp sibling must be cleaned up after a mid-stream abort"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn pull_to_vec_returns_the_whole_decompressed_payload() {
     // The buffer hatch over a compressed opaque stream returns the decompressed

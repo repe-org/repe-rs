@@ -428,6 +428,67 @@ async fn trailer_verified_async_rejects_a_tampered_trailer_and_commits_nothing()
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A router that streams several real chunks and then aborts the producer before
+/// the terminating chunk — the async twin of the sync mid-stream-abort test,
+/// exercising the `Msg::Fail` path (a genuine mid-stream failure, not a clean-short
+/// stream and not a failure at `open`). The 64 KiB write flushes past the 16 KiB
+/// chunk size and the one-chunk lookahead, so real payload reaches the consumer's
+/// temp file before the abort surfaces. Uncompressed keeps the chunk flow
+/// deterministic (a zstd encoder buffers, so an abort mid-frame might emit nothing).
+fn writer_aborts_midstream_router() -> Router {
+    Router::new().with_writer_stream(
+        BodyFormat::RawBinary,
+        move |resource: &str| {
+            (resource == "aborts").then_some(|w: &mut dyn Write| -> io::Result<()> {
+                w.write_all(&vec![0xA5u8; 64 * 1024])?;
+                Err(io::Error::other("svs: producer aborted mid-stream"))
+            })
+        },
+        small_chunks(Compression::None),
+    )
+}
+
+#[tokio::test]
+async fn trailer_verified_async_rejects_a_midstream_abort_and_commits_nothing() {
+    // Chunks flow, then the producer fails before `last`. `run_pull` surfaces the
+    // pull error *before* the consume result, so the otherwise-`Ok` temp guard is
+    // dropped and removed and nothing is committed. The surfaced error is the raw
+    // server error (`ServerError`), not the sync path's `io`-wrapped form.
+    let addr = spawn(writer_aborts_midstream_router());
+    let client = AsyncClient::connect(addr).await.expect("connect");
+
+    let dir = temp_dir("tv-abort");
+    let path = dir.join("payload.beve");
+    let err = pull_to_file_trailer_verified_async(
+        &client,
+        "aborts",
+        &path,
+        8,
+        FnvHash::new(io::sink()),
+        check_fnv,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, RepeError::ServerError { .. }),
+        "a mid-stream abort must surface as an error, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("aborted mid-stream"),
+        "the error must be the producer's mid-stream abort, not an open failure: {err:?}"
+    );
+    assert!(
+        !path.exists(),
+        "a truncated transfer must not commit a file"
+    );
+    assert!(
+        !dir.join("payload.beve.svspart").exists(),
+        "the temp sibling must be cleaned up after a mid-stream abort"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // The same async pullers drive a `WebSocketClient`. The WebSocket server runs
 // the SVS `next` handler off the reader task (it honours `Execution::OffReader`),
 // so blocking for backpressure there is fine.
