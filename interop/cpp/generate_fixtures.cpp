@@ -37,6 +37,33 @@ struct demo_body
    std::vector<int32_t> values = {1, 2, 3};
 };
 
+// A nested object that an older schema never declared, carried inside
+// demo_body_v2 so the fixture exercises skipping a whole unknown sub-object
+// (not just a scalar), including over BEVE. Plain aggregate, like demo_body.
+struct extra_meta
+{
+   std::string locale = "en-GB";
+   int32_t schema_rev = 2;
+};
+
+// A forward-version request body: every field of demo_body plus keys an older
+// server has never heard of -- an interleaved scalar (`region`, between two
+// known fields) and a trailing nested object (`meta`). Serializing this and
+// decoding it into demo_body's Rust twin pins the version-skew guarantee: the
+// unknown keys are ignored, not rejected. Field order is declaration order
+// under Glaze reflection, so `region` lands mid-object and the decoder must
+// skip it and resync to the next known key.
+struct demo_body_v2
+{
+   std::string name = "sensor-7";
+   int32_t count = 42;
+   std::string region = "eu-west"; // unknown to v1, sits between known keys
+   double ratio = -3.5;
+   bool active = true;
+   std::vector<int32_t> values = {1, 2, 3};
+   extra_meta meta{}; // unknown nested object to v1
+};
+
 // One manifest record per fixture. All numeric header fields are widened to
 // uint64_t so the JSON encodes them as plain numbers (uint8_t would serialize
 // as a character) and the Rust side can read them uniformly.
@@ -221,6 +248,36 @@ int main(int argc, char** argv)
       manifest.fixtures.push_back(
          from_msg("empty_query_empty_body", "Minimal frame: empty query, empty body (48-byte header).",
                   msg, "none", "", "", true));
+   }
+
+   // 10. Schema-evolution JSON body: a newer client sends keys an older server
+   //     never declared (interleaved scalar + trailing nested object). Pins that
+   //     the older Rust struct decodes the known fields and ignores the rest.
+   {
+      const demo_body_v2 v{};
+      const auto msg = repe::request_json(repe::user_header{.query = "/api/v2/update", .id = 20}, v);
+      write_frame(out, "json_request_unknown_key", repe::to_buffer(msg));
+      std::string body_json;
+      std::ignore = glz::write_json(v, body_json);
+      manifest.fixtures.push_back(from_msg(
+         "json_request_unknown_key",
+         "JSON body carrying keys an older schema never declared (forward-compat / version skew).",
+         msg, "json", body_json, "", false));
+   }
+
+   // 11. Schema-evolution BEVE body: the same forward-version body over BEVE,
+   //     where skipping an unknown key (and a whole unknown sub-object) is the
+   //     non-trivial binary-format case.
+   {
+      const demo_body_v2 v{};
+      const auto msg = repe::request_beve(repe::user_header{.query = "/api/v2/update", .id = 21}, v);
+      write_frame(out, "beve_request_unknown_key", repe::to_buffer(msg));
+      std::string body_json;
+      std::ignore = glz::write_json(v, body_json);
+      manifest.fixtures.push_back(from_msg(
+         "beve_request_unknown_key",
+         "BEVE body carrying keys an older schema never declared (forward-compat / version skew).",
+         msg, "beve_struct", body_json, "", false));
    }
 
    std::string manifest_str;

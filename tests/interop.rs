@@ -227,6 +227,52 @@ fn build_equivalent(f: &Fixture) -> Message {
     b.build()
 }
 
+/// A server built against an older version of a request schema: it declares
+/// only the fields it knew about. The Glaze-authored `*_unknown_key` fixtures
+/// carry these fields plus keys this struct never declared.
+#[derive(Debug, Deserialize, PartialEq)]
+struct DemoBodyV1 {
+    name: String,
+    count: i32,
+    ratio: f64,
+    active: bool,
+    values: Vec<i32>,
+}
+
+/// The version-skew guarantee, pinned against bytes repe did not author: a
+/// request body a newer client produced with object keys an older server never
+/// declared decodes into that older server's struct with the unknown keys
+/// ignored, not rejected. The `json_request_unknown_key` / `beve_request_unknown_key`
+/// fixtures carry an interleaved scalar (`region`, between two known fields) and
+/// a trailing nested object (`meta`), so both a mid-object skip-and-resync and a
+/// whole-sub-object skip are exercised — over BEVE as well as JSON, where
+/// skipping an unknown key is the non-trivial binary-format path. See
+/// `docs/protocol.md` ("Schema Evolution").
+#[test]
+fn glaze_unknown_key_body_decodes_into_older_struct() {
+    let expected = DemoBodyV1 {
+        name: "sensor-7".into(),
+        count: 42,
+        ratio: -3.5,
+        active: true,
+        values: vec![1, 2, 3],
+    };
+
+    let json_msg = Message::from_slice(&load_frame("json_request_unknown_key"))
+        .expect("parse json_request_unknown_key");
+    let from_json: DemoBodyV1 = json_msg
+        .json_body()
+        .expect("older struct must decode a newer JSON body, ignoring unknown keys");
+    assert_eq!(from_json, expected, "JSON unknown-key decode");
+
+    let beve_msg = Message::from_slice(&load_frame("beve_request_unknown_key"))
+        .expect("parse beve_request_unknown_key");
+    let from_beve: DemoBodyV1 = beve_msg
+        .beve_body()
+        .expect("older struct must decode a newer BEVE body, ignoring unknown keys");
+    assert_eq!(from_beve, expected, "BEVE unknown-key decode");
+}
+
 /// Every `.repe` file on disk must have a manifest entry and vice versa, so a
 /// newly generated fixture can't silently escape coverage.
 #[test]

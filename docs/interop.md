@@ -55,6 +55,14 @@ fails on any diff — so neither a Glaze change nor a repe-rs change can break
 compatibility unnoticed. To regenerate locally, see
 [`interop/README.md`](https://github.com/repe-org/repe-rs/blob/main/interop/README.md).
 
+## Schema evolution (unknown body keys)
+
+REPE recommends that a server ignore unknown object keys in a structured request body and decode the rest, so a newer client's optional field degrades gracefully against an older server (see [Schema Evolution](protocol.md#schema-evolution)). repe-rs does this by default on every request-decode path; `tests/unknown_fields.rs` pins it end-to-end in Rust.
+
+One direction of this is pinned cross-implementation. The `json_request_unknown_key` and `beve_request_unknown_key` fixtures are Glaze-authored request bodies that carry object keys an older schema never declared — an interleaved scalar (`region`, between two known fields) and a trailing nested object (`meta`). `tests/interop.rs` decodes each into the older Rust struct and asserts the unknown keys are ignored rather than rejected, over both JSON and BEVE (where skipping an unknown key, and a whole unknown sub-object, is the non-trivial binary-format path).
+
+The reverse direction — a repe-produced body with an extra key decoding on a Glaze *server* under its default policy — is still follow-up. It needs a running Glaze server (the fixture generator only emits bytes, it does not receive them) and depends on the C++ side defaulting its REPE server to ignore unknown keys; Glaze's `error_on_unknown_keys` is strict by default today. That is the ecosystem-level half of the same recommendation.
+
 ## Versioning note (v1 vs v2)
 
 The [REPE specification](https://github.com/repe-org/REPE) has a work-in-progress

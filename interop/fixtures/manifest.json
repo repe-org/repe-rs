@@ -155,6 +155,40 @@
          "body_json": "",
          "body_text": "",
          "encoder_parity": true
+      },
+      {
+         "name": "json_request_unknown_key",
+         "description": "JSON body carrying keys an older schema never declared (forward-compat / version skew).",
+         "id": 20,
+         "notify": 0,
+         "ec": 0,
+         "query_format": 1,
+         "body_format": 2,
+         "query_length": 14,
+         "body_length": 134,
+         "length": 196,
+         "query": "/api/v2/update",
+         "body_kind": "json",
+         "body_json": "{\"name\":\"sensor-7\",\"count\":42,\"region\":\"eu-west\",\"ratio\":-3.5,\"active\":true,\"values\":[1,2,3],\"meta\":{\"locale\":\"en-GB\",\"schema_rev\":2}}",
+         "body_text": "",
+         "encoder_parity": false
+      },
+      {
+         "name": "beve_request_unknown_key",
+         "description": "BEVE body carrying keys an older schema never declared (forward-compat / version skew).",
+         "id": 21,
+         "notify": 0,
+         "ec": 0,
+         "query_format": 1,
+         "body_format": 1,
+         "query_length": 14,
+         "body_length": 125,
+         "length": 187,
+         "query": "/api/v2/update",
+         "body_kind": "beve_struct",
+         "body_json": "{\"name\":\"sensor-7\",\"count\":42,\"region\":\"eu-west\",\"ratio\":-3.5,\"active\":true,\"values\":[1,2,3],\"meta\":{\"locale\":\"en-GB\",\"schema_rev\":2}}",
+         "body_text": "",
+         "encoder_parity": false
       }
    ]
 }

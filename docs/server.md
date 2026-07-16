@@ -34,6 +34,12 @@ server.serve(listener)?;
 
 Router keys must be JSON Pointer paths (e.g. `/ping`, `/echo`). Raw-binary queries are rejected with `Invalid query`. Missing routes return `MethodNotFound` with the requested path.
 
+### Unknown request-body keys
+
+repe-rs ignores object keys it does not recognize when decoding a request body into a typed handler (`with_typed`) or a registered struct, across both JSON and BEVE. This is a deliberate, guaranteed forward-compatibility property, not an accident of the codec: a newer client can add an optional field to a request and an older server built against this crate decodes the rest and drops the unknown key rather than rejecting the call. See [Schema Evolution](protocol.md#schema-evolution) for the protocol stance.
+
+A handler that wants the opposite — reject a request carrying undeclared keys, for instance to catch a client typo — opts in per type with serde's `#[serde(deny_unknown_fields)]` on its request struct; the rejection then names the offending key. Strictness is a per-type decision the handler author makes, never the server default.
+
 ## Typed Handlers via `JsonTypedHandler`
 
 Implement the `JsonTypedHandler` trait to attach a service type's methods to a router:
