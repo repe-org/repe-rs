@@ -30,7 +30,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{
     Callback, ErrorResponse, Request, Response,
 };
 use tokio_tungstenite::tungstenite::{self, Message as WsMessage, http::StatusCode};
-use tokio_tungstenite::{WebSocketStream, accept_hdr_async};
+use tokio_tungstenite::{WebSocketStream, accept_hdr_async_with_config};
 use tokio_util::sync::CancellationToken;
 
 type ConnectHook = Arc<dyn Fn(PeerHandle) + Send + Sync>;
@@ -100,6 +100,23 @@ pub enum ConnectionError {
         /// The query path of the handler that panicked.
         method: String,
     },
+    /// An outbound message exceeded the connection's
+    /// [`assumed_peer_frame_limit`](crate::WebSocketLimits::assumed_peer_frame_limit)
+    /// and was not sent.
+    ///
+    /// A response was replaced with an [`ErrorCode::InternalError`] response so
+    /// the caller learns its request produced an undeliverable result; a notify
+    /// was dropped, since it has no response to carry the failure. Either way
+    /// the connection stays up, which is the point: sending the message would
+    /// have made the peer's reader close it.
+    OutboundTooLarge {
+        /// The query path of the message that was too large.
+        method: String,
+        /// Serialized size of the message that was refused.
+        size: usize,
+        /// The configured assumption it exceeded.
+        limit: usize,
+    },
     /// An off-reader request was rejected because the connection's
     /// [`with_offreader_limit`](WebSocketServer::with_offreader_limit)
     /// cap was reached. The client received an
@@ -120,6 +137,9 @@ impl ConnectionError {
         match self {
             ConnectionError::HandlerPanic { .. } => Some(ErrorCode::InternalError),
             ConnectionError::Saturation { .. } => Some(ErrorCode::ResourceExhausted),
+            // A refused response is substituted with an InternalError response;
+            // a refused notify carries no code because notifies have none.
+            ConnectionError::OutboundTooLarge { .. } => Some(ErrorCode::InternalError),
             ConnectionError::Handshake(_) | ConnectionError::Connection(_) => None,
         }
     }
@@ -139,6 +159,17 @@ impl std::fmt::Display for ConnectionError {
             ConnectionError::Saturation { method } => {
                 write!(f, "off-reader dispatch limit reached for {method}; retry")
             }
+            ConnectionError::OutboundTooLarge {
+                method,
+                size,
+                limit,
+            } => {
+                write!(
+                    f,
+                    "outbound message for {method} is {size} bytes, over the {limit} byte assumed \
+                     peer frame limit; not sent"
+                )
+            }
         }
     }
 }
@@ -147,7 +178,9 @@ impl std::error::Error for ConnectionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ConnectionError::Handshake(err) | ConnectionError::Connection(err) => Some(err),
-            ConnectionError::HandlerPanic { .. } | ConnectionError::Saturation { .. } => None,
+            ConnectionError::HandlerPanic { .. }
+            | ConnectionError::Saturation { .. }
+            | ConnectionError::OutboundTooLarge { .. } => None,
         }
     }
 }
@@ -392,6 +425,7 @@ fn report_error(hooks: &[ErrorHook], err: ConnectionError) {
 
 pub struct WebSocketServer {
     router: Router,
+    limits: crate::WebSocketLimits,
     outbound_capacity: usize,
     offreader_limit: Option<usize>,
     peer_id_counter: Arc<AtomicU64>,
@@ -405,6 +439,7 @@ impl WebSocketServer {
     pub fn new(router: Router) -> Self {
         Self {
             router,
+            limits: crate::WebSocketLimits::default(),
             outbound_capacity: DEFAULT_OUTBOUND_CAPACITY,
             offreader_limit: Some(DEFAULT_OFFREADER_LIMIT),
             peer_id_counter: Arc::new(AtomicU64::new(0)),
@@ -433,6 +468,22 @@ impl WebSocketServer {
             "WebSocketServer outbound capacity must be >= 1"
         );
         self.outbound_capacity = capacity;
+        self
+    }
+
+    /// Size limits for every connection this server accepts. Defaults to
+    /// [`WebSocketLimits::default`](crate::WebSocketLimits::default).
+    ///
+    /// The inbound thresholds are applied during the handshake, so they reach
+    /// only connections this server upgrades itself: [`serve`](Self::serve) and
+    /// friends, plus [`accept_with_limits`](Self::accept_with_limits). A
+    /// connection the embedder upgraded and handed to
+    /// [`SharedWebSocketServer::serve_connection`] carries whatever inbound
+    /// limits that upgrade was given, and cannot be retrofitted here: the
+    /// underlying transport fixes them at construction and exposes no setter.
+    /// The outbound guard, being repe's own, applies on every path.
+    pub fn with_limits(mut self, limits: crate::WebSocketLimits) -> Self {
+        self.limits = limits;
         self
     }
 
@@ -769,6 +820,7 @@ impl WebSocketServer {
         SharedWebSocketServer {
             config: Arc::new(ConnectionConfig {
                 router: self.router,
+                limits: self.limits,
                 outbound_capacity: self.outbound_capacity,
                 offreader_limit: self.offreader_limit,
                 peer_id_counter: self.peer_id_counter,
@@ -793,9 +845,24 @@ impl WebSocketServer {
         stream: TcpStream,
         path: &str,
     ) -> Result<WebSocketStream<TcpStream>, RepeError> {
+        Self::accept_with_limits(stream, path, crate::WebSocketLimits::default()).await
+    }
+
+    /// [`accept`](Self::accept) with explicit size limits.
+    ///
+    /// An associated function cannot see a builder-set
+    /// [`with_limits`](Self::with_limits), and the inbound thresholds are fixed
+    /// during the handshake, so an embedder driving its own accept must pass
+    /// them here. Use the same value the server was built with, or the inbound
+    /// limits will not match what the rest of the server expects.
+    pub async fn accept_with_limits(
+        stream: TcpStream,
+        path: &str,
+        limits: crate::WebSocketLimits,
+    ) -> Result<WebSocketStream<TcpStream>, RepeError> {
         // No handshake capture: this path feeds `serve_connection`, which
         // does not fire handshake-aware hooks.
-        accept_repe_websocket(stream, &normalize_path(path), false)
+        accept_repe_websocket(stream, &normalize_path(path), false, limits)
             .await
             .map(|(ws, _handshake)| ws)
     }
@@ -815,7 +882,20 @@ impl WebSocketServer {
         stream: TcpStream,
         path: &str,
     ) -> Result<(WebSocketStream<TcpStream>, HandshakeContext), RepeError> {
-        let (ws, handshake) = accept_repe_websocket(stream, &normalize_path(path), true).await?;
+        Self::accept_with_handshake_and_limits(stream, path, crate::WebSocketLimits::default())
+            .await
+    }
+
+    /// [`accept_with_handshake`](Self::accept_with_handshake) with explicit
+    /// size limits. See [`accept_with_limits`](Self::accept_with_limits) for why
+    /// an associated function cannot read them from the builder.
+    pub async fn accept_with_handshake_and_limits(
+        stream: TcpStream,
+        path: &str,
+        limits: crate::WebSocketLimits,
+    ) -> Result<(WebSocketStream<TcpStream>, HandshakeContext), RepeError> {
+        let (ws, handshake) =
+            accept_repe_websocket(stream, &normalize_path(path), true, limits).await?;
         // `capture_handshake = true` always yields `Some` on the accept
         // path (the validator populates it before returning `Ok`).
         Ok((
@@ -827,6 +907,7 @@ impl WebSocketServer {
 
 struct ConnectionConfig {
     router: Router,
+    limits: crate::WebSocketLimits,
     outbound_capacity: usize,
     offreader_limit: Option<usize>,
     peer_id_counter: Arc<AtomicU64>,
@@ -852,6 +933,38 @@ pub struct SharedWebSocketServer {
 }
 
 impl SharedWebSocketServer {
+    /// Perform the REPE WebSocket handshake using this server's configured
+    /// [`WebSocketLimits`](crate::WebSocketLimits).
+    ///
+    /// Prefer this over the associated [`WebSocketServer::accept`] in an
+    /// embedder-owned accept loop. That one takes no `self`, so it cannot see a
+    /// builder-set [`with_limits`](WebSocketServer::with_limits) and accepts
+    /// with the defaults instead: the limits would appear to be configured and
+    /// silently not be.
+    pub async fn accept(
+        &self,
+        stream: TcpStream,
+        path: &str,
+    ) -> Result<WebSocketStream<TcpStream>, RepeError> {
+        WebSocketServer::accept_with_limits(stream, path, self.config.limits).await
+    }
+
+    /// [`accept`](Self::accept), also returning the upgrade's
+    /// [`HandshakeContext`].
+    pub async fn accept_with_handshake(
+        &self,
+        stream: TcpStream,
+        path: &str,
+    ) -> Result<(WebSocketStream<TcpStream>, HandshakeContext), RepeError> {
+        WebSocketServer::accept_with_handshake_and_limits(stream, path, self.config.limits).await
+    }
+
+    /// This server's size limits, for an embedder that upgrades the stream
+    /// through some path of its own and needs to configure it to match.
+    pub fn limits(&self) -> crate::WebSocketLimits {
+        self.config.limits
+    }
+
     /// Run one connection's reader/writer loop using this server's
     /// router, hooks, and capacities. Pair with
     /// [`WebSocketServer::accept`] to serve a stream the embedder
@@ -960,7 +1073,7 @@ impl SharedWebSocketServer {
         shutdown: Option<&ShutdownToken>,
     ) {
         let capture = !self.config.on_connect_ctx.is_empty();
-        match accept_repe_websocket(stream, expected_path, capture).await {
+        match accept_repe_websocket(stream, expected_path, capture, self.config.limits).await {
             Ok((ws, handshake)) => {
                 let conn_token = match shutdown {
                     Some(token) => token.child_token(),
@@ -989,6 +1102,24 @@ pub async fn proxy_connection<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    proxy_connection_with_limits(ws_stream, upstream, crate::WebSocketLimits::default()).await
+}
+
+/// [`proxy_connection`] with explicit size limits.
+///
+/// Only the outbound guard applies: the stream is already upgraded, so its
+/// inbound thresholds were fixed by whoever performed the handshake. A response
+/// forwarded from upstream that exceeds `assumed_peer_frame_limit` is refused
+/// rather than sent, since sending it would make the downstream reader close the
+/// connection and leave the proxy with no error to report.
+pub async fn proxy_connection_with_limits<S>(
+    ws_stream: WebSocketStream<S>,
+    upstream: AsyncClient,
+    limits: crate::WebSocketLimits,
+) -> Result<(), RepeError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let (mut writer, mut reader) = ws_stream.split();
 
     loop {
@@ -1005,10 +1136,14 @@ where
         };
 
         if let Some(response) = upstream.forward_message(&request).await? {
-            writer
-                .send(WsMessage::Binary(response.into_wire_bytes()))
-                .await
-                .map_err(websocket_transport_error)?;
+            // A proxy has no error hooks, so the refusal is reported by
+            // substituting the error response `frame_outbound` builds.
+            if let Some(bytes) = frame_outbound(response, &limits, &[]) {
+                writer
+                    .send(WsMessage::Binary(bytes))
+                    .await
+                    .map_err(websocket_transport_error)?;
+            }
         }
     }
 
@@ -1028,6 +1163,7 @@ async fn accept_repe_websocket(
     stream: TcpStream,
     expected_path: &str,
     capture_handshake: bool,
+    limits: crate::WebSocketLimits,
 ) -> Result<(WebSocketStream<TcpStream>, Option<HandshakeContext>), RepeError> {
     // The handshake `Callback` borrows the request only for the duration
     // of `on_request`, so stash the captured context in a shared slot the
@@ -1035,12 +1171,13 @@ async fn accept_repe_websocket(
     // hook will read it, the slot is absent and the validator skips the
     // capture entirely.
     let captured = capture_handshake.then(|| Arc::new(std::sync::Mutex::new(None)));
-    let ws = accept_hdr_async(
+    let ws = accept_hdr_async_with_config(
         stream,
         WebSocketPathValidator {
             expected: expected_path.to_owned(),
             captured: captured.clone(),
         },
+        Some(limits.into()),
     )
     .await
     .map_err(websocket_transport_error)?;
@@ -1094,6 +1231,8 @@ async fn handle_connection_with_config(
         ws_writer,
         outbound_rx,
         shutdown_rx,
+        config.limits,
+        Arc::clone(&config.on_error),
     )));
 
     let reader_result = {
@@ -1362,10 +1501,61 @@ async fn spawn_off_reader(
     true
 }
 
+/// Serialize an outbound message, refusing one the peer is assumed to reject.
+///
+/// Every outbound message funnels through the writer task, which makes this the
+/// one place the guard has to live. A response is replaced by an error response
+/// carrying the same request id, so the caller gets a real REPE error instead of
+/// a vanished connection. A notify has no response to carry anything, so it is
+/// dropped and reported through the error hooks.
+///
+/// Returns `None` when nothing should go on the wire.
+fn frame_outbound(
+    m: Message,
+    limits: &crate::WebSocketLimits,
+    on_error: &[ErrorHook],
+) -> Option<Vec<u8>> {
+    let method = m.query_str().unwrap_or("").to_string();
+    let notify = m.header.notify != 0;
+    let id = m.header.id;
+    let bytes = m.into_wire_bytes();
+    let Err(err) = limits.check_outbound(bytes.len()) else {
+        return Some(bytes);
+    };
+    let (size, limit) = match err {
+        RepeError::MessageTooLarge { size, limit } => (size, limit),
+        _ => unreachable!("check_outbound yields only MessageTooLarge"),
+    };
+    report_error(
+        on_error,
+        ConnectionError::OutboundTooLarge {
+            method: method.clone(),
+            size,
+            limit,
+        },
+    );
+    if notify {
+        return None;
+    }
+    let mut replacement = crate::message::create_error_message(
+        ErrorCode::InternalError,
+        format!(
+            "response is {size} bytes, over the {limit} byte assumed peer frame limit; \
+             raise the peer's inbound limit or reduce the response"
+        ),
+    );
+    // Carry the request id across so the client matches this to its pending
+    // request. Only the id changes, so the header's length stays correct.
+    replacement.header.id = id;
+    Some(replacement.into_wire_bytes())
+}
+
 async fn writer_task(
     mut ws_writer: SplitSink<WebSocketStream<TcpStream>, WsMessage>,
     mut outbound_rx: mpsc::Receiver<Message>,
     mut shutdown_rx: oneshot::Receiver<()>,
+    limits: crate::WebSocketLimits,
+    on_error: Arc<Vec<ErrorHook>>,
 ) -> Result<(), RepeError> {
     let mut result: Result<(), RepeError> = Ok(());
     loop {
@@ -1375,10 +1565,10 @@ async fn writer_task(
             // notifies make the wire before shutdown.
             msg = outbound_rx.recv() => match msg {
                 Some(m) => {
-                    if let Err(err) = ws_writer
-                        .send(WsMessage::Binary(m.into_wire_bytes()))
-                        .await
-                    {
+                    let Some(bytes) = frame_outbound(m, &limits, &on_error) else {
+                        continue;
+                    };
+                    if let Err(err) = ws_writer.send(WsMessage::Binary(bytes)).await {
                         result = Err(websocket_transport_error(err));
                         break;
                     }
@@ -1394,7 +1584,10 @@ async fn writer_task(
                 // drops.
                 let deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
                 while let Ok(m) = outbound_rx.try_recv() {
-                    let send_fut = ws_writer.send(WsMessage::Binary(m.into_wire_bytes()));
+                    let Some(bytes) = frame_outbound(m, &limits, &on_error) else {
+                        continue;
+                    };
+                    let send_fut = ws_writer.send(WsMessage::Binary(bytes));
                     match tokio::time::timeout_at(deadline, send_fut).await {
                         Ok(Ok(())) => {}
                         Ok(Err(err)) => {
@@ -1666,6 +1859,7 @@ mod tests {
     ) -> Result<(), RepeError> {
         let config = Arc::new(ConnectionConfig {
             router,
+            limits: crate::WebSocketLimits::default(),
             outbound_capacity: DEFAULT_OUTBOUND_CAPACITY,
             offreader_limit: Some(DEFAULT_OFFREADER_LIMIT),
             peer_id_counter: Arc::new(AtomicU64::new(0)),
@@ -1691,7 +1885,9 @@ mod tests {
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (ws_stream, _handshake) =
-                accept_repe_websocket(stream, "/repe", false).await.unwrap();
+                accept_repe_websocket(stream, "/repe", false, crate::WebSocketLimits::default())
+                    .await
+                    .unwrap();
             run_default_connection(ws_stream, router).await.unwrap();
         });
 
@@ -1781,7 +1977,9 @@ mod tests {
             let upstream = AsyncClient::connect(upstream_addr).await.unwrap();
             let (stream, _) = proxy_listener.accept().await.unwrap();
             let (ws_stream, _handshake) =
-                accept_repe_websocket(stream, "/repe", false).await.unwrap();
+                accept_repe_websocket(stream, "/repe", false, crate::WebSocketLimits::default())
+                    .await
+                    .unwrap();
             proxy_connection(ws_stream, upstream).await.unwrap();
         });
 

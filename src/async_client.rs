@@ -923,6 +923,10 @@ fn clone_fatal_error_for_waiter(err: &RepeError, request_id: u64) -> RepeError {
             code: *code,
             message: message.clone(),
         },
+        RepeError::MessageTooLarge { size, limit } => RepeError::MessageTooLarge {
+            size: *size,
+            limit: *limit,
+        },
     }
 }
 

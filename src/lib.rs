@@ -41,6 +41,8 @@ pub mod wasm_client;
 #[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]
 pub mod websocket_client;
 #[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]
+pub mod websocket_limits;
+#[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]
 pub mod websocket_server;
 
 #[doc(hidden)]
@@ -117,6 +119,8 @@ pub use value_stream::{
 pub use wasm_client::WasmClient;
 #[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]
 pub use websocket_client::{AlreadySubscribed, WebSocketClient};
+#[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]
+pub use websocket_limits::{DEFAULT_MAX_FRAME_SIZE, DEFAULT_MAX_MESSAGE_SIZE, WebSocketLimits};
 #[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]
 pub use websocket_server::{
     ConnectionError, HandshakeContext, SharedWebSocketServer, ShutdownToken, WebSocketServer,
