@@ -1,6 +1,6 @@
 # Changelog
 
-## [6.0.0] - Unreleased
+## [6.0.0] - 2026-07-20
 
 ### Added
 - `WebSocketLimits` — per-connection size limits for the WebSocket transport, with `WebSocketClient::connect_with_limits`, `WebSocketServer::with_limits`, and the associated-function variants `WebSocketServer::accept_with_limits` / `accept_with_handshake_and_limits`. Previously every REPE WebSocket connection was stuck with the underlying transport's defaults (16 MiB per frame, 64 MiB per message), because repe passed no configuration to the handshake and exposed no way to supply one.
