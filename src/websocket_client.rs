@@ -16,7 +16,7 @@ use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinError;
 use tokio::time::{Duration, timeout};
 use tokio_tungstenite::tungstenite::{self, Message as WsMessage};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 
 type PendingSender = oneshot::Sender<Result<Message, RepeError>>;
 type PendingRequests = HashMap<u64, PendingSender>;
@@ -50,6 +50,10 @@ impl std::error::Error for AlreadySubscribed {}
 
 struct WebSocketClientInner {
     writer: Mutex<WsWriter>,
+    /// Size limits for this connection. The read-side thresholds were applied
+    /// to the transport at connect time; `assumed_peer_frame_limit` is retained
+    /// because it is repe's own guard, checked on every send.
+    limits: crate::WebSocketLimits,
     pending: StdMutex<PendingRequests>,
     next_id: AtomicU64,
     /// Unbounded sender for inbound notify messages (any header whose
@@ -136,11 +140,32 @@ impl Drop for WebSocketClient {
 }
 
 impl WebSocketClient {
+    /// Connect with the default [`WebSocketLimits`](crate::WebSocketLimits).
     pub async fn connect(url: &str) -> std::io::Result<Self> {
-        let (stream, _response) = connect_async(url).await.map_err(websocket_connect_error)?;
+        Self::connect_with_limits(url, crate::WebSocketLimits::default()).await
+    }
+
+    /// Connect with explicit size limits.
+    ///
+    /// `limits` sets both what this client accepts while reading and the
+    /// assumed peer limit above which an outbound message is refused with
+    /// [`RepeError::MessageTooLarge`] rather than sent. Raising the inbound
+    /// thresholds here does not raise the server's: WebSocket limits are
+    /// per-endpoint and read-side, so a larger payload in either direction
+    /// requires the *receiving* end to be configured for it.
+    pub async fn connect_with_limits(
+        url: &str,
+        limits: crate::WebSocketLimits,
+    ) -> std::io::Result<Self> {
+        // `disable_nagle: false` matches what `connect_async` passes, so the
+        // only behavior this changes is the configured limits.
+        let (stream, _response) = connect_async_with_config(url, Some(limits.into()), false)
+            .await
+            .map_err(websocket_connect_error)?;
         let (writer, reader) = stream.split();
         let inner = Arc::new(WebSocketClientInner {
             writer: Mutex::new(writer),
+            limits,
             pending: StdMutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             notify_tx: StdMutex::new(None),
@@ -149,6 +174,11 @@ impl WebSocketClient {
         spawn_response_loop(reader, Arc::downgrade(&inner));
 
         Ok(Self { inner })
+    }
+
+    /// This connection's size limits.
+    pub fn limits(&self) -> crate::WebSocketLimits {
+        self.inner.limits
     }
 
     /// Subscribe to inbound notify messages (server-pushed messages with
@@ -570,9 +600,15 @@ impl WebSocketClient {
     }
 
     async fn write_request(&self, msg: &Message) -> Result<(), RepeError> {
+        let bytes = msg.to_vec();
+        // Refuse before sending. The local write would succeed either way; it is
+        // the peer's reader that rejects an oversized frame and closes the
+        // connection, so without this the caller loses the socket and never
+        // learns why.
+        self.inner.limits.check_outbound(bytes.len())?;
         let mut writer = self.inner.writer.lock().await;
         writer
-            .send(WsMessage::Binary(msg.to_vec()))
+            .send(WsMessage::Binary(bytes))
             .await
             .map_err(websocket_transport_error)?;
         Ok(())
@@ -854,6 +890,10 @@ fn clone_fatal_error_for_waiter(err: &RepeError, request_id: u64) -> RepeError {
         RepeError::ServerError { code, message } => RepeError::ServerError {
             code: *code,
             message: message.clone(),
+        },
+        RepeError::MessageTooLarge { size, limit } => RepeError::MessageTooLarge {
+            size: *size,
+            limit: *limit,
         },
     }
 }

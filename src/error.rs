@@ -1,7 +1,13 @@
 use crate::constants::ErrorCode;
 use std::fmt::{Display, Formatter};
 
+/// A REPE protocol, transport, or codec failure.
+///
+/// Marked `#[non_exhaustive]`: match with a `_` arm. New variants are added as
+/// the protocol and its transports grow, and requiring a major release for each
+/// one would price a clearer error out of ever shipping.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RepeError {
     #[error("version mismatch: {0}")]
     VersionMismatch(u8),
@@ -30,6 +36,23 @@ pub enum RepeError {
     },
     #[error("server error {code}: {message}")]
     ServerError { code: ErrorCode, message: String },
+    /// An outbound message exceeded the peer's assumed maximum frame size and
+    /// was not sent.
+    ///
+    /// This is a *pre-send* check against a configured assumption, not an
+    /// observation. WebSocket size limits are enforced by the **reader**, so a
+    /// sender has no way to discover what the peer will accept: the local write
+    /// succeeds, and the peer's reader closes the connection. Left unguarded,
+    /// an oversized message costs the sender a dropped connection with no error
+    /// at all, and a reconnecting client that re-requests the same payload
+    /// loops forever. Substituting this error keeps the connection alive and
+    /// tells the sender exactly what happened.
+    ///
+    /// `limit` is the configured assumption, not a value learned from the peer.
+    #[error(
+        "outbound message of {size} bytes exceeds the assumed peer frame limit of {limit} bytes"
+    )]
+    MessageTooLarge { size: usize, limit: usize },
 }
 
 impl RepeError {
@@ -47,6 +70,11 @@ impl RepeError {
             RepeError::UnknownEnumValue(_) => ErrorCode::ParseError,
             RepeError::UnexpectedBodyFormat { .. } => ErrorCode::InvalidBody,
             RepeError::ServerError { code, .. } => *code,
+            // Not `ResourceExhausted`: that code tells the client to retry, and
+            // retrying an oversized response reproduces it exactly. The handler
+            // produced a result that cannot be delivered, which is the internal
+            // condition `InternalError` describes.
+            RepeError::MessageTooLarge { .. } => ErrorCode::InternalError,
         }
     }
 }

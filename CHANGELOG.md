@@ -1,5 +1,30 @@
 # Changelog
 
+## [6.0.0] - 2026-07-20
+
+### Added
+- `WebSocketLimits` — per-connection size limits for the WebSocket transport, with `WebSocketClient::connect_with_limits`, `WebSocketServer::with_limits`, and the associated-function variants `WebSocketServer::accept_with_limits` / `accept_with_handshake_and_limits`. Previously every REPE WebSocket connection was stuck with the underlying transport's defaults (16 MiB per frame, 64 MiB per message), because repe passed no configuration to the handshake and exposed no way to supply one.
+
+  The type is repe-owned rather than a re-export of the transport's own config struct: repe exposes no transport types in its public API, and keeping it that way means a transport version bump stays an internal detail instead of a repe breaking change. It also confines the surface to the knobs that carry protocol meaning, leaving out buffer-tuning fields that make the transport panic when set inconsistently.
+
+  Note the direction. WebSocket size limits are enforced by the **reader**, so `max_incoming_frame_size` / `max_incoming_message_size` govern what this endpoint accepts, not what the peer will. A larger payload in either direction requires the *receiving* end to be configured for it.
+
+- An outbound guard, so an undeliverable message reports instead of vanishing. Because limits are read-side and no handshake field carries them, a sender cannot discover what the peer accepts: an oversized message left the sender cleanly, the peer's reader rejected it and closed the connection, and the sender observed a dropped socket with no error at all. A reconnecting client that re-requested the same payload looped forever.
+
+  `WebSocketLimits::assumed_peer_frame_limit` is checked before sending. A refused **response** is replaced with an `ErrorCode::InternalError` response carrying the same request id, so the caller gets a real REPE error and the connection stays up; a refused **notify** is dropped, having no response to carry the failure. Both reach the server's `on_error` hooks as the new `ConnectionError::OutboundTooLarge`. On the client, an oversized request fails locally with `RepeError::MessageTooLarge` before reaching the wire.
+
+  It defaults **on**, at the transport's own 16 MiB default frame size. This cannot break a working deployment: before `WebSocketLimits` existed there was no way to raise a peer's inbound limit, so no message above it has ever been deliverable to a default peer, and the guard converts a failure that was already happening silently into one that says so. The case to know about is a peer that is not this library, configured with a larger inbound limit; raise `assumed_peer_frame_limit` to match it, or clear it to disable the check.
+
+  Limits set here reach only connections repe upgrades itself. A connection the embedder upgraded and handed to `SharedWebSocketServer::serve_connection` carries whatever inbound limits that upgrade was given and cannot be retrofitted, since the transport fixes them at construction and exposes no setter. The outbound guard, being repe's own, applies on every path.
+
+- `SharedWebSocketServer::accept` / `accept_with_handshake` / `limits`. The associated `WebSocketServer::accept` takes no `self`, so in an embedder-owned accept loop it cannot see a builder-set `with_limits` and upgrades with the defaults instead: the limits appear configured and silently are not. These `&self` methods close that gap; prefer them for one-port co-hosting.
+- `proxy_connection_with_limits`, so a proxy's forwarding writer can refuse a response the downstream reader would reject.
+
+### Changed
+- **BREAKING:** `RepeError` is now `#[non_exhaustive]` and gains a `MessageTooLarge { size, limit }` variant. Downstream matches need a `_` arm. This is the one-time cost of making every future error variant a non-breaking addition.
+- **BREAKING:** `ConnectionError` gains `OutboundTooLarge { method, size, limit }`. It is already `#[non_exhaustive]`, so a match with a `_` arm is unaffected.
+- **BREAKING:** `proxy_connection` now applies the outbound guard at the default 16 MiB, forwarding an error response rather than a message the downstream reader would reject. Use `proxy_connection_with_limits` to change or disable it.
+
 ## [5.0.0] - 2026-07-15
 
 ### Added

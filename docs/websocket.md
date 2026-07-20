@@ -292,6 +292,54 @@ Removing per-connection serialization also removes an implicit safety net. Inlin
 
 The wiring above — install a `TransferControl`, spawn the producer off the reader, and route inbound ack/cancel/resume through your own handlers — is deliberately left to the embedder. A higher-level `WebSocketServer` stream-source surface that owns all of it (you would supply only the byte source and the chunk method names, and `begin`/ack/cancel/resume would be handled internally) is **deferred** until a second distinct windowed-transfer consumer of the built-in server exists, so the trait is designed against more than one transfer shape rather than over-fit to one. Its prerequisites — cancellation-on-disconnect ([above](#cancellation-on-disconnect-and-shutdown)) and orderly drain ([below](#draining-in-flight-connections)) — now exist, so the surface can be designed against this consumer once a second appears. When it is built it should be *pull-based* (the server asks the source for the next chunk only when the credit window has room) and expose a seek so replay/resume can re-emit from an arbitrary offset. Until then, off-reader dispatch plus the [`repe::stream`](streaming.md) API fully cover a single consumer.
 
+## Message Size Limits
+
+WebSocket size limits are enforced by the **reader**. Each endpoint carries its own thresholds, a writer consults none of them, and nothing in the handshake communicates either side's choice. Everything in this section follows from that asymmetry.
+
+### Configuring what an endpoint accepts
+
+`WebSocketLimits` sets the thresholds for a connection. It is a repe-owned type rather than a re-export of the underlying transport's config, so a transport version bump does not become a repe breaking change.
+
+```rust
+use repe::{WebSocketClient, WebSocketLimits, WebSocketServer};
+use repe::server::Router;
+
+let limits = WebSocketLimits::default()
+    .with_max_incoming_frame_size(Some(64 << 20))
+    .with_max_incoming_message_size(Some(64 << 20))
+    .with_assumed_peer_frame_limit(Some(64 << 20));
+
+// Server: applies to every connection it upgrades itself.
+let server = WebSocketServer::new(Router::new()).with_limits(limits);
+
+// Client: applies to this connection.
+// let client = WebSocketClient::connect_with_limits(url, limits).await?;
+```
+
+Raising a limit on one side does **not** raise it on the other. `max_incoming_frame_size` governs what *this* endpoint will read, so a larger payload in either direction requires the *receiving* end to be configured for it. Both ends usually want the same value.
+
+Two paths do not pick up a server's limits, because repe never ran their handshake:
+
+- `SharedWebSocketServer::serve_connection` and friends take a stream the embedder already upgraded. The transport fixes inbound limits at construction and exposes no setter, so they cannot be retrofitted; set them on your own upgrade call.
+- `WebSocketServer::accept` and `accept_with_handshake` are associated functions and cannot see a builder. Use `accept_with_limits` / `accept_with_handshake_and_limits`.
+
+The outbound guard below is repe's own, so it applies on every path regardless.
+
+### Guarding outbound size
+
+Because limits are read-side and undiscoverable, an oversized message fails in a way that looks like nothing at all: it leaves the sender cleanly, the peer's reader rejects it and closes the connection, and the sender sees a dropped socket with no error. A client that reconnects and re-requests the same payload reproduces it indefinitely.
+
+`assumed_peer_frame_limit` is an assumption you configure, checked before sending:
+
+- an oversized **response** is replaced with an `ErrorCode::InternalError` response carrying the same request id, so the caller gets a real error and the connection stays up;
+- an oversized **notify** is dropped, since it has no response to carry a failure;
+- both reach the server's `on_error` hooks as `ConnectionError::OutboundTooLarge`;
+- on the client, an oversized request fails locally with `RepeError::MessageTooLarge` before it reaches the wire.
+
+It defaults on, at the transport's own 16 MiB default frame size. Set it to the peer's `max_incoming_frame_size` when you know it, or clear it with `.with_assumed_peer_frame_limit(None)` for a peer whose limits are known to be absent.
+
+For a payload with no useful upper bound, prefer [SVS streaming](streaming-serialized-values.md) over raising limits: it chunks the transfer, so frame size stays bounded however large the payload grows, and no assumption about the peer is needed.
+
 ## Graceful Shutdown
 
 `serve` and `serve_listener` run until the listener errors or the task is dropped. To stop accepting cleanly without tearing down the runtime, use `serve_with_shutdown` (which binds an address) or `serve_listener_with_shutdown` (which takes an already-bound listener); both `select!` between accepting connections and a shutdown future and return `Ok(())` once it resolves.
