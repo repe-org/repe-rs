@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- **MSRV raised to 1.96** (from 1.89), required by `uniudp 1.1.0`. Cargo's `rust-version` has no per-feature granularity, so the crate declares the highest floor any feature needs; in practice the new floor only binds when the optional `fleet-udp` feature is enabled, and the rest of repe still compiles on 1.89.
+- Depend on `uniudp = "1.1.0"` (raised from `1.0.0`) behind `fleet-udp`, which refreshes its crypto/RNG stack (`hmac` 0.13, `sha2` 0.11, `rand` 0.10, `mio` 1.2). No repe API change.
+- Moved the lockfile off the yanked `spin 0.9.8` to `0.9.9` (an unyanked release in the same `^0.9.2` range `reed-solomon-erasure` requires), silencing the yank warning `cargo publish` emitted. Transitive and lockfile-only; it does not affect downstreams, which resolve their own.
+
 ## [6.0.0] - 2026-07-20
 
 ### Added
