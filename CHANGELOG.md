@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [6.1.0] - 2026-07-27
+
 ### Changed
 - **MSRV raised to 1.96** (from 1.89), required by `uniudp` 1.1.0 and later. Cargo's `rust-version` has no per-feature granularity, so the crate declares the highest floor any feature needs; in practice the new floor only binds when the optional `fleet-udp` feature is enabled, and the rest of repe still compiles on 1.89.
 - Depend on `uniudp = "1.2.1"` (raised from `1.0.0`) behind `fleet-udp`. 1.1.0 refreshed its crypto/RNG stack (`hmac` 0.13, `sha2` 0.11, `rand` 0.10, `mio` 1.2); 1.2.x replaced the unmaintained `reed-solomon-erasure` with `reed-solomon-engine` 0.2 and added receiver accessors for the pending reassembly backlog. The UDP wire format is unchanged, so a peer on the older version still interoperates. No repe API change: repe drives only uniudp's sender.
