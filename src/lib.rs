@@ -22,6 +22,10 @@ pub mod header;
 pub mod io;
 pub mod json_pointer;
 pub mod message;
+// `wasm_client`'s notify slot, hoisted so the host test suite can exercise it.
+// Compiled off wasm32 only under `test`; a plain host build has no user for it.
+#[cfg(all(feature = "websocket-wasm", any(target_arch = "wasm32", test)))]
+mod notify_slot;
 pub mod peer;
 pub mod registry;
 pub mod server;
@@ -115,10 +119,14 @@ pub use value_stream::{
     pull_to_file_verified_async, pull_to_vec, pull_to_vec_async, pull_typed_slice,
     pull_typed_slice_async, pull_value, pull_value_async,
 };
+// Both notify-capable clients share this, so it is exported off the feature
+// rather than off either transport.
+#[cfg(any(feature = "websocket", feature = "websocket-wasm"))]
+pub use error::AlreadySubscribed;
 #[cfg(all(feature = "websocket-wasm", target_arch = "wasm32"))]
 pub use wasm_client::WasmClient;
 #[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]
-pub use websocket_client::{AlreadySubscribed, WebSocketClient};
+pub use websocket_client::WebSocketClient;
 #[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]
 pub use websocket_limits::{DEFAULT_MAX_FRAME_SIZE, DEFAULT_MAX_MESSAGE_SIZE, WebSocketLimits};
 #[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]

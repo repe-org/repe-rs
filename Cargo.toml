@@ -94,7 +94,9 @@ thiserror = "1"
 repe-derive = { path = "repe-derive", version = "0.1.0" }
 parking_lot = { version = "0.12", optional = true }
 uniudp = { version = "1.2.1", optional = true }
-futures-channel = { version = "0.3", optional = true }
+# 0.3.32 for `UnboundedReceiver::try_recv`, which the `notify_slot` tests use
+# (`try_next` is deprecated there, and CI builds tests at `-D warnings`).
+futures-channel = { version = "0.3.32", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
 clap = { version = "4", features = ["derive", "env"], optional = true }
 clap_complete = { version = "4", optional = true }

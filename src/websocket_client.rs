@@ -29,24 +29,10 @@ pub struct WebSocketClient {
     inner: Arc<WebSocketClientInner>,
 }
 
-/// Returned by [`WebSocketClient::subscribe_notifies`] when a live
-/// subscription already exists.
-///
-/// "Live" means the prior receiver has not been dropped. To replace a
-/// live subscription, call [`WebSocketClient::unsubscribe_notifies`]
-/// first. A subscription whose receiver has already been dropped does
-/// not block resubscription: `subscribe_notifies` silently replaces
-/// the stale slot and returns the new receiver.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AlreadySubscribed;
-
-impl std::fmt::Display for AlreadySubscribed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("a notify subscription is already active on this WebSocketClient")
-    }
-}
-
-impl std::error::Error for AlreadySubscribed {}
+/// Re-exported so `repe::websocket_client::AlreadySubscribed` keeps resolving.
+/// The type moved to [`crate::error`] when `WasmClient` gained the same
+/// one-subscriber contract.
+pub use crate::error::AlreadySubscribed;
 
 struct WebSocketClientInner {
     writer: Mutex<WsWriter>,
@@ -63,6 +49,10 @@ struct WebSocketClientInner {
     /// [`WebSocketClient::subscribe_notifies`] returns an
     /// [`AlreadySubscribed`] error if this slot still holds a sender
     /// whose receiver hasn't been dropped.
+    ///
+    /// `WasmClient` implements the same rules over a `RefCell` and a
+    /// `futures_channel` sender; that copy lives in `crate::notify_slot`,
+    /// where the shared rules are unit-tested. Keep the two in step.
     notify_tx: StdMutex<Option<mpsc::UnboundedSender<Message>>>,
 }
 
@@ -205,6 +195,13 @@ impl WebSocketClient {
     /// elide it; if the application needs to know whether messages were
     /// missed, it must subscribe before the first such notify.
     ///
+    /// The channel closes (`recv()` yields `None`) when the socket
+    /// closes or errors, which for a consumer driven only by server
+    /// pushes is the sole signal that the connection is gone. A
+    /// malformed inbound frame does not end the stream on its own.
+    /// Resubscribing on a dead client succeeds, but the receiver it
+    /// hands back is wired to a socket that is gone; reconnect instead.
+    ///
     /// Memory hazard: the channel is unbounded. The transport read loop
     /// pushes every inbound notify into the channel without backpressure,
     /// so a slow or stalled consumer plus a high-rate producer will
@@ -237,11 +234,7 @@ impl WebSocketClient {
     /// notify will be dropped until [`Self::subscribe_notifies`] is
     /// called again.
     pub fn unsubscribe_notifies(&self) {
-        *self
-            .inner
-            .notify_tx
-            .lock()
-            .expect("repe websocket notify_tx mutex poisoned") = None;
+        take_notify_sender(&self.inner);
     }
 
     fn next_request_id(&self) -> u64 {
@@ -836,6 +829,17 @@ async fn fail_all_pending(inner: &std::sync::Weak<WebSocketClientInner>, err: Re
         return;
     };
 
+    // End the notify stream first. A request waiter learns the socket died from
+    // the error below; a notify subscriber has no such channel, and a consumer
+    // driven only by server pushes would otherwise park on `recv()` forever.
+    // Dropping the sender terminates the stream, so `recv()` yields `None`.
+    //
+    // Ahead of `close_writer` deliberately: that awaits a close handshake on a
+    // socket already known to be dead, which on a half-open connection (or
+    // behind another task mid-flush) can stall for TCP-retransmit durations.
+    // The subscriber should not wait on it to learn the connection is gone.
+    take_notify_sender(&inner_ref);
+
     let _ = close_writer(&inner_ref).await;
 
     let waiters = {
@@ -846,6 +850,23 @@ async fn fail_all_pending(inner: &std::sync::Weak<WebSocketClientInner>, err: Re
     for (request_id, sender) in waiters {
         let _ = sender.send(Err(clone_fatal_error_for_waiter(&err, request_id)));
     }
+}
+
+/// Empty the notify slot, dropping the sender *after* the mutex guard is
+/// released.
+///
+/// Dropping the last sender wakes the parked receiver. tokio wakers never run
+/// inline, so an assignment under the guard would not deadlock today, but
+/// waking anything while holding a non-reentrant `std::sync::Mutex` is a trap
+/// to leave lying around. `notify_slot::unsubscribe` keeps the same discipline
+/// on the wasm side, where the equivalent bug is a live `RefCell` panic.
+fn take_notify_sender(inner: &Arc<WebSocketClientInner>) {
+    let previous = inner
+        .notify_tx
+        .lock()
+        .expect("repe websocket notify_tx mutex poisoned")
+        .take();
+    drop(previous);
 }
 
 async fn close_writer(inner: &Arc<WebSocketClientInner>) -> Result<(), RepeError> {
@@ -1157,6 +1178,74 @@ mod tests {
         // stale-slot path (which only kicks in after the receiver is
         // dropped).
         drop(first);
+    }
+
+    #[tokio::test]
+    async fn the_notify_stream_ends_when_the_socket_closes() {
+        // A push-only consumer never issues a request, so end-of-stream is the
+        // only way it can learn the connection died. Without the slot being
+        // cleared on teardown, `recv()` here parks forever.
+        //
+        // The server pushes only after seeing a request, so the notify cannot
+        // race ahead of `subscribe_notifies` and be dropped. That keeps the test
+        // deterministic regardless of runtime flavor, matching
+        // `subscribe_notifies_routes_inbound_notify_to_subscriber`.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+
+            let request = match ws.next().await.unwrap().unwrap() {
+                WsMessage::Binary(payload) => Message::from_slice_exact(&payload).unwrap(),
+                other => panic!("unexpected frame: {other:?}"),
+            };
+            let ack = Message::builder()
+                .id(request.header.id)
+                .query_str("/ack")
+                .query_format(QueryFormat::JsonPointer)
+                .body_json(&serde_json::json!({ "ok": true }))
+                .unwrap()
+                .build();
+            ws.send(WsMessage::Binary(ack.to_vec())).await.unwrap();
+
+            let pushed = Message::builder()
+                .id(0)
+                .notify(true)
+                .query_str("/push")
+                .query_format(QueryFormat::JsonPointer)
+                .body_json(&serde_json::json!({}))
+                .unwrap()
+                .build();
+            ws.send(WsMessage::Binary(pushed.to_vec())).await.unwrap();
+            ws.close(None).await.unwrap();
+        });
+
+        let client = WebSocketClient::connect(&format!("ws://{addr}/close"))
+            .await
+            .unwrap();
+        let mut notifies = client.subscribe_notifies().expect("subscribe");
+        client
+            .call_json("/ready", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        // The pushed notify arrives first, then the close ends the stream.
+        let pushed = timeout(Duration::from_secs(2), notifies.recv())
+            .await
+            .expect("notify did not arrive in time")
+            .expect("subscriber channel closed early");
+        assert_eq!(pushed.query_str().unwrap(), "/push");
+
+        // `client` is deliberately still alive: the stream must end because the
+        // socket died, not because the last client handle was dropped.
+        let ended = timeout(Duration::from_secs(2), notifies.recv())
+            .await
+            .expect("stream did not end after close");
+        assert!(ended.is_none(), "expected end-of-stream, got {ended:?}");
+
+        drop(client);
+        server_task.await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
