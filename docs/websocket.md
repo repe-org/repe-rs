@@ -50,7 +50,7 @@ The receiver yields raw `Message` values; decode the body using `Message::json_b
 - At most one subscriber may be active at a time. If a live subscription already exists, `subscribe_notifies` returns `Err(AlreadySubscribed)` without disturbing the existing receiver. This matters because `WebSocketClient` is `Clone`: the loud-replace contract keeps two holders of the same client from silently stealing each other's subscription. Call `unsubscribe_notifies()` first to take over.
 - A stale slot whose receiver was already dropped does not block a new subscription; in that case `subscribe_notifies` silently installs the new sender.
 - Notifies that arrive while no subscriber is registered are silently dropped. Logging every drop would avalanche under high-rate notifies (e.g. server-pushed binary chunks).
-- The channel closes when the socket closes or errors, so `recv()` yields `None`. A consumer driven only by server pushes never issues a request and so never sees a transport error; end-of-stream is its signal to reconnect. Resubscribing on a dead client succeeds but yields a receiver that never produces anything.
+- The channel closes when the socket closes or errors, so `recv()` yields `None`. A consumer driven only by server pushes never issues a request and so never sees a transport error; end-of-stream is its signal to reconnect. A malformed inbound frame does *not* end the stream on its own — only the connection going away does. Resubscribing on a dead client succeeds, but the receiver it hands back is wired to a socket that is gone; reconnect instead.
 
 ### Backpressure
 
@@ -68,7 +68,7 @@ One difference: it returns a `futures_channel::mpsc::UnboundedReceiver<Message>`
 [dependencies]
 repe = { version = "7", features = ["websocket-wasm"] }
 futures-channel = "0.3"       # only to name UnboundedReceiver in a struct or signature
-futures-util = "0.3"          # StreamExt::next
+futures-util = "0.3"          # StreamExt::next; needs default features, unlike repe's own build of it
 wasm-bindgen-futures = "0.4"  # spawn_local
 web-sys = { version = "0.3", features = ["console"] }
 ```

@@ -19,8 +19,11 @@ use std::cell::RefCell;
 
 /// Holds the one live notify subscriber, or `None` while nobody is listening.
 ///
-/// A `RefCell` suffices because wasm32 is single-threaded and every borrow here
-/// is released before anything that could re-enter.
+/// A `RefCell` suffices because wasm32 is single-threaded. It is not free,
+/// though: dropping a sender or sending on one wakes the receiver
+/// synchronously, so every function here releases its borrow before doing
+/// either. A consumer that resubscribes when woken would otherwise re-enter a
+/// live borrow and panic.
 pub(crate) type NotifySlot = RefCell<Option<mpsc::UnboundedSender<Message>>>;
 
 /// Install a fresh subscriber, refusing to displace a live one.
@@ -37,6 +40,9 @@ pub(crate) fn subscribe(
         return Err(AlreadySubscribed);
     }
     let (tx, rx) = mpsc::unbounded();
+    // Safe to drop the old sender under the guard, unlike in `unsubscribe`: we
+    // only get here when the slot was empty or its receiver was already gone, so
+    // the wake that `close_channel` fires has no live task to re-enter with.
     *slot = Some(tx);
     Ok(rx)
 }
@@ -44,7 +50,14 @@ pub(crate) fn subscribe(
 /// Drop the active subscription. Subsequent notifies are discarded until the
 /// next [`subscribe`].
 pub(crate) fn unsubscribe(slot: &NotifySlot) {
-    *slot.borrow_mut() = None;
+    // Taken out and dropped *after* the guard, not assigned over. Dropping the
+    // last sender calls `close_channel`, which wakes the parked receiver
+    // synchronously; `*slot.borrow_mut() = None` would run that wake with the
+    // mutable borrow still held, and a consumer that resubscribes on wake would
+    // panic on the re-entrant borrow. Unlike the drops in `subscribe` and
+    // `route`, this one can reach a *live* receiver, so the wake is real.
+    let previous = slot.borrow_mut().take();
+    drop(previous);
 }
 
 /// Route `msg` to the notify subscriber if its `notify` header flag is set.
@@ -92,6 +105,29 @@ fn route(slot: &NotifySlot, notify: Message) {
 mod tests {
     use super::*;
     use crate::constants::BodyFormat;
+    use futures_util::StreamExt;
+    use std::cell::Cell;
+    use std::sync::Arc;
+
+    thread_local! {
+        /// The slot [`ReentrantProbe`] pokes at when woken, and what it found.
+        /// A thread local rather than a captured reference because
+        /// [`std::task::Wake`] requires `Send + Sync`, which a `RefCell` is not;
+        /// the wake fires synchronously on this same thread, so this reaches the
+        /// slot under test.
+        static PROBE_SLOT: NotifySlot = const { RefCell::new(None) };
+        static PROBE_SAW_FREE_SLOT: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+
+    /// Stands in for a consumer that resubscribes the moment its stream ends.
+    struct ReentrantProbe;
+
+    impl std::task::Wake for ReentrantProbe {
+        fn wake(self: Arc<Self>) {
+            let free = PROBE_SLOT.with(|slot| slot.try_borrow_mut().is_ok());
+            PROBE_SAW_FREE_SLOT.with(|seen| seen.set(Some(free)));
+        }
+    }
 
     fn notify(query: &str) -> Message {
         frame(query, true)
@@ -155,12 +191,20 @@ mod tests {
     }
 
     #[test]
-    fn routing_with_no_subscriber_is_a_silent_no_op() {
+    fn a_notify_with_no_subscriber_is_dropped_not_queued() {
+        // Dropped for real: nothing installs a sender behind the scenes, and the
+        // message is not buffered for whoever subscribes next. A subscriber that
+        // attaches late starts from the notifies that follow it.
         let slot = NotifySlot::default();
 
         route(&slot, notify("/nobody-listening"));
 
-        assert!(slot.borrow().is_none());
+        assert!(slot.borrow().is_none(), "no sender should be installed");
+        let mut late = subscribe(&slot).expect("subscribe after the drop");
+        assert!(
+            late.try_recv().is_err(),
+            "the earlier notify must not be replayed"
+        );
     }
 
     #[test]
@@ -173,6 +217,31 @@ mod tests {
         route(&slot, notify("/into-the-void"));
 
         assert!(slot.borrow().is_none());
+    }
+
+    #[test]
+    fn unsubscribe_releases_its_borrow_before_waking_the_receiver() {
+        // Dropping the last sender calls `close_channel`, which wakes the parked
+        // receiver synchronously. If that wake runs while the slot is still
+        // mutably borrowed, a consumer that resubscribes on end-of-stream -- the
+        // reconnect flow the docs prescribe -- panics on the re-entrant borrow.
+        let mut rx = PROBE_SLOT.with(subscribe).expect("subscribe");
+
+        // Park the receiver so there is a registered waker to fire.
+        let waker = std::task::Waker::from(Arc::new(ReentrantProbe));
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(
+            rx.poll_next_unpin(&mut cx).is_pending(),
+            "an empty, open channel should park"
+        );
+
+        PROBE_SLOT.with(unsubscribe);
+
+        match PROBE_SAW_FREE_SLOT.with(|seen| seen.get()) {
+            Some(true) => {}
+            Some(false) => panic!("the slot was still borrowed when the receiver woke"),
+            None => panic!("unsubscribe did not wake the parked receiver"),
+        }
     }
 
     #[test]

@@ -168,8 +168,10 @@ impl WasmClient {
     ///
     /// The stream ends (`next()` yields `None`) when the socket closes or
     /// errors, which for a page driven only by server pushes is the sole signal
-    /// that the connection is gone. Resubscribing on a dead client succeeds and
-    /// yields a stream that never produces anything; reconnect instead.
+    /// that the connection is gone. A malformed inbound frame does not end the
+    /// stream on its own. Resubscribing on a dead client succeeds, but the
+    /// stream it hands back is wired to a socket that is gone; reconnect
+    /// instead.
     ///
     /// Memory hazard: the channel is unbounded and the socket callback pushes
     /// into it without backpressure, so a stalled consumer under a high-rate
@@ -666,7 +668,7 @@ impl WasmClientInner {
             let weak = weak.clone();
             Closure::wrap(Box::new(move |_event: Event| {
                 if let Some(inner) = weak.upgrade() {
-                    inner.fail_all_pending(websocket_event_error("websocket error"));
+                    inner.fail_connection(websocket_event_error("websocket error"));
                 }
             }) as Box<dyn FnMut(Event)>)
         };
@@ -674,7 +676,7 @@ impl WasmClientInner {
         let onclose = {
             Closure::wrap(Box::new(move |_event: CloseEvent| {
                 if let Some(inner) = weak.upgrade() {
-                    inner.fail_all_pending(websocket_closed_error());
+                    inner.fail_connection(websocket_closed_error());
                 }
             }) as Box<dyn FnMut(CloseEvent)>)
         };
@@ -719,17 +721,31 @@ impl WasmClientInner {
         }
     }
 
+    /// Hand `err` to every in-flight request. The socket is left alone: a single
+    /// undecodable frame does not desynchronize a message-framed transport, so
+    /// later frames may still be good.
     fn fail_all_pending(&self, err: RepeError) {
         let waiters = self.pending.borrow_mut().drain().collect::<Vec<_>>();
         for (request_id, sender) in waiters {
             let _ = sender.send(Err(clone_fatal_error_for_waiter(&err, request_id)));
         }
+    }
 
-        // End the notify stream as well. A request waiter learns the socket died
-        // from the error above; a notify subscriber has no such channel, and a
-        // page driven only by server pushes would otherwise await a message that
-        // can never arrive. Dropping the sender terminates the stream, so
-        // `next()` yields `None`.
+    /// The socket itself is gone: fail every waiter *and* end the notify stream.
+    ///
+    /// Kept distinct from [`Self::fail_all_pending`] because ending the stream is
+    /// a claim that no further notify can arrive. That is true once the socket is
+    /// closed or errored, and false after a decode failure, where the socket
+    /// stays open and the next frame may well be a valid notify. A subscriber
+    /// treats end-of-stream as its signal to reconnect, so ending it early would
+    /// churn a live connection.
+    fn fail_connection(&self, err: RepeError) {
+        self.fail_all_pending(err);
+
+        // A request waiter learns the socket died from the error above; a notify
+        // subscriber has no such channel, and a page driven only by server pushes
+        // would otherwise await a message that can never arrive. Dropping the
+        // sender terminates the stream, so `next()` yields `None`.
         notify_slot::unsubscribe(&self.notify_tx);
     }
 }
