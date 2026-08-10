@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [7.0.1] - 2026-08-10
+
 ### Changed
 - The lockfile resolves `beve` to **7.1.0** (from 7.0.1). The requirement in `Cargo.toml` stays `beve = "7"`, which already admitted it, so this is lockfile-only and downstreams resolve their own.
 
