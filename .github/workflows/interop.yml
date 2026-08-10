@@ -17,7 +17,7 @@ on:
   workflow_dispatch:
 
 env:
-  GLAZE_TAG: v7.7.1
+  GLAZE_TAG: v8.0.0
 
 jobs:
   interop:

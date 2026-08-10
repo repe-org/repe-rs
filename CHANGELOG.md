@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Changed
+- The interop suite's pinned Glaze tag moves to **v8.0.0** (from v7.7.1), in `interop/cpp/CMakeLists.txt`, the `interop` CI workflow, and the fixture generator's default. Dev-only: `interop/` is not in the published crate, and no repe source changes.
+
+  Regenerating against Glaze 8 leaves **all 11 fixture frames byte-identical** — only `manifest.json`'s `glaze_version` field changes — so the REPE wire output is unaffected by the Glaze major, and `tests/interop.rs` passes untouched. Glaze's baseline compiler requirement is unchanged (GCC 13+, Clang 18+), so the CI job's `g++-14` still builds the generator.
+
+  The reason to move: Glaze 8.0.0 is where Glaze adopted BEVE **Version 2**, the same move `beve` made in 5.0 and repe picked up in 7.0.0. Pinning against 7.7.1 meant the two ends of the suite sat on opposite sides of that line. They now match. `docs/interop.md` is updated to say so — variants are still unpinned coverage rather than a known incompatibility, and the note about matching the variant *shape* (serde's external tagging vs. a bare `std::variant` vs. `tag`/`ids`) still stands.
+
 ## [7.0.0] - 2026-08-10
 
 ### Changed

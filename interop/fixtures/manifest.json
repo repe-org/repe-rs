@@ -1,6 +1,6 @@
 {
    "repe_version": "1",
-   "glaze_version": "v7.7.1",
+   "glaze_version": "v8.0.0",
    "note": "Authentic Glaze-produced REPE v1 frames. Regenerate with interop/cpp; do not hand-edit.",
    "fixtures": [
       {

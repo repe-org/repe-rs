@@ -6,7 +6,7 @@
 #
 #   cmake -S interop/cpp -B interop/cpp/build [-DGLAZE_SOURCE_DIR=/path/to/glaze]
 #   cmake --build interop/cpp/build
-#   interop/cpp/build/generate_fixtures interop/fixtures v7.7.1
+#   interop/cpp/build/generate_fixtures interop/fixtures v8.0.0
 
 cmake_minimum_required(VERSION 3.21)
 project(repe_interop_fixtures CXX)
@@ -15,7 +15,7 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(GLAZE_SOURCE_DIR "" CACHE PATH "Path to a local Glaze checkout (overrides the FetchContent fetch)")
-set(GLAZE_GIT_TAG "v7.7.1" CACHE STRING "Glaze git tag to fetch when GLAZE_SOURCE_DIR is unset")
+set(GLAZE_GIT_TAG "v8.0.0" CACHE STRING "Glaze git tag to fetch when GLAZE_SOURCE_DIR is unset")
 
 if(GLAZE_SOURCE_DIR)
     message(STATUS "Using local Glaze checkout: ${GLAZE_SOURCE_DIR}")
