@@ -13,6 +13,7 @@ Each doc carries a `## Status` line. Three kinds live here:
 
 - [`feature-expansion-plan.md`](feature-expansion-plan.md) — post-Registry roadmap. Generic call/notify, fleet, and UniUDP shipped; the Glaze/C++ interop test suite is still open.
 - [`typed-numeric-body-fast-path.md`](typed-numeric-body-fast-path.md) — numeric/complex body fast path. Core shipped in 3.4.0; remaining items (complex streaming writer, `with_typed_slice` route, matrix path) are tracked here.
+- [`tls-support.md`](tls-support.md) — what it would take to support TLS properly. Nothing started. `wss://` is advertised by the CLI and fails at runtime, since no TLS backend is compiled in. Records why this is more than a feature flag (the WebSocket server API is concrete over `TcpStream`, two clients split the connection with TCP-only mechanisms, and the co-hosting helper is built on `MSG_PEEK`) and proposes a three-phase plan that puts the WebSocket transport first.
 - [`unknown-field-tolerance.md`](unknown-field-tolerance.md) — make "ignore unknown request-body object keys" a documented protocol stance and an explicit per-server/per-endpoint opt-in, so a newer client adding an optional field does not break an older server. The protocol stance, the documented guarantee, and its tests shipped in #37; the strictness opt-in (`UnknownFieldPolicy`, the derive attribute, BEVE parity) is still open.
 
 **Deferred decisions** — a design that was investigated and deliberately *not* built, kept so the question is not reopened from scratch:
