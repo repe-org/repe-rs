@@ -63,6 +63,16 @@ One direction of this is pinned cross-implementation. The `json_request_unknown_
 
 The reverse direction — a repe-produced body with an extra key decoding on a Glaze *server* under its default policy — is still follow-up. It needs a running Glaze server (the fixture generator only emits bytes, it does not receive them) and depends on the C++ side defaulting its REPE server to ignore unknown keys; Glaze's `error_on_unknown_keys` is strict by default today. That is the ecosystem-level half of the same recommendation.
 
+## A note on BEVE variants
+
+The guarantee above covers BEVE **objects** and **typed numeric arrays**, which is what the fixtures exercise. It does not cover a sum type — a Rust `enum` against a C++ `std::variant` — and that gap is currently real rather than merely unpinned.
+
+The BEVE specification has its own version line, independent of REPE's. BEVE **Version 2** deprecates the type-tag extension that Version 1 used to mark a variant, and writes one as ordinary self-describing data instead. Both implementations have moved: the `beve` crate as of its 5.0 release, and Glaze as of 8.0.0. A peer older than either — including the Glaze v7.7.1 tag these fixtures are generated from — is Version 1 on this axis. Decoding is backward compatible and encoding is not, so an older peer's variant is read correctly here while one this crate writes is not.
+
+Version 2 alone does not make the two sides agree, because it fixes the encoding but not the *shape*, and each language picks that per type. Rust's serde defaults to external tagging (`{"Name": payload}`); a plain C++ `std::variant` is written bare, which corresponds to `#[serde(untagged)]`; a Glaze variant with `tag`/`ids` is internally tagged, which corresponds to `#[serde(tag = "...")]`. Pair them deliberately — the encoding is only half the contract.
+
+None of this is pinned by the fixture suite, so nothing here fails loudly if it drifts. If you would rather not carry the coordination, model the case as an object with an explicit discriminant field, or send it over JSON. Structs, numbers, strings, containers, and typed numeric arrays are unaffected either way, and are what the fixtures cover.
+
 ## Versioning note (v1 vs v2)
 
 The [REPE specification](https://github.com/repe-org/REPE) has a work-in-progress
