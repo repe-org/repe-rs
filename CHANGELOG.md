@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING:** upgraded the `beve` dependency from `3` to `7`. As in the 4.0.0 bump, beve types appear in repe's public API (`RepeError::Beve(beve::Error)`, the re-exported `beve::{BeveTypedSlice, Complex}`, and the `T: beve::BeveTypedSlice` bounds on the typed/complex body, route, and stream-pull surfaces), so a beve major is a repe major. Downstreams that also depend on `beve` directly must move to `beve 7`. Every beve primitive repe builds on — the aligned typed-array family, the streaming typed/complex writers and their size functions, the bulk `read_typed_slice` / `read_complex_slice` decoders, `to_writer_streaming` / `from_reader_streaming` / `serialized_size` — is unchanged, so there is no repe API change of its own and no MSRV move (beve 7 requires 1.89; repe's 1.96 floor comes from `uniudp`).
+
+  Three of the four majors do not reach repe: beve 4, 6, and 7 move the optional `mat` (MATLAB v7.3 / HDF5) dependency forward, and repe does not enable that feature.
+
+- **BREAKING (wire):** beve 5.0 is BEVE **Version 2** compliance, which changes the bytes a serde **enum** encodes to inside a BEVE body. Nothing repe itself puts on the wire is affected — the REPE header is hand-packed, and every body type repe defines (the SVS `open`/`next`/`cancel` messages) is a plain struct — but an application enum in a `body_beve` / `with_typed` / `call_typed_beve` body now encodes differently:
+
+  | Variant kind | via beve 3 | via beve 7 |
+  | --- | --- | --- |
+  | unit | bare `u32` index (`Circle` → `0`) | the name as a string (`"Circle"`) |
+  | newtype / tuple / struct | type-tag extension (`0x0E`) + index + payload | single-key object (`{"Rect": {...}}`) |
+
+  This is what `serde_json` writes, so a repe endpoint's BEVE and JSON bodies now describe an enum the same way. Both old forms still **decode**, so a peer on this version reads bodies written by a peer on repe 6.x or earlier; the reverse does not hold. Two peers exchanging enums must therefore be upgraded reader-first, or together.
+
+  It also matters for **C++ interop**. Glaze moved to BEVE Version 2 in 8.0.0, so this bump brings the two implementations back onto the same encoding; a Glaze peer older than that (including the v7.7.1 tag `interop/fixtures/` is generated from) reads the Version 1 form only. Nothing in `interop/fixtures/` exercises variants, so the interop suite is unaffected and still passes unchanged. See [`docs/interop.md`](docs/interop.md#a-note-on-beve-variants), which also covers the separate matter of the variant *shape* — Version 2 fixes the encoding, not whether a Rust enum and a `std::variant` were configured to describe themselves the same way.
+
+- beve 5.0.1/5.0.2 additionally tightened the serializer: a hand-written `Serialize` whose body does not match the field or entry count it declared to `serialize_struct` / `serialize_map` is now an error at `end` rather than an object header promising data the reader never finds. This affects an application body type with a hand-written impl; a `#[derive(Serialize)]` type (including one using `skip_serializing_if`) cannot trip it.
+
 ## [6.1.0] - 2026-07-27
 
 ### Changed
