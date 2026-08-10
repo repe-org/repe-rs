@@ -1,0 +1,19 @@
+[package]
+name = "repe-wasm-test-server"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone rather than a member of the repe workspace: this is CI scaffolding,
+# not part of the crate, and keeping it out means `cargo test` at the root never
+# builds it.
+[workspace]
+
+[dependencies]
+repe = { path = "../.." }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+# Matches the version behind repe's `websocket` feature, so both sides of these
+# tests frame identically.
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+serde_json = "1"

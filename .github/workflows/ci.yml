@@ -64,6 +64,78 @@ jobs:
       - name: Clippy (core, no features)
         run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
 
+  # The job above proves `wasm_client` compiles. This one proves it works.
+  #
+  # Nothing in the host suite executes a line of that module, so its failure
+  # mode after 7.0.2 stopped being "does not build" and became "builds and
+  # silently does nothing" -- which is exactly how server-pushed notifies were
+  # unreachable from the browser. These tests drive a real `WebSocket` in a real
+  # browser against a scripted server; see `wasm-tests/README.md`.
+  #
+  # Separate from the `wasm` job so a chromedriver flake cannot mask a genuine
+  # compile regression, and vice versa.
+  wasm-browser:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v5
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          # The test client and fixture server are standalone crates with their
+          # own lockfiles and target dirs; without this they share a cache key
+          # with the root crate and thrash it.
+          workspaces: |
+            .
+            wasm-tests/client
+            wasm-tests/server
+
+      # Pinned rather than `latest` so an upstream release cannot break CI on a
+      # commit that changed nothing. This is the version the suite was
+      # developed against.
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: "v0.13.1"
+
+      - name: Build the scripted test server
+        run: cargo build --release --manifest-path wasm-tests/server/Cargo.toml
+
+      - name: Start the scripted test server
+        run: |
+          nohup ./wasm-tests/server/target/release/repe-wasm-test-server \
+            > "$RUNNER_TEMP/wasm-test-server.log" 2>&1 &
+          # Poll the listener instead of sleeping a fixed amount: a sleep long
+          # enough to be safe is wasted on every green run, and a short one
+          # flakes.
+          for _ in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/8791) 2>/dev/null; then
+              cat "$RUNNER_TEMP/wasm-test-server.log"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "the test server never started listening on 8791" >&2
+          cat "$RUNNER_TEMP/wasm-test-server.log" >&2
+          exit 1
+
+      # ubuntu-latest ships Chrome; wasm-pack fetches a matching chromedriver.
+      - name: Browser tests (headless Chrome)
+        run: wasm-pack test --headless --chrome
+        working-directory: wasm-tests/client
+
+      - name: Test server log
+        if: failure()
+        run: cat "$RUNNER_TEMP/wasm-test-server.log"
+
   nightly:
     runs-on: ubuntu-latest
     env:
