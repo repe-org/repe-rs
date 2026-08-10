@@ -98,6 +98,33 @@ impl Display for ErrorCode {
     }
 }
 
+/// Returned by a client's `subscribe_notifies` when a live subscription
+/// already exists.
+///
+/// "Live" means the prior receiver has not been dropped. To replace a live
+/// subscription, call `unsubscribe_notifies` first. A subscription whose
+/// receiver has already been dropped does not block resubscription:
+/// `subscribe_notifies` silently replaces the stale slot and returns the new
+/// receiver.
+///
+/// Shared by `WebSocketClient` and `WasmClient` so the one-subscriber contract
+/// reads the same on both transports. Lives here rather than in either client
+/// because both modules are feature- and target-gated, and neither can see the
+/// other.
+#[cfg(any(feature = "websocket", feature = "websocket-wasm"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlreadySubscribed;
+
+#[cfg(any(feature = "websocket", feature = "websocket-wasm"))]
+impl Display for AlreadySubscribed {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a notify subscription is already active on this client")
+    }
+}
+
+#[cfg(any(feature = "websocket", feature = "websocket-wasm"))]
+impl std::error::Error for AlreadySubscribed {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

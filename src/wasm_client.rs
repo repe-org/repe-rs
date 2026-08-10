@@ -1,8 +1,9 @@
 use crate::constants::{BodyFormat, ErrorCode, QueryFormat, REPE_VERSION};
-use crate::error::RepeError;
+use crate::error::{AlreadySubscribed, RepeError};
 use crate::message::{Message, MessageBuilder};
+use crate::notify_slot::{self, NotifySlot};
 use beve::from_slice as beve_from_slice;
-use futures_channel::oneshot;
+use futures_channel::{mpsc, oneshot};
 use futures_util::future::{Either, join_all, select};
 use js_sys::{ArrayBuffer, Uint8Array};
 use serde::Serialize;
@@ -33,6 +34,9 @@ struct WasmClientInner {
     ws: WebSocket,
     pending: RefCell<PendingRequests>,
     next_id: Cell<u64>,
+    /// Inbound notifies go here. `None` means no subscriber, in which case they
+    /// are dropped; see [`WasmClient::subscribe_notifies`].
+    notify_tx: NotifySlot,
     onmessage: Closure<dyn FnMut(MessageEvent)>,
     onerror: Closure<dyn FnMut(Event)>,
     onclose: Closure<dyn FnMut(CloseEvent)>,
@@ -139,6 +143,53 @@ impl WasmClient {
             .set_onclose(Some(inner.onclose.as_ref().unchecked_ref()));
 
         Ok(Self { inner })
+    }
+
+    /// Subscribe to inbound notify messages (server-pushed messages with the
+    /// `notify` header flag set).
+    ///
+    /// Returns an unbounded receiver yielding raw [`Message`]s; decoding bodies
+    /// is the application's job. The receiver is a [`Stream`], so drain it with
+    /// `StreamExt::next().await`. This differs from
+    /// `WebSocketClient::subscribe_notifies`, which returns a tokio receiver
+    /// with `recv()`: tokio does not build for wasm32, so the browser client
+    /// uses `futures_channel` throughout.
+    ///
+    /// At most one subscriber may be active at a time. If a live subscription
+    /// already exists, this returns [`AlreadySubscribed`] without disturbing the
+    /// existing receiver; call [`Self::unsubscribe_notifies`] first to take
+    /// over. "Live" means the prior receiver has not been dropped: a stale slot
+    /// whose receiver was dropped installs the new subscription silently. That
+    /// matters because [`WasmClient`] is `Clone`, and without the loud-replace
+    /// rule two holders of the same client could steal each other's stream.
+    ///
+    /// Notifies arriving with no subscriber registered are dropped silently, so
+    /// subscribe before the first one you care about.
+    ///
+    /// The stream ends (`next()` yields `None`) when the socket closes or
+    /// errors, which for a page driven only by server pushes is the sole signal
+    /// that the connection is gone. Resubscribing on a dead client succeeds and
+    /// yields a stream that never produces anything; reconnect instead.
+    ///
+    /// Memory hazard: the channel is unbounded and the socket callback pushes
+    /// into it without backpressure, so a stalled consumer under a high-rate
+    /// producer grows the buffer until the tab dies. Drain promptly and apply
+    /// application-level backpressure. No bounded variant is offered for the
+    /// same reason as on the native client: dropping notifies on overflow
+    /// corrupts chunk streams, and blocking the callback would stall the
+    /// request/response correlation sharing this socket.
+    ///
+    /// [`Stream`]: futures_util::Stream
+    pub fn subscribe_notifies(
+        &self,
+    ) -> Result<mpsc::UnboundedReceiver<Message>, AlreadySubscribed> {
+        notify_slot::subscribe(&self.inner.notify_tx)
+    }
+
+    /// Drop the active notify subscription, if any. Notifies are dropped again
+    /// until [`Self::subscribe_notifies`] is called.
+    pub fn unsubscribe_notifies(&self) {
+        notify_slot::unsubscribe(&self.inner.notify_tx);
     }
 
     pub async fn call_json<P: AsRef<str>, T: Serialize>(
@@ -632,6 +683,7 @@ impl WasmClientInner {
             ws,
             pending: RefCell::new(HashMap::new()),
             next_id: Cell::new(1),
+            notify_tx: RefCell::new(None),
             onmessage,
             onerror,
             onclose,
@@ -645,6 +697,12 @@ impl WasmClientInner {
                 self.fail_all_pending(err);
                 return;
             }
+        };
+
+        // Notifies are siphoned off before the id lookup; see
+        // [`notify_slot::route_notify`].
+        let Some(response) = notify_slot::route_notify(&self.notify_tx, response) else {
+            return;
         };
 
         let sender = self.pending.borrow_mut().remove(&response.header.id);
@@ -666,6 +724,13 @@ impl WasmClientInner {
         for (request_id, sender) in waiters {
             let _ = sender.send(Err(clone_fatal_error_for_waiter(&err, request_id)));
         }
+
+        // End the notify stream as well. A request waiter learns the socket died
+        // from the error above; a notify subscriber has no such channel, and a
+        // page driven only by server pushes would otherwise await a message that
+        // can never arrive. Dropping the sender terminates the stream, so
+        // `next()` yields `None`.
+        notify_slot::unsubscribe(&self.notify_tx);
     }
 }
 

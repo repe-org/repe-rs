@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Added
+- **`WasmClient::subscribe_notifies()` / `unsubscribe_notifies()`.** The browser client matched every inbound frame by request id and dropped anything unmatched, so a server-pushed notify could not reach the application at all — push-driven protocols were native-only. Notifies are now routed to a subscriber, checked before the correlation map so they cannot collide with an in-flight request sharing the same id.
+
+  Same one-subscriber contract as `WebSocketClient`, including `Err(AlreadySubscribed)` rather than a silent steal. The receiver is a `futures_channel::mpsc::UnboundedReceiver<Message>` — a `Stream`, drained with `StreamExt::next()` — because tokio does not build for `wasm32-unknown-unknown`. See [docs/websocket.md](docs/websocket.md#from-the-browser).
+
+### Fixed
+- **A notify subscription now ends when the connection does,** on both `WebSocketClient` and `WasmClient`. The channel was left open when the socket closed or errored, so a consumer driven only by server pushes — which never issues a request and so never sees a transport error — waited forever on a message that could not arrive. The stream now terminates (`recv()`/`next()` yields `None`), which is that consumer's signal to reconnect.
+
+### Changed
+- `AlreadySubscribed` moved from `websocket_client` to `error`, so both notify-capable clients name one type. `repe::AlreadySubscribed` and `repe::websocket_client::AlreadySubscribed` both still resolve, and it is now exported whenever either `websocket` or `websocket-wasm` is enabled. Its `Display` text drops the `WebSocketClient` mention: "a notify subscription is already active on this client".
+
 ## [7.0.2] - 2026-08-10
 
 ### Fixed

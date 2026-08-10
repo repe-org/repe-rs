@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Receiving Server-Pushed Notifies
 
-`WebSocketClient::subscribe_notifies()` returns a tokio mpsc receiver that yields every inbound `Message` whose `notify` header flag is set. The response loop checks the notify flag *before* the request/response correlation map, so server-pushed notifies never collide with an in-flight request that happens to share the same id.
+`WebSocketClient::subscribe_notifies()` returns a tokio mpsc receiver that yields every inbound `Message` whose `notify` header flag is set. The response loop checks the notify flag *before* the request/response correlation map, so server-pushed notifies never collide with an in-flight request that happens to share the same id. The browser `WasmClient` has the same method; see [From the browser](#from-the-browser).
 
 ```rust
 use repe::WebSocketClient;
@@ -50,12 +50,42 @@ The receiver yields raw `Message` values; decode the body using `Message::json_b
 - At most one subscriber may be active at a time. If a live subscription already exists, `subscribe_notifies` returns `Err(AlreadySubscribed)` without disturbing the existing receiver. This matters because `WebSocketClient` is `Clone`: the loud-replace contract keeps two holders of the same client from silently stealing each other's subscription. Call `unsubscribe_notifies()` first to take over.
 - A stale slot whose receiver was already dropped does not block a new subscription; in that case `subscribe_notifies` silently installs the new sender.
 - Notifies that arrive while no subscriber is registered are silently dropped. Logging every drop would avalanche under high-rate notifies (e.g. server-pushed binary chunks).
+- The channel closes when the socket closes or errors, so `recv()` yields `None`. A consumer driven only by server pushes never issues a request and so never sees a transport error; end-of-stream is its signal to reconnect. Resubscribing on a dead client succeeds but yields a receiver that never produces anything.
 
 ### Backpressure
 
 The notify channel is unbounded by design. The transport read loop pushes every inbound notify into the channel without backpressure, so a slow consumer plus a high-rate producer will grow the buffer until the process OOMs. Application-level backpressure (e.g. ACK windows in a chunk protocol; see [streaming.md](streaming.md)) is the right fix; the consumer must drain the receiver promptly.
 
 A bounded variant is not offered: dropping notifies on overflow corrupts chunk streams, and blocking the read loop on overflow stalls the request/response correlation path that shares the same socket.
+
+### From the browser
+
+`WasmClient::subscribe_notifies()` is the same API under the `websocket-wasm` feature, with the same subscription rules (including end-of-stream when the socket drops, which surfaces here as `next()` yielding `None`), the same notify-before-correlation ordering, and the same unbounded-channel hazard.
+
+One difference: it returns a `futures_channel::mpsc::UnboundedReceiver<Message>`, which is a `Stream`, not a tokio receiver. Drain it with `StreamExt::next().await` rather than `recv().await`. tokio does not build for `wasm32-unknown-unknown`, so the browser client uses `futures_channel` throughout. Naming that receiver type or calling `next()` on it means depending on the same crates repe does:
+
+```toml
+[dependencies]
+repe = { version = "7", features = ["websocket-wasm"] }
+futures-channel = "0.3"       # only to name UnboundedReceiver in a struct or signature
+futures-util = "0.3"          # StreamExt::next
+wasm-bindgen-futures = "0.4"  # spawn_local
+web-sys = { version = "0.3", features = ["console"] }
+```
+
+```rust,ignore
+use futures_util::StreamExt;
+use repe::WasmClient;
+
+let client = WasmClient::connect("ws://127.0.0.1:8081/repe").await?;
+let mut notifies = client.subscribe_notifies()?;
+wasm_bindgen_futures::spawn_local(async move {
+    while let Some(msg) = notifies.next().await {
+        let path = msg.query_str().unwrap_or("");
+        web_sys::console::log_1(&format!("notify {path}").into());
+    }
+});
+```
 
 ## Server-Initiated Notifies
 
