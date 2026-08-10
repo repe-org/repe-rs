@@ -133,7 +133,7 @@ int main(int argc, char** argv)
    fs::create_directories(out);
 
    manifest_doc manifest;
-   manifest.glaze_version = (argc > 2) ? argv[2] : "v7.7.1";
+   manifest.glaze_version = (argc > 2) ? argv[2] : "v8.0.0";
 
    // 1. JSON request: JSON-pointer query + JSON object body.
    {

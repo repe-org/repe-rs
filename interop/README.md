@@ -24,12 +24,12 @@ in `tests/interop.rs` read `fixtures/` at runtime.
 ## Regenerating the fixtures
 
 Requires CMake and a C++23 compiler. By default Glaze is fetched at the pinned
-tag (`v7.7.1`) so the committed bytes and CI stay in lockstep:
+tag (`v8.0.0`) so the committed bytes and CI stay in lockstep:
 
 ```sh
 cmake -S interop/cpp -B interop/cpp/build
 cmake --build interop/cpp/build
-interop/cpp/build/generate_fixtures interop/fixtures v7.7.1
+interop/cpp/build/generate_fixtures interop/fixtures v8.0.0
 ```
 
 To iterate against a local Glaze checkout instead of fetching:
