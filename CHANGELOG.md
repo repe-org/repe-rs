@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Fixed
+- **The `websocket-wasm` feature compiles again.** It has not built for `wasm32-unknown-unknown` since 6.0.0, failing with `error[E0004]: non-exhaustive patterns: &RepeError::MessageTooLarge { .. } not covered` — 6.0.0 added that variant and `clone_fatal_error_for_waiter` in `wasm_client.rs` was never extended to carry it to a waiter. A browser client could not depend on this crate's own WebSocket transport at all across 6.0.0, 6.1.0, 7.0.0 and 7.0.1; the workaround was to frame by hand over the public `Message` API. The variant is now cloned through like every other.
+
+  No `_` arm was added. `RepeError` is this crate's own, so `#[non_exhaustive]` does not force a wildcard on an in-crate match, and the compile error a new variant produces here is worth keeping — it is the reminder to decide how that variant reaches a waiter. What was missing is a build that surfaces it.
+
+- A `collapsible_if` clippy warning in `wasm_client.rs`, unreported for the same reason.
+
+### Changed
+- CI builds `wasm32-unknown-unknown`. `wasm_client` is gated on `all(feature = "websocket-wasm", target_arch = "wasm32")`, so the existing `--all-features` job on ubuntu leaves that cfg false and never compiles the module — which is how it stayed broken across four releases. The new job runs clippy at `-D warnings` for `--features websocket-wasm` and for the core crate with no features.
+
+  It deliberately does not run `--all-features`: `websocket` pulls tokio-tungstenite and `value-stream` pulls zstd, neither of which targets wasm32. `websocket-wasm` is the feature that claims to, so it is the one held to it.
+
 ## [7.0.1] - 2026-08-10
 
 ### Changed

@@ -712,10 +712,10 @@ impl JsTimeout {
     }
 
     fn clear(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            if let Some(window) = web_sys::window() {
-                window.clear_timeout_with_handle(handle);
-            }
+        if let Some(handle) = self.handle.take()
+            && let Some(window) = web_sys::window()
+        {
+            window.clear_timeout_with_handle(handle);
         }
         self.callback.take();
     }
@@ -821,5 +821,14 @@ fn clone_fatal_error_for_waiter(err: &RepeError, request_id: u64) -> RepeError {
             code: *code,
             message: message.clone(),
         },
+        RepeError::MessageTooLarge { size, limit } => RepeError::MessageTooLarge {
+            size: *size,
+            limit: *limit,
+        },
+        // Deliberately no `_` arm. `RepeError` is this crate's own, so
+        // `#[non_exhaustive]` does not force one here, and the compile error a
+        // new variant causes is the reminder to decide how it reaches a
+        // waiter. The wasm32 CI job is what surfaces that error -- an
+        // `--all-features` host build never compiles this module.
     }
 }
