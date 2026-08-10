@@ -33,6 +33,37 @@ jobs:
       - name: Docs
         run: cargo doc --no-deps
 
+  # `wasm_client` is gated on `all(feature = "websocket-wasm", target_arch =
+  # "wasm32")`, so the `check` job above never compiles it: `--all-features` on
+  # ubuntu leaves the cfg false. Without this job the module is unbuilt, which
+  # is how it spent 6.0.0 through 7.0.1 failing to compile against a
+  # `RepeError` variant added in 6.0.0.
+  #
+  # `--all-features` is wrong here on purpose. `websocket` pulls
+  # tokio-tungstenite and `value-stream` pulls zstd, neither of which targets
+  # wasm32; `websocket-wasm` is the feature that claims to.
+  wasm:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v5
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (websocket-wasm)
+        run: cargo clippy --features websocket-wasm --target wasm32-unknown-unknown -- -D warnings
+
+      - name: Clippy (core, no features)
+        run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+
   nightly:
     runs-on: ubuntu-latest
     env:
