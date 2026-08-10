@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Changed
+- The lockfile resolves `beve` to **7.1.0** (from 7.0.1). The requirement in `Cargo.toml` stays `beve = "7"`, which already admitted it, so this is lockfile-only and downstreams resolve their own.
+
+  Nothing in it reaches repe. beve's `src/` is byte-identical between 7.0.1 and 7.1.0 — the release is a manifest change moving the optional `mat` (MATLAB v7.3 / HDF5) feature to `hdf5-pure` 0.35, plus README corrections. repe does not enable `mat`, so no repe source, wire output, or MSRV changes, and the full suite passes untouched. 7.0.1 itself was a docs.rs configuration fix.
+
 - The interop suite's pinned Glaze tag moves to **v8.0.0** (from v7.7.1), in `interop/cpp/CMakeLists.txt`, the `interop` CI workflow, and the fixture generator's default. Dev-only: `interop/` is not in the published crate, and no repe source changes.
 
   Regenerating against Glaze 8 leaves **all 11 fixture frames byte-identical** — only `manifest.json`'s `glaze_version` field changes — so the REPE wire output is unaffected by the Glaze major, and `tests/interop.rs` passes untouched. Glaze's baseline compiler requirement is unchanged (GCC 13+, Clang 18+), so the CI job's `g++-14` still builds the generator.
