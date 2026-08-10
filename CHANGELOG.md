@@ -13,6 +13,8 @@
 ### Changed
 - `AlreadySubscribed` moved from `websocket_client` to `error`, so both notify-capable clients name one type. `repe::AlreadySubscribed` and `repe::websocket_client::AlreadySubscribed` both still resolve, and it is now exported whenever either `websocket` or `websocket-wasm` is enabled. Its `Display` text drops the `WebSocketClient` mention: "a notify subscription is already active on this client".
 
+- CI runs the browser client in a real browser. 7.0.2 added a job proving `wasm_client` compiles; nothing ran it, so its failure mode became "builds and silently does nothing" — which is how notifies were unreachable in the first place. A headless-Chrome job now drives it against a scripted server. Test-only, no effect on the published crate; see [wasm-tests/README.md](wasm-tests/README.md).
+
 ## [7.0.2] - 2026-08-10
 
 ### Fixed
