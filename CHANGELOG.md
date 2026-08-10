@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [7.0.2] - 2026-08-10
+
 ### Fixed
 - **The `websocket-wasm` feature compiles again.** It has not built for `wasm32-unknown-unknown` since 6.0.0, failing with `error[E0004]: non-exhaustive patterns: &RepeError::MessageTooLarge { .. } not covered` — 6.0.0 added that variant and `clone_fatal_error_for_waiter` in `wasm_client.rs` was never extended to carry it to a waiter. A browser client could not depend on this crate's own WebSocket transport at all across 6.0.0, 6.1.0, 7.0.0 and 7.0.1; the workaround was to frame by hand over the public `Message` API. The variant is now cloned through like every other.
 
