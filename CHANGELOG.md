@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [7.0.0] - 2026-08-10
+
 ### Changed
 - **BREAKING:** upgraded the `beve` dependency from `3` to `7`. As in the 4.0.0 bump, beve types appear in repe's public API (`RepeError::Beve(beve::Error)`, the re-exported `beve::{BeveTypedSlice, Complex}`, and the `T: beve::BeveTypedSlice` bounds on the typed/complex body, route, and stream-pull surfaces), so a beve major is a repe major. Downstreams that also depend on `beve` directly must move to `beve 7`. Every beve primitive repe builds on — the aligned typed-array family, the streaming typed/complex writers and their size functions, the bulk `read_typed_slice` / `read_complex_slice` decoders, `to_writer_streaming` / `from_reader_streaming` / `serialized_size` — is unchanged, so there is no repe API change of its own and no MSRV move (beve 7 requires 1.89; repe's 1.96 floor comes from `uniudp`).
 
