@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [7.1.0] - 2026-08-10
 
 ### Added
 - **`WasmClient::subscribe_notifies()` / `unsubscribe_notifies()`.** The browser client matched every inbound frame by request id and dropped anything unmatched, so a server-pushed notify could not reach the application at all — push-driven protocols were native-only. Notifies are now routed to a subscriber, checked before the correlation map so they cannot collide with an in-flight request sharing the same id.
