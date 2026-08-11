@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- **`PeerRegistry::broadcast_notify_*` allocates once per peer instead of twice.** A broadcast has to copy its body once per peer regardless — each sink takes an owned `NotifyBody` — but that copy landed in a buffer sized exactly to the body. `Message::into_wire_bytes` prepends the header and query in place only when the body buffer has capacity for them, so every peer then missed the fast path and allocated a second buffer to copy the body across again. Each per-peer body is now built with room for the prefix, which halves the allocation count of a fan-out and drops the raw variant's redundant leading `to_vec`.
+
+  Bytes moved is unchanged: both paths make two passes over the body, the second now a memmove inside one allocation rather than a copy between two. The saving is allocator pressure at fan-out, which is what a broadcast at data rate is actually spending. No API or wire change; over-reserving is harmless for an embedder sink that frames a different query.
+
 ## [7.1.0] - 2026-08-10
 
 ### Added
