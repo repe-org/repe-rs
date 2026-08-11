@@ -446,6 +446,62 @@ loop {
 
 The built-in `serve` / `serve_listener` loop is itself implemented on top of `into_shared` + `accept` + `serve_connection`, so a co-hosted connection behaves identically to one accepted by the built-in loop.
 
+### Adopting a connection your HTTP framework upgraded
+
+The peek-then-fork recipe above requires repe to own the `TcpStream` before any HTTP is parsed. That is the wrong shape for an embedder whose routes already live in an HTTP framework — an `axum` `Router` with a `/healthz` probe and a handful of `/api/*` routes, wanting the REPE endpoint to be one more route on it. There, the framework owns the socket and answers the `101` itself; repe never sees a `TcpStream`.
+
+For that shape, hand repe the byte stream the framework upgraded. `SharedWebSocketServer::adopt_upgraded(io)` wraps it into a server-role `WebSocketStream` carrying this server's configured `WebSocketLimits`, and `serve_connection` takes it from there — the serving path is generic over the underlying stream, so it does not have to be a socket this crate accepted.
+
+```rust
+use axum::body::Body;
+use axum::extract::{Request, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use hyper::upgrade::OnUpgrade;
+use hyper_util::rt::TokioIo;
+use repe::{derive_accept_key, SharedWebSocketServer, WebSocketServer};
+
+async fn repe_upgrade(State(shared): State<SharedWebSocketServer>, mut req: Request) -> Response {
+    let Some(key) = req.headers().get("sec-websocket-key").cloned() else {
+        return (StatusCode::BAD_REQUEST, "missing Sec-WebSocket-Key").into_response();
+    };
+    let Some(on_upgrade) = req.extensions_mut().remove::<OnUpgrade>() else {
+        return (StatusCode::BAD_REQUEST, "not an upgrade request").into_response();
+    };
+
+    tokio::spawn(async move {
+        let Ok(upgraded) = on_upgrade.await else { return };
+        let ws = shared.adopt_upgraded(TokioIo::new(upgraded)).await;
+        let _ = shared.serve_connection(ws).await;
+    });
+
+    Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header("upgrade", "websocket")
+        .header("connection", "Upgrade")
+        .header("sec-websocket-accept", derive_accept_key(key.as_bytes()))
+        .body(Body::empty())
+        .expect("valid 101 response")
+}
+
+let shared = WebSocketServer::new(router).into_shared();
+let app = axum::Router::new()
+    .route("/healthz", get(|| async { "ok" }))
+    .route("/repe", get(repe_upgrade))
+    .with_state(shared);
+axum::serve(listener, app).await?;
+```
+
+Everything a connection gets under `serve` it also gets here: connect/disconnect hooks, an attached `PeerRegistry`, `CallContext::peer`, off-reader dispatch, and pushed notifies. `serve_connection_with_cancel` works the same way, so a framework-hosted server drains exactly as [below](#draining-a-co-hosted-server).
+
+Two things are the caller's responsibility, because they happen before repe is involved:
+
+- **The handshake.** Validate the upgrade request and answer `101` with the `derive_accept_key` of the client's `Sec-WebSocket-Key` — `derive_accept_key` is re-exported for that. `adopt_upgraded` reads nothing before the first REPE frame, so a stream whose handshake never completed surfaces as a protocol error on that one connection.
+- **Path routing.** `adopt_upgraded` does no path validation, since the framework already routed the request to this handler. This is the counterpart to the `path` argument that `WebSocketServer::accept` takes.
+
+Only the *outbound* size guard is repe's to set on an adopted stream: inbound thresholds are fixed when the stream is constructed. That is why this constructor exists rather than leaving embedders to call `tokio_tungstenite`'s `from_raw_socket` themselves, which would silently substitute the transport defaults for the limits the server was built with. The `tokio_tungstenite` repe is built against is re-exported as `repe::tokio_tungstenite` for embedders who need to *name* `WebSocketStream` in their own signatures.
+
 ### Draining a co-hosted server
 
 Because a co-hosting embedder owns its accept loop, it cannot hand its listener to `serve_listener_with_graceful_drain`. To get the cancellation half on its own terms, create one `ShutdownToken`, serve each connection with `serve_connection_with_cancel(ws, &token)` instead of `serve_connection(ws)`, and `token.cancel()` on shutdown — every connection's in-flight off-reader handlers then observe [`ctx.is_cancelled()`](#cancellation-on-disconnect-and-shutdown) at once. Track the futures in your own `JoinSet` (as you already do for one-port hosting) and drain it with whatever deadline you choose.

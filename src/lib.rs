@@ -132,5 +132,12 @@ pub use websocket_limits::{DEFAULT_MAX_FRAME_SIZE, DEFAULT_MAX_MESSAGE_SIZE, Web
 #[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]
 pub use websocket_server::{
     ConnectionError, HandshakeContext, SharedWebSocketServer, ShutdownToken, WebSocketServer,
-    is_websocket_upgrade, proxy_connection,
+    derive_accept_key, is_websocket_upgrade, proxy_connection,
 };
+/// The `tokio-tungstenite` this crate is built against, re-exported so an
+/// embedder handing repe a connection its own HTTP stack upgraded can name
+/// `WebSocketStream` at the matching version instead of guessing which
+/// requirement to add. Only needed to *name* the type — the value itself
+/// comes from [`SharedWebSocketServer::adopt_upgraded`], which infers it.
+#[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]
+pub use tokio_tungstenite;

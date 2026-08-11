@@ -1,5 +1,23 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **`SharedWebSocketServer::adopt_upgraded(io)`.** Serves a connection whose upgrade repe did not perform, wrapping the already-upgraded byte stream into a server-role `WebSocketStream` that carries this server's configured `WebSocketLimits`.
+
+  The shipped one-port recipe (`is_websocket_upgrade` + `WebSocketServer::accept`) requires repe to own the `TcpStream` before any HTTP is parsed. That excluded the shape an embedder actually has when its routes live in an HTTP framework: an `axum` `Router` already holding `/healthz` and some `/api/*` routes, wanting the REPE endpoint to be one more route on it. There, the framework owns the socket and answers the `101`, so repe never sees a `TcpStream` — and no entry point accepted an already-upgraded stream, at any price. The only ways out were a second port or abandoning the framework's serving path for a hand-written accept loop. See [docs/websocket.md](docs/websocket.md#adopting-a-connection-your-http-framework-upgraded) for the worked `axum` recipe.
+
+  Path validation is the caller's job here (the framework already routed the request), which is the counterpart to the `path` argument `WebSocketServer::accept` takes.
+
+- **`derive_accept_key`** (re-exported at the crate root): the `Sec-WebSocket-Accept` derivation an embedder answering the upgrade itself needs. It is the one part of the handshake that is easy to get subtly wrong, and a wrong answer is rejected by the client, not by this crate.
+
+- **`repe::tokio_tungstenite`**, the `tokio-tungstenite` this crate is built against. Needed only to *name* `WebSocketStream` in an embedder's own signatures — the value comes from `adopt_upgraded`, which infers it. Previously an embedder had to guess which version requirement would unify with repe's.
+
+### Changed
+- `SharedWebSocketServer::serve_connection`, `serve_connection_with_handshake`, `serve_connection_with_cancel`, and `serve_connection_with_cancel_and_handshake` are now generic over the underlying byte stream (`S: AsyncRead + AsyncWrite + Unpin + Send + 'static`) rather than fixed to `WebSocketStream<TcpStream>` — matching `proxy_connection`, which was already generic. The connection loop never used a `TcpStream` method, so the restriction was incidental rather than principled.
+
+  Existing calls compile unchanged: `TcpStream` satisfies the bound and is inferred from the argument. Only a caller who named one of these as a function item or turbofished it is affected.
+
 ## [7.1.0] - 2026-08-10
 
 ### Added
