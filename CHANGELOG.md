@@ -9,14 +9,20 @@
 
   Path validation is the caller's job here (the framework already routed the request), which is the counterpart to the `path` argument `WebSocketServer::accept` takes.
 
-- **`derive_accept_key`** (re-exported at the crate root): the `Sec-WebSocket-Accept` derivation an embedder answering the upgrade itself needs. It is the one part of the handshake that is easy to get subtly wrong, and a wrong answer is rejected by the client, not by this crate.
+- **`SharedWebSocketServer::adopt_upgraded_partially_read(io, buffered)`**, for a framework that returns the bytes it read past the upgrade request separately from the stream. A client may legally pipeline its first frame with the upgrade, so dropping those bytes loses a frame; `hyper` replays them itself, but a framework handing back `(io, buffered)` has nowhere else to put them.
 
-- **`repe::tokio_tungstenite`**, the `tokio-tungstenite` this crate is built against. Needed only to *name* `WebSocketStream` in an embedder's own signatures — the value comes from `adopt_upgraded`, which infers it. Previously an embedder had to guess which version requirement would unify with repe's.
+- **`HandshakeContext::from_http_request(&req)`.** `HandshakeContext` had no public constructor, so `on_peer_connect_with_handshake` — the hook for keying peers off an identity carried in the upgrade request — could not fire on a connection repe did not accept. That excluded the best-positioned caller in the crate: a framework handler holding the entire request. Generic over the body type and borrowing, so it composes with any `http::Request` and leaves the caller free to answer the upgrade afterwards.
+
+- **`derive_accept_key`** (at the crate root): the `Sec-WebSocket-Accept` derivation an embedder answering the upgrade itself needs. It is the one part of the handshake that is easy to get subtly wrong, and a wrong answer is rejected by the client, not by this crate. A thin wrapper rather than a re-export of the transport's function, so the signature is repe's to keep stable.
+
+- **`repe::tokio_tungstenite`**, the `tokio-tungstenite` this crate is built against. Needed only to *name* `WebSocketStream` (or the `http` types behind `from_http_request`) in an embedder's own signatures — the value comes from `adopt_upgraded`, which infers it. Previously an embedder had to guess which version requirement would unify with repe's.
 
 ### Changed
 - `SharedWebSocketServer::serve_connection`, `serve_connection_with_handshake`, `serve_connection_with_cancel`, and `serve_connection_with_cancel_and_handshake` are now generic over the underlying byte stream (`S: AsyncRead + AsyncWrite + Unpin + Send + 'static`) rather than fixed to `WebSocketStream<TcpStream>` — matching `proxy_connection`, which was already generic. The connection loop never used a `TcpStream` method, so the restriction was incidental rather than principled.
 
   Existing calls compile unchanged: `TcpStream` satisfies the bound and is inferred from the argument. Only a caller who named one of these as a function item or turbofished it is affected.
+
+- `WebSocketLimits`' documentation no longer claims repe "exposes no transport types in its public API". It never quite did (`accept` returns a `WebSocketStream`), and `repe::tokio_tungstenite` makes it plainly false. The honest version: the repe-owned type exists to keep the surface to knobs that carry protocol meaning and to keep out buffer fields the transport panics on, and a tokio-tungstenite major bump is a repe major bump either way.
 
 ## [7.1.0] - 2026-08-10
 

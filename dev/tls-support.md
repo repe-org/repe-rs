@@ -10,7 +10,7 @@ The immediate trigger: `wss://` is advertised in the CLI help and in `docs/cli.m
 
 repe has no TLS support on any native transport. Adding it is not one feature flag, because three things in the current shape assume a plain `TcpStream`:
 
-1. The WebSocket server API is concrete over `TcpStream` in every public signature.
+1. The WebSocket server API is concrete over `TcpStream` in every public signature. **Partly resolved (unreleased):** the *serving* half is done — `handle_connection_with_config`, `reader_task`, `writer_task`, and all four public `serve_connection*` methods are now generic over `S: AsyncRead + AsyncWrite + Unpin + Send + 'static`, generalized in place rather than as the `serve_connection_on<S>` sibling this document proposed (no duplicate surface, no naming debt — prefer that shape for the rest). What remains concrete is the *accept* half: `WebSocketServer::accept{,_with_limits,_with_handshake,_with_handshake_and_limits}`, `SharedWebSocketServer::accept{,_with_handshake}`, and the internal `accept_repe_websocket`. An embedder holding a `TlsStream` can already serve it by performing the upgrade itself and calling `SharedWebSocketServer::adopt_upgraded`; making `accept` generic is what removes that requirement. See `http-cohosting-and-keyed-peer-registry.md`.
 2. Two of the four clients split a connection using mechanisms that exist only for TCP sockets (`try_clone`, `into_split`). Neither works for a TLS session.
 3. The shipped co-hosting helper `is_websocket_upgrade` is built on `TcpStream::peek`, and a decrypted TLS stream has no `peek`.
 
@@ -73,16 +73,20 @@ The codec layer is already transport-agnostic and needs no work: `io.rs` is gene
 
 ### 1. The server API is concrete over `TcpStream`
 
+> **Half of this landed (unreleased).** The serving path is generic now; the text
+> below is kept because the remaining accept half is the same problem with the
+> same fix, and the reasoning still applies to it verbatim.
+
 Every public entry point on the WebSocket server names the stream type:
 
 ```rust
-pub async fn accept(stream: TcpStream, ...) -> Result<WebSocketStream<TcpStream>, RepeError>          // :844
-pub async fn serve_connection(&self, ws: WebSocketStream<TcpStream>) -> Result<(), RepeError>          // :982
+pub async fn accept(stream: TcpStream, ...) -> Result<WebSocketStream<TcpStream>, RepeError>          // still concrete
+pub async fn serve_connection(&self, ws: WebSocketStream<TcpStream>) -> Result<(), RepeError>          // now generic over S
 ```
 
-An embedder holding a `tokio_rustls::server::TlsStream<TcpStream>` has nothing to call.
+An embedder holding a `tokio_rustls::server::TlsStream<TcpStream>` has nothing to call — though it can now perform the upgrade itself and hand the result to `adopt_upgraded`, which is a workaround rather than the fix.
 
-There is already precedent in the file for the fix. `proxy_connection` (`:1098`) is generic over exactly the right bound:
+There is already precedent in the file for the fix. `proxy_connection` is generic over exactly the right bound:
 
 ```rust
 pub async fn proxy_connection<S>(ws_stream: WebSocketStream<S>, upstream: AsyncClient) -> Result<(), RepeError>
@@ -90,7 +94,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 ```
 
-So the bound is written and proven; it just is not applied to the main path. `handle_connection_with_config` (`:1194`) and the `writer_task` / `reader_task` pair (`:1554`, `:1318`) would need the same parameter threaded through.
+So the bound is written and proven. It is now applied to `handle_connection_with_config`, `reader_task`, and `writer_task` as well; `accept_repe_websocket` is the one internal still concrete, and `accept_hdr_async_with_config` beneath it is already generic, so threading the parameter through is mechanical.
 
 ### 2. Two clients split the connection with TCP-only mechanisms
 

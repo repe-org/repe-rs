@@ -134,10 +134,14 @@ pub use websocket_server::{
     ConnectionError, HandshakeContext, SharedWebSocketServer, ShutdownToken, WebSocketServer,
     derive_accept_key, is_websocket_upgrade, proxy_connection,
 };
-/// The `tokio-tungstenite` this crate is built against, re-exported so an
-/// embedder handing repe a connection its own HTTP stack upgraded can name
-/// `WebSocketStream` at the matching version instead of guessing which
-/// requirement to add. Only needed to *name* the type — the value itself
-/// comes from [`SharedWebSocketServer::adopt_upgraded`], which infers it.
+// The `tokio-tungstenite` this crate is built against, so an embedder handing
+// repe a connection its own HTTP stack upgraded can name `WebSocketStream` (or
+// the `http` types behind `HandshakeContext::from_http_request`) at the matching
+// version instead of guessing which requirement to add.
+//
+// Deliberately a plain comment: rustdoc renders a bare `pub use <crate>;` as a
+// Re-exports table row with no description slot, so a doc comment here would not
+// reach a reader. The user-facing explanation lives on
+// `SharedWebSocketServer::adopt_upgraded` and in `docs/websocket.md`.
 #[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]
 pub use tokio_tungstenite;

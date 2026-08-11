@@ -31,12 +31,16 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 64 << 20;
 /// Size limits for one WebSocket connection.
 ///
 /// This is a repe-owned type rather than a re-export of the underlying
-/// transport's configuration struct. repe exposes no transport types in its
-/// public API, and keeping it that way means a transport version bump stays an
-/// internal detail instead of a repe breaking change. It also keeps the surface
-/// to the knobs that carry protocol meaning: buffer-tuning fields are
-/// deliberately absent, which additionally avoids the transport's habit of
-/// panicking on internally inconsistent buffer settings.
+/// transport's configuration struct, so the surface stays the knobs that carry
+/// protocol meaning: buffer-tuning fields are deliberately absent, which
+/// additionally avoids the transport's habit of panicking on internally
+/// inconsistent buffer settings.
+///
+/// The transport type itself does appear in repe's public API — `accept`,
+/// `proxy_connection`, and `adopt_upgraded` all name `WebSocketStream` — so a
+/// tokio-tungstenite major bump is a repe major bump regardless. The crate is
+/// re-exported as `repe::tokio_tungstenite` so an embedder can always name the
+/// matching version rather than guess it.
 ///
 /// # Example
 ///

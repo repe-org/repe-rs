@@ -37,12 +37,18 @@ use tokio_util::sync::CancellationToken;
 /// Derive the `Sec-WebSocket-Accept` response header value from a client's
 /// `Sec-WebSocket-Key`, per RFC 6455.
 ///
-/// Re-exported for an embedder answering the upgrade with its own HTTP
-/// stack before handing the connection to
-/// [`SharedWebSocketServer::adopt_upgraded`]. This is the one piece of the
-/// handshake that is easy to get subtly wrong, and getting it wrong is
-/// rejected by the *client*, not by this crate.
-pub use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
+/// For an embedder answering the upgrade with its own HTTP stack before
+/// handing the connection to [`SharedWebSocketServer::adopt_upgraded`].
+/// This is the one piece of the handshake that is easy to get subtly
+/// wrong, and getting it wrong is rejected by the *client*, not by this
+/// crate.
+///
+/// A thin wrapper rather than a re-export of the transport's function, so
+/// this signature is repe's to keep stable across a transport version
+/// bump.
+pub fn derive_accept_key(sec_websocket_key: &[u8]) -> String {
+    tokio_tungstenite::tungstenite::handshake::derive_accept_key(sec_websocket_key)
+}
 
 type ConnectHook = Arc<dyn Fn(PeerHandle) + Send + Sync>;
 type ConnectCtxHook = Arc<dyn Fn(&PeerHandle, &HandshakeContext) + Send + Sync>;
@@ -221,8 +227,30 @@ pub struct HandshakeContext {
 }
 
 impl HandshakeContext {
-    /// Capture the parts of an upgrade [`Request`] an embedder may key on.
-    fn from_request(request: &Request) -> Self {
+    /// Capture the parts of an upgrade request an embedder may key on.
+    ///
+    /// Public for the embedder whose HTTP framework performed the upgrade
+    /// itself and who is serving the result through
+    /// [`SharedWebSocketServer::adopt_upgraded`]: repe never saw that
+    /// request, so it cannot capture the context on its own. Such a
+    /// handler is holding the whole request, which makes it the
+    /// best-positioned caller in the crate for the identity-keying this
+    /// type exists for. Pair it with
+    /// [`SharedWebSocketServer::serve_connection_with_handshake`].
+    ///
+    /// Generic over the body type so it accepts any `http::Request`,
+    /// whatever the framework parameterizes it with, and borrows rather
+    /// than consumes so the caller can still answer the upgrade with it.
+    /// The `http` version is the one this crate's transport is built
+    /// against, reachable as
+    /// `repe::tokio_tungstenite::tungstenite::http` if you need to name
+    /// it.
+    ///
+    /// Connections repe upgrades itself get this for free — the built-in
+    /// `serve*` loops and
+    /// [`WebSocketServer::accept_with_handshake`](WebSocketServer::accept_with_handshake)
+    /// capture it — so this is only for the adopted path.
+    pub fn from_http_request<T>(request: &tungstenite::http::Request<T>) -> Self {
         let uri = request.uri();
         let headers = request
             .headers()
@@ -996,22 +1024,66 @@ impl SharedWebSocketServer {
     /// `Upgrade`/`Connection`/`Sec-WebSocket-Version` and answering `101`
     /// with the [`derive_accept_key`] of the client's `Sec-WebSocket-Key`.
     /// Frameworks that expose the upgrade as an extractor do that part;
-    /// `derive_accept_key` is re-exported for those that hand back the raw
-    /// request. Nothing is read from `io` before the first REPE frame, so
-    /// passing a stream whose handshake never completed produces a
-    /// protocol error on that connection rather than corrupting others.
+    /// [`derive_accept_key`] is provided for those that hand back the raw
+    /// request. Path validation is the caller's too — the framework
+    /// already routed the request here, which is the counterpart to the
+    /// `path` argument [`WebSocketServer::accept`] takes.
     ///
-    /// Unlike a stream this crate upgraded, only the *outbound* guard is
-    /// this server's to set here — inbound thresholds are fixed at
-    /// construction, which is precisely why this constructor exists rather
-    /// than leaving embedders to call `from_raw_socket` with defaults and
-    /// silently lose their configured limits.
+    /// Nothing is read from `io` before the first REPE frame, so a stream
+    /// whose handshake produced garbage surfaces as a protocol error on
+    /// that connection alone. The other failure shape is quieter: if the
+    /// client is still waiting for a `101` that never came, neither side
+    /// speaks, and repe applies no read timeout or idle deadline — the
+    /// framework's own upgrade timeout is what bounds that.
+    ///
+    /// To *name* the returned type in your own signatures, the transport
+    /// crate is re-exported as `repe::tokio_tungstenite`; call sites that
+    /// pass the value straight to
+    /// [`serve_connection`](Self::serve_connection) never need to.
+    ///
+    /// This call is where the connection's inbound thresholds are fixed —
+    /// they cannot be changed afterwards — which is precisely why it
+    /// exists rather than leaving embedders to call the transport's
+    /// `from_raw_socket` themselves and silently substitute its defaults
+    /// for the limits the server was built with. The outbound guard
+    /// travels with the server config and applies on every path.
     pub async fn adopt_upgraded<S>(&self, io: S) -> WebSocketStream<S>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
         WebSocketStream::from_raw_socket(
             io,
+            tungstenite::protocol::Role::Server,
+            Some(self.config.limits.into()),
+        )
+        .await
+    }
+
+    /// [`adopt_upgraded`](Self::adopt_upgraded) for a framework that hands
+    /// back the bytes it read past the upgrade request separately from the
+    /// stream, as `(io, buffered)`.
+    ///
+    /// A client may legally pipeline its first frame with the upgrade
+    /// request, so those bytes can be real REPE traffic. `hyper` hides this
+    /// — its `Upgraded` replays what it buffered — but a framework that
+    /// returns the two halves separately needs somewhere to put them, and
+    /// dropping them loses a frame. Pass them here and they are decoded
+    /// ahead of anything read from `io`.
+    ///
+    /// Prefer [`adopt_upgraded`](Self::adopt_upgraded) when the stream
+    /// already replays its own leftovers; passing `buffered` bytes that
+    /// `io` will also yield would double-decode them.
+    pub async fn adopt_upgraded_partially_read<S>(
+        &self,
+        io: S,
+        buffered: Vec<u8>,
+    ) -> WebSocketStream<S>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        WebSocketStream::from_partially_read(
+            io,
+            buffered,
             tungstenite::protocol::Role::Server,
             Some(self.config.limits.into()),
         )
@@ -1028,7 +1100,7 @@ impl SharedWebSocketServer {
     /// some *other* HTTP stack upgraded — an `axum`/`hyper` route that
     /// answered the 101 itself — is served by wrapping its upgraded IO
     /// with [`adopt_upgraded`](Self::adopt_upgraded) and passing the
-    /// result here. See the crate docs on co-hosting.
+    /// result here.
     ///
     /// Connect/disconnect hooks (and any [`PeerRegistry`] attached via
     /// [`WebSocketServer::with_peer_registry`]) fire for connections
@@ -1916,7 +1988,7 @@ impl Callback for WebSocketPathValidator {
             // below without capturing).
             if let Some(slot) = &self.captured {
                 *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                    Some(HandshakeContext::from_request(request));
+                    Some(HandshakeContext::from_http_request(request));
             }
             Ok(response)
         } else {
@@ -3727,7 +3799,7 @@ mod tests {
             .body(())
             .unwrap();
 
-        let ctx = HandshakeContext::from_request(&request);
+        let ctx = HandshakeContext::from_http_request(&request);
 
         // The ASCII header survives and stays case-insensitively addressable.
         assert_eq!(ctx.header("authorization"), Some("Bearer good-token"));
@@ -3752,7 +3824,7 @@ mod tests {
             .body(())
             .unwrap();
 
-        let ctx = HandshakeContext::from_request(&request);
+        let ctx = HandshakeContext::from_http_request(&request);
         let rendered = format!("{ctx:?}");
 
         // Neither secret value appears anywhere in the rendering.
