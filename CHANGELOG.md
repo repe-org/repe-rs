@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Changed
+- **`PeerRegistry::broadcast_notify_*` allocates once per peer instead of twice.** A broadcast has to copy its body once per peer regardless — each sink takes an owned `NotifyBody` — but that copy landed in a buffer sized exactly to the body. `Message::into_wire_bytes` prepends the header and query in place only when the body buffer has capacity for them, so every peer then missed the fast path and allocated a second buffer to copy the body across again. Each per-peer body is now built with room for the prefix, which halves the allocation count of a fan-out and drops the raw variant's redundant leading `to_vec`.
+
+  Bytes moved is unchanged: both paths make two passes over the body, the second now a memmove inside one allocation rather than a copy between two. The saving is allocator pressure at fan-out, which is what a broadcast at data rate is actually spending. No API or wire change; over-reserving is harmless for an embedder sink that frames a different query.
+
 - **The outbound frame guard no longer allocates a `String` per frame.** `frame_outbound` — the one place every response and pushed notify funnels through — copied the message's query out to a `String` before consuming the message, so it would still have the method name if the frame turned out to be over the peer's assumed limit. That name is read only to fill the `OutboundTooLarge` error hook, which almost never fires, so every frame the server sent paid for a heap allocation it immediately dropped.
 
   The limit is now checked before the frame is built, from the closed-form length (`HEADER_SIZE + query + body`, exactly what `into_wire_bytes` emits) rather than by measuring the built frame. That leaves the message intact through the check, so the method is read from it only on the rejection path. A refused frame is also no longer built at all — previously an over-limit message was serialized in full and then thrown away, which is the case where that buffer is at its largest.
