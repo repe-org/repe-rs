@@ -1665,12 +1665,22 @@ fn frame_outbound(
     limits: &crate::WebSocketLimits,
     on_error: &[ErrorHook],
 ) -> Option<Vec<u8>> {
-    let method = m.query_str().unwrap_or("").to_string();
-    let notify = m.header.notify != 0;
-    let id = m.header.id;
-    let bytes = m.into_wire_bytes();
-    let Err(err) = limits.check_outbound(bytes.len()) else {
-        return Some(bytes);
+    // Size the frame in closed form and check the limit before building it,
+    // rather than framing first and measuring the result. `into_wire_bytes`
+    // emits exactly `HEADER_SIZE + query + body` bytes, so the guard sees the
+    // same number either way — `frame_outbound_checks_the_length_it_frames`
+    // pins that equality so the two cannot drift.
+    //
+    // Ordering it this way is what keeps the message intact through the check,
+    // which is what the common path is actually paying for: the method name is
+    // read only to report a rejection, so it no longer has to be copied out of
+    // the message before it is consumed. Every frame the server sends was
+    // allocating (and immediately dropping) a `String` for a hook that almost
+    // never fires. A rejected frame is now never built either, which is the
+    // one case where that buffer is at its largest.
+    let frame_len = crate::constants::HEADER_SIZE + m.query.len() + m.body.len();
+    let Err(err) = limits.check_outbound(frame_len) else {
+        return Some(m.into_wire_bytes());
     };
     let (size, limit) = match err {
         RepeError::MessageTooLarge { size, limit } => (size, limit),
@@ -1679,14 +1689,15 @@ fn frame_outbound(
     report_error(
         on_error,
         ConnectionError::OutboundTooLarge {
-            method: method.clone(),
+            method: m.query_str().unwrap_or("").to_string(),
             size,
             limit,
         },
     );
-    if notify {
+    if m.header.notify != 0 {
         return None;
     }
+    let id = m.header.id;
     let mut replacement = crate::message::create_error_message(
         ErrorCode::InternalError,
         format!(
@@ -3397,6 +3408,74 @@ mod tests {
         assert_eq!(
             ConnectionError::Handshake(RepeError::InvalidSpec(0)).error_code(),
             None
+        );
+    }
+
+    // ---- Outbound framing guard ------------------------------------
+
+    /// `frame_outbound` sizes a frame in closed form and checks the limit
+    /// before building it, so the number the guard sees is right only while
+    /// `HEADER_SIZE + query + body` is what `into_wire_bytes` emits. This pins
+    /// the threshold end to end — a frame exactly at the limit goes out, one
+    /// byte over is refused — plus the two things the reordering could quietly
+    /// break: the reported `size` is still the framed length, and the method
+    /// name still survives to the hook now that it is read from a message the
+    /// guard has already inspected rather than copied out beforehand.
+    #[test]
+    fn frame_outbound_checks_the_length_it_frames() {
+        const PATH: &str = "/sized";
+        const BODY: usize = 64;
+        let build = |notify: bool| {
+            Message::builder()
+                .id(1)
+                .notify(notify)
+                .query_str(PATH)
+                .query_format(QueryFormat::JsonPointer)
+                .body_bytes(vec![b'x'; BODY])
+                .body_format_code(u16::from(BodyFormat::RawBinary))
+                .build()
+        };
+        let framed_len = build(true).into_wire_bytes().len();
+        assert_eq!(
+            framed_len,
+            crate::constants::HEADER_SIZE + PATH.len() + BODY
+        );
+
+        let at_limit =
+            crate::WebSocketLimits::default().with_assumed_peer_frame_limit(Some(framed_len));
+        assert_eq!(
+            frame_outbound(build(true), &at_limit, &[])
+                .expect("a frame exactly at the limit goes out")
+                .len(),
+            framed_len,
+        );
+
+        // One byte under. A notify has no response to carry an error, so it is
+        // dropped outright — the unambiguous signal that the guard fired.
+        let under =
+            crate::WebSocketLimits::default().with_assumed_peer_frame_limit(Some(framed_len - 1));
+        assert!(frame_outbound(build(true), &under, &[]).is_none());
+
+        // The same refusal on a request yields the replacement error frame and
+        // reports what the refused message was carrying.
+        let seen = Arc::new(Mutex::new(Vec::<(String, usize, usize)>::new()));
+        let seen_h = Arc::clone(&seen);
+        let hook: ErrorHook = Arc::new(move |err: &ConnectionError| {
+            if let ConnectionError::OutboundTooLarge {
+                method,
+                size,
+                limit,
+            } = err
+            {
+                seen_h.lock().unwrap().push((method.clone(), *size, *limit));
+            }
+        });
+        let replacement = frame_outbound(build(false), &under, std::slice::from_ref(&hook))
+            .expect("a request's response is replaced rather than dropped");
+        assert_ne!(replacement.len(), framed_len);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(PATH.to_string(), framed_len, framed_len - 1)],
         );
     }
 

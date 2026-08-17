@@ -115,6 +115,32 @@ impl NotifyBody {
     }
 }
 
+/// Bytes a notify's wire prefix occupies ahead of its body: the fixed REPE
+/// header plus the query, which for the `QueryFormat::JsonPointer` notifies
+/// the `broadcast_notify_*` helpers emit is `path` verbatim.
+fn notify_prefix_len(path: &str) -> usize {
+    crate::constants::HEADER_SIZE + path.len()
+}
+
+/// Copy `src` into a fresh buffer that also has room for a `prefix_len`-byte
+/// wire prefix.
+///
+/// A broadcast has to copy the body once per peer regardless, because each
+/// peer's sink takes an owned [`NotifyBody`]. Sizing that copy for the prefix
+/// too is what makes it the *only* allocation: [`Message::into_wire_bytes`]
+/// prepends the header and query in place when the body buffer already has
+/// the capacity, and otherwise allocates a second buffer and copies the body
+/// across again. Over-reserving is harmless: a sink that frames a longer query
+/// than `path` (or none at all) just falls back to the same behavior it had
+/// before.
+///
+/// [`Message::into_wire_bytes`]: crate::Message::into_wire_bytes
+fn clone_with_prefix_room(src: &[u8], prefix_len: usize) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(prefix_len + src.len());
+    buf.extend_from_slice(src);
+    buf
+}
+
 /// Implemented by the embedder for each connected peer's outbound side.
 ///
 /// Repe-rs does not provide a default implementation. Embedders construct
@@ -600,7 +626,8 @@ impl PeerRegistry {
     /// Broadcast a JSON-bodied notify to every connected peer.
     ///
     /// The body is encoded once on the caller's task; the encoded
-    /// bytes are cloned into each peer's outbound channel. Returns a
+    /// bytes are cloned into each peer's outbound channel, sized so the
+    /// sink can frame that clone in place. Returns a
     /// per-peer result map so callers can surface backpressure
     /// ([`PeerSendError::Full`]) or prune dead peers
     /// ([`PeerSendError::Disconnected`]). The registry's lock is held
@@ -617,7 +644,9 @@ impl PeerRegistry {
         T: Serialize + ?Sized,
     {
         let encoded = serde_json::to_vec(body)?;
-        Ok(self.broadcast_each(path.as_ref(), |_peer| NotifyBody::Json(encoded.clone())))
+        Ok(self.broadcast_each(path.as_ref(), |_peer, prefix_room| {
+            NotifyBody::Json(clone_with_prefix_room(&encoded, prefix_room))
+        }))
     }
 
     /// BEVE-bodied broadcast. See [`broadcast_notify_json`] for
@@ -634,7 +663,9 @@ impl PeerRegistry {
         T: Serialize,
     {
         let encoded = beve::to_vec(body)?;
-        Ok(self.broadcast_each(path.as_ref(), |_peer| NotifyBody::Beve(encoded.clone())))
+        Ok(self.broadcast_each(path.as_ref(), |_peer, prefix_room| {
+            NotifyBody::Beve(clone_with_prefix_room(&encoded, prefix_room))
+        }))
     }
 
     /// UTF-8-bodied broadcast. Plain text is advertised with
@@ -648,8 +679,12 @@ impl PeerRegistry {
         P: AsRef<str>,
         S: AsRef<str>,
     {
-        let text = text.as_ref().to_owned();
-        self.broadcast_each(path.as_ref(), |_peer| NotifyBody::Utf8(text.clone()))
+        let text = text.as_ref();
+        self.broadcast_each(path.as_ref(), |_peer, prefix_room| {
+            let mut buf = String::with_capacity(prefix_room + text.len());
+            buf.push_str(text);
+            NotifyBody::Utf8(buf)
+        })
     }
 
     /// Raw-body broadcast. The caller supplies the body bytes and the
@@ -663,24 +698,29 @@ impl PeerRegistry {
     where
         P: AsRef<str>,
     {
-        let bytes = body.to_vec();
-        self.broadcast_each(path.as_ref(), move |_peer| {
-            NotifyBody::Raw(bytes.clone(), body_format)
+        self.broadcast_each(path.as_ref(), |_peer, prefix_room| {
+            NotifyBody::Raw(clone_with_prefix_room(body, prefix_room), body_format)
         })
     }
 
+    /// Shared body of the `broadcast_notify_*` helpers.
+    ///
+    /// `body_for` is handed the number of bytes to leave free ahead of the
+    /// body it builds, so the per-peer copy it has to make anyway lands in an
+    /// allocation the sink can frame in place. See [`clone_with_prefix_room`].
     fn broadcast_each<F>(
         &self,
         path: &str,
         mut body_for: F,
     ) -> HashMap<PeerId, Result<(), PeerSendError>>
     where
-        F: FnMut(&PeerHandle) -> NotifyBody,
+        F: FnMut(&PeerHandle, usize) -> NotifyBody,
     {
+        let prefix_room = notify_prefix_len(path);
         let snapshot = self.peers();
         let mut out = HashMap::with_capacity(snapshot.len());
         for peer in snapshot {
-            let body = body_for(&peer);
+            let body = body_for(&peer, prefix_room);
             let result = peer.send_notify(path, body);
             out.insert(peer.peer_id(), result);
         }
@@ -955,5 +995,62 @@ mod tests {
             .collect();
         assert!(keyed.contains_key("alice"));
         assert!(keyed.contains_key("bob"));
+    }
+
+    #[test]
+    fn broadcast_bodies_carry_room_for_the_wire_prefix() {
+        // Every broadcast body is built with room for the header and query,
+        // so the sink's `Message::into_wire_bytes` prepends them in place
+        // instead of allocating a second buffer and copying the body across
+        // again. What this asserts is that function's fast-path condition.
+        let sink = Arc::new(CapturingSink {
+            connected: true,
+            ..Default::default()
+        });
+        let registry = PeerRegistry::new();
+        registry.insert(PeerHandle::new(PeerId(1), sink.clone()));
+
+        let path = "/broadcast/prefix_room";
+        registry
+            .broadcast_notify_json(path, &serde_json::json!({ "n": 1 }))
+            .unwrap();
+        registry
+            .broadcast_notify_beve(path, &vec![1u8, 2, 3])
+            .unwrap();
+        registry.broadcast_notify_utf8(path, "hello");
+        registry.broadcast_notify_raw(path, BodyFormat::RawBinary, &[9u8; 64]);
+
+        let captured = sink.sent.lock().unwrap();
+        assert_eq!(captured.len(), 4);
+        let prefix = notify_prefix_len(path);
+        for (method, body, fmt) in captured.iter() {
+            assert_eq!(method, path);
+            assert!(!body.is_empty());
+            assert!(
+                body.capacity() >= prefix + body.len(),
+                "{fmt:?} body of {} bytes has capacity {}, short of the {prefix}-byte prefix",
+                body.len(),
+                body.capacity(),
+            );
+        }
+    }
+
+    #[test]
+    fn broadcast_prefix_room_matches_the_framed_prefix() {
+        // Pins `notify_prefix_len` to what the sink actually prepends, so a
+        // change to either side cannot silently push every broadcast back
+        // onto `into_wire_bytes`' reallocating path.
+        let path = "/broadcast/prefix_room";
+        let body = vec![7u8; 32];
+        let msg = crate::Message::builder()
+            .id(0)
+            .notify(true)
+            .query_str(path)
+            .query_format(crate::constants::QueryFormat::JsonPointer)
+            .body_bytes(body.clone())
+            .body_format(BodyFormat::RawBinary)
+            .build();
+        let framed = msg.into_wire_bytes();
+        assert_eq!(framed.len() - body.len(), notify_prefix_len(path));
     }
 }
