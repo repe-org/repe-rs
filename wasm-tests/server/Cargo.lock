@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "beve"
-version = "7.3.0"
+version = "8.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "891c827e7345c15e79140e300d751276ad1ebd64b24c40b01c98f097d1652606"
+checksum = "a5f36df50ad76787ac7d894b612ae9f312c32b21c432596937ef5f31cb8a992f"
 dependencies = [
  "bytemuck",
  "half",
@@ -318,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "repe"
-version = "7.2.0"
+version = "8.0.0"
 dependencies = [
  "beve",
  "repe-derive",

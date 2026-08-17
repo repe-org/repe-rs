@@ -1,5 +1,16 @@
 # Changelog
 
+## [8.0.0] - 2026-08-17
+
+### Changed
+- **BREAKING:** upgraded the `beve` dependency from `7` to `8`. As in the 7.0.0 and 4.0.0 bumps, beve types appear in repe's public API (`RepeError::Beve(beve::Error)`, the re-exported `beve::{BeveTypedSlice, Complex}`, and the `T: beve::BeveTypedSlice` bounds on the typed/complex body, route, and stream-pull surfaces), so a beve major is a repe major. Downstreams that also depend on `beve` directly must move to `beve 8`.
+
+  **No repe API change and no wire change**, and nothing in the suite needed editing. beve 8 exists for one reason: its `beve::complex::*_array` and `beve::complex_array::*` serde helpers took an unconstrained `T` and checked it with `size_of`/`align_of` at run time, which let a padded or wrong-class type through and read uninitialized bytes into the output. They now require the new unsafe `beve::ComplexElement` trait. repe does not reach complex arrays that way: every complex path here — `MessageBuilder::body_complex_slice`, `Message::decode_complex_slice`, `write_message_complex_slice`, and the SVS bulk complex modes — calls `to_writer_complex_slice` / `complex_slice_size` / `read_complex_slice` / `read_complex_slice_from_reader`, which take `&[beve::Complex<T>]` concretely and were never generic over a caller's own type. Those signatures are untouched.
+
+  It can still reach an **application** payload struct, since that struct is compiled against beve directly: a field annotated `#[serde(with = "beve::complex_array::...")]` or `serialize_with = "beve::complex::f32_array"` over a hand-rolled complex type now needs `unsafe impl beve::ComplexElement for MyIq { type Component = f32; }`. `beve::Complex<T>` and (behind beve's new `num-complex` feature) `num_complex::Complex<T>` work unchanged.
+
+- **MSRV raised to 1.96.1** (from 1.96), the floor beve 8 declares. The previous 1.96 floor came from `uniudp` and only bound the optional `fleet-udp` feature; this one binds every build, since `beve` is not optional. The full `--all-features --all-targets` build checks clean on 1.96.1; on 1.96.0 cargo now refuses to resolve.
+
 ## [7.2.0] - 2026-08-17
 
 ### Added
