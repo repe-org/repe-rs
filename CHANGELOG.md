@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Changed
+- **`PeerRegistry::broadcast_notify_*` allocates once per peer instead of twice.** A broadcast has to copy its body once per peer regardless — each sink takes an owned `NotifyBody` — but that copy landed in a buffer sized exactly to the body. `Message::into_wire_bytes` prepends the header and query in place only when the body buffer has capacity for them, so every peer then missed the fast path and allocated a second buffer to copy the body across again. Each per-peer body is now built with room for the prefix, which halves the allocation count of a fan-out and drops the raw variant's redundant leading `to_vec`.
+
+  Bytes moved is unchanged: both paths make two passes over the body, the second now a memmove inside one allocation rather than a copy between two. The saving is allocator pressure at fan-out, which is what a broadcast at data rate is actually spending. No API or wire change; over-reserving is harmless for an embedder sink that frames a different query.
+
 - **The lockfile resolves `beve` to 7.3.0** (from 7.1.0). The requirement in `Cargo.toml` stays `beve = "7"`, which already admitted it, so this is lockfile-only and downstreams resolve their own — but unlike the last bump, this one is not inert. 7.2.0 and 7.3.0 carry fixes and a behavior change that reach code repe calls.
 
   Every bulk primitive repe names directly is untouched. `to_writer_complex_slice`, `complex_slice_size`, `read_complex_slice`, `read_typed_slice`, and the aligned typed-slice family all live in beve's `fast` module, whose only diff across these two releases is a doc comment. `MessageBuilder::body_complex_slice`, `write_message_complex_slice`, and the SVS bulk modes emit and accept the same bytes they did on 7.1.0. (7.2.0's headline "complex arrays in one bulk copy" speedup is about beve's `serde(with)` helpers; `to_writer_complex_slice` was already a single `write_all`.)
