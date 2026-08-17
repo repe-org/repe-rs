@@ -328,7 +328,7 @@ WebSocket size limits are enforced by the **reader**. Each endpoint carries its 
 
 ### Configuring what an endpoint accepts
 
-`WebSocketLimits` sets the thresholds for a connection. It is a repe-owned type rather than a re-export of the underlying transport's config, so a transport version bump does not become a repe breaking change.
+`WebSocketLimits` sets the thresholds for a connection. It is a repe-owned type rather than a re-export of the underlying transport's config, so the surface stays the knobs that carry protocol meaning and leaves out buffer-tuning fields the transport panics on if set inconsistently. (The transport type itself does appear in repe's public API — `accept`, `proxy_connection`, and `adopt_upgraded` all name `WebSocketStream` — so a tokio-tungstenite major bump is a repe major bump either way; it is re-exported as `repe::tokio_tungstenite` so you can always name the matching version.)
 
 ```rust
 use repe::{WebSocketClient, WebSocketLimits, WebSocketServer};
@@ -445,6 +445,95 @@ loop {
 `examples/websocket_cohosting.rs` is a runnable end-to-end demo: it fills in both pieces the sketch above leaves open — the `is_websocket_upgrade` classifier and a minimal, dependency-free `serve_http` (a `/healthz` probe plus a small JSON `GET`) — and drives both forks against one port. Run it with `cargo run --example websocket_cohosting --features websocket`.
 
 The built-in `serve` / `serve_listener` loop is itself implemented on top of `into_shared` + `accept` + `serve_connection`, so a co-hosted connection behaves identically to one accepted by the built-in loop.
+
+### Adopting a connection your HTTP framework upgraded
+
+The peek-then-fork recipe above requires repe to own the `TcpStream` before any HTTP is parsed. That is the wrong shape for an embedder whose routes already live in an HTTP framework — an `axum` `Router` with a `/healthz` probe and a handful of `/api/*` routes, wanting the REPE endpoint to be one more route on it. There, the framework owns the socket and answers the `101` itself; repe never sees a `TcpStream`.
+
+For that shape, hand repe the byte stream the framework upgraded. `SharedWebSocketServer::adopt_upgraded(io)` wraps it into a server-role `WebSocketStream` carrying this server's configured `WebSocketLimits`, and `serve_connection` takes it from there — the serving path is generic over the underlying stream, so it does not have to be a socket this crate accepted.
+
+Note this does *not* go through `axum::extract::ws::WebSocketUpgrade`. That extractor hands back axum's own `WebSocket`, a wrapper around its own tungstenite version with only `send`/`recv` on it — not a byte stream anything else can adopt. Taking `hyper::upgrade::OnUpgrade` out of the request directly is what yields the raw upgraded IO, and it keeps axum's tungstenite out of the dependency graph entirely.
+
+```rust
+use axum::body::Body;
+use axum::extract::{Request, State};
+use axum::http::header::{SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION};
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use hyper::upgrade::OnUpgrade;
+use hyper_util::rt::TokioIo;
+use repe::{HandshakeContext, ShutdownToken, SharedWebSocketServer, WebSocketServer, derive_accept_key};
+
+#[derive(Clone)]
+struct AppState {
+    repe: SharedWebSocketServer,
+    shutdown: ShutdownToken,
+}
+
+async fn repe_upgrade(State(state): State<AppState>, mut req: Request) -> Response {
+    // RFC 6455 requires all three. The framework routed the path here, but it
+    // did not check that this is really a WebSocket upgrade.
+    if req.headers().get(SEC_WEBSOCKET_VERSION).map(|v| v.as_bytes()) != Some(b"13") {
+        return (StatusCode::BAD_REQUEST, "unsupported Sec-WebSocket-Version").into_response();
+    }
+    let Some(key) = req.headers().get(SEC_WEBSOCKET_KEY).cloned() else {
+        return (StatusCode::BAD_REQUEST, "missing Sec-WebSocket-Key").into_response();
+    };
+    let Some(on_upgrade) = req.extensions_mut().remove::<OnUpgrade>() else {
+        return (StatusCode::BAD_REQUEST, "not an upgrade request").into_response();
+    };
+
+    // Capture before answering: the peer is keyed off the upgrade request, and
+    // after this handler returns the request is gone.
+    let handshake = HandshakeContext::from_http_request(&req);
+
+    tokio::spawn(async move {
+        let upgraded = match on_upgrade.await {
+            Ok(upgraded) => upgraded,
+            Err(err) => return tracing::warn!(%err, "upgrade failed"),
+        };
+        let ws = state.repe.adopt_upgraded(TokioIo::new(upgraded)).await;
+        // Errors surface here rather than through `on_error` — this is an
+        // embedder-driven path, so the connection result is yours to handle.
+        if let Err(err) = state
+            .repe
+            .serve_connection_with_cancel_and_handshake(ws, handshake, &state.shutdown)
+            .await
+        {
+            tracing::warn!(%err, "repe connection ended");
+        }
+    });
+
+    Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header(header::UPGRADE, "websocket")
+        .header(header::CONNECTION, "Upgrade")
+        .header(SEC_WEBSOCKET_ACCEPT, derive_accept_key(key.as_bytes()))
+        .body(Body::empty())
+        .expect("valid 101 response")
+}
+
+let state = AppState {
+    repe: WebSocketServer::new(router).into_shared(),
+    shutdown: ShutdownToken::new(),
+};
+let app = axum::Router::new()
+    .route("/healthz", get(|| async { "ok" }))
+    .route("/repe", get(repe_upgrade))
+    .with_state(state);
+axum::serve(listener, app).await?;
+```
+
+Everything a connection gets under `serve` it also gets here: connect/disconnect hooks, an attached `PeerRegistry`, `CallContext::peer`, off-reader dispatch, pushed notifies, and — via the captured `HandshakeContext` — `on_peer_connect_with_handshake`, so peers can be `alias`ed by an identity carried in the upgrade request just as they are under `serve`.
+
+Three things are the caller's responsibility, because they happen before repe is involved:
+
+- **The handshake.** Validate the request and answer `101` with the `derive_accept_key` of the client's `Sec-WebSocket-Key`. `adopt_upgraded` reads nothing before the first REPE frame, so a botched handshake that produces garbage surfaces as a protocol error on that connection alone. The quieter shape is a client still waiting for a `101` that never came: neither side speaks, and repe applies no read timeout or idle deadline, so the framework's own upgrade timeout is what bounds it.
+- **Path routing.** `adopt_upgraded` does no path validation, since the framework already routed the request to this handler. This is the counterpart to the `path` argument that `WebSocketServer::accept` takes.
+- **Draining.** The connection runs on a task the embedder spawned, and `axum::serve`'s graceful shutdown does not wait for upgraded connections. Serving through `serve_connection_with_cancel*` and a shared `ShutdownToken`, as above, is what gives you the cancellation half; see [below](#draining-a-co-hosted-server) for the rest.
+
+`adopt_upgraded` is where the connection's inbound thresholds are fixed — they cannot be changed afterwards — which is why it exists rather than leaving you to call `tokio_tungstenite`'s `from_raw_socket`, whose defaults would silently replace the limits the server was built with. If your framework hands back the bytes it read past the request separately, as `(io, buffered)`, use `adopt_upgraded_partially_read(io, buffered)` instead: a client may legally pipeline its first frame with the upgrade request, and dropping those bytes loses a frame. (`hyper` replays them itself, so the plain call is right there.)
 
 ### Draining a co-hosted server
 

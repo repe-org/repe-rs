@@ -20,6 +20,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
@@ -32,6 +33,22 @@ use tokio_tungstenite::tungstenite::handshake::server::{
 use tokio_tungstenite::tungstenite::{self, Message as WsMessage, http::StatusCode};
 use tokio_tungstenite::{WebSocketStream, accept_hdr_async_with_config};
 use tokio_util::sync::CancellationToken;
+
+/// Derive the `Sec-WebSocket-Accept` response header value from a client's
+/// `Sec-WebSocket-Key`, per RFC 6455.
+///
+/// For an embedder answering the upgrade with its own HTTP stack before
+/// handing the connection to [`SharedWebSocketServer::adopt_upgraded`].
+/// This is the one piece of the handshake that is easy to get subtly
+/// wrong, and getting it wrong is rejected by the *client*, not by this
+/// crate.
+///
+/// A thin wrapper rather than a re-export of the transport's function, so
+/// this signature is repe's to keep stable across a transport version
+/// bump.
+pub fn derive_accept_key(sec_websocket_key: &[u8]) -> String {
+    tokio_tungstenite::tungstenite::handshake::derive_accept_key(sec_websocket_key)
+}
 
 type ConnectHook = Arc<dyn Fn(PeerHandle) + Send + Sync>;
 type ConnectCtxHook = Arc<dyn Fn(&PeerHandle, &HandshakeContext) + Send + Sync>;
@@ -210,8 +227,30 @@ pub struct HandshakeContext {
 }
 
 impl HandshakeContext {
-    /// Capture the parts of an upgrade [`Request`] an embedder may key on.
-    fn from_request(request: &Request) -> Self {
+    /// Capture the parts of an upgrade request an embedder may key on.
+    ///
+    /// Public for the embedder whose HTTP framework performed the upgrade
+    /// itself and who is serving the result through
+    /// [`SharedWebSocketServer::adopt_upgraded`]: repe never saw that
+    /// request, so it cannot capture the context on its own. Such a
+    /// handler is holding the whole request, which makes it the
+    /// best-positioned caller in the crate for the identity-keying this
+    /// type exists for. Pair it with
+    /// [`SharedWebSocketServer::serve_connection_with_handshake`].
+    ///
+    /// Generic over the body type so it accepts any `http::Request`,
+    /// whatever the framework parameterizes it with, and borrows rather
+    /// than consumes so the caller can still answer the upgrade with it.
+    /// The `http` version is the one this crate's transport is built
+    /// against, reachable as
+    /// `repe::tokio_tungstenite::tungstenite::http` if you need to name
+    /// it.
+    ///
+    /// Connections repe upgrades itself get this for free — the built-in
+    /// `serve*` loops and
+    /// [`WebSocketServer::accept_with_handshake`](WebSocketServer::accept_with_handshake)
+    /// capture it — so this is only for the adopted path.
+    pub fn from_http_request<T>(request: &tungstenite::http::Request<T>) -> Self {
         let uri = request.uri();
         let headers = request
             .headers()
@@ -965,10 +1004,103 @@ impl SharedWebSocketServer {
         self.config.limits
     }
 
+    /// Wrap the raw IO of a connection **another HTTP stack already
+    /// upgraded** into a server-role [`WebSocketStream`] carrying this
+    /// server's configured [`WebSocketLimits`](crate::WebSocketLimits),
+    /// ready for [`serve_connection`](Self::serve_connection).
+    ///
+    /// This is the seam for an embedder whose HTTP routes live in a
+    /// framework (`axum`, `hyper`, `tower`) rather than in a hand-written
+    /// accept loop. Such an embedder already owns a `Router` with its own
+    /// paths on it and wants the REPE endpoint to be one more route,
+    /// answering the 101 through the framework's own upgrade machinery.
+    /// The peek-then-fork recipe (`is_websocket_upgrade` +
+    /// [`accept`](Self::accept)) cannot serve that shape, because it
+    /// requires repe to own the `TcpStream` before any HTTP is parsed.
+    /// Here the framework keeps the socket, performs the handshake, and
+    /// hands back the upgraded byte stream — which is what `io` is.
+    ///
+    /// The caller is responsible for the handshake itself: validating
+    /// `Upgrade`/`Connection`/`Sec-WebSocket-Version` and answering `101`
+    /// with the [`derive_accept_key`] of the client's `Sec-WebSocket-Key`.
+    /// Frameworks that expose the upgrade as an extractor do that part;
+    /// [`derive_accept_key`] is provided for those that hand back the raw
+    /// request. Path validation is the caller's too — the framework
+    /// already routed the request here, which is the counterpart to the
+    /// `path` argument [`WebSocketServer::accept`] takes.
+    ///
+    /// Nothing is read from `io` before the first REPE frame, so a stream
+    /// whose handshake produced garbage surfaces as a protocol error on
+    /// that connection alone. The other failure shape is quieter: if the
+    /// client is still waiting for a `101` that never came, neither side
+    /// speaks, and repe applies no read timeout or idle deadline — the
+    /// framework's own upgrade timeout is what bounds that.
+    ///
+    /// To *name* the returned type in your own signatures, the transport
+    /// crate is re-exported as `repe::tokio_tungstenite`; call sites that
+    /// pass the value straight to
+    /// [`serve_connection`](Self::serve_connection) never need to.
+    ///
+    /// This call is where the connection's inbound thresholds are fixed —
+    /// they cannot be changed afterwards — which is precisely why it
+    /// exists rather than leaving embedders to call the transport's
+    /// `from_raw_socket` themselves and silently substitute its defaults
+    /// for the limits the server was built with. The outbound guard
+    /// travels with the server config and applies on every path.
+    pub async fn adopt_upgraded<S>(&self, io: S) -> WebSocketStream<S>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        WebSocketStream::from_raw_socket(
+            io,
+            tungstenite::protocol::Role::Server,
+            Some(self.config.limits.into()),
+        )
+        .await
+    }
+
+    /// [`adopt_upgraded`](Self::adopt_upgraded) for a framework that hands
+    /// back the bytes it read past the upgrade request separately from the
+    /// stream, as `(io, buffered)`.
+    ///
+    /// A client may legally pipeline its first frame with the upgrade
+    /// request, so those bytes can be real REPE traffic. `hyper` hides this
+    /// — its `Upgraded` replays what it buffered — but a framework that
+    /// returns the two halves separately needs somewhere to put them, and
+    /// dropping them loses a frame. Pass them here and they are decoded
+    /// ahead of anything read from `io`.
+    ///
+    /// Prefer [`adopt_upgraded`](Self::adopt_upgraded) when the stream
+    /// already replays its own leftovers; passing `buffered` bytes that
+    /// `io` will also yield would double-decode them.
+    pub async fn adopt_upgraded_partially_read<S>(
+        &self,
+        io: S,
+        buffered: Vec<u8>,
+    ) -> WebSocketStream<S>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        WebSocketStream::from_partially_read(
+            io,
+            buffered,
+            tungstenite::protocol::Role::Server,
+            Some(self.config.limits.into()),
+        )
+        .await
+    }
+
     /// Run one connection's reader/writer loop using this server's
     /// router, hooks, and capacities. Pair with
     /// [`WebSocketServer::accept`] to serve a stream the embedder
     /// accepted and upgraded itself.
+    ///
+    /// Generic over the underlying byte stream, so the connection need
+    /// not have come from a [`TcpStream`] this crate accepted. A stream
+    /// some *other* HTTP stack upgraded — an `axum`/`hyper` route that
+    /// answered the 101 itself — is served by wrapping its upgraded IO
+    /// with [`adopt_upgraded`](Self::adopt_upgraded) and passing the
+    /// result here.
     ///
     /// Connect/disconnect hooks (and any [`PeerRegistry`] attached via
     /// [`WebSocketServer::with_peer_registry`]) fire for connections
@@ -979,7 +1111,10 @@ impl SharedWebSocketServer {
     /// [`CallContext::cancelled`](crate::CallContext::cancelled)) fire on
     /// disconnect. To also fire it on an embedder-driven shutdown, use
     /// [`serve_connection_with_cancel`](Self::serve_connection_with_cancel).
-    pub async fn serve_connection(&self, ws: WebSocketStream<TcpStream>) -> Result<(), RepeError> {
+    pub async fn serve_connection<S>(&self, ws: WebSocketStream<S>) -> Result<(), RepeError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         // No parent: the connection token is cancelled only when this
         // connection's reader exits (disconnect). No captured handshake,
         // so on_peer_connect_with_handshake hooks do not fire.
@@ -993,11 +1128,14 @@ impl SharedWebSocketServer {
     /// [`on_peer_connect_with_handshake`](WebSocketServer::on_peer_connect_with_handshake)
     /// hooks fire for this connection. For a one-port co-hosting embedder
     /// that keys peers off the upgrade request.
-    pub async fn serve_connection_with_handshake(
+    pub async fn serve_connection_with_handshake<S>(
         &self,
-        ws: WebSocketStream<TcpStream>,
+        ws: WebSocketStream<S>,
         handshake: HandshakeContext,
-    ) -> Result<(), RepeError> {
+    ) -> Result<(), RepeError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         handle_connection_with_config(
             ws,
             Arc::clone(&self.config),
@@ -1019,11 +1157,14 @@ impl SharedWebSocketServer {
     /// shared one, so cancelling the shared token cancels every
     /// connection, and a single connection's disconnect cancels only its
     /// own child.
-    pub async fn serve_connection_with_cancel(
+    pub async fn serve_connection_with_cancel<S>(
         &self,
-        ws: WebSocketStream<TcpStream>,
+        ws: WebSocketStream<S>,
         shutdown: &ShutdownToken,
-    ) -> Result<(), RepeError> {
+    ) -> Result<(), RepeError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         handle_connection_with_config(ws, Arc::clone(&self.config), shutdown.child_token(), None)
             .await
     }
@@ -1035,12 +1176,15 @@ impl SharedWebSocketServer {
     /// handlers down, and
     /// [`on_peer_connect_with_handshake`](WebSocketServer::on_peer_connect_with_handshake)
     /// hooks fire from the captured `handshake`.
-    pub async fn serve_connection_with_cancel_and_handshake(
+    pub async fn serve_connection_with_cancel_and_handshake<S>(
         &self,
-        ws: WebSocketStream<TcpStream>,
+        ws: WebSocketStream<S>,
         handshake: HandshakeContext,
         shutdown: &ShutdownToken,
-    ) -> Result<(), RepeError> {
+    ) -> Result<(), RepeError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         handle_connection_with_config(
             ws,
             Arc::clone(&self.config),
@@ -1191,12 +1335,15 @@ async fn accept_repe_websocket(
     Ok((ws, handshake))
 }
 
-async fn handle_connection_with_config(
-    ws_stream: WebSocketStream<TcpStream>,
+async fn handle_connection_with_config<S>(
+    ws_stream: WebSocketStream<S>,
     config: Arc<ConnectionConfig>,
     conn_token: CancellationToken,
     handshake: Option<HandshakeContext>,
-) -> Result<(), RepeError> {
+) -> Result<(), RepeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (outbound_tx, outbound_rx) = mpsc::channel::<Message>(config.outbound_capacity);
 
     let peer_id_value = config.peer_id_counter.fetch_add(1, Ordering::Relaxed);
@@ -1314,12 +1461,15 @@ struct ConnDispatch {
     on_error: Arc<Vec<ErrorHook>>,
 }
 
-async fn reader_task(
-    mut ws_reader: SplitStream<WebSocketStream<TcpStream>>,
+async fn reader_task<S>(
+    mut ws_reader: SplitStream<WebSocketStream<S>>,
     router: &Router,
     conn: ConnDispatch,
     offreader_sem: Option<Arc<Semaphore>>,
-) -> Result<(), RepeError> {
+) -> Result<(), RepeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     // One signal shared by every inline dispatch on this connection; the
     // off-reader path builds its own owned clone per spawned handler.
     let inline_signal = TokenSignal(conn.conn_token.clone());
@@ -1561,13 +1711,16 @@ fn frame_outbound(
     Some(replacement.into_wire_bytes())
 }
 
-async fn writer_task(
-    mut ws_writer: SplitSink<WebSocketStream<TcpStream>, WsMessage>,
+async fn writer_task<S>(
+    mut ws_writer: SplitSink<WebSocketStream<S>, WsMessage>,
     mut outbound_rx: mpsc::Receiver<Message>,
     mut shutdown_rx: oneshot::Receiver<()>,
     limits: crate::WebSocketLimits,
     on_error: Arc<Vec<ErrorHook>>,
-) -> Result<(), RepeError> {
+) -> Result<(), RepeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut result: Result<(), RepeError> = Ok(());
     loop {
         tokio::select! {
@@ -1846,7 +1999,7 @@ impl Callback for WebSocketPathValidator {
             // below without capturing).
             if let Some(slot) = &self.captured {
                 *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                    Some(HandshakeContext::from_request(request));
+                    Some(HandshakeContext::from_http_request(request));
             }
             Ok(response)
         } else {
@@ -3725,7 +3878,7 @@ mod tests {
             .body(())
             .unwrap();
 
-        let ctx = HandshakeContext::from_request(&request);
+        let ctx = HandshakeContext::from_http_request(&request);
 
         // The ASCII header survives and stays case-insensitively addressable.
         assert_eq!(ctx.header("authorization"), Some("Bearer good-token"));
@@ -3750,7 +3903,7 @@ mod tests {
             .body(())
             .unwrap();
 
-        let ctx = HandshakeContext::from_request(&request);
+        let ctx = HandshakeContext::from_http_request(&request);
         let rendered = format!("{ctx:?}");
 
         // Neither secret value appears anywhere in the rendering.

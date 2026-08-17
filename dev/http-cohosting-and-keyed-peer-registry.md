@@ -4,6 +4,8 @@
 
 Shipped in 3.2.0. Both friction points were addressed: co-hosting via `is_websocket_upgrade` + `examples/websocket_cohosting.rs` + `HandshakeContext` / `on_peer_connect_with_handshake`; embedder-keyed lookup via `PeerRegistry::alias` / `get_by` / `key_for` / `aliases_for`. Retained as the design record behind those additions.
 
+**Follow-on (unreleased):** R1 covers only embedders willing to own the raw accept loop, because peek-then-fork requires repe to hold the `TcpStream` before any HTTP is parsed. A second consumer surfaced with the opposite shape — routes already on an `axum` `Router`, so the *framework* owns the socket and answers the `101`. That case was not merely inconvenient, it was impossible: no entry point took an already-upgraded stream. `SharedWebSocketServer::adopt_upgraded` plus generic-over-`S` `serve_connection*` closes it. Notably this resolves the framework case **without** R2: repe does not grow an HTTP surface, it accepts a stream from whatever already serves HTTP. R2 remains parked, and is now needed only by an embedder that wants co-hosted HTTP with *no* framework at all.
+
 ## Summary
 
 Two friction points surfaced while building a server-push application on top of the shipped `WebSocketServer` + `PeerRegistry` surface. Neither is a blocker; both have working manual workarounds today. This document records them as requests so the core crate can decide whether to smooth them over.
