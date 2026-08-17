@@ -3,6 +3,12 @@
 ## [Unreleased]
 
 ### Changed
+- **The outbound frame guard no longer allocates a `String` per frame.** `frame_outbound` — the one place every response and pushed notify funnels through — copied the message's query out to a `String` before consuming the message, so it would still have the method name if the frame turned out to be over the peer's assumed limit. That name is read only to fill the `OutboundTooLarge` error hook, which almost never fires, so every frame the server sent paid for a heap allocation it immediately dropped.
+
+  The limit is now checked before the frame is built, from the closed-form length (`HEADER_SIZE + query + body`, exactly what `into_wire_bytes` emits) rather than by measuring the built frame. That leaves the message intact through the check, so the method is read from it only on the rejection path. A refused frame is also no longer built at all — previously an over-limit message was serialized in full and then thrown away, which is the case where that buffer is at its largest.
+
+  No API, wire, or behavior change: the guard trips at the same threshold, and reports the same method, size, and limit. A new unit test pins the threshold end to end so the closed form and the framer cannot drift apart.
+
 - **The lockfile resolves `beve` to 7.3.0** (from 7.1.0). The requirement in `Cargo.toml` stays `beve = "7"`, which already admitted it, so this is lockfile-only and downstreams resolve their own — but unlike the last bump, this one is not inert. 7.2.0 and 7.3.0 carry fixes and a behavior change that reach code repe calls.
 
   Every bulk primitive repe names directly is untouched. `to_writer_complex_slice`, `complex_slice_size`, `read_complex_slice`, `read_typed_slice`, and the aligned typed-slice family all live in beve's `fast` module, whose only diff across these two releases is a doc comment. `MessageBuilder::body_complex_slice`, `write_message_complex_slice`, and the SVS bulk modes emit and accept the same bytes they did on 7.1.0. (7.2.0's headline "complex arrays in one bulk copy" speedup is about beve's `serde(with)` helpers; `to_writer_complex_slice` was already a single `write_all`.)
