@@ -7,6 +7,22 @@
 
   Bytes moved is unchanged: both paths make two passes over the body, the second now a memmove inside one allocation rather than a copy between two. The saving is allocator pressure at fan-out, which is what a broadcast at data rate is actually spending. No API or wire change; over-reserving is harmless for an embedder sink that frames a different query.
 
+- **The lockfile resolves `beve` to 7.3.0** (from 7.1.0). The requirement in `Cargo.toml` stays `beve = "7"`, which already admitted it, so this is lockfile-only and downstreams resolve their own — but unlike the last bump, this one is not inert. 7.2.0 and 7.3.0 carry fixes and a behavior change that reach code repe calls.
+
+  Every bulk primitive repe names directly is untouched. `to_writer_complex_slice`, `complex_slice_size`, `read_complex_slice`, `read_typed_slice`, and the aligned typed-slice family all live in beve's `fast` module, whose only diff across these two releases is a doc comment. `MessageBuilder::body_complex_slice`, `write_message_complex_slice`, and the SVS bulk modes emit and accept the same bytes they did on 7.1.0. (7.2.0's headline "complex arrays in one bulk copy" speedup is about beve's `serde(with)` helpers; `to_writer_complex_slice` was already a single `write_all`.)
+
+  What does reach repe is the generic serde path — `to_writer_streaming` / `from_reader_streaming` behind SVS value mode, and `from_slice` / `to_vec` behind every JSON-or-BEVE body — where the payload type is the caller's:
+
+  - **An untrusted element count can no longer abort the process** (beve 7.3.0). The `beve::typed::*` and `beve::complex_array::*` visitors sized their result `Vec` from a sequence `size_hint` taken straight off the wire, so a 27-byte body claiming 2^55 elements reached `Vec::with_capacity`, which aborts rather than returning an error. A repe server decodes bodies it did not write, so a handler whose payload struct carries either annotation was one malformed frame away from an abort no `Result` could catch. The reserve is now capped at 8 MiB and grows with what actually arrives.
+
+  - **`Complex<f16>` and `Complex<bf16>` survive SVS value mode** (beve 7.2.0). `to_writer_streaming` rejected every `Complex<bf16>` as `Mismatch("invalid complex payload size")`, and `from_reader_streaming` refused both half widths as `Unsupported("unsupported complex float width")` — so a value-mode stream of a type holding either field failed at the producer or the consumer, on payloads the buffered codec handled. Both now decode the four float widths the slice deserializer always has.
+
+  - **A complex array whose component class differs from the field's now decodes** through serde instead of returning `Error::Mismatch` (beve 7.3.0) — a complex `i16` payload into a `Vec<Complex<f32>>` field converts in one pass. This is a loosening, so anything that leaned on the old strictness as a schema check needs its own check. `Message::complex_slice` is deliberately *not* part of this: it calls `read_complex_slice`, where naming `T` is the whole interface and a class mismatch is still an error. The two disagreeing is intended, not an oversight.
+
+  The `mat` feature moved to hdf5-pure 0.39 over the same span, which repe does not enable.
+
+  The `wasm-tests` lockfiles move in step, and pick up the stale `repe` path-dep version they still recorded as 7.0.2.
+
 ## [7.1.0] - 2026-08-10
 
 ### Added
