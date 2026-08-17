@@ -44,7 +44,9 @@ async fn hand_rolled_upgrade(stream: TcpStream) -> std::io::Result<(TcpStream, h
 
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).await? == 0 {
-        return Err(std::io::Error::other("client closed before the request line"));
+        return Err(std::io::Error::other(
+            "client closed before the request line",
+        ));
     }
     let target = request_line
         .split_whitespace()
@@ -341,8 +343,11 @@ async fn an_adopted_connection_enforces_the_outbound_guard() {
         Ok(json!({ "data": "x".repeat(len) }))
     });
     let small = WebSocketLimits::default().with_assumed_peer_frame_limit(Some(4096));
-    let (addr, _) =
-        spawn_adopting_server(WebSocketServer::new(router).with_limits(small), Serve::Plain).await;
+    let (addr, _) = spawn_adopting_server(
+        WebSocketServer::new(router).with_limits(small),
+        Serve::Plain,
+    )
+    .await;
 
     let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
         .await
@@ -432,7 +437,9 @@ async fn buffered_bytes_are_decoded_before_the_stream() {
 
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
     let shared = WebSocketServer::new(echo_router()).into_shared();
-    let ws = shared.adopt_upgraded_partially_read(server_io, pipelined).await;
+    let ws = shared
+        .adopt_upgraded_partially_read(server_io, pipelined)
+        .await;
     tokio::spawn(async move { shared.serve_connection(ws).await });
 
     // The client never sent that request over the socket, yet the response
