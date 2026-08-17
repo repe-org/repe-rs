@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [7.2.0] - 2026-08-17
 
 ### Added
 - **`SharedWebSocketServer::adopt_upgraded(io)`.** Serves a connection whose upgrade repe did not perform, wrapping the already-upgraded byte stream into a server-role `WebSocketStream` that carries this server's configured `WebSocketLimits`.

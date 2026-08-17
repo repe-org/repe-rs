@@ -318,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "repe"
-version = "7.1.0"
+version = "7.2.0"
 dependencies = [
  "beve",
  "repe-derive",
