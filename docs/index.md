@@ -22,7 +22,7 @@ Rust implementation of the [REPE RPC protocol](https://github.com/repe-org/REPE)
 
 ```toml
 [dependencies]
-repe = "7"
+repe = "8"
 ```
 
 Or `cargo add repe`. The CLI ships under a feature flag: `cargo install repe --features cli`.
