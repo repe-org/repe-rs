@@ -279,10 +279,14 @@ impl<'a> CallContext<'a> {
     /// Used by the built-in `WebSocketServer` to thread the connection's
     /// cancellation handle (fired on disconnect / shutdown) onto each
     /// dispatch.
-    // Only the feature-gated WebSocket server constructs a cancel-bearing
-    // context (the unit tests above also exercise it); a build without the
-    // `websocket` feature has no caller, so don't warn there.
-    #[cfg_attr(not(feature = "websocket"), allow(dead_code))]
+    // Only the WebSocket server constructs a cancel-bearing context (the unit
+    // tests above also exercise it), so a build without that module has no
+    // caller. The predicate mirrors its gate in lib.rs, not just its feature:
+    // on wasm32 the module is absent even with `websocket` on.
+    #[cfg_attr(
+        not(all(feature = "websocket", not(target_arch = "wasm32"))),
+        allow(dead_code)
+    )]
     pub(crate) fn with_cancel(
         method: &'a str,
         peer: &'a PeerHandle,

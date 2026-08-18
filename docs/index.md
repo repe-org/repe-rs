@@ -68,8 +68,11 @@ Replace `body_json` with `body_beve` to encode the body with BEVE; everything el
 | `websocket` | Native `WebSocketClient`, `WebSocketServer`, and `proxy_connection`. |
 | `websocket-wasm` | Browser `WasmClient` on `wasm32-unknown-unknown`. |
 | `fleet-udp` | UDP fanout via `UniUdpFleet`. |
+| `value-stream` | Streaming value transfer (SVS), with an optional zstd codec. |
 | `parking-lot` | `Lockable` impls for `parking_lot::Mutex` / `RwLock`. |
 | `cli` | Builds the `repe` command-line client (pulls in `clap` and `websocket`). |
+
+`fleet-udp` and `value-stream` are native-only: on `wasm32-unknown-unknown` both their modules and their non-portable dependencies compile away, so enabling either there is inert rather than a build failure. That matters for a workspace hoisting one shared feature set across a native server and a browser client, since Cargo features are additive and the wasm member cannot subtract one.
 
 ## License
 

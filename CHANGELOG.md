@@ -1,5 +1,21 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **`value-stream` and `fleet-udp` no longer break a `wasm32-unknown-unknown` build.** Both features' modules have always been `not(target_arch = "wasm32")` in `lib.rs`, but their non-portable dependencies sat in the untargeted `[dependencies]` table, so Cargo built them for wasm32 regardless — for a consumer that `cfg` had already compiled out. `zstd` failed inside `zstd-sys`'s build script (clang: "No available targets are compatible with triple wasm32-unknown-unknown", compiling `huf_decompress_amd64.S`) and `uniudp` failed inside mio ("This wasm target is unsupported by mio"). Both are now declared under `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]` alongside `tokio`, so enabling either feature on wasm32 is inert rather than fatal.
+
+  The cost landed on workspaces rather than on single crates. Cargo features are purely additive: a crate inheriting a workspace dependency can add features but never subtract one. A workspace that hoists one shared repe pin — the usual way to make repe compile once and share a single `beve` build across several products — therefore could not carry `value-stream` at all if any member targeted wasm32, even when that member wanted nothing but core `Message` framing. The workaround was a second, hand-maintained repe entry with `default-features = false` for the browser crate, and a comment explaining why the two must not be merged.
+
+  Native builds are unaffected in every respect: the same dependencies resolve, with the same features, the same API, and the same wire output, and `Cargo.lock` does not move. The gate is `target_arch`, matching the existing module gates exactly, so `wasm32-wasip1` and `wasm32-wasip2` likewise stop building a dependency whose only consumer was already `cfg`'d out there.
+
+- **`CallContext::with_cancel` and `stamp_response_query` no longer warn as dead code on wasm32.** Their `#[cfg_attr(..., allow(dead_code))]` predicates keyed on `not(feature = "websocket")`, but their only caller — `websocket_server` — is gated on that feature *and* `not(target_arch = "wasm32")`. With `websocket` enabled on wasm32 the allow went inactive while the caller stayed absent, so the build warned about functions it had itself removed the users of. Both predicates now mirror the module's own gate. Surfaced by the new CI step below, and unreachable before it, since nothing built that combination.
+
+### Changed
+- **CI clippies `--all-features --lib` for `wasm32-unknown-unknown` at `-D warnings`.** The job's previous comment said `--all-features` was "wrong here on purpose" because `value-stream` pulls zstd. That was true when written, and it is also why the target-gating defect went unnoticed: the failure was in a build script no job ever reached, so the manifest and the `cfg`s in `lib.rs` were free to disagree. `--lib` excludes the `cli` binary, which is a native CLI (tokio runtime, sockets) and is not meant to target wasm32 at any feature set; every other feature is now covered here automatically as more are added.
+
+- `value-stream` appears in the feature tables in `README.md` and `docs/index.md`, which had omitted it entirely, together with a note that it and `fleet-udp` compile away on wasm32 instead of failing.
+
 ## [8.0.0] - 2026-08-17
 
 ### Changed

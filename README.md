@@ -123,8 +123,11 @@ A `with_typed_slice_ref` route is a drop-in superset of `with_typed_slice`: it s
 | `websocket` | Native `WebSocketClient`, `WebSocketServer`, and `proxy_connection`. |
 | `websocket-wasm` | Browser `WasmClient` on `wasm32-unknown-unknown`. |
 | `fleet-udp` | UDP fanout via `UniUdpFleet`. |
+| `value-stream` | Streaming value transfer (SVS), with an optional zstd codec. |
 | `parking-lot` | `Lockable` impls for `parking_lot::Mutex` / `RwLock`. |
 | `cli` | Builds the `repe` command-line client (pulls in `clap` and `websocket`). |
+
+`fleet-udp` and `value-stream` are native-only: on `wasm32-unknown-unknown` both their modules and their non-portable dependencies compile away, so enabling either there is inert rather than a build failure. That matters for a workspace hoisting one shared feature set across a native server and a browser client, since Cargo features are additive and the wasm member cannot subtract one.
 
 ## Documentation
 
