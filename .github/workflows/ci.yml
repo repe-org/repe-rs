@@ -39,9 +39,11 @@ jobs:
   # is how it spent 6.0.0 through 7.0.1 failing to compile against a
   # `RepeError` variant added in 6.0.0.
   #
-  # `--all-features` is wrong here on purpose. `websocket` pulls
-  # tokio-tungstenite and `value-stream` pulls zstd, neither of which targets
-  # wasm32; `websocket-wasm` is the feature that claims to.
+  # Every non-portable module is `not(wasm32)` in lib.rs and every non-portable
+  # dependency is target-gated to match, so any feature set is buildable here.
+  # The `--lib` on the all-features step is what excludes the `cli` binary,
+  # which is a native CLI (tokio runtime, sockets) and is not meant to target
+  # wasm32 at any feature set.
   wasm:
     runs-on: ubuntu-latest
     env:
@@ -63,6 +65,15 @@ jobs:
 
       - name: Clippy (core, no features)
         run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+
+      # Guards the target-gating of `zstd` and `uniudp`. Enabling `value-stream`
+      # or `fleet-udp` on wasm32 used to fail in a *build script* — zstd-sys
+      # compiling `huf_decompress_amd64.S`, mio rejecting the target — which no
+      # job here reached, so a workspace could not hoist either feature into a
+      # feature set shared with a browser client. `--lib` skips the `cli` bin;
+      # everything else stays covered as new features are added.
+      - name: Clippy (all features, lib only)
+        run: cargo clippy --all-features --lib --target wasm32-unknown-unknown -- -D warnings
 
   # The job above proves `wasm_client` compiles. This one proves it works.
   #

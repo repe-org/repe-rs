@@ -1183,7 +1183,12 @@ pub(crate) fn create_response_unstamped(
 // Used only by the WebSocket server: the off-reader path moves its owned request
 // query in, the inline path copies the borrowed view query. The TCP/async servers
 // echo through `response_echo_query` (a pure borrow) instead.
-#[cfg_attr(not(feature = "websocket"), allow(dead_code))]
+// The predicate mirrors `websocket_server`'s own gate in lib.rs, not just its
+// feature: on wasm32 that module is absent even with `websocket` on.
+#[cfg_attr(
+    not(all(feature = "websocket", not(target_arch = "wasm32"))),
+    allow(dead_code)
+)]
 pub(crate) fn stamp_response_query(response: &mut Message, request_query: Cow<[u8]>) {
     if request_query.is_empty() || !response.query.is_empty() {
         return;
