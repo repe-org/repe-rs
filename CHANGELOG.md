@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [8.0.1] - 2026-08-17
 
 ### Fixed
 - **`value-stream` and `fleet-udp` no longer break a `wasm32-unknown-unknown` build.** Both features' modules have always been `not(target_arch = "wasm32")` in `lib.rs`, but their non-portable dependencies sat in the untargeted `[dependencies]` table, so Cargo built them for wasm32 regardless — for a consumer that `cfg` had already compiled out. `zstd` failed inside `zstd-sys`'s build script (clang: "No available targets are compatible with triple wasm32-unknown-unknown", compiling `huf_decompress_amd64.S`) and `uniudp` failed inside mio ("This wasm target is unsupported by mio"). Both are now declared under `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]` alongside `tokio`, so enabling either feature on wasm32 is inert rather than fatal.
