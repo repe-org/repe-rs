@@ -20,3 +20,7 @@ dev/.claude/
 # path dep on repe; informs perf work but is not part of the published crate).
 # Kept out of the tree deliberately so it can't be swept into a commit.
 /bench/
+
+# Local scratch. Kept out of the tree deliberately so it can't be swept into a
+# commit.
+/tmp/

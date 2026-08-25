@@ -358,3 +358,126 @@ fn websocket_inline_dispatch_allocation_budget() {
         "websocket-inline allocation budget changed (was {EXPECTED}, now {allocs})"
     );
 }
+
+/// A struct-backed read: request with no body, so nothing on the inbound side
+/// is decoded and the whole budget is the response encode.
+fn request_empty(path: &str) -> Vec<u8> {
+    Message::builder()
+        .id(1)
+        .query_str(path)
+        .query_format(QueryFormat::JsonPointer)
+        .build()
+        .to_vec()
+}
+
+/// A device status block: the access pattern the struct read path is sized for,
+/// where a client polls the whole object (or one wide field) at high frequency.
+#[derive(Default, serde::Serialize, serde::Deserialize, repe::RepeStruct)]
+struct Status {
+    id: String,
+    temperature: f64,
+    state: String,
+    #[repe(typed)]
+    samples: [u32; 8],
+}
+
+fn status() -> Status {
+    Status {
+        id: "sensor-42".into(),
+        temperature: 21.5,
+        state: "online".into(),
+        samples: [1, 2, 3, 4, 5, 6, 7, 8],
+    }
+}
+
+/// Read → dispatch → write for one struct path, with the writer buffer warmed.
+fn struct_read_allocs(router: &Router, path: &str) -> usize {
+    let wire = request_empty(path);
+    let mut out = Vec::new();
+    dispatch_cycle(router, &wire, path, &mut out);
+    let (_, allocs) = count_allocs(|| dispatch_cycle(router, &wire, path, &mut out));
+    allocs
+}
+
+#[test]
+fn struct_read_allocation_budget() {
+    // Every struct read costs the same two allocations:
+    //
+    //   1  read_message: the query Vec (a read request has no body)
+    //   1  the response body buffer, pre-sized for the wire prefix plus a small
+    //      body allowance, so a leaf encode neither regrows nor re-reserves
+    //   0  the encode itself — serialized straight into that buffer
+    //   0  query echo (moved from the request)
+    //   0  write_message (reuses the warmed `out` buffer)
+    //   ----
+    //   2
+    //
+    // The whole-object case exceeds the body allowance and regrows once, but
+    // `Vec` doubling absorbs it within the initial allocation's own growth, so
+    // the count holds. The `serde_json::Map` node, its per-key `String`s and the
+    // `Value` per field are all gone; `encoding_in_place_beats_the_value_path`
+    // pins that difference directly.
+    const EXPECTED: usize = 2;
+    let (router, _handle) = Router::new().with_struct("/status", status());
+
+    for path in [
+        "/status",         // the whole object
+        "/status/state",   // a string leaf
+        "/status/samples", // a `#[repe(typed)]` leaf, bulk-copied as BEVE
+    ] {
+        let allocs = struct_read_allocs(&router, path);
+        assert_eq!(
+            allocs, EXPECTED,
+            "allocation budget for `{path}` changed (was {EXPECTED}, now {allocs}); \
+             a reduction is good news — update EXPECTED; an increase is a regression"
+        );
+    }
+}
+
+#[test]
+fn encoding_in_place_beats_the_value_path() {
+    // The friction the encode-in-place path removes, measured directly rather
+    // than inferred: both `RepeStruct` methods produce the same response bytes
+    // for the same read, but the `Value` form allocates a map node, a `String`
+    // per key and a `Value` per field before any of it reaches a buffer.
+    //
+    // For this four-field status block the split measured 1 allocation in place
+    // against 9 through `Value`. Compared as a strict inequality, not a fixed
+    // count, so the test states the property (in-place is cheaper) rather than
+    // serde_json's current internals.
+    use repe::structs::{RepeStruct, ResponseBody};
+
+    let mut value_side = status();
+    let mut encode_side = status();
+
+    // Warm up any lazily-initialized allocations inside serde_json.
+    black_box(serde_json::to_vec(&value_side.repe_handle(&[], None).unwrap()).unwrap());
+    {
+        let mut buf = Vec::with_capacity(256);
+        let mut out = ResponseBody::new(&mut buf);
+        encode_side.repe_handle_into(&[], None, &mut out).unwrap();
+    }
+
+    let (value_bytes, value_allocs) = count_allocs(|| {
+        let value = value_side.repe_handle(&[], None).unwrap().unwrap();
+        serde_json::to_vec(&value).unwrap()
+    });
+
+    let (encode_bytes, encode_allocs) = count_allocs(|| {
+        let mut buf = Vec::with_capacity(256);
+        let mut out = ResponseBody::new(&mut buf);
+        encode_side.repe_handle_into(&[], None, &mut out).unwrap();
+        buf
+    });
+
+    assert!(
+        encode_allocs < value_allocs,
+        "encode-in-place should allocate less than the Value path \
+         (in place {encode_allocs}, via Value {value_allocs})"
+    );
+
+    // Same response, modulo the key ordering `serde_json::Map` imposes.
+    let via_value: serde_json::Value = serde_json::from_slice(&value_bytes).unwrap();
+    let in_place: serde_json::Value = serde_json::from_slice(&encode_bytes).unwrap();
+    assert_eq!(in_place, via_value);
+}

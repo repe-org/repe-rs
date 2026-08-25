@@ -51,11 +51,18 @@ pub mod websocket_server;
 
 #[doc(hidden)]
 pub mod derive {
-    pub use repe_derive::RepeStruct;
+    pub use repe_derive::{RepeStruct, methods};
 }
 
 /// Derive macro to generate [`structs::RepeStruct`] implementations.
 pub use repe_derive::RepeStruct;
+
+/// Attribute macro that publishes every method of an inherent `impl` block,
+/// generating the [`structs::RepeMethods`] table from the signatures themselves.
+///
+/// Pair it with `#[repe(methods)]` on the `#[derive(RepeStruct)]` struct; each
+/// half asserts the other, so neither can be forgotten silently.
+pub use repe_derive::methods;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use async_client::AsyncClient;
@@ -105,7 +112,7 @@ pub use stream::{
     DEFAULT_REPLAY_RING_BYTES, DEFAULT_WINDOW_BYTES, PendingResume, ReconnectOutcome,
     ResumeRejection, RingChunk, TransferControl, TransferRegistry, spawn_watchdog,
 };
-pub use structs::{RepeStruct, StructError};
+pub use structs::{RepeStruct, ResponseBody, StructError};
 #[cfg(all(feature = "fleet-udp", not(target_arch = "wasm32")))]
 pub use udp_client::UniUdpClient;
 #[cfg(all(feature = "fleet-udp", not(target_arch = "wasm32")))]
