@@ -1,17 +1,18 @@
-use crate::constants::{BodyFormat, ErrorCode};
+use crate::constants::{BodyFormat, ErrorCode, HEADER_SIZE};
 use crate::error::RepeError;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::io::{read_message_into, write_message_streaming};
 use crate::message::{
-    Message, MessageView, create_error_response_like, create_error_response_unstamped_view,
-    create_response_unstamped, create_response_unstamped_view,
-    create_typed_slice_response_unstamped, create_typed_slice_response_unstamped_view,
+    Message, MessageView, create_body_response_unstamped, create_error_response_like,
+    create_error_response_unstamped_view, create_response_unstamped,
+    create_response_unstamped_view, create_typed_slice_response_unstamped,
+    create_typed_slice_response_unstamped_view,
 };
 use crate::peer::{CallContext, PeerHandle};
 use crate::registry::Registry;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::server_request::route_request_view;
-use crate::structs::RepeStruct;
+use crate::structs::{RepeStruct, ResponseBody};
 use beve::from_slice as beve_from_slice;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -1657,6 +1658,12 @@ where
 /// `Vec<&str>` only when the path is unusually deep. The escape path keeps the
 /// original `Vec<String>` + `Vec<&str>` shape because each escaped segment
 /// genuinely needs an owned `String`.
+///
+/// The handler encodes through [`RepeStruct::repe_handle_into`], writing the
+/// response body straight into `buf` rather than returning a
+/// [`serde_json::Value`] for this function to re-serialize. The buffer is then
+/// grown by the wire prefix so [`Message::into_wire_bytes`] reuses it instead of
+/// allocating a frame, making a leaf read one allocation end to end.
 fn dispatch_struct_segments<T>(
     handler: &mut T,
     relative: &str,
@@ -1667,16 +1674,26 @@ where
     T: RepeStruct + ?Sized,
 {
     const STACK_SEGS: usize = 16;
+    /// Body allowance reserved on top of the wire prefix. The frame needs the
+    /// prefix regardless, and a scalar or short-string leaf read — the case this
+    /// path exists for — fits in the rest, so the encode comes for free out of
+    /// the one allocation and the result already satisfies
+    /// [`Message::into_wire_bytes`]'s in-place condition
+    /// (`capacity >= HEADER_SIZE + query + body`).
+    const LEAF_BODY_HINT: usize = 64;
+
+    let mut buf = Vec::with_capacity(HEADER_SIZE + req.query.len() + LEAF_BODY_HINT);
+    let mut out = ResponseBody::new(&mut buf);
 
     let result = if !relative.contains('~') {
         if relative.is_empty() {
-            handler.repe_handle(&[], body)
+            handler.repe_handle_into(&[], body, &mut out)
         } else if relative == "/" {
             // RFC 6901: "/" decodes to a single empty reference token. The
             // old `json_pointer::parse("/")` path returned `vec![""]`; the
             // fast path must match so trailing-slash requests still surface
             // as `InvalidPath` rather than silently serving the whole struct.
-            handler.repe_handle(&[""], body)
+            handler.repe_handle_into(&[""], body, &mut out)
         } else {
             let trimmed = relative.strip_prefix('/').unwrap_or(relative);
             let mut stack: [&str; STACK_SEGS] = [""; STACK_SEGS];
@@ -1696,18 +1713,19 @@ where
                 }
             }
             match overflow.as_deref() {
-                Some(v) => handler.repe_handle(v, body),
-                None => handler.repe_handle(&stack[..count], body),
+                Some(v) => handler.repe_handle_into(v, body, &mut out),
+                None => handler.repe_handle_into(&stack[..count], body, &mut out),
             }
         }
     } else {
         let owned = crate::json_pointer::parse(relative);
         let seg_refs: Vec<&str> = owned.iter().map(String::as_str).collect();
-        handler.repe_handle(&seg_refs, body)
+        handler.repe_handle_into(&seg_refs, body, &mut out)
     };
 
+    let body_format = out.format();
     match result {
-        Ok(value) => create_response_unstamped(req, value.unwrap_or(Value::Null), BodyFormat::Json),
+        Ok(()) => Ok(create_body_response_unstamped(req, buf, body_format)),
         Err(err) => Ok(create_error_response_like(req, err.code(), err.to_string())),
     }
 }

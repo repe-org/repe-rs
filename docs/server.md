@@ -67,18 +67,14 @@ let router = Router::new().with_handler("/greet", Greeter);
 
 ## Registering a Struct
 
-`register_struct` exposes a struct's fields and methods through JSON Pointer paths automatically. Annotate methods to publish with `#[repe(methods(...))]` and mark nested struct fields with `#[repe(nested)]`.
+`register_struct` exposes a struct's fields and methods through JSON Pointer paths automatically. `#[derive(RepeStruct)]` reflects the **fields**; `#[repe::methods]` on an inherent `impl` block reflects the **methods**. Mark nested struct fields with `#[repe(nested)]`.
 
 ```rust
 use repe::Router;
 use serde::{Deserialize, Serialize};
 
 #[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
-#[repe(methods(
-    greet(&self) -> String,
-    set_status(&mut self, new_status: String) -> (),
-    reset_metrics(&mut self) -> ()
-))]
+#[repe(methods)]
 struct Device {
     id: String,
     status: String,
@@ -92,6 +88,7 @@ struct Metrics {
     humidity: f64,
 }
 
+#[repe::methods]
 impl Device {
     fn greet(&self) -> String { format!("device {} reporting {}", self.id, self.status) }
     fn set_status(&mut self, new_status: String) { self.status = new_status; }
@@ -116,6 +113,104 @@ The resulting paths:
 - `/device/status` with body `"offline"` writes the field and returns null.
 - `/device/metrics/temperature` reads the nested value `21.5`.
 - `/device/reset_metrics` zeroes out the metrics.
+- `/device` reads the whole object, with each method published as its signature string.
+
+### The two halves of the surface
+
+A derive macro is attached to the struct definition and cannot see `impl` blocks, so the two macros are tied together by a compile-time handshake: `#[repe(methods)]` on the struct says "my methods live in a `#[repe::methods]` block", and the attribute macro asserts that marker back. Leave either half off and the build fails naming the attribute that is missing — a method can never be quietly absent from the served surface.
+
+Everything in an annotated block becomes an endpoint, with two exceptions that need no annotation:
+
+- **associated functions** (`fn new() -> Self`) — there is no instance to dispatch on, so they are simply not endpoints;
+- **`#[repe(skip)]`** methods, for anything else you want to keep off the wire.
+
+`#[repe(rename = "...")]` publishes a method under a different path segment. A method that consumes `self`, is `async`, `unsafe`, generic, takes a reference argument, or is behind a `#[cfg]` is a compile error rather than a silent omission; add `#[repe(skip)]` if it belongs in the block but not on the wire.
+
+`#[cfg]` is worth calling out because the reason is not obvious: conditional compilation is applied *after* attribute macros run, so the macro would publish an endpoint for a method that may not exist. Put a conditionally-compiled method in a plain `impl` block, or `#[repe(skip)]` it and publish an unconditional wrapper.
+
+Two declarations claiming the same endpoint — two fields, two methods, or a field and a method — are also rejected. One of them would win dispatch and the other would be unreachable forever, and the whole-object listing would carry the key twice.
+
+### Arguments
+
+A method's arguments are deserialized from the request body:
+
+| Arity | Body |
+|---|---|
+| 0 | ignored |
+| 1 | *is* the argument |
+| 2+ | an array of N values, positionally, **or** an object keyed by parameter name |
+
+```rust
+#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+#[repe(methods)]
+struct Mixer { gain: f64 }
+
+#[repe::methods]
+impl Mixer {
+    fn blend(&self, left: f64, right: f64) -> f64 { self.gain * (left + right) }
+}
+```
+
+`/blend` accepts `[1.0, 3.0]` or `{"left": 1.0, "right": 3.0}`. In the object form a missing key decodes as `null`, so an `Option<T>` parameter may be omitted.
+
+### Fallible methods
+
+A method returning `Result<T, E>` sends `Ok(v)` as the payload and turns `Err(e)` into an error frame carrying `e.to_string()`, rather than serializing the `Result` itself.
+
+The check is **name-based**: a macro sees a type, not a resolved one, so it matches anything whose last path segment is `Result` with one or two type arguments. That covers `Result<T, E>`, `std::result::Result<T, E>`, and the widespread one-parameter aliases — `anyhow::Result<T>`, `std::io::Result<T>`, a crate's own `pub type Result<T> = ...`.
+
+It has a boundary in each direction, and the second one matters:
+
+- A type of your own that is *named* `Result` but is not one is treated as fallible. You will notice: it fails to compile.
+- A `Result` aliased under **another name** (`type DeviceResult<T> = Result<T, DeviceError>`) is **not** recognized, and is serialized as data — so `Err` reaches the client as a *success* frame carrying `{"Err": ...}`. Nothing warns about this. If you use such an alias, spell the return type as `Result<..>` on any method you publish.
+
+Resolving either would need type information a macro does not have.
+
+### Reflection, and its floor
+
+Adding a **field** to the struct, or a **method** to the annotated block, adds the endpoint. Nothing restates a signature, so the served surface cannot fall behind the type.
+
+Worth stating plainly: Rust cannot reach Glaze's zero-annotation reflection. Glaze counts and names the members of any aggregate with nothing added to the type; `repr(Rust)` has no defined layout and no stable field enumeration, so every Rust path runs through a macro that has seen the definition. One derive per struct, plus one attribute per impl block, is the floor.
+
+The struct-level list form remains as the escape hatch for a block that cannot be annotated — a foreign type, or an impl generated by another macro:
+
+```rust
+#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+#[repe(methods(
+    greet(&self) -> String,
+    blend(&self, left: f64, right: f64) -> f64,
+    alias = greet(&self) -> String
+))]
+struct Legacy { gain: f64 }
+
+impl Legacy {
+    fn greet(&self) -> String { format!("gain {}", self.gain) }
+    fn blend(&self, left: f64, right: f64) -> f64 { self.gain * (left + right) }
+}
+```
+
+It supports the same arities and the same `Result` mapping, and the two forms may be used on the same struct. It carries the drift the impl-block form removes, though: renaming a listed method or changing its types is a compile error, but *adding* one to the impl block leaves it off the wire. Prefer `#[repe::methods]` where you can annotate the block.
+
+### Field attributes
+
+| Attribute | Effect |
+|---|---|
+| `#[repe(rename = "...")]` | publish under a different path segment |
+| `#[repe(skip)]` | keep the field off the wire entirely |
+| `#[repe(readonly)]` | reads succeed, writes return `InvalidBody` |
+| `#[repe(nested)]` | descend into a field that is itself a `RepeStruct` |
+| `#[repe(typed)]` | encode a numeric slice as a BEVE typed array |
+
+`#[repe(typed)]` routes a numeric array or `Vec` field to the bulk encoder behind [`MessageBuilder::body_typed_slice`](numeric-bodies.md) — one `copy_nonoverlapping` rather than a per-element serde walk, and byte-identical to what Glaze emits for the same array. That response carries `BodyFormat::Beve`; decode it with `Message::decode_typed_slice`. Writes to the field are unaffected and still take JSON. Inside the whole-object read the frame is already committed to JSON, so the field appears there as an ordinary JSON array; the typed encoding is what you get by reading the field on its own, which is the case it exists for.
+
+### Reads do not build an intermediate `Value`
+
+A read serializes the live field straight into the outgoing frame buffer. `RepeStruct` carries two methods for this: `repe_handle`, which returns a `serde_json::Value` and is all a hand-written impl needs, and `repe_handle_into`, which encodes in place and is what the router calls. The derive generates both; the default `repe_handle_into` falls back to `repe_handle`, so an existing hand-written impl keeps working unchanged and can override the second method when it is worth it.
+
+Two consequences worth knowing:
+
+- Reading a whole object no longer walks a `serde_json::Map`, so its keys come out in **declaration order** rather than sorted. Previously the order came from `serde_json::Map`, which is alphabetical unless something in the dependency graph enables `serde_json/preserve_order` — declaration order is both stable and what Glaze emits.
+- `#[repe(typed)]` only takes effect on the encoding path; `repe_handle` still yields a JSON array, since a `Value` cannot carry a BEVE typed body.
 
 `Router` accepts `Arc<L>` for any lock implementing `repe::Lockable<T>`, so you can swap in `tokio::sync::Mutex` / `RwLock` (via their `blocking_*` APIs) or enable the optional `parking-lot` feature to use `parking_lot::Mutex` / `RwLock` without extra wrapper types.
 

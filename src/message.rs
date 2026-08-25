@@ -1168,6 +1168,23 @@ pub(crate) fn create_response_unstamped(
     finish_response(builder, result, body_format)
 }
 
+/// Query-less success response whose body is already encoded.
+///
+/// The pre-encoded twin of [`create_response_unstamped`], used by the
+/// struct-handler dispatch: the handler serializes straight into a buffer via
+/// [`ResponseBody`](crate::structs::ResponseBody), so there is no `impl Serialize`
+/// left to run and the format is whatever that write settled on.
+pub(crate) fn create_body_response_unstamped(
+    request: &Message,
+    body: Vec<u8>,
+    body_format: BodyFormat,
+) -> Message {
+    response_header_builder(request.header.id, request.header.query_format)
+        .body_bytes(body)
+        .body_format(body_format)
+        .build()
+}
+
 /// Echo `request_query` into a response left query-less by
 /// [`create_response_unstamped`] / [`create_response_unstamped_view`], fixing up
 /// the header lengths.

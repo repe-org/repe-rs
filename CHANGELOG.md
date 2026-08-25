@@ -1,5 +1,31 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **`#[repe::methods]` — methods reflected off the impl block.** An attribute macro on an inherent `impl` that publishes every method in it, deriving names, arities and types from the signatures. Adding a method now adds the endpoint; the struct-level `#[repe(methods(..))]` list could only be kept in step by hand, and *adding* to it was the one drift the compiler could not catch.
+
+  The struct opts in with a bare `#[repe(methods)]` beside its `#[derive(RepeStruct)]`. A derive cannot see `impl` blocks, so the two halves are tied together at compile time: `structs::MethodsDeclared` (which the derive emits) is a supertrait of the generated `structs::RepeMethods`, so leaving either half off fails the build naming the attribute that is missing. Associated functions (`fn new() -> Self`) are not endpoints; `#[repe(skip)]` and `#[repe(rename = "...")]` cover the rest. `self`-by-value, `async`, `unsafe`, generic, reference-argument and `#[cfg]`-gated methods are compile errors rather than silent omissions — `#[cfg]` because conditional compilation runs *after* attribute macros, so the endpoint would be published for a method that may not exist.
+
+  Two declarations claiming the same endpoint — two fields, two methods, or a field and a method — are rejected. Otherwise one silently wins dispatch, the other is unreachable forever, and the whole-object listing carries the key twice.
+
+  The list form stays as the escape hatch for a block that cannot be annotated (a foreign type, an impl behind another macro), and the two may be used together.
+
+- **Methods take any number of arguments**, on both surfaces — the previous cap was one, undocumented, and surfaced as a macro error. Zero arguments ignore the body, one *is* the body (unchanged on the wire), and two or more arrive as a positional array or an object keyed by parameter name.
+
+- **`Result` returns map to error frames.** A method returning `Result<T, E>` sends `Ok(v)` as the payload and turns `Err(e)` into an error frame carrying `e.to_string()`, instead of serializing the `Result` itself.
+
+  Detection is **name-based** — a macro sees a type, not a resolved one — so it covers `Result<T, E>`, `std::result::Result<T, E>` and the one-parameter aliases (`anyhow::Result<T>`, `std::io::Result<T>`, a crate's own `pub type Result<T>`). A `Result` aliased under another name (`type DeviceResult<T> = ...`) is **not** recognized and is serialized as data, so `Err` reaches the client as a success frame carrying `{"Err": ...}`. Spell such a return type as `Result<..>` on any method you publish; both boundaries are documented in `docs/server.md` and pinned by tests.
+
+- **`#[repe(typed)]` field attribute**, routing a numeric array or `Vec` field to the bulk BEVE typed-array encoder (one `copy_nonoverlapping`, byte-identical to Glaze) rather than a per-element serde walk. The response carries `BodyFormat::Beve`; writes are unaffected and still take JSON. Inside the whole-object read the field stays a JSON array, since that frame is already JSON.
+
+- **`RepeStruct::repe_handle_into`**, plus `structs::{ResponseBody, ObjectBody, RepeMethods, MethodsDeclared, MethodArgs}`. A provided method with a default that delegates to `repe_handle`, so existing hand-written impls are unaffected.
+
+### Changed
+- **Struct reads no longer build an intermediate `serde_json::Value`.** The router now dispatches through `repe_handle_into`, which serializes the live field straight into the outgoing frame buffer. Reading a four-field status block measured 1 allocation in place against 9 through `Value`; end to end — request query included — every struct read is now 2 allocations, leaf or whole-object. Pinned by `struct_read_allocation_budget` and `encoding_in_place_beats_the_value_path` in `tests/allocations.rs`.
+
+- **A whole-struct read emits its keys in declaration order**, where it previously inherited `serde_json::Map`'s ordering — alphabetical, unless something in the dependency graph enabled `serde_json/preserve_order`. Declaration order is stable regardless and is what Glaze emits. Object key order is not semantic, so a conforming client is unaffected; anything comparing struct-listing bodies byte-for-byte is not.
+
 ## [8.0.1] - 2026-08-17
 
 ### Fixed
