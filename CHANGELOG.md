@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [8.1.0] - 2026-08-25
 
 ### Added
 - **`#[repe::methods]` — methods reflected off the impl block.** An attribute macro on an inherent `impl` that publishes every method in it, deriving names, arities and types from the signatures. Adding a method now adds the endpoint; the struct-level `#[repe(methods(..))]` list could only be kept in step by hand, and *adding* to it was the one drift the compiler could not catch.
@@ -23,6 +23,8 @@
 
 ### Changed
 - **Struct reads no longer build an intermediate `serde_json::Value`.** The router now dispatches through `repe_handle_into`, which serializes the live field straight into the outgoing frame buffer. Reading a four-field status block measured 1 allocation in place against 9 through `Value`; end to end — request query included — every struct read is now 2 allocations, leaf or whole-object. Pinned by `struct_read_allocation_budget` and `encoding_in_place_beats_the_value_path` in `tests/allocations.rs`.
+
+- **`repe-derive` is now `0.2.0`**, and `repe` requires it. The macro crate gained the `methods` attribute and its generated code names items that only exist in `repe` 8.1.0, so the two move together. Nothing to do unless you depend on `repe-derive` directly, which is not the supported way to reach it — use `repe::RepeStruct` / `repe::methods`.
 
 - **A whole-struct read emits its keys in declaration order**, where it previously inherited `serde_json::Map`'s ordering — alphabetical, unless something in the dependency graph enabled `serde_json/preserve_order`. Declaration order is stable regardless and is what Glaze emits. Object key order is not semantic, so a conforming client is unaffected; anything comparing struct-listing bodies byte-for-byte is not.
 
