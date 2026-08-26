@@ -466,7 +466,37 @@ fn unescape_token(token: &str) -> Result<Cow<'_, str>, ()> {
     Ok(Cow::Owned(out))
 }
 
-fn escape_token(token: &str) -> String {
+/// Normalize a mount prefix: absolute, no trailing separator, empty for the root.
+///
+/// Shared so that every API in this crate taking a mount agrees on what a given
+/// string means — `Router::with_registry` and `RestGateway` in particular, where
+/// two different readings of `"/api/v1/"` would be a trap rather than a feature.
+/// Normalizing rather than rejecting keeps the mount a convenience argument
+/// instead of a fallible one.
+pub(crate) fn normalize_mount(prefix: &str) -> String {
+    if prefix.is_empty() || prefix == "/" {
+        return String::new();
+    }
+    let absolute = if prefix.starts_with('/') {
+        prefix.to_string()
+    } else {
+        format!("/{prefix}")
+    };
+    let trimmed = absolute.trim_end_matches('/');
+    // All separators: `"///"` is the root, not the empty-key path `"//"`.
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// RFC 6901 escaping. `~` first: doing `/` first would turn a literal `/` into
+/// `~1`, and the following pass would then escape that `~` into `~01`.
+pub(crate) fn escape_token(token: &str) -> String {
+    if !token.contains('~') && !token.contains('/') {
+        return token.to_string();
+    }
     token.replace('~', "~0").replace('/', "~1")
 }
 

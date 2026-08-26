@@ -14,7 +14,7 @@ registry.register_value("/counter", serde_json::json!(0))?;
 
 // One registry, two carriers.
 let router = Router::new().with_registry("/api/v1", Arc::clone(&registry));
-let gateway = RestGateway::new("/api/v1", registry)?;
+let gateway = RestGateway::new("/api/v1", registry);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -25,7 +25,23 @@ gateway.serve(listener).await
 # }
 ```
 
-`serve` handles HTTP/1.1 and HTTP/2 on the one listener, detecting the protocol per connection. TLS is out of scope: put this behind a terminator that already does certificate rotation and ALPN.
+`serve` handles HTTP/1.1 and HTTP/2 on the one listener, detecting the protocol per connection.
+
+## This gateway has no authentication
+
+TLS and identity are both out of scope. Put this behind a terminator that already handles certificate rotation, ALPN, and authentication — an ingress, an API gateway, a sidecar. `RestConfig` reduces blast radius; it is not an access-control system, and the defaults assume something in front is doing that job.
+
+Three defaults exist specifically to keep an unauthenticated deployment from being worse than it looks:
+
+- **`read_only`** (default `false`) answers every mutation with `405`. Reads are what this facade is for — the safe, cacheable, CDN-frontable half. A gateway that only publishes state should say so here rather than trust an upstream to filter methods.
+- **`allow_root_write`** (default `false`) refuses a `PUT` at the mount itself. The registry treats the empty pointer as a *merge* of the request object into the root, so such a write introduces keys the caller chose rather than assigning a value at a path the caller named — it can inject arbitrary state and grow the in-memory tree without bound. That is a different hazard from writing a known leaf, so it is a separate decision.
+- **`accept_beve_bodies`** (default `false`) refuses BEVE request bodies with `415`. See below.
+
+### Why BEVE request bodies are opt-in
+
+As of `beve` 8 the deserializer has no recursion limit. A few kilobytes of nested array tags overflow the thread stack, and a Rust stack overflow **aborts the process** rather than unwinding into the per-connection catch — so one unauthenticated request takes down the gateway and anything co-hosted with it. `serde_json` caps its own recursion depth, so the JSON leg does not have this problem, and `max_body_bytes` is three orders of magnitude too loose to help.
+
+BEVE *responses* are unaffected and always available: encoding is driven by the server's own data, not by an anonymous caller. Turn the request leg on only for a gateway whose clients are already trusted, and prefer pointing binary clients at the REPE leg, which is what it is for.
 
 ## Why the translation is mechanical
 
@@ -61,6 +77,8 @@ $ curl -si -X OPTIONS localhost:8080/api/v1/add | grep -i allow
 allow: GET, HEAD, POST, OPTIONS
 ```
 
+`OPTIONS *` (RFC 9110 §9.3.7) reports the server-wide method set rather than any one resource's.
+
 A `PUT` or `POST` with an empty body is `400`, not a read. An empty body is how the registry spells READ, so passing one through would answer a write with `200` and the *old* value, having written nothing. A call that takes no arguments sends `null`.
 
 ## Caching
@@ -82,7 +100,19 @@ Reads also carry `Vary: Accept`, because the gateway content-negotiates JSON aga
 
 `RestConfig::cache_control` sets the freshness directive, defaulting to `no-cache`: revalidate every time, which keeps `ETag` and `304` working while never serving stale state from a registry that has no way to announce a mutation. Raise it to a `max-age` per deployment where the data allows, which is where the real edge-caching win comes from.
 
-Mutations carry neither a validator nor a freshness directive.
+Mutations carry no validator and no freshness directive. Error responses carry `Cache-Control: no-store`, because RFC 9111 §4.2.2 makes 404 and 405 heuristically cacheable — a cached 405 would keep its stale `Allow` after the path became a function, leaving the resource unreachable through its only correct verb.
+
+## Conditional writes
+
+`If-Match` is honored on `PUT`, so the validators handed out on reads are usable for optimistic concurrency rather than decorative. A stale tag is `412` and the write does not happen:
+
+```
+$ curl -s -o /dev/null -w '%{http_code}\n' -X PUT -d 1 \
+    -H 'If-Match: "0000000000000000"' localhost:8080/api/v1/counter
+412
+```
+
+Comparison is strong (RFC 9110 §13.1.1), so a `W/`-prefixed weak validator never satisfies it — unlike `If-None-Match`, which uses weak comparison. `If-Match: *` requires only that the resource exist. A tag from either representation is accepted, since the client's tag came from whichever one it negotiated and changing the value changes both encodings.
 
 ## Content negotiation
 
@@ -94,6 +124,10 @@ $ curl -s -H 'Accept: application/x-beve' localhost:8080/api/v1/config | xxd | h
 ```
 
 `Accept` handling covers media types and `q` values; anything unrecognized falls back to JSON rather than answering `406`. A missing `Content-Type` on a request body is treated as JSON, which is what `curl -d` sends. An unsupported one is `415`.
+
+## Mounting
+
+The mount is normalized the same way `Router::with_registry` normalizes its prefix, through the same function: made absolute, stripped of a trailing separator, empty for the root. `"/api/v1"`, `"/api/v1/"`, and `"api/v1"` all name the same mount, so construction is infallible.
 
 ## Paths
 
@@ -122,7 +156,9 @@ An application error defaults to 500 because the gateway cannot know whether a g
 
 ## Configuration
 
-`RestConfig` carries the policy: `max_body_bytes` (default 1 MiB, answering `413`), `cache_control`, `etag`, and `application_error_status`. The body limit bounds the facade, not the protocol: a REST body is buffered whole before it can be decoded, so an unbounded limit is an unbounded allocation driven by an anonymous caller. Bulk payloads belong on the REPE leg, which streams.
+`RestConfig` carries the policy: `max_body_bytes` (default 1 MiB, answering `413`), `cache_control`, `application_error_status`, the three safety defaults above, and `max_connections` (default 1024). The body limit bounds the facade, not the protocol: a REST body is buffered whole before it can be decoded, so an unbounded limit is an unbounded allocation driven by an anonymous caller. Bulk payloads belong on the REPE leg, which streams.
+
+`max_connections` bounds concurrency in `serve`: past the cap it stops accepting, so a burst waits in the listen backlog rather than in the descriptor table. Connections also get a 30-second header-read timeout, without which a client that connects and sends nothing holds a task and a descriptor indefinitely — which is how an idle-connection flood reaches the process descriptor limit without ever sending a valid request.
 
 ## Testing without a socket
 

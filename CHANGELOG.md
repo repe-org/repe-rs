@@ -19,6 +19,10 @@
 
   Reads carry a strong `ETag` (FNV-1a/64, so instances behind one load balancer agree) plus `Vary: Accept` and a configurable `Cache-Control`, so a conditional `GET` costs a `304` with no body. Bodies negotiate JSON against BEVE on both legs. Failures answer as RFC 9457 problem details carrying the originating REPE error code.
 
+  Safety defaults assume an unauthenticated deployment: `read_only`, `allow_root_write`, and `accept_beve_bodies` are all off unless asked for. The last of these is not a preference — `beve` 8's deserializer has no recursion limit, so a few KB of nested array tags overflow the stack, and a Rust stack overflow aborts the process rather than unwinding. BEVE responses are unaffected. `serve` caps concurrent connections and applies a header-read timeout, so idle-connection floods cannot walk the process to its descriptor limit.
+
+  `If-Match` is honored on writes (strong comparison, `412` on failure), so the validators reads hand out are usable for optimistic concurrency. Error responses carry `Cache-Control: no-store`, since RFC 9111 makes 404 and 405 heuristically cacheable and a cached 405 outlives the `Allow` it advertised. `OPTIONS *` reports the server-wide method set.
+
   `RestGateway::respond` is the whole mapping with no transport involved — the REST-side counterpart to `Router::call` — so `serve` is a thin hyper shim over it and any other HTTP stack can be one too.
 
 - **`Registry::is_function`.** Whether a pointer names a registered function rather than a value. The registry decides read-vs-write-vs-call from the body alone, which is right for REPE; a caller that must commit to a verb before it has a body needs the distinction up front, and probing it with a read is not a substitute because a read of a function returns a descriptor a stored value could equally well contain.

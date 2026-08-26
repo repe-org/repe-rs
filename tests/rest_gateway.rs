@@ -62,15 +62,15 @@ async fn send(
     // Head first: read until the blank line that ends the header block.
     let mut buffer = Vec::new();
     let head_end = loop {
-        if let Some(position) = buffer
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-        {
+        if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
             break position + 4;
         }
         let mut chunk = [0u8; 1024];
         let read = stream.read(&mut chunk).await.unwrap();
-        assert!(read > 0, "connection closed before the headers were complete");
+        assert!(
+            read > 0,
+            "connection closed before the headers were complete"
+        );
         buffer.extend_from_slice(&chunk[..read]);
     };
 
@@ -134,7 +134,7 @@ async fn start(config: RestConfig) -> (std::net::SocketAddr, Arc<Registry>) {
         })
         .unwrap();
 
-    let gateway = RestGateway::with_config("/api/v1", Arc::clone(&registry), config).unwrap();
+    let gateway = RestGateway::with_config("/api/v1", Arc::clone(&registry), config);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -249,7 +249,13 @@ async fn a_call_round_trips_through_the_function() {
 
 #[tokio::test]
 async fn beve_is_negotiated_on_both_legs() {
-    let (addr, _registry) = start(RestConfig::default()).await;
+    // BEVE *bodies* are opt-in (see `RestConfig::accept_beve_bodies`); BEVE
+    // responses are not, and this exercises both legs.
+    let (addr, _registry) = start(RestConfig {
+        accept_beve_bodies: true,
+        ..RestConfig::default()
+    })
+    .await;
     let mut stream = connect(addr).await;
 
     let read = send(

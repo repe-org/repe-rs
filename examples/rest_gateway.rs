@@ -14,6 +14,8 @@
 //! curl -i -X POST -d '{"a":2,"b":3}' localhost:8080/api/v1/add
 //! curl -i -H 'If-None-Match: "..."' localhost:8080/api/v1/counter   # 304
 //! curl -i -X POST -d 1 localhost:8080/api/v1/counter                # 405
+//! curl -i -X PUT -d 1 -H 'If-Match: "deadbeefdeadbeef"' \
+//!      localhost:8080/api/v1/counter                                # 412
 //! curl -i -X OPTIONS localhost:8080/api/v1/add                      # Allow
 //! ```
 //!
@@ -54,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = repe.serve(repe_listener).await;
     });
 
-    let gateway = RestGateway::new("/api/v1", registry)?;
+    let gateway = RestGateway::new("/api/v1", registry);
     let http_listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
     println!("REST  on http://127.0.0.1:8080/api/v1");
     gateway.serve(http_listener).await?;
