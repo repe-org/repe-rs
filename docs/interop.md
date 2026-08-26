@@ -63,6 +63,17 @@ One direction of this is pinned cross-implementation. The `json_request_unknown_
 
 The reverse direction — a repe-produced body with an extra key decoding on a Glaze *server* under its default policy — is still follow-up. It needs a running Glaze server (the fixture generator only emits bytes, it does not receive them) and depends on the C++ side defaulting its REPE server to ignore unknown keys; Glaze's `error_on_unknown_keys` is strict by default today. That is the ecosystem-level half of the same recommendation.
 
+## The plugin ABI
+
+Beyond the wire format, the two implementations share a **C plugin ABI**
+(`glaze/rpc/repe/plugin.h`), and it is pinned the same way and against the same
+Glaze tag: `interop/cpp/plugin_host.cpp` is a C++ REPE host that `dlopen`s the
+Rust plugin example and drives it, encoding every request and decoding every
+response with Glaze rather than by hand. It runs in the same CI job, and it fails
+if the exported symbols, the metadata struct's layout, or the response-buffer
+contract diverge. See [Plugins](plugins.md) for the ABI itself and
+`interop/README.md` for how to run it locally.
+
 ## A note on BEVE variants
 
 The guarantee above covers BEVE **objects** and **typed numeric arrays**, which is what the fixtures exercise. It does not cover a sum type — a Rust `enum` against a C++ `std::variant`. That is a gap in coverage, not a known incompatibility, and it is worth knowing why.

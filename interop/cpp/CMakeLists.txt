@@ -34,3 +34,12 @@ endif()
 
 add_executable(generate_fixtures generate_fixtures.cpp)
 target_link_libraries(generate_fixtures PRIVATE glaze::glaze)
+
+# Plugin-ABI host: dlopens a Rust plugin and drives it through
+# glaze/rpc/repe/plugin.h. Shares this project's Glaze so both interop halves —
+# wire format and plugin ABI — are pinned to one tag.
+#
+#   cargo build --release --features plugin --example repe_plugin
+#   interop/cpp/build/plugin_host target/release/examples/librepe_plugin.{so,dylib}
+add_executable(plugin_host plugin_host.cpp)
+target_link_libraries(plugin_host PRIVATE glaze::glaze ${CMAKE_DL_LIBS})

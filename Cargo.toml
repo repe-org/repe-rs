@@ -41,6 +41,13 @@ websocket-wasm = [
     "dep:web-sys",
 ]
 cli = ["websocket", "dep:clap", "dep:clap_complete"]
+# C-ABI plugin surface: expose a `Router` as a `cdylib` a REPE host `dlopen`s,
+# against the same ABI Glaze's `glaze/rpc/repe/plugin.h` defines. Pure `std`, no
+# new dependencies; opt-in because it adds `extern "C"` exports and a version
+# constant pinned to that header, which a crate not building a plugin should not
+# carry. Off on wasm32, where the module is `not(wasm32)` in lib.rs: there is no
+# dynamic loader for it to be loaded by.
+plugin = []
 # Streaming transfer of a serialized, optionally zstd-compressed in-memory value
 # over ordinary REPE request/response (the SVS wire contract). Pulls in `zstd`
 # for the compressed path; the engine itself is plain `std` threads + channels.
@@ -63,6 +70,14 @@ required-features = ["websocket"]
 [[example]]
 name = "websocket_cohosting"
 required-features = ["websocket"]
+
+# Built as a real shared library, so the generated exports are checked by the
+# linker rather than only by rustc: `cargo build --features plugin --example
+# repe_plugin` produces a `.so`/`.dylib` a REPE host can `dlopen`.
+[[example]]
+name = "repe_plugin"
+crate-type = ["cdylib"]
+required-features = ["plugin"]
 
 [[example]]
 name = "value_stream"

@@ -1441,6 +1441,107 @@ impl Router {
             .find(|entry| entry.matches(path))
             .map(|entry| Arc::clone(&entry.dispatched))
     }
+
+    /// Dispatch one serialized REPE request frame and return the serialized
+    /// response frame, with no transport involved.
+    ///
+    /// This is the router reduced to its essential shape — bytes in, bytes out —
+    /// and it is the same work the built-in servers do between reading a frame
+    /// off a socket and writing one back: version and query-format validation,
+    /// handler resolution, notify semantics, `MethodNotFound` framing, and the
+    /// response query echo. Reaching those through [`get`](Self::get) plus
+    /// [`HandlerErased::handle`] means reimplementing all five, and the notify
+    /// and query-echo rules in particular are easy to get subtly wrong.
+    ///
+    /// Returns `None` when the request is a notify, which by protocol produces
+    /// no response at all. A caller that must answer every frame should treat
+    /// `None` as "write nothing", not as an error.
+    ///
+    /// Use it for any carrier the crate does not ship a server for: the C-ABI
+    /// [`plugin`](crate::plugin) surface (where it is literally the body of
+    /// `repe_plugin_call`), a shared-memory or in-process transport, a foreign
+    /// event loop, or a test that wants to exercise routing without a socket.
+    ///
+    /// ```
+    /// use repe::{Message, QueryFormat, server::Router};
+    ///
+    /// let router = Router::new().with_json("/double", |v: serde_json::Value| {
+    ///     Ok(serde_json::json!(v.as_i64().unwrap_or(0) * 2))
+    /// });
+    ///
+    /// let request = Message::builder()
+    ///     .id(1)
+    ///     .query_str("/double")
+    ///     .query_format(QueryFormat::JsonPointer)
+    ///     .body_json(&21)
+    ///     .unwrap()
+    ///     .build()
+    ///     .to_vec();
+    ///
+    /// let response = Message::from_slice(&router.call(&request).unwrap()).unwrap();
+    /// assert_eq!(response.json_body::<i64>().unwrap(), 42);
+    /// ```
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn call(&self, request: &[u8]) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        self.call_into(request, &mut out).then_some(out)
+    }
+
+    /// [`call`](Self::call) writing into a caller-owned buffer instead of
+    /// allocating one, returning `true` if a response was written and `false`
+    /// for a notify. `out` is cleared first either way.
+    ///
+    /// This is the form a hot loop wants: a carrier that holds one reusable
+    /// response buffer per connection or per thread pays no per-request
+    /// allocation, which is exactly why the C-ABI plugin surface is built on it
+    /// rather than on [`call`](Self::call).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn call_into(&self, request: &[u8], out: &mut Vec<u8>) -> bool {
+        out.clear();
+        // `from_slice_exact`, not `from_slice`: one frame per buffer is the
+        // contract here (the caller states the length), so trailing bytes mean
+        // the caller miscounted. Surfacing that beats silently serving a prefix.
+        match MessageView::from_slice_exact(request) {
+            Ok(view) => {
+                let Some(response) = route_request_view(self, &view) else {
+                    return false;
+                };
+                // The response leaves its query empty for the carrier to fill,
+                // so it is framed rather than written directly: the echoed query
+                // is a borrowed slice of `request`, not part of the response.
+                //
+                // The `expect` is not a swallowed error. `write_message_streaming`
+                // is generic over [`Write`], and `Vec<u8>`'s impl returns `Ok`
+                // unconditionally (it can abort on allocation failure, which is
+                // not an `Err`), so there is no reachable failure to propagate.
+                let echo = crate::message::response_echo_query(&response, view.query);
+                write_message_streaming(
+                    out,
+                    response.header,
+                    echo,
+                    response.body.len() as u64,
+                    |w| w.write_all(&response.body),
+                )
+                .expect("`Vec<u8>` as a `Write` sink is infallible");
+                true
+            }
+            Err(err) => {
+                // The frame did not parse, so neither the request id nor the
+                // notify flag is knowable. Answer with an id-0 error frame,
+                // which is what Glaze's `plugin_error_response` emits for the
+                // same condition. Staying silent on the chance it was a notify
+                // would strand a caller that was in fact awaiting a response,
+                // and an id of 0 is the honest statement that the id was
+                // unreadable.
+                //
+                // This one carries its own (empty) query, so it writes itself.
+                crate::message::create_error_message(err.to_error_code(), err.to_string())
+                    .write_to(out)
+                    .expect("`Vec<u8>` as a `Write` sink is infallible");
+                true
+            }
+        }
+    }
 }
 
 impl Default for Router {
@@ -2675,5 +2776,144 @@ mod tests {
 
         drop(client);
         let _ = srv.join().unwrap();
+    }
+    // ---------------------------------------------------------------------
+    // `Router::call` / `Router::call_into` — transport-free dispatch
+    // ---------------------------------------------------------------------
+
+    fn call_request(path: &str, body: &serde_json::Value, notify: bool) -> Vec<u8> {
+        Message::builder()
+            .id(11)
+            .notify(notify)
+            .query_str(path)
+            .query_format(crate::constants::QueryFormat::JsonPointer)
+            .body_json(body)
+            .unwrap()
+            .build()
+            .to_vec()
+    }
+
+    fn echo_router() -> Router {
+        Router::new().with_json("/echo", Ok)
+    }
+
+    #[test]
+    fn call_round_trips_id_query_and_body() {
+        let response = echo_router()
+            .call(&call_request(
+                "/echo",
+                &serde_json::json!({ "n": 3 }),
+                false,
+            ))
+            .expect("a non-notify request produces a response");
+        let message = Message::from_slice(&response).unwrap();
+        assert_eq!(message.header.id, 11);
+        assert_eq!(message.query_str().unwrap(), "/echo");
+        assert_eq!(
+            message.json_body::<serde_json::Value>().unwrap(),
+            serde_json::json!({ "n": 3 })
+        );
+    }
+
+    #[test]
+    fn call_returns_nothing_for_a_notify() {
+        // The distinction `get` + `handle` cannot make on its own, and the one
+        // a hand-written carrier most often gets wrong.
+        assert!(
+            echo_router()
+                .call(&call_request("/echo", &serde_json::json!(1), true))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn call_frames_method_not_found_rather_than_returning_none() {
+        let response = echo_router()
+            .call(&call_request("/absent", &serde_json::json!(1), false))
+            .expect("an unknown method is still answered");
+        let message = Message::from_slice(&response).unwrap();
+        assert_eq!(message.error_code(), Some(ErrorCode::MethodNotFound));
+        assert_eq!(message.header.id, 11, "the id is echoed even on an error");
+    }
+
+    #[test]
+    fn call_answers_an_unparseable_frame_with_an_id_zero_error() {
+        let response = echo_router()
+            .call(b"too short to be a header")
+            .expect("a malformed frame is answered, not swallowed");
+        let message = Message::from_slice(&response).unwrap();
+        assert!(message.is_error());
+        assert_eq!(message.header.id, 0, "the id could not be read");
+    }
+
+    #[test]
+    fn call_rejects_a_buffer_carrying_more_than_one_frame() {
+        let mut wire = call_request("/echo", &serde_json::json!(1), false);
+        wire.extend_from_slice(b"trailing");
+        let response = echo_router().call(&wire).expect("answered");
+        assert!(
+            Message::from_slice(&response).unwrap().is_error(),
+            "trailing bytes mean the caller miscounted; serving the prefix would hide it"
+        );
+    }
+
+    #[test]
+    fn call_into_clears_the_buffer_between_requests() {
+        // The reuse contract the plugin surface depends on: a carrier holding one
+        // buffer per thread must not see the previous response bleed through.
+        let router = echo_router();
+        let mut out = Vec::new();
+
+        // A long payload first, then a short one: if the buffer were not cleared,
+        // the tail of the long response would trail the short one.
+        assert!(router.call_into(
+            &call_request("/echo", &serde_json::json!("a".repeat(64)), false),
+            &mut out
+        ));
+
+        assert!(router.call_into(
+            &call_request("/echo", &serde_json::json!("short"), false),
+            &mut out
+        ));
+        let message = Message::from_slice(&out).unwrap();
+        assert_eq!(message.json_body::<String>().unwrap(), "short");
+        assert_eq!(
+            out.len() as u64,
+            message.header.length,
+            "the buffer holds exactly the second response and no residue"
+        );
+
+        // A notify leaves the buffer empty rather than stale, so a carrier that
+        // writes `out` whenever it is non-empty cannot resend the last response.
+        assert!(!router.call_into(
+            &call_request("/echo", &serde_json::json!(0), true),
+            &mut out
+        ));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn call_preserves_a_response_query_the_handler_set_itself() {
+        // The echo rule: an empty response query means "echo the request's", but a
+        // handler that sets one keeps it. Reimplementing this per carrier is
+        // exactly what `call` exists to prevent.
+        struct Rerouting;
+        impl HandlerErased for Rerouting {
+            fn handle(&self, req: &Message) -> Result<Message, RepeError> {
+                let mut response = create_error_response_like(req, ErrorCode::Ok, "");
+                response.header.ec = 0;
+                response.query = b"/elsewhere".to_vec();
+                Ok(response)
+            }
+        }
+
+        let router = Router::new().with_erased_handler("/here", Arc::new(Rerouting));
+        let response = router
+            .call(&call_request("/here", &serde_json::json!(null), false))
+            .unwrap();
+        assert_eq!(
+            Message::from_slice(&response).unwrap().query_str().unwrap(),
+            "/elsewhere"
+        );
     }
 }

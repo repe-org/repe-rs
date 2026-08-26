@@ -3,6 +3,10 @@
 //! Supports JSON, UTF-8, raw binary, and BEVE body formats.
 //! Spec reference: <https://github.com/beve-org/beve>
 
+// Lets the derive macros emit `::repe` paths that resolve inside this crate as
+// well as outside it. See `repe_derive::repe_crate_path`.
+extern crate self as repe;
+
 #[cfg(not(target_arch = "wasm32"))]
 pub mod async_client;
 #[cfg(not(target_arch = "wasm32"))]
@@ -27,6 +31,8 @@ pub mod message;
 #[cfg(all(feature = "websocket-wasm", any(target_arch = "wasm32", test)))]
 mod notify_slot;
 pub mod peer;
+#[cfg(all(feature = "plugin", not(target_arch = "wasm32")))]
+pub mod plugin;
 pub mod registry;
 pub mod server;
 #[cfg(not(target_arch = "wasm32"))]
@@ -56,6 +62,15 @@ pub mod derive {
 
 /// Derive macro to generate [`structs::RepeStruct`] implementations.
 pub use repe_derive::RepeStruct;
+
+/// Attribute macro that exports a [`server::Router`] constructor as a REPE
+/// C-ABI plugin, generating the five symbols a host resolves after `dlopen`.
+///
+/// Lives in the macro namespace, so `#[repe::plugin(..)]` names this while
+/// `repe::plugin::..` names the [`plugin`] module holding the ABI types.
+/// See that module for the buffer contract and deployment requirements.
+#[cfg(all(feature = "plugin", not(target_arch = "wasm32")))]
+pub use repe_derive::plugin;
 
 /// Attribute macro that publishes every method of an inherent `impl` block,
 /// generating the [`structs::RepeMethods`] table from the signatures themselves.
