@@ -34,6 +34,8 @@ pub mod peer;
 #[cfg(all(feature = "plugin", not(target_arch = "wasm32")))]
 pub mod plugin;
 pub mod registry;
+#[cfg(all(feature = "rest", not(target_arch = "wasm32")))]
+pub mod rest;
 pub mod server;
 #[cfg(not(target_arch = "wasm32"))]
 mod server_request;

@@ -65,6 +65,7 @@ nav:
   - Server: server.md
   - Plugins: plugins.md
   - Client: client.md
+  - REST Gateway: rest.md
   - Registry: registry.md
   - Fleet: fleet.md
   - WebSocket Transport: websocket.md

@@ -13,6 +13,7 @@ Rust implementation of the [REPE RPC protocol](https://github.com/repe-org/REPE)
 - Sync and async (tokio) clients and servers, with multiplexed in-flight requests, per-call timeouts, batching, and notify support.
 - Dynamic [`Registry`](https://repe-org.github.io/repe-rs/registry/) routing with JSON Pointer semantics.
 - [`Fleet`](https://repe-org.github.io/repe-rs/fleet/) APIs for multi-node TCP and UDP fanout.
+- Optional [REST gateway](https://repe-org.github.io/repe-rs/rest/) (`RestGateway`) fronting a `Registry` over HTTP/1.1 and HTTP/2, with verb-checked reads/writes/calls, `ETag` revalidation, and JSON/BEVE negotiation.
 - Optional [WebSocket transport](https://repe-org.github.io/repe-rs/websocket/), including a wasm browser client and server-pushed notify subscriptions.
 - Optional [`stream`](https://repe-org.github.io/repe-rs/streaming/) module for backpressure-controlled bulk transfers with reconnect-resume.
 - Optional [`repe` CLI](https://repe-org.github.io/repe-rs/cli/) for talking to any REPE server over TCP or WebSocket.
@@ -120,6 +121,7 @@ A `with_typed_slice_ref` route is a drop-in superset of `with_typed_slice`: it s
 
 | Flag | Effect |
 | --- | --- |
+| `rest` | `RestGateway`: a REST facade over a `Registry`, served on HTTP/1.1 and HTTP/2. |
 | `websocket` | Native `WebSocketClient`, `WebSocketServer`, and `proxy_connection`. |
 | `websocket-wasm` | Browser `WasmClient` on `wasm32-unknown-unknown`. |
 | `fleet-udp` | UDP fanout via `UniUdpFleet`. |
@@ -127,7 +129,7 @@ A `with_typed_slice_ref` route is a drop-in superset of `with_typed_slice`: it s
 | `parking-lot` | `Lockable` impls for `parking_lot::Mutex` / `RwLock`. |
 | `cli` | Builds the `repe` command-line client (pulls in `clap` and `websocket`). |
 
-`fleet-udp` and `value-stream` are native-only: on `wasm32-unknown-unknown` both their modules and their non-portable dependencies compile away, so enabling either there is inert rather than a build failure. That matters for a workspace hoisting one shared feature set across a native server and a browser client, since Cargo features are additive and the wasm member cannot subtract one.
+`fleet-udp`, `value-stream`, and `rest` are native-only: on `wasm32-unknown-unknown` their modules and their non-portable dependencies both compile away, so enabling any of them there is inert rather than a build failure. That matters for a workspace hoisting one shared feature set across a native server and a browser client, since Cargo features are additive and the wasm member cannot subtract one.
 
 ## Documentation
 

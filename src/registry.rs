@@ -225,6 +225,26 @@ impl Registry {
         Ok(())
     }
 
+    /// Whether `pointer` names a registered function rather than a value.
+    ///
+    /// The registry decides read-vs-write-vs-call from the *body* alone, which
+    /// is the right rule for REPE, where a path is a path. A caller that has to
+    /// commit to a verb before it has a body — a REST facade choosing between
+    /// `PUT` (write a value) and `POST` (call a function), an introspection
+    /// endpoint, a generated client — needs the distinction up front, and
+    /// probing it with a read is not a substitute: a read of a function returns
+    /// a descriptor object that a stored value could equally well contain.
+    ///
+    /// A pointer that is malformed, or that names nothing at all, is not a
+    /// function, so this answers `false` rather than raising: callers use it to
+    /// pick a branch, and the branch they pick then reports the real error.
+    pub fn is_function(&self, pointer: &str) -> bool {
+        match canonical_key(pointer) {
+            Ok(key) => self.read_state().functions.contains_key(key.as_ref()),
+            Err(_) => false,
+        }
+    }
+
     pub fn read_value(&self, pointer: &str) -> Result<Value, RegistryError> {
         let state = self.read_state();
         let segments = parse_pointer(pointer)?;

@@ -13,6 +13,16 @@
 
 - **Plugin-ABI interop coverage.** `interop/cpp/plugin_host.cpp` is a C++ REPE host that `dlopen`s the Rust plugin example and drives it, encoding every request and decoding every response with Glaze rather than by hand. It runs in the existing `interop` CI job against the same pinned Glaze tag as the wire-format fixtures, so the plugin ABI is pinned against the implementation that defines it. Covers the symbol table, `repe_plugin_data`'s layout, the version handshake, the response-buffer contract (including a `std::string_view` built from a zero-size response), field reads and writes, methods with and without arguments, a handler `Err`, a `#[repe(typed)]` field crossing as BEVE, notify, `method_not_found`, a malformed frame, and post-shutdown refusal.
 
+- **REST gateway (`rest` feature).** `RestGateway` fronts a `Registry` with HTTP/1.1 and HTTP/2, adding a front door rather than replacing one: public clients get curl, OpenAPI, and edge caching, while REPE clients keep the aligned numeric fast path and notify against the same registry.
+
+  The translation is mechanical because both sides address state by JSON Pointer, and the registry's read/write/call trichotomy already matches the three HTTP verbs worth having: `GET` reads, `PUT` writes, `POST` calls. The mismatch is refused rather than coerced — `PUT` at a function and `POST` at a value are both `405` — which is what keeps the facade from becoming RPC in a REST costume with none of REST's guarantees. `OPTIONS` reports the `Allow` set the target actually supports.
+
+  Reads carry a strong `ETag` (FNV-1a/64, so instances behind one load balancer agree) plus `Vary: Accept` and a configurable `Cache-Control`, so a conditional `GET` costs a `304` with no body. Bodies negotiate JSON against BEVE on both legs. Failures answer as RFC 9457 problem details carrying the originating REPE error code.
+
+  `RestGateway::respond` is the whole mapping with no transport involved — the REST-side counterpart to `Router::call` — so `serve` is a thin hyper shim over it and any other HTTP stack can be one too.
+
+- **`Registry::is_function`.** Whether a pointer names a registered function rather than a value. The registry decides read-vs-write-vs-call from the body alone, which is right for REPE; a caller that must commit to a verb before it has a body needs the distinction up front, and probing it with a read is not a substitute because a read of a function returns a descriptor a stored value could equally well contain.
+
 ### Fixed
 - **The derive macros now work in this crate's own examples and doc-tests.** `proc_macro_crate` reports `FoundCrate::Itself` for every target that is not an integration test, so the generated paths were `crate::…` — correct for the library, wrong inside an example, where `crate` is the example. The macros now emit `::repe`, which `extern crate self as repe;` in `lib.rs` makes resolve from inside the library too. No effect on downstream crates, which were already on the `::repe` path.
 

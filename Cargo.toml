@@ -50,6 +50,14 @@ cli = ["websocket", "dep:clap", "dep:clap_complete"]
 # not be held to that. Off on wasm32, where the module is `not(wasm32)` in
 # lib.rs: there is no dynamic loader for it to be loaded by.
 plugin = []
+# REST facade over a `Registry`: an HTTP/1.1 + HTTP/2 gateway that maps HTTP
+# verbs onto the registry's read / write / call trichotomy, so public clients get
+# curl, OpenAPI, and edge caching while REPE clients keep the binary fast path.
+# Pulls in hyper for the HTTP layer, because a public-facing gateway is the last
+# place to hand-roll header and framing parsing. Target-gated like the deps
+# below: the module is `not(wasm32)` in lib.rs, since there is no listener to
+# bind there.
+rest = ["dep:hyper", "dep:hyper-util", "dep:http-body-util"]
 # Streaming transfer of a serialized, optionally zstd-compressed in-memory value
 # over ordinary REPE request/response (the SVS wire contract). Pulls in `zstd`
 # for the compressed path; the engine itself is plain `std` threads + channels.
@@ -80,6 +88,10 @@ required-features = ["websocket"]
 name = "repe_plugin"
 crate-type = ["cdylib"]
 required-features = ["plugin"]
+
+[[example]]
+name = "rest_gateway"
+required-features = ["rest"]
 
 [[example]]
 name = "value_stream"
@@ -151,6 +163,14 @@ uniudp = { version = "1.2.1", optional = true }
 # That made `value-stream` unusable in a *workspace* feature union, since Cargo
 # features are additive and an inheriting wasm32 crate cannot subtract one.
 zstd = { version = "0.13", optional = true }
+
+# The `rest` feature's HTTP layer. `hyper` with `http1` + `http2` so the gateway
+# serves both over one listener via hyper-util's auto builder: HTTP/2 for clients
+# that negotiate it (prior knowledge on cleartext, ALPN behind a TLS terminator),
+# HTTP/1.1 for curl and for the origin leg behind a CDN.
+hyper = { version = "1", optional = true, default-features = false, features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", optional = true, default-features = false, features = ["server-auto", "server-graceful", "tokio"] }
+http-body-util = { version = "0.1", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = { version = "0.3", optional = true }
