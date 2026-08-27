@@ -2,7 +2,12 @@
 
 A REPE **plugin** is a shared library that a host loads at runtime and drives over a small C ABI. The payloads crossing the boundary are ordinary REPE frames, so a plugin is just a router that happens to live behind `dlopen` instead of behind a socket.
 
-The ABI is defined by [Glaze](https://github.com/stephenberry/glaze) in `glaze/rpc/repe/plugin.h`, and this crate implements the same one. A `cdylib` built here loads into an existing C++ REPE host with no adapter on either side, which is the cheapest way to introduce Rust into an established C++ deployment: one leaf at a time, without touching the host.
+The ABI is defined by [Glaze](https://github.com/stephenberry/glaze) in `glaze/rpc/repe/plugin.h`, and this crate implements both ends of it. A `cdylib` built here loads into an existing C++ REPE host with no adapter on either side, which is the cheapest way to introduce Rust into an established C++ deployment: one leaf at a time, without touching the host. A Rust host loads C++ plugins the same way, which is what makes the reverse migration possible — port the host and keep the plugins.
+
+| | Feature | What it gives you |
+|---|---|---|
+| **Build a plugin** | `plugin` | `#[repe::plugin]`, which turns a `Router` into the five C exports |
+| **Host plugins** | `plugin-host` | `plugin::host::Plugin`, which loads a library and drives it |
 
 ## Building a plugin
 
@@ -83,7 +88,7 @@ Each of these fails in a way that is hard to trace back to its cause.
 
 Pinning the constant here is deliberate coupling: the ABI belongs to the protocol rather than to either implementation, so a bump on the Glaze side needs a repe release before any Rust host or plugin speaks the new version. That is the same coupling already accepted for [the wire format](interop.md), managed the same way.
 
-Glaze's header recommends an exact-equality check. A host written against this crate should prefer a **closed range**, because the two ends are not symmetric: a plugin must be exact, since it exports whatever it was compiled against, but a host can reasonably drive an older plugin — and the alternative is that every ABI bump orphans every plugin binary in a deployment on the same day. No such predicate ships here, since no host does; it belongs with the host that needs it.
+Glaze's header recommends an exact-equality check. `Plugin::load` uses a **closed range** instead, because the two ends are not symmetric: a plugin must be exact, since it exports whatever it was compiled against, but a host can reasonably drive an older plugin — and the alternative is that every ABI bump orphans every plugin binary in a deployment on the same day. `plugin::host::supported_interface_versions()` is that range. It is `3..=3` today, since 3 is the only layout this crate has ever bound; what it buys is the *next* bump, which if additive leaves already-deployed plugin binaries loading. A deployment that wants exact equality can have it by comparing `plugin.interface_version()` after loading.
 
 ## Beyond the router
 
@@ -91,16 +96,55 @@ Glaze's header recommends an exact-equality check. A host written against this c
 
 ## Hosting plugins
 
-The other direction — a Rust host that `dlopen`s plugins — is not in this crate yet. `interop/cpp/plugin_host.cpp` is a working C++ one, and is the clearest available reference for the sequence: resolve, check the version, read the metadata, route by `root_path` prefix, call, copy before the next call.
- The ABI binding and the buffer contract are here; the loader, its lifecycle, and the policy around it (plugin directories, hot reload, prefix matching) are not.
+Requires the `plugin-host` feature. `Plugin::load` resolves the symbols, performs the version handshake **before** reading anything the version governs, reads the metadata, and runs the optional initializer:
 
-A host needs three layers, and only the first two generalize:
+```rust
+use repe::plugin::host::Plugin;
 
-1. **ABI binding** — the types and symbol signatures. This crate, today.
-2. **Host** — `dlopen`/`dlsym`, the version check, a safe call wrapper that copies the response before the borrow expires. Generic, and where all the unsafe lives.
-3. **Manager policy** — plugin directory resolution, hot reload, extension filtering, prefix matching, the RPC surface that exposes all of it. Deployment policy, not protocol, and it belongs in the application.
+// SAFETY: loading a native library runs its initializers, so the caller
+// vouches for the file. Everything after that, the crate checks.
+let plugin = unsafe { Plugin::load("libinstrument.so") }?;
+println!("{} {} claims {}", plugin.name(), plugin.version(), plugin.root_path());
 
-Layer 2 is small but its shape is not yet known; freezing it into a published API before it has run against real plugins would ship the wrong one permanently. It is expected to be proven inside a consumer first and promoted here afterward.
+if let Some(response) = plugin.call(&request_frame)? {
+    // Owned. Nothing borrows across the boundary.
+}
+```
+
+`call` returns `Ok(None)` for a response of size zero, which is what a notify produces and which a host must read as *send nothing* rather than as an error. A request the plugin rejects — an unknown method, a malformed frame, a handler that failed — comes back as `Ok(Some(frame))` carrying a REPE error response: that belongs to whoever sent the request, and the host forwards it rather than interpreting it. `HostError` is reserved for a plugin that failed to hold up its end of `plugin.h`. `call_into` writes into a caller-owned buffer for a host that keeps one per connection or per worker.
+
+`Plugin` is `Send + Sync`, and holds no borrows: the metadata is copied in at load and each response is copied out before it is returned. Sharing one across a thread pool is the intended use, and it is the copy that makes it safe — the plugin's buffer is a thread-local that dies at that thread's next call.
+
+### Routing
+
+A host dispatches with `Plugin::claims`, against a query that `MessageView` reads out of a frame without decoding the body:
+
+```rust
+let query = MessageView::from_slice(&frame)?.query_str()?;
+if let Some(plugin) = plugins.iter().find(|p| p.claims(query)) {
+    // ...
+}
+```
+
+Use it rather than `query.starts_with(p.root_path())`: the separator has to be part of the comparison, or a plugin rooted at `/inst` swallows every request meant for one rooted at `/instrument`. That works in every test a host writes and fails once both are deployed.
+
+`load` refuses a `root_path` that is relative or carries a trailing separator, because either one matches nothing and does it silently: the plugin loads, reports healthy, and every request under it comes back method-not-found. An **empty** root is accepted — it is what Glaze's registry reports for an object published at the top level — and claims every absolute query.
+
+### The library is never unloaded
+
+`load` leaks its handle, and dropping a `Plugin` unloads nothing. That is the only correct behavior available — see the `dlclose` bullet above — and it has consequences worth planning for rather than discovering:
+
+- **Reloading a path yields the resident copy, not the new file.** `dlopen` refcounts by path, so replacing a plugin binary in place and reloading it serves the old code with no error anywhere. Publish each build under its own path if reload has to mean anything.
+- **Two `Plugin` values for one path are two handles to one instance.** They share the plugin's state, its initialization, and its shutdown. A second `load` reaching an already-initialized plugin is treated as success, not as a conflict.
+- **`shutdown` is one-way and belongs to the library, not the handle.** It consumes the `Plugin`, but reloading the path afterward reaches the same retired instance — for a plugin built on this crate, `load` then fails with `HostError::InitFailed`. Dropping a `Plugin` deliberately does *not* shut it down, or an ordinary early return would retire the plugin for the rest of the process.
+
+### What is deliberately not here
+
+The loader and the call wrapper are generic. Everything above them is deployment policy rather than protocol, and is left to the application: which directory plugins are read from, which file extensions count, whether a reload probes before replacing, and whether any of that is published as an RPC surface. Those answers differ per deployment.
+
+A worked host is in [`examples/plugin_host.rs`](https://github.com/repe-org/repe-rs/blob/main/examples/plugin_host.rs). It takes a library path on argv and drives whatever is there, so the same binary loads a Rust plugin and a C++ Glaze one — which is what CI uses it for, in both directions. See [C++ Interoperability](interop.md).
+
+One thing a host cannot check from the outside: a panic or an exception that escapes `repe_plugin_call` unwinds through an `extern "C"` frame and aborts. The guard is the plugin's, and so is the build setting that keeps it live.
 
 ## Transport-free dispatch
 

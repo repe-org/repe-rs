@@ -9,11 +9,13 @@ name: Interop (C++ / Glaze)
 #   * Wire format — rebuilds the fixture generator, regenerates the committed
 #     fixtures, and fails if anything drifted (a Glaze change or a repe-rs change
 #     that breaks parity), then runs the Rust interop tests against them.
-#   * Plugin ABI — builds the Rust plugin example as a real `cdylib` and has a
-#     C++ Glaze host `dlopen` it and drive it, with every frame encoded and
-#     decoded by Glaze. This is the half that no Rust-only test can cover: it
-#     fails if the exported symbols, the metadata layout, or the response-buffer
-#     contract diverge from `glaze/rpc/repe/plugin.h`.
+#   * Plugin ABI, both directions — a C++ Glaze host drives this crate's plugin
+#     example, and this crate's host drives a C++ Glaze plugin. This is the half
+#     no Rust-only test can cover: it fails if the exported symbols, the metadata
+#     layout, or the response-buffer contract diverge from
+#     `glaze/rpc/repe/plugin.h`. Running it in one direction only would leave one
+#     implementation agreeing with itself, which it does by construction even
+#     when both ends misread the same clause.
 
 on:
   push:
@@ -69,3 +71,11 @@ jobs:
 
       - name: Drive the Rust plugin from a C++ Glaze host
         run: ./interop/cpp/build/plugin_host target/release/examples/librepe_plugin.so
+
+      # The mirror. `libexample_plugin.so` is a C++ Glaze plugin, built by the
+      # CMake step above alongside the host.
+      - name: Build the Rust host
+        run: cargo build --release --features plugin-host --example plugin_host
+
+      - name: Drive a C++ Glaze plugin from the Rust host
+        run: ./target/release/examples/plugin_host interop/cpp/build/libexample_plugin.so

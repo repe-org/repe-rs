@@ -5,7 +5,7 @@ C++ REPE implementation in [Glaze](https://github.com/stephenberry/glaze), in tw
 halves against one pinned Glaze tag:
 
 - **Wire format** — committed fixture frames produced by Glaze, parsed by Rust.
-- **Plugin ABI** — a C++ Glaze host that `dlopen`s a Rust plugin and drives it.
+- **Plugin ABI, both directions** — a C++ Glaze host that `dlopen`s a Rust plugin and drives it, and a Rust host that `dlopen`s a C++ Glaze plugin and drives it.
 
 Both implement REPE **version 1** (the 48-byte header). See
 [`docs/interop.md`](../docs/interop.md) for the compatibility guarantee and the
@@ -22,7 +22,12 @@ the plugin ABI.
   Glaze and every response is decoded by Glaze, so a framing divergence surfaces
   as a failed decode rather than as a byte comparison both sides got equally
   wrong.
-- `cpp/CMakeLists.txt` — builds both; fetches Glaze at a pinned tag by
+- `cpp/example_plugin.cpp` — the mirror: a C++ Glaze plugin, built as a shared
+  library, for the Rust host in `examples/plugin_host.rs` to load. It publishes
+  the same object as `examples/repe_plugin.rs`, field for field and method for
+  method, so one host binary drives both implementations with the same
+  expectations.
+- `cpp/CMakeLists.txt` — builds all three; fetches Glaze at a pinned tag by
   default.
 - `fixtures/*.repe` — committed raw REPE frames produced by the generator.
 - `fixtures/manifest.json` — committed; describes the expected decode of each
@@ -62,11 +67,16 @@ The `interop` CI workflow runs exactly this loop, so a fixture that no longer
 matches the pinned Glaze output (or a repe-rs change that breaks parity) fails
 the build.
 
-## Running the plugin-ABI host
+## Running the plugin-ABI checks
 
-This is the half no Rust-only test can cover: whether a Rust `cdylib` is
-loadable and drivable by a real C++ REPE host. Build the plugin as a shared
-library, then point the host at it:
+This is the half no Rust-only test can cover: whether each implementation's
+plugins and hosts actually work against the *other's*. One implementation
+driving itself agrees with itself by construction — both ends can misread the
+same clause of `plugin.h` and pass — so it is run in both directions.
+
+### A C++ host driving a Rust plugin
+
+Build the plugin as a shared library, then point the host at it:
 
 ```sh
 cargo build --release --features plugin --example repe_plugin
@@ -89,3 +99,39 @@ pins, none of which `tests/plugin_abi.rs` can reach from inside Rust:
 - notify producing no response, an unknown method producing `method_not_found`,
   a malformed frame producing an id-0 error, and a post-shutdown call being
   refused.
+
+### A Rust host driving a C++ plugin
+
+The mirror, and the same CMake build produces the plugin:
+
+```sh
+cargo build --release --features plugin-host --example plugin_host
+cmake -S interop/cpp -B interop/cpp/build && cmake --build interop/cpp/build
+target/release/examples/plugin_host interop/cpp/build/libexample_plugin.so
+```
+
+What this pins that the direction above cannot:
+
+- `dlopen` and `dlsym` against a library this crate did not produce, so the
+  symbol names and signatures are checked against Glaze's exports rather than
+  against the ones `#[repe::plugin]` emits;
+- `repe_plugin_data` read from a C++ `static`, so the layout is checked against
+  a struct laid out by the C++ compiler;
+- a response buffer owned by Glaze's thread-local `std::string`, copied out by
+  the host before the borrow expires;
+- both optional lifecycle symbols present, which is the branch a plugin that
+  omits them cannot exercise.
+
+The same host binary drives the Rust plugin too, which is worth doing while
+editing either of them — though CI does not, since that pairing is one
+implementation agreeing with itself and `tests/plugin_host.rs` already covers
+it:
+
+```sh
+target/release/examples/plugin_host target/release/examples/librepe_plugin.so
+```
+
+That is what keeps the checks in it protocol-level. Behavior that is this
+crate's rather than the protocol's — the response echoing the request query,
+which Glaze's registry does not do — is pinned in `tests/plugin_host.rs`, where
+the plugin under test is known.

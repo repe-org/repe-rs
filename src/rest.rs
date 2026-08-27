@@ -1930,7 +1930,14 @@ mod tests {
                 let barrier = Arc::clone(&barrier);
                 let tag = tag.clone();
                 scope.spawn(move || {
-                    let body = worker.to_string();
+                    // Offset so that no worker writes the value already stored.
+                    // A worker that wrote it would leave the resource — and so
+                    // its validator — unchanged, and the next worker's
+                    // `If-Match` would legitimately match as well. That is
+                    // `write_if` behaving correctly on a resource nobody
+                    // changed, but it is indistinguishable here from the lost
+                    // update this test exists to catch.
+                    let body = (1000 + worker).to_string();
                     barrier.wait();
                     let response = gateway.respond(
                         RestRequest {

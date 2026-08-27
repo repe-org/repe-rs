@@ -43,3 +43,13 @@ target_link_libraries(generate_fixtures PRIVATE glaze::glaze)
 #   interop/cpp/build/plugin_host target/release/examples/librepe_plugin.{so,dylib}
 add_executable(plugin_host plugin_host.cpp)
 target_link_libraries(plugin_host PRIVATE glaze::glaze ${CMAKE_DL_LIBS})
+
+# The mirror: a C++ Glaze plugin for the *Rust* host to dlopen. MODULE rather
+# than SHARED because nothing links against it — it is only ever loaded at
+# runtime, which is also what gives it the platform's plugin naming.
+#
+#   cargo build --release --features plugin-host --example plugin_host
+#   target/release/examples/plugin_host interop/cpp/build/libexample_plugin.{so,dylib}
+add_library(example_plugin MODULE example_plugin.cpp)
+target_link_libraries(example_plugin PRIVATE glaze::glaze)
+set_target_properties(example_plugin PROPERTIES PREFIX "lib")

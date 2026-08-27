@@ -58,6 +58,13 @@
 //! one plugin per `cdylib`) is in the plugin guide rather than here, since none
 //! of it is visible from the API.
 //!
+//! # Driving a plugin
+//!
+//! The other direction is [`host`], behind the `plugin-host` feature:
+//! [`host::Plugin`] loads a library, performs the handshake, and copies each
+//! response out before the borrow expires. It drives any conforming plugin, so a
+//! Rust host loads a C++ one as readily as one built here.
+//!
 //! # Concurrency
 //!
 //! `plugin.h` states that `repe_plugin_call` may be invoked concurrently from
@@ -80,6 +87,9 @@
 //! A plugin that must survive a handler bug should not publish its state through
 //! [`with_struct`](Router::with_struct).
 
+#[cfg(feature = "plugin-host")]
+pub mod host;
+
 use std::cell::RefCell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
@@ -96,10 +106,11 @@ use crate::server::Router;
 /// `REPE_PLUGIN_INTERFACE_VERSION` in Glaze's `plugin.h`.
 ///
 /// A host must refuse any plugin whose `repe_plugin_interface_version()` it
-/// does not support. Glaze's header recommends an exact-equality check; when a
-/// host is written against this crate it should prefer a range, since a host can
-/// reasonably drive an older plugin where a plugin must be exact — see
-/// `docs/plugins.md`. No such predicate ships here, because no host does.
+/// does not support. Glaze's header recommends an exact-equality check; a host
+/// should prefer a range, since a host can reasonably drive an older plugin
+/// where a plugin must be exact. That is what
+/// [`host::supported_interface_versions`] is, and what
+/// [`host::Plugin::load`] checks against.
 ///
 /// This constant is deliberate coupling: the ABI is defined by the protocol, not
 /// by either implementation, so a bump on the Glaze side needs a repe release
