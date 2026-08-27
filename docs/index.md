@@ -13,6 +13,7 @@ Rust implementation of the [REPE RPC protocol](https://github.com/repe-org/REPE)
 - Sync and async (tokio) clients and servers, with multiplexed in-flight requests, per-call timeouts, batching, and notify support.
 - Dynamic [`Registry`](registry.md) routing with JSON Pointer semantics.
 - [`Fleet`](fleet.md) APIs for multi-node TCP and UDP fanout.
+- Optional [REST gateway](rest.md) (`RestGateway`) fronting a `Registry` over HTTP/1.1 and HTTP/2, with verb-checked reads/writes/calls, `ETag` revalidation, and JSON/BEVE negotiation.
 - Optional [WebSocket transport](websocket.md), including a wasm browser client and server-pushed notify subscriptions.
 - Optional [`stream`](streaming.md) module for backpressure-controlled bulk transfers with reconnect-resume.
 - Optional [`repe` CLI](cli.md) for talking to any REPE server over TCP or WebSocket.
@@ -56,6 +57,7 @@ Replace `body_json` with `body_beve` to encode the body with BEVE; everything el
 - New here? Start with the [wire format](protocol.md) for a quick mental model, then read the [server](server.md) and [client](client.md) pages.
 - Building dynamic routes? See [Registry](registry.md).
 - Multi-node deployments? See [Fleet](fleet.md).
+- Exposing a registry to public clients or a CDN? See [REST gateway](rest.md).
 - Pushing through firewalls or browsers? See [WebSocket](websocket.md).
 - Moving large payloads with flow control? See [Streaming](streaming.md).
 - Debugging from a terminal? See the [CLI](cli.md).
@@ -65,6 +67,7 @@ Replace `body_json` with `body_beve` to encode the body with BEVE; everything el
 
 | Flag | Effect |
 | --- | --- |
+| `rest` | `RestGateway`: a REST facade over a `Registry`, served on HTTP/1.1 and HTTP/2. |
 | `websocket` | Native `WebSocketClient`, `WebSocketServer`, and `proxy_connection`. |
 | `websocket-wasm` | Browser `WasmClient` on `wasm32-unknown-unknown`. |
 | `fleet-udp` | UDP fanout via `UniUdpFleet`. |
@@ -72,7 +75,7 @@ Replace `body_json` with `body_beve` to encode the body with BEVE; everything el
 | `parking-lot` | `Lockable` impls for `parking_lot::Mutex` / `RwLock`. |
 | `cli` | Builds the `repe` command-line client (pulls in `clap` and `websocket`). |
 
-`fleet-udp` and `value-stream` are native-only: on `wasm32-unknown-unknown` both their modules and their non-portable dependencies compile away, so enabling either there is inert rather than a build failure. That matters for a workspace hoisting one shared feature set across a native server and a browser client, since Cargo features are additive and the wasm member cannot subtract one.
+`fleet-udp`, `value-stream`, and `rest` are native-only: on `wasm32-unknown-unknown` their modules and their non-portable dependencies both compile away, so enabling any of them there is inert rather than a build failure. That matters for a workspace hoisting one shared feature set across a native server and a browser client, since Cargo features are additive and the wasm member cannot subtract one.
 
 ## License
 

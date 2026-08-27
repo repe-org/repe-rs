@@ -1555,18 +1555,8 @@ struct RegisteredRegistry {
 
 impl RegisteredRegistry {
     fn new(prefix: &str, registry: Arc<Registry>) -> Self {
-        let mut normalized = if prefix.is_empty() || prefix == "/" {
-            String::new()
-        } else if prefix.starts_with('/') {
-            prefix.to_string()
-        } else {
-            format!("/{}", prefix)
-        };
-        if normalized.len() > 1 {
-            normalized = normalized.trim_end_matches('/').to_string();
-        }
         Self {
-            prefix: normalized,
+            prefix: crate::registry::normalize_mount(prefix),
             registry,
         }
     }

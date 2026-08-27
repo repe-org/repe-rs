@@ -225,10 +225,122 @@ impl Registry {
         Ok(())
     }
 
+    /// Whether `pointer` names a registered function rather than a value.
+    ///
+    /// The registry decides read-vs-write-vs-call from the *body* alone, which
+    /// is the right rule for REPE, where a path is a path. A caller that has to
+    /// commit to a verb before it has a body — a REST facade choosing between
+    /// `PUT` (write a value) and `POST` (call a function), an introspection
+    /// endpoint, a generated client — needs the distinction up front, and
+    /// probing it with a read is not a substitute: a read of a function returns
+    /// a descriptor object that a stored value could equally well contain.
+    ///
+    /// A pointer that is malformed, or that names nothing at all, is not a
+    /// function, so this answers `false` rather than raising: callers use it to
+    /// pick a branch, and the branch they pick then reports the real error.
+    pub fn is_function(&self, pointer: &str) -> bool {
+        match canonical_key(pointer) {
+            Ok(key) => self.read_state().functions.contains_key(key.as_ref()),
+            Err(_) => false,
+        }
+    }
+
     pub fn read_value(&self, pointer: &str) -> Result<Value, RegistryError> {
         let state = self.read_state();
         let segments = parse_pointer(pointer)?;
         resolve_ref(&state.root, &segments).cloned()
+    }
+
+    /// Write `value` at `pointer`, but only into the value tree, and only if
+    /// `accept` approves what is there now.
+    ///
+    /// Returns `Ok(None)` when `accept` declined; the tree is untouched in that
+    /// case. `accept` receives `None` when nothing is registered at `pointer`.
+    ///
+    /// Two guarantees [`dispatch`](Self::dispatch) cannot give a caller that
+    /// needs them:
+    ///
+    /// * **The read and the write are one critical section.** Comparing a
+    ///   validator with [`read_value`](Self::read_value) and then writing is
+    ///   check-then-act: two callers can both observe the value they expected
+    ///   and both write, which is exactly the lost update an `If-Match`-style
+    ///   precondition exists to prevent.
+    /// * **A function is never called by it.** `dispatch` decides between a
+    ///   value write and a function call from the body alone, so a caller that
+    ///   already resolved "this is a value" races anyone registering a function
+    ///   at that pointer in between — and loses by handing its write payload to
+    ///   a function as arguments.
+    ///
+    /// Writing the root (`""` or `"/"`) merges an object, matching `dispatch`.
+    pub fn write_if(
+        &self,
+        pointer: &str,
+        value: Value,
+        accept: impl FnOnce(Option<&Value>) -> bool,
+    ) -> Result<Option<Value>, RegistryError> {
+        let segments = parse_pointer(pointer)?;
+        let key = canonical_key(pointer)?;
+        let mut state = self.write_state();
+
+        if state.functions.contains_key(key.as_ref()) {
+            return Err(RegistryError::PathNotFound {
+                path: pointer.to_string(),
+            });
+        }
+
+        {
+            let current = resolve_ref(&state.root, &segments).ok();
+            if !accept(current) {
+                return Ok(None);
+            }
+        }
+
+        if segments.is_empty() {
+            let Value::Object(object) = value else {
+                return Err(RegistryError::RootWriteRequiresObject);
+            };
+            let root = ensure_object_root(&mut state.root)?;
+            for (key, value) in object {
+                root.insert(key, value);
+            }
+            return Ok(Some(json!({
+                "status": "ok",
+                "path": "/",
+            })));
+        }
+
+        set_pointer(&mut state.root, &segments, value)?;
+        Ok(Some(json!({
+            "status": "ok",
+            "path": canonical_pointer(&segments),
+        })))
+    }
+
+    /// Call the function at `pointer`, and only a function.
+    ///
+    /// The counterpart of [`write_if`](Self::write_if) for a caller that has
+    /// already committed to "this is a call": a pointer that stops being a
+    /// function is a [`PathNotFound`](RegistryError::PathNotFound), never a
+    /// silent write of the arguments into the value tree.
+    pub fn call(
+        &self,
+        pointer: &str,
+        body: Option<Value>,
+        ctx: &CallContext,
+    ) -> Result<Value, RegistryError> {
+        let key = canonical_key(pointer)?;
+        let function = {
+            let state = self.read_state();
+            state.functions.get(key.as_ref()).cloned()
+        };
+        let Some(function) = function else {
+            return Err(RegistryError::PathNotFound {
+                path: pointer.to_string(),
+            });
+        };
+        function
+            .call(ctx, body)
+            .map_err(|(code, message)| RegistryError::Execution { code, message })
     }
 
     /// Dispatch a request to a registered value or function.
@@ -402,8 +514,19 @@ fn canonical_key(pointer: &str) -> Result<Cow<'_, str>, RegistryError> {
 /// for tokens that contain a `~` escape. The returned tokens borrow `pointer`,
 /// so the value-tree walk in `resolve_ref`/`resolve_mut`/`set_pointer` resolves
 /// without a per-segment `String` allocation.
+/// Whether `pointer` addresses the registry root.
+///
+/// The root has more than one spelling — `""` and `"/"` both parse to no
+/// segments — and a caller that gates on *writing* the root has to agree with
+/// [`parse_pointer`] about which those are. Two independent answers to that
+/// question is a policy check that can be walked around: the REST gateway's
+/// `//` maps to `"/"`, which is not the empty string but is the root.
+pub(crate) fn addresses_root(pointer: &str) -> bool {
+    pointer.is_empty() || pointer == "/"
+}
+
 fn parse_pointer(pointer: &str) -> Result<Vec<Cow<'_, str>>, RegistryError> {
-    if pointer.is_empty() || pointer == "/" {
+    if addresses_root(pointer) {
         return Ok(Vec::new());
     }
     if !pointer.starts_with('/') {
@@ -446,7 +569,37 @@ fn unescape_token(token: &str) -> Result<Cow<'_, str>, ()> {
     Ok(Cow::Owned(out))
 }
 
-fn escape_token(token: &str) -> String {
+/// Normalize a mount prefix: absolute, no trailing separator, empty for the root.
+///
+/// Shared so that every API in this crate taking a mount agrees on what a given
+/// string means — `Router::with_registry` and `RestGateway` in particular, where
+/// two different readings of `"/api/v1/"` would be a trap rather than a feature.
+/// Normalizing rather than rejecting keeps the mount a convenience argument
+/// instead of a fallible one.
+pub(crate) fn normalize_mount(prefix: &str) -> String {
+    if prefix.is_empty() || prefix == "/" {
+        return String::new();
+    }
+    let absolute = if prefix.starts_with('/') {
+        prefix.to_string()
+    } else {
+        format!("/{prefix}")
+    };
+    let trimmed = absolute.trim_end_matches('/');
+    // All separators: `"///"` is the root, not the empty-key path `"//"`.
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// RFC 6901 escaping. `~` first: doing `/` first would turn a literal `/` into
+/// `~1`, and the following pass would then escape that `~` into `~01`.
+pub(crate) fn escape_token(token: &str) -> String {
+    if !token.contains('~') && !token.contains('/') {
+        return token.to_string();
+    }
     token.replace('~', "~0").replace('/', "~1")
 }
 
