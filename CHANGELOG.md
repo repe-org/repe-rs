@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- **Depend on `uniudp = "1.2.2"`** (raised from `1.2.1`) behind `fleet-udp`. 1.2.2 drops `mio`, `rand`, `subtle`, and `hmac`, taking 8 packages out of the lockfile: it moves to a plain `std::net::UdpSocket` and seeds from `getrandom` directly. The UDP wire format is unchanged and the MSRV floor is still 1.96 (below repe's 1.96.1), so this is a lockfile-and-floor move with no repe API change — repe drives only uniudp's sender.
+
+  The `Cargo.toml` note explaining why `uniudp` is target-gated is corrected with it. The gate is still needed, but no longer because of mio: `getrandom` refuses `wasm32-unknown-unknown` unless the consumer enables its `wasm_js` backend. `--all-features --lib` still builds for wasm32.
+
 ## [9.1.0] - 2026-08-27
 
 ### Added

@@ -162,10 +162,12 @@ tokio-tungstenite = { version = "0.24", optional = true }
 # only with the `websocket` feature.
 tokio-util = { version = "0.7", optional = true, default-features = false, features = ["rt"] }
 # Same target-gating rationale as `zstd` below: `uniudp_fleet` is already
-# `not(wasm32)` in lib.rs, and uniudp pulls mio and a UDP socket stack that
-# refuse wasm32-unknown-unknown outright ("This wasm target is unsupported by
-# mio").
-uniudp = { version = "1.2.1", optional = true }
+# `not(wasm32)` in lib.rs, and uniudp is a std UDP socket stack that refuses
+# wasm32-unknown-unknown outright. 1.2.2 dropped mio (whose "This wasm target is
+# unsupported by mio" was the old refusal) but still pulls `getrandom`, which
+# errors on wasm32-unknown-unknown unless the consumer enables its `wasm_js`
+# backend feature.
+uniudp = { version = "1.2.2", optional = true }
 # Streaming zstd codec for the `value-stream` feature (SVS `compression = 1`).
 # Optional so the core crate stays free of the libzstd C dependency.
 #
