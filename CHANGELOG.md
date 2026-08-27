@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [9.1.0] - 2026-08-27
 
 ### Added
 - **`Router::with_mount_fallthrough` — a mount's miss is still a miss.** A mounted registry or struct answers for its whole prefix, misses included, which is right at a prefix and degenerate at the root: a struct mounted at `""` matches every path, so it does not narrow a `with_fallback` handler, it makes it unreachable. With this on, a mount that would frame `MethodNotFound` hands the request to the fallback instead. Nothing is reordered, and registration order does not matter. Opt-in, because it replaces the mount's own diagnostic for paths it does not serve — and because the trigger is the error code, so a handler that deliberately answers `MethodNotFound` is superseded too.
