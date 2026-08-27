@@ -1,8 +1,21 @@
 # Changelog
 
-## Unreleased
+## [Unreleased]
+
+### Added
+- **`Router::call` / `Router::call_into` — transport-free dispatch.** One serialized REPE request frame in, one response frame out, with no socket involved. This is the work the built-in servers do between reading a frame and writing one back: version and query-format validation, handler resolution, notify semantics (`None` means *send nothing*), `MethodNotFound` framing, and the response query echo. Reaching it through `Router::get` plus `HandlerErased::handle` meant reimplementing all five per carrier. `call_into` writes into a caller-owned buffer so a carrier holding one buffer per connection or per thread allocates nothing per request.
+
+- **C-ABI plugin surface (`plugin` feature).** `#[repe::plugin(root = "/x")]` on a `Router` constructor exports it as a REPE plugin: the five symbols a host resolves after `dlopen`, against the same ABI Glaze defines in `glaze/rpc/repe/plugin.h`. A `cdylib` built here loads into an existing C++ REPE host with no adapter on either side. `name` and `version` default to the crate's `CARGO_PKG_NAME` / `CARGO_PKG_VERSION`; the annotated function stays callable, so the same router can be driven by an in-process test.
+
+  The crate owns the three things a hand-written shim reliably gets wrong: the version handshake, the thread-local response buffer's borrow contract (including a non-null pointer at `size == 0`, which a C++ host's `string_view` requires), and a panic guard, since unwinding across the boundary would abort the host. A panicking handler, a malformed frame, a call after shutdown, and a reentrant call on one thread all come back as REPE error responses instead — except where the request was a notify, which is answered with nothing even when its handler panicked. A constructor that panics is latched rather than retried, so it cannot repeat a partial side effect once per request.
+
+  `plugin::PluginRuntime` is the same machinery for a plugin that needs to write the exports by hand. Hosting plugins — the `dlopen` side — is not included; see `docs/plugins.md`.
+
+- **Plugin-ABI interop coverage.** `interop/cpp/plugin_host.cpp` is a C++ REPE host that `dlopen`s the Rust plugin example and drives it, encoding every request and decoding every response with Glaze rather than by hand. It runs in the existing `interop` CI job against the same pinned Glaze tag as the wire-format fixtures, so the plugin ABI is pinned against the implementation that defines it. Covers the symbol table, `repe_plugin_data`'s layout, the version handshake, the response-buffer contract (including a `std::string_view` built from a zero-size response), field reads and writes, methods with and without arguments, a handler `Err`, a `#[repe(typed)]` field crossing as BEVE, notify, `method_not_found`, a malformed frame, and post-shutdown refusal.
 
 ### Fixed
+- **The derive macros now work in this crate's own examples and doc-tests.** `proc_macro_crate` reports `FoundCrate::Itself` for every target that is not an integration test, so the generated paths were `crate::…` — correct for the library, wrong inside an example, where `crate` is the example. The macros now emit `::repe`, which `extern crate self as repe;` in `lib.rs` makes resolve from inside the library too. No effect on downstream crates, which were already on the `::repe` path.
+
 - **A 48-byte frame could panic the parser (security).** `query_length` and `body_length` are attacker-controlled `u64`s read off the wire, and the framed total `48 + query_length + body_length` was summed unchecked. With `query_length = u64::MAX - 47` the sum wraps to `0`, which the header's own `length` field can be set to match — so the frame decoded, and slicing the query out of it computed `buf[48..0]` and panicked.
 
   Neither the TCP nor the async server catches unwinds, so one such frame took down the connection thread; under `panic = "abort"` it takes the process. `Header::decode` now rejects a total that does not fit both `u64` and the target's address space, with the new `RepeError::FrameLengthOverflow`. That single check is what makes every later `query_length as usize` in the crate safe, including on 32-bit targets such as `wasm32`.

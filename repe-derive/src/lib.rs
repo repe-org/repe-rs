@@ -307,7 +307,14 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
 
 fn repe_crate_path() -> TokenStream2 {
     match crate_name("repe") {
-        Ok(FoundCrate::Itself) => quote!(crate),
+        // `::repe`, not `crate`, even when expanding inside repe itself.
+        // `proc_macro_crate` reports `Itself` for every target that is not an
+        // integration test (it detects those by `CARGO_TARGET_TMPDIR`), which
+        // lumps repe's own examples and doc-tests in with its lib — and in those
+        // `crate` is the example, not repe. `extern crate self as repe;` in
+        // `lib.rs` makes this path resolve from inside the lib too, so one
+        // spelling is correct for all four cases.
+        Ok(FoundCrate::Itself) => quote!(::repe),
         Ok(FoundCrate::Name(name)) => {
             let ident = Ident::new(&name, Span::call_site());
             quote!(::#ident)
@@ -1260,4 +1267,223 @@ fn parse_impl_method(
         ret,
         signature_display,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// `#[repe::plugin]` — the C-ABI plugin exports
+// ---------------------------------------------------------------------------
+
+/// Export a [`Router`] constructor as a REPE C-ABI plugin.
+///
+/// Applied to a zero-argument function returning a `Router`, this emits the five
+/// symbols a REPE host resolves after `dlopen` — `repe_plugin_interface_version`,
+/// `repe_plugin_info`, `repe_plugin_init`, `repe_plugin_shutdown`, and
+/// `repe_plugin_call` — each delegating to a `repe::plugin::PluginRuntime` built
+/// from your function. See `repe::plugin` for the ABI contract and the
+/// deployment requirements that come with it.
+///
+/// ```ignore
+/// // Cargo.toml: [lib] crate-type = ["cdylib"]
+/// use repe::server::Router;
+///
+/// #[repe::plugin(root = "/calculator")]
+/// fn build() -> Router {
+///     Router::new().with_typed("/calculator/add", |(a, b): (i64, i64)| Ok(a + b))
+/// }
+/// ```
+///
+/// # Arguments
+///
+/// * `root` (required) — the RPC path prefix this plugin claims, reported to the
+///   host as `repe_plugin_data::root_path`. Must be an absolute JSON Pointer
+///   prefix: leading `/`, no trailing `/`.
+/// * `name` — defaults to the crate's `CARGO_PKG_NAME`.
+/// * `version` — defaults to the crate's `CARGO_PKG_VERSION`.
+///
+/// Both defaults exist so the plugin's identity is not restated beside the
+/// manifest that already carries it, and so it cannot drift from it.
+///
+/// The annotated function is left in place and stays callable, which is what
+/// lets the same router be exercised by ordinary in-process tests.
+///
+/// [`Router`]: repe::server::Router
+#[proc_macro_attribute]
+pub fn plugin(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let mut args = PluginArgs::default();
+    let parser = syn::meta::parser(|meta| args.parse(meta));
+    parse_macro_input!(attr with parser);
+
+    let item_fn = parse_macro_input!(item as syn::ItemFn);
+    match expand_plugin(args, item_fn) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+#[derive(Default)]
+struct PluginArgs {
+    name: Option<LitStr>,
+    version: Option<LitStr>,
+    root: Option<LitStr>,
+}
+
+impl PluginArgs {
+    fn parse(&mut self, meta: ParseNestedMeta) -> syn::Result<()> {
+        if meta.path.is_ident("name") {
+            self.name = Some(meta.value()?.parse()?);
+        } else if meta.path.is_ident("version") {
+            self.version = Some(meta.value()?.parse()?);
+        } else if meta.path.is_ident("root") {
+            self.root = Some(meta.value()?.parse()?);
+        } else {
+            return Err(meta.error(
+                "unknown `#[repe::plugin]` argument; expected `root`, `name`, or `version`",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Reject a string that cannot survive the trip through a C `const char*`.
+///
+/// An interior nul truncates the string silently at the host, which surfaces as
+/// a plugin that loads under a name nobody typed — worth catching here, where
+/// the literal is in view.
+fn reject_interior_nul(field: &str, literal: &LitStr) -> syn::Result<()> {
+    if literal.value().contains('\0') {
+        return Err(syn::Error::new_spanned(
+            literal,
+            format!(
+                "`{field}` cannot contain a nul byte: it is handed to the host as a C string and \
+                 would be truncated there"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn expand_plugin(args: PluginArgs, item_fn: syn::ItemFn) -> syn::Result<TokenStream2> {
+    let repe = repe_crate_path();
+
+    let Some(root) = args.root else {
+        return Err(syn::Error::new(
+            Span::call_site(),
+            "`#[repe::plugin]` needs a `root` path prefix, e.g. \
+             `#[repe::plugin(root = \"/calculator\")]`",
+        ));
+    };
+    reject_interior_nul("root", &root)?;
+    let root_value = root.value();
+    if !root_value.starts_with('/') {
+        return Err(syn::Error::new_spanned(
+            &root,
+            "`root` must be an absolute JSON Pointer prefix, so it has to start with `/`",
+        ));
+    }
+    if root_value.len() > 1 && root_value.ends_with('/') {
+        return Err(syn::Error::new_spanned(
+            &root,
+            "`root` must not end with `/`: hosts prefix-match this against request paths, and the \
+             trailing separator is not part of the prefix",
+        ));
+    }
+
+    // Default identity to the manifest rather than restating it. `concat!`
+    // expands `env!` eagerly, so both branches produce one `&'static str`
+    // literal usable in a `static` initializer.
+    let name = match &args.name {
+        Some(name) => {
+            reject_interior_nul("name", name)?;
+            quote! { #name }
+        }
+        None => quote! { env!("CARGO_PKG_NAME") },
+    };
+    let version = match &args.version {
+        Some(version) => {
+            reject_interior_nul("version", version)?;
+            quote! { #version }
+        }
+        None => quote! { env!("CARGO_PKG_VERSION") },
+    };
+
+    if !item_fn.sig.inputs.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &item_fn.sig.inputs,
+            "`#[repe::plugin]` applies to a function taking no arguments: the host calls it \
+             through a C ABI that has nothing to pass",
+        ));
+    }
+    if !item_fn.sig.generics.params.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &item_fn.sig.generics,
+            "`#[repe::plugin]` applies to a non-generic function: the exports are one fixed              set of symbols, so there is no parameter for the host to choose",
+        ));
+    }
+    if item_fn.sig.asyncness.is_some() {
+        return Err(syn::Error::new_spanned(
+            &item_fn.sig,
+            "`#[repe::plugin]` cannot be applied to an `async fn`: `repe_plugin_call` is \
+             synchronous, with no runtime on the host side of the ABI to drive a future",
+        ));
+    }
+
+    let build = &item_fn.sig.ident;
+
+    Ok(quote! {
+        #item_fn
+
+        #[doc(hidden)]
+        static __REPE_PLUGIN_INFO: #repe::plugin::RepePluginData = #repe::plugin::RepePluginData {
+            name: concat!(#name, "\0").as_ptr() as *const ::core::ffi::c_char,
+            version: concat!(#version, "\0").as_ptr() as *const ::core::ffi::c_char,
+            root_path: concat!(#root, "\0").as_ptr() as *const ::core::ffi::c_char,
+        };
+
+        #[doc(hidden)]
+        static __REPE_PLUGIN_RUNTIME: #repe::plugin::PluginRuntime =
+            #repe::plugin::PluginRuntime::new(#build);
+
+        /// `repe_plugin_interface_version`: the ABI version this plugin was
+        /// built against, which the host checks before reading anything else.
+        #[unsafe(no_mangle)]
+        pub extern "C" fn repe_plugin_interface_version() -> ::core::primitive::u32 {
+            #repe::plugin::REPE_PLUGIN_INTERFACE_VERSION
+        }
+
+        /// `repe_plugin_info`: this plugin's name, version, and claimed RPC path
+        /// prefix. The pointee is a `static`, so it outlives every call.
+        #[unsafe(no_mangle)]
+        pub extern "C" fn repe_plugin_info() -> *const #repe::plugin::RepePluginData {
+            &__REPE_PLUGIN_INFO
+        }
+
+        /// `repe_plugin_init`: build the router. Optional for the host to call —
+        /// the first request builds it lazily if this never runs.
+        #[unsafe(no_mangle)]
+        pub extern "C" fn repe_plugin_init() -> #repe::plugin::RepeResult {
+            __REPE_PLUGIN_RUNTIME.init()
+        }
+
+        /// `repe_plugin_shutdown`: refuse further requests.
+        #[unsafe(no_mangle)]
+        pub extern "C" fn repe_plugin_shutdown() {
+            __REPE_PLUGIN_RUNTIME.shutdown()
+        }
+
+        /// `repe_plugin_call`: dispatch one REPE request frame.
+        ///
+        /// # Safety
+        ///
+        /// `request` must point to `request_size` readable bytes, or be null
+        /// with a `request_size` of 0. The returned buffer borrows from this
+        /// thread's response buffer and is invalidated by this thread's next
+        /// call, so the host must copy before calling again.
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn repe_plugin_call(
+            request: *const ::core::ffi::c_char,
+            request_size: ::core::primitive::u64,
+        ) -> #repe::plugin::RepeBuffer {
+            unsafe { __REPE_PLUGIN_RUNTIME.call(request, request_size) }
+        }
+    })
 }

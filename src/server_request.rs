@@ -101,6 +101,25 @@ pub(crate) fn route_request_view(router: &Router, view: &MessageView) -> Option<
     }
 }
 
+/// Frame a query-less response from [`route_request_view`] onto `w`, echoing
+/// the request's query.
+///
+/// The response leaves its query empty for the carrier to fill, because the
+/// echoed query is a borrowed slice of the caller's read buffer rather than
+/// part of the response. That makes the framing step the same three lines for
+/// every carrier that takes the borrowing path, so it lives here rather than
+/// once per carrier.
+pub(crate) fn write_view_response<W: std::io::Write>(
+    w: &mut W,
+    response: &Message,
+    query: &[u8],
+) -> Result<(), crate::error::RepeError> {
+    let echo = crate::message::response_echo_query(response, query);
+    crate::io::write_message_streaming(w, response.header, echo, response.body.len() as u64, |w| {
+        w.write_all(&response.body)
+    })
+}
+
 /// Borrowing twin of [`dispatch`]: invoke `handler.handle_view` and map the
 /// result to a query-less response (or `None` for a notify). Used by the
 /// TCP/async borrowing path and the WebSocket inline path.
