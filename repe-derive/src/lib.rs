@@ -12,7 +12,7 @@
 use proc_macro::TokenStream;
 use proc_macro_crate::{FoundCrate, crate_name};
 use proc_macro2::{Span, TokenStream as TokenStream2};
-use quote::{ToTokens, format_ident, quote};
+use quote::{ToTokens, format_ident, quote, quote_spanned};
 use syn::{
     Attribute, DeriveInput, Field, FnArg, GenericArgument, Ident, ImplItem, ItemImpl, LitStr,
     PathArguments, ReturnType, Signature, Token, Type,
@@ -86,6 +86,12 @@ impl Sink {
 
     /// Respond with `expr`, serialized. `path` is a string literal naming the
     /// endpoint, read only if serialization fails.
+    ///
+    /// The encoding form is the write's own `StructResult` rather than
+    /// `{ write(..)?; Ok(()) }`, which is the same thing spelled longer. That
+    /// matters beyond brevity: it makes the expression usable where `?` is not,
+    /// which is how the shared-borrow read path reuses these emitters verbatim
+    /// under its `Option` return instead of keeping a second copy of them.
     fn emit_value(self, repe: &TokenStream2, path: &LitStr, expr: TokenStream2) -> TokenStream2 {
         match self {
             Sink::Value => quote! {
@@ -98,12 +104,7 @@ impl Sink {
                     Ok(Some(value))
                 }
             },
-            Sink::Encode => quote! {
-                {
-                    out.write(#path, &#expr)?;
-                    Ok(())
-                }
-            },
+            Sink::Encode => quote! { out.write(#path, &#expr) },
         }
     }
 
@@ -120,12 +121,7 @@ impl Sink {
     ) -> TokenStream2 {
         match self {
             Sink::Value => self.emit_value(repe, path, expr),
-            Sink::Encode => quote! {
-                {
-                    out.write_typed_slice(#path, &#expr[..])?;
-                    Ok(())
-                }
-            },
+            Sink::Encode => quote! { out.write_typed_slice(#path, &#expr[..]) },
         }
     }
 
@@ -303,6 +299,40 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
         });
     }
 
+    let read_listing =
+        build_read_listing(&field_specs, &struct_attrs.methods, from_impl_block, &repe);
+    let read_field_arms = build_read_field_arms(&field_specs, &repe);
+    let read_method_arms = build_read_method_arms(&struct_attrs.methods, &repe);
+    let read_fallthrough = if from_impl_block {
+        quote! {
+            _ => <Self as #repe::structs::RepeMethods>::repe_call_read_into(self, segments, out),
+        }
+    } else {
+        quote! {
+            _ => Some(Err(#repe::StructError::InvalidPath {
+                path: #repe::structs::path_from_segments(segments),
+            })),
+        }
+    };
+    bodies.push(quote! {
+        fn repe_read_into(
+            &self,
+            segments: &[&str],
+            out: &mut #repe::structs::ResponseBody<'_>,
+        ) -> Option<#repe::structs::StructResult<()>> {
+            if segments.is_empty() {
+                return #read_listing;
+            }
+
+            let (head, tail) = segments.split_first().unwrap();
+            match *head {
+                #(#read_field_arms)*
+                #(#read_method_arms)*
+                #read_fallthrough
+            }
+        }
+    });
+
     Ok(quote! {
         impl #repe::RepeStruct for #struct_ident {
             #(#bodies)*
@@ -462,6 +492,9 @@ impl ReturnSpec {
 struct MethodSpec {
     endpoint: String,
     method_ident: Ident,
+    /// `&self` or `&mut self`. Read by the shared-borrow path, which can only
+    /// call the former.
+    receiver: ReceiverKind,
     args: Vec<(Ident, Type)>,
     ret: ReturnSpec,
     signature_display: String,
@@ -550,6 +583,7 @@ impl Parse for MethodSpec {
         Ok(MethodSpec {
             endpoint,
             method_ident,
+            receiver,
             args,
             ret,
             signature_display,
@@ -1126,6 +1160,250 @@ fn build_accessor_arm(accessor: &AccessorSpec, repe: &TokenStream2, sink: Sink) 
 }
 
 // ---------------------------------------------------------------------------
+// Shared-borrow read path
+// ---------------------------------------------------------------------------
+//
+// `repe_read_into` and `repe_call_read_into` serve a bodiless request through
+// `&self`, so a read does not queue behind a long-running call on the same
+// object. They are built separately from the two `&mut self` bodies rather than
+// as a third `Sink` pass, because the arm *shape* is genuinely different: there
+// is no body, so no write branch, and an arm that cannot be served under a
+// shared borrow declines instead of answering.
+//
+// The encoding is not duplicated. Every value below goes through the same
+// `Sink::Encode` emitter the exclusive path uses, wrapped in `Some(..)`, so the
+// two cannot disagree about how a value is serialized — only about whether this
+// path serves it at all. `tests/shared_reads.rs` pins the rest by reading one
+// struct through both and comparing frames.
+//
+// One rule governs what may run here: **a listing never invokes a published
+// method.** A listing is the one read that composes many others, so a decline
+// discovered partway through would leave the entries before it already
+// executed, and the exclusive retry then executes them again — a `&self` getter
+// over a read counter would report the second call. Getters are the only
+// listing entries that are invoked rather than serialized, so a struct with any
+// field-shaped endpoint declines its listing at the top, before writing or
+// calling anything. What is left is serialization, which re-runs harmlessly.
+// Reading one of those endpoints on its own is unaffected: that arm decides
+// from the receiver, before it calls anything.
+
+/// The refusal for a path segment below a leaf endpoint.
+fn read_invalid_subpath(repe: &TokenStream2) -> TokenStream2 {
+    quote! {
+        Some(Err(#repe::StructError::InvalidSubpath {
+            path: #repe::structs::path_from_segments(segments),
+        }))
+    }
+}
+
+/// The read arm shared by a published method and the getter half of a
+/// field-shaped endpoint: both are a zero-argument call whose result is the
+/// whole response, and both decline a `&mut self` receiver.
+fn build_read_call_arm(
+    endpoint: &str,
+    receiver: ReceiverKind,
+    invocation: TokenStream2,
+    ret: &ReturnSpec,
+    typed: bool,
+    repe: &TokenStream2,
+) -> TokenStream2 {
+    let key = LitStr::new(endpoint, Span::call_site());
+    if !matches!(receiver, ReceiverKind::Ref) {
+        return quote! { #key => None, };
+    }
+    let path = LitStr::new(&format!("/{endpoint}"), Span::call_site());
+    let emit_ok = if ret.ok_is_unit() {
+        Sink::Encode.emit_null()
+    } else if typed {
+        Sink::Encode.emit_typed_slice(repe, &path, quote! { __repe_ok })
+    } else {
+        Sink::Encode.emit_value(repe, &path, quote! { __repe_ok })
+    };
+    let call = call_and_emit(invocation, ret, emit_ok, repe, &path);
+    let subpath = read_invalid_subpath(repe);
+    quote! {
+        #key => {
+            if !tail.is_empty() {
+                return #subpath;
+            }
+            Some(#call)
+        }
+    }
+}
+
+/// One read arm per field: a leaf serializes itself, a nested field asks its
+/// child, which may decline in turn.
+fn build_read_field_arms(fields: &[FieldSpec], repe: &TokenStream2) -> Vec<TokenStream2> {
+    let subpath = read_invalid_subpath(repe);
+    let mut arms = Vec::new();
+    for field in fields {
+        if field.attrs.skip {
+            continue;
+        }
+        let key = LitStr::new(&field.endpoint, Span::call_site());
+        let ident = &field.ident;
+        let path = LitStr::new(&format!("/{}", field.endpoint), Span::call_site());
+
+        if field.attrs.nested {
+            // `tail` covers both cases the exclusive path splits: empty reads
+            // the child whole, non-empty descends. Only the write branch needed
+            // them apart, and there is no write here.
+            let ty = &field.ty;
+            arms.push(quote! {
+                #key => <#ty as #repe::RepeStruct>::repe_read_into(&self.#ident, tail, out)
+                    .map(|__repe_result| {
+                        __repe_result.map_err(|err| #repe::structs::prepend_path(err, #key))
+                    }),
+            });
+        } else {
+            let read = if field.attrs.typed {
+                Sink::Encode.emit_typed_slice(repe, &path, quote! { self.#ident })
+            } else {
+                Sink::Encode.emit_value(repe, &path, quote! { self.#ident })
+            };
+            arms.push(quote! {
+                #key => {
+                    if !tail.is_empty() {
+                        return #subpath;
+                    }
+                    Some(#read)
+                }
+            });
+        }
+    }
+    arms
+}
+
+/// One read arm per published method, served when the signature allows it.
+fn build_read_method_arms(methods: &[MethodSpec], repe: &TokenStream2) -> Vec<TokenStream2> {
+    methods
+        .iter()
+        .map(|method| {
+            // A method taking arguments reads them from a request body, and a
+            // request carrying one is a write, so the shared path never has to
+            // serve this. Declining costs nothing: the exclusive path answers
+            // it with the same `BodyExpected` it always has.
+            if !method.args.is_empty() {
+                let key = LitStr::new(&method.endpoint, Span::call_site());
+                return quote! { #key => None, };
+            }
+            let method_ident = &method.method_ident;
+            // Spanned at the method name, because this is the one call in the
+            // generated code whose receiver comes from a *declaration* rather
+            // than from a signature: a `#[repe(methods(..))]` entry that says
+            // `&self` for a `&mut self` method fails here, and the error has to
+            // point at that entry rather than at `#[derive(RepeStruct)]`.
+            let invocation = quote_spanned! { method_ident.span()=>
+                Self::#method_ident(self)
+            };
+            build_read_call_arm(
+                &method.endpoint,
+                method.receiver,
+                invocation,
+                &method.ret,
+                false,
+                repe,
+            )
+        })
+        .collect()
+}
+
+/// The read arm for a field-shaped endpoint: the getter, when it takes `&self`.
+fn build_read_accessor_arm(accessor: &AccessorSpec, repe: &TokenStream2) -> TokenStream2 {
+    let getter = &accessor.get.method_ident;
+    build_read_call_arm(
+        &accessor.endpoint,
+        accessor.get.receiver,
+        quote! { Self::#getter(self) },
+        &accessor.get.ret,
+        accessor.typed,
+        repe,
+    )
+}
+
+/// The whole-struct listing, read through a shared borrow.
+///
+/// Serialization only: see the rule at the top of this section. The one entry
+/// that can still decline is a nested child, which declines before writing
+/// anything of its own, and `ObjectBody::entry_try_with` rewinds the object it
+/// was building — so a `None` from here leaves the response body exactly as it
+/// was found, which is what `RepeStruct::repe_read_into` promises.
+fn build_read_listing(
+    fields: &[FieldSpec],
+    methods: &[MethodSpec],
+    from_impl_block: bool,
+    repe: &TokenStream2,
+) -> TokenStream2 {
+    // A constant, so for a table with no field-shaped endpoints this folds away
+    // and the listing is served shared as it stands.
+    let guard = from_impl_block.then(|| {
+        quote! {
+            if !<Self as #repe::structs::RepeMethods>::REPE_ACCESSOR_ENDPOINTS.is_empty() {
+                return None;
+            }
+        }
+    });
+
+    let mut entries = Vec::new();
+    for field in fields {
+        if field.attrs.skip {
+            continue;
+        }
+        let key = LitStr::new(&field.endpoint, Span::call_site());
+        let ident = &field.ident;
+        if field.attrs.nested {
+            let ty = &field.ty;
+            entries.push(quote! {
+                if let Err(__repe_err) = __repe_obj.entry_try_with(#key, |__repe_nested| {
+                    <#ty as #repe::RepeStruct>::repe_read_into(&self.#ident, &[], __repe_nested)
+                        .map(|__repe_result| {
+                            __repe_result.map_err(|err| #repe::structs::prepend_path(err, #key))
+                        })
+                })? {
+                    return Some(Err(__repe_err));
+                }
+            });
+        } else {
+            entries.push(quote! {
+                if let Err(__repe_err) = __repe_obj.entry(#key, &self.#ident) {
+                    return Some(Err(__repe_err));
+                }
+            });
+        }
+    }
+
+    for method in methods {
+        let key = LitStr::new(&method.endpoint, Span::call_site());
+        let signature = LitStr::new(&method.signature_display, Span::call_site());
+        entries.push(quote! {
+            if let Err(__repe_err) = __repe_obj.entry(#key, &#signature) {
+                return Some(Err(__repe_err));
+            }
+        });
+    }
+
+    if from_impl_block {
+        entries.push(quote! {
+            for &(name, signature) in <Self as #repe::structs::RepeMethods>::REPE_METHOD_SIGNATURES {
+                if let Err(__repe_err) = __repe_obj.entry(name, &signature) {
+                    return Some(Err(__repe_err));
+                }
+            }
+        });
+    }
+
+    quote! {
+        {
+            #guard
+            let mut __repe_obj = out.object();
+            #(#entries)*
+            __repe_obj.finish();
+            Some(Ok(()))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // #[repe::methods]
 // ---------------------------------------------------------------------------
 
@@ -1383,6 +1661,41 @@ fn methods_impl(
             }
         });
     }
+
+    let read_arms = build_read_method_arms(&published.methods, repe)
+        .into_iter()
+        .chain(
+            published
+                .accessors
+                .iter()
+                .map(|accessor| build_read_accessor_arm(accessor, repe)),
+        )
+        .collect::<Vec<_>>();
+    let read_invalid_root = quote! {
+        Some(Err(#repe::StructError::InvalidPath { path: String::from("") }))
+    };
+    let read_invalid_path = quote! {
+        Some(Err(#repe::StructError::InvalidPath {
+            path: #repe::structs::path_from_segments(segments),
+        }))
+    };
+    bodies.push(quote! {
+        fn repe_call_read_into(
+            &self,
+            segments: &[&str],
+            out: &mut #repe::structs::ResponseBody<'_>,
+        ) -> Option<#repe::structs::StructResult<()>> {
+            let Some((head, tail)) = segments.split_first() else {
+                return #read_invalid_root;
+            };
+            // Every arm may be a decline, in which case neither is read.
+            let _ = (&out, tail);
+            match *head {
+                #(#read_arms)*
+                _ => #read_invalid_path,
+            }
+        }
+    });
 
     // No handshake assertion to emit: `MethodsDeclared` is a supertrait of
     // `RepeMethods`, so this impl cannot compile unless the struct declared
@@ -1688,6 +2001,7 @@ fn parse_impl_method(
         MethodSpec {
             endpoint,
             method_ident: sig.ident.clone(),
+            receiver: kind,
             args,
             ret,
             signature_display,

@@ -251,6 +251,8 @@ impl Legacy {
 
 It supports the same arities and the same `Result` mapping, and the two forms may be used on the same struct. It carries the drift the impl-block form removes, though: renaming a listed method or changing its types is a compile error, but *adding* one to the impl block leaves it off the wire. Prefer `#[repe::methods]` where you can annotate the block.
 
+Declare the receiver accurately. A method listed as `&self` is served through the shared read path below, so listing a `&mut self` method as `&self` is a compile error in the generated code rather than a silently exclusive endpoint.
+
 ### Field attributes
 
 | Attribute | Effect |
@@ -275,6 +277,46 @@ Two consequences worth knowing:
 - `#[repe(typed)]` only takes effect on the encoding path; `repe_handle` still yields a JSON array, since a `Value` cannot carry a BEVE typed body.
 
 `Router` accepts `Arc<L>` for any lock implementing `repe::Lockable<T>`, so you can swap in `tokio::sync::Mutex` / `RwLock` (via their `blocking_*` APIs) or enable the optional `parking-lot` feature to use `parking_lot::Mutex` / `RwLock` without extra wrapper types.
+
+### Reads share the guard
+
+A read does not need exclusive access, and behind an `RwLock` it no longer takes it. REPE separates a read from a write at the frame level — a request with no body is a read — so the router can decide before it locks anything:
+
+```rust
+use repe::server::Router;
+
+# #[derive(Default, serde::Serialize, serde::Deserialize, repe::RepeStruct)]
+# struct Instrument { gain: f64 }
+let (router, instrument) = Router::new().with_struct_rw("/instrument", Instrument::default());
+```
+
+`with_struct_rw` is `with_struct` behind an `RwLock` instead of a `Mutex`; `with_struct_shared` takes any `Arc<L>` where `L: repe::Lockable<T>`, including `tokio::sync::RwLock` and, with the `parking-lot` feature, `parking_lot::RwLock`.
+
+Under that registration a `/instrument/gain` read runs concurrently with any other read, including one already inside a slow `&self` method. What is served this way is everything the derive can reach without `&mut self`:
+
+- every field read, at any depth through `#[repe(nested)]`;
+- a `#[repe::methods]` method taking `&self` and no arguments;
+- the getter half of a field-shaped endpoint, when that getter takes `&self`;
+- the whole-object listing, when nothing in it has to be *invoked* — see below.
+
+Everything else — every write, every `&mut self` method, a `&mut self` getter — **declines**: the shared attempt returns without writing anything, and the router retakes the lock exclusively and dispatches exactly as it always did. Declining is invisible from the outside; the answer is the same frame either way.
+
+`with_struct` puts the value behind a `Mutex`, which has no shared mode. There the shared path is compiled out entirely rather than acquiring the same lock twice, so a mutex-backed struct dispatches exactly as it did before.
+
+#### A listing never invokes a getter
+
+A whole-object read is the one read that composes many others, so a decline discovered partway through would leave the entries before it already executed — and the exclusive retry then executes them again. A `&self` getter over a read counter would report the second call.
+
+So a struct that publishes any field-shaped endpoint declines its whole-object listing outright, before writing or calling anything. Everything left in a shared listing is serialization, which re-runs harmlessly. Reading one of those endpoints on its own is unaffected: that decision comes from the receiver, before anything is called.
+
+The trade is deliberate. A struct with accessors keeps the shared path for every individual read and gives it up only for the whole-object read, which is a discovery request rather than a hot one — and is [already quadratic in the accessor count](#field-shaped-endpoints) for the same reason.
+
+#### Two things that change for callers
+
+- **Two `&self` methods on one object now run at the same time.** The exclusive guard used to give them mutual exclusion for free. A `&self` method that reads several interior-mutable cells expecting a consistent snapshot needs its own synchronization now. Writers still exclude readers.
+- **A panic under a shared guard no longer poisons the lock.** `std::sync::RwLock` poisons only on a panic while the *write* guard is held, so a panicking `&self` handler no longer retires the object for the life of the process the way it did under a `Mutex`. A panicking `&mut self` handler still does.
+
+A hand-written `RepeStruct` impl gets the exclusive behavior by default. To opt one in, override `repe_read_into`, which carries two obligations: answer a path identically to `repe_handle_into` or decline it, and write nothing into the response body when declining. `ObjectBody::entry_try_with` is there for the second one when the decline surfaces partway through an object — it rewinds the whole object, so propagating its `None` is all the caller has to do.
 
 ## Async Server
 

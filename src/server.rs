@@ -12,7 +12,7 @@ use crate::peer::{CallContext, PeerHandle};
 use crate::registry::Registry;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::server_request::route_request_view;
-use crate::structs::{RepeStruct, ResponseBody};
+use crate::structs::{RepeStruct, ResponseBody, StructResult};
 use beve::from_slice as beve_from_slice;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -919,6 +919,23 @@ pub trait Lockable<T: ?Sized>: Send + Sync {
         Self: 'a;
 
     fn lock(&self) -> Result<Self::Guard<'_>, LockError>;
+
+    /// Run `f` under a *shared* guard, or report `None` if this lock has no
+    /// shared mode.
+    ///
+    /// The two guard types have no common supertype — `RwLockReadGuard` is not
+    /// a `RwLockWriteGuard` — so the borrow is handed to a closure rather than
+    /// returned. `None` rather than a silent fallback to [`lock`](Self::lock):
+    /// a mutex would then take the same lock the caller is about to take
+    /// anyway, and the router needs to know not to try. `Self` is a generic
+    /// parameter at every call site, so a mutex folds this to nothing.
+    fn with_read<R, F>(&self, f: F) -> Option<Result<R, LockError>>
+    where
+        F: FnOnce(&T) -> R,
+    {
+        let _ = f;
+        None
+    }
 }
 
 impl<T: ?Sized + Send> Lockable<T> for Mutex<T> {
@@ -947,6 +964,17 @@ impl<T: ?Sized + Send + Sync> Lockable<T> for std::sync::RwLock<T> {
     fn lock(&self) -> Result<Self::Guard<'_>, LockError> {
         std::sync::RwLock::write(self).map_err(LockError::from)
     }
+
+    fn with_read<R, F>(&self, f: F) -> Option<Result<R, LockError>>
+    where
+        F: FnOnce(&T) -> R,
+    {
+        Some(
+            std::sync::RwLock::read(self)
+                .map_err(LockError::from)
+                .map(|guard| f(&guard)),
+        )
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -971,6 +999,13 @@ impl<T: ?Sized + Send + Sync> Lockable<T> for tokio::sync::RwLock<T> {
     fn lock(&self) -> Result<Self::Guard<'_>, LockError> {
         Ok(self.blocking_write())
     }
+
+    fn with_read<R, F>(&self, f: F) -> Option<Result<R, LockError>>
+    where
+        F: FnOnce(&T) -> R,
+    {
+        Some(Ok(f(&self.blocking_read())))
+    }
 }
 
 #[cfg(feature = "parking-lot")]
@@ -994,6 +1029,13 @@ impl<T: ?Sized + Send + Sync> Lockable<T> for parking_lot::RwLock<T> {
 
     fn lock(&self) -> Result<Self::Guard<'_>, LockError> {
         Ok(self.write())
+    }
+
+    fn with_read<R, F>(&self, f: F) -> Option<Result<R, LockError>>
+    where
+        F: FnOnce(&T) -> R,
+    {
+        Some(Ok(f(&self.read())))
     }
 }
 
@@ -1530,6 +1572,38 @@ impl Router {
         shared
     }
 
+    /// [`with_struct`](Self::with_struct) behind an `RwLock`, so that reads
+    /// share the guard.
+    ///
+    /// The default `Mutex` serializes every request against the object,
+    /// including a pure field read. Under an `RwLock` a read is attempted
+    /// through `&self` first — every field at any nesting depth, a listing with
+    /// nothing to invoke, a `&self` method taking no arguments, and the getter
+    /// half of a `&self` field-shaped endpoint — and only falls back to the
+    /// exclusive guard when the struct declines. Writes and `&mut self` methods
+    /// are unaffected.
+    ///
+    /// Prefer this for an object whose handlers can block: it is what keeps a
+    /// `/version` read from queueing behind a long-running command.
+    pub fn with_struct_rw<T>(mut self, root: &str, value: T) -> (Self, Arc<std::sync::RwLock<T>>)
+    where
+        T: RepeStruct + Send + Sync + 'static,
+    {
+        let shared = self.register_struct_rw(root, value);
+        (self, shared)
+    }
+
+    /// [`with_struct_rw`](Self::with_struct_rw) in place, returning the shared
+    /// handle without breaking builder chains.
+    pub fn register_struct_rw<T>(&mut self, root: &str, value: T) -> Arc<std::sync::RwLock<T>>
+    where
+        T: RepeStruct + Send + Sync + 'static,
+    {
+        let shared = Arc::new(std::sync::RwLock::new(value));
+        self.register_struct_shared::<T, std::sync::RwLock<T>>(root, Arc::clone(&shared));
+        shared
+    }
+
     /// Register a dynamic [`Registry`] under `path_prefix`.
     ///
     /// The prefix can be empty to serve the registry at the root path. Requests under the
@@ -1819,6 +1893,25 @@ where
             ));
         };
 
+        // A read — a frame with no body, by REPE's own read/write distinction —
+        // may be servable through a shared borrow, which is the whole point of
+        // registering the struct behind an `RwLock`. A mutex answers `None`
+        // from a defaulted method with no work in it, so it compiles out.
+        if req.body.is_empty() {
+            match self
+                .shared
+                .with_read(|handler| read_struct_segments(handler, relative, req))
+            {
+                Some(Ok(Some(response))) => return Ok(response),
+                // The struct declined: this path needs `&mut self`. Nothing was
+                // written, so the exclusive attempt below starts from scratch.
+                Some(Ok(None)) => {}
+                Some(Err(err)) => return Ok(lock_error_response(req, path, err)),
+                // This lock has no shared mode.
+                None => {}
+            }
+        }
+
         let body = if req.body.is_empty() {
             None
         } else {
@@ -1842,47 +1935,102 @@ where
 
         let mut guard = match self.shared.lock() {
             Ok(g) => g,
-            Err(err) => {
-                let detail = match err {
-                    LockError::Poisoned(msg) => {
-                        format!("struct handler `{path}` lock poisoned: {msg}")
-                    }
-                    LockError::Other(msg) => {
-                        format!("struct handler `{path}` lock error: {msg}")
-                    }
-                };
-                return Ok(create_error_response_like(
-                    req,
-                    ErrorCode::ParseError,
-                    detail,
-                ));
-            }
+            Err(err) => return Ok(lock_error_response(req, path, err)),
         };
 
-        dispatch_struct_segments(&mut *guard, relative, body, req)
+        Ok(dispatch_struct_segments(&mut *guard, relative, body, req))
     }
 }
 
-/// Run a `RepeStruct::repe_handle` call after parsing `relative` into
-/// path segments and map the result back to a `Message`.
+/// The response to a lock that could not be taken, shared by the exclusive and
+/// shared paths so a poisoned lock reads the same either way.
+fn lock_error_response(req: &Message, path: &str, err: LockError) -> Message {
+    let detail = match err {
+        LockError::Poisoned(msg) => format!("struct handler `{path}` lock poisoned: {msg}"),
+        LockError::Other(msg) => format!("struct handler `{path}` lock error: {msg}"),
+    };
+    create_error_response_like(req, ErrorCode::ParseError, detail)
+}
+
+/// Parse `relative` into JSON Pointer segments and hand them to `f`.
 ///
 /// Segment parsing mirrors [`crate::json_pointer::parse`] byte-for-byte so the
 /// dispatch result is independent of which path is taken:
 ///
-/// * `""` → no reference tokens; calls `repe_handle(&[], _)` (whole struct).
-/// * `"/"` → one empty reference token; calls `repe_handle(&[""], _)`. The
-///   derive-macro impls treat this as `InvalidPath`, matching RFC 6901
-///   semantics ("/" points at a field named `""`).
+/// * `""` → no reference tokens; calls `f(&[])` (whole struct).
+/// * `"/"` → one reference token, empty; calls `f(&[""])`. The derive-macro
+///   impls treat this as `InvalidPath`, matching RFC 6901 semantics ("/" points
+///   at a field named `""`).
 ///
 /// The escape-free fast path (`!relative.contains('~')`, the common case for
-/// JSON Pointers) avoids the `Vec<String>` from `json_pointer::parse` and
-/// drops segment `&str`s into a fixed-size stack buffer, spilling to a
-/// `Vec<&str>` only when the path is unusually deep. The escape path keeps the
-/// original `Vec<String>` + `Vec<&str>` shape because each escaped segment
-/// genuinely needs an owned `String`.
+/// JSON Pointers) avoids the `Vec<String>` from `json_pointer::parse` and drops
+/// segment `&str`s into a fixed-size stack buffer, spilling to a `Vec<&str>`
+/// only when the path is unusually deep. The escape path keeps the original
+/// `Vec<String>` + `Vec<&str>` shape because each escaped segment genuinely
+/// needs an owned `String`.
+fn with_segments<R, F>(relative: &str, f: F) -> R
+where
+    F: FnOnce(&[&str]) -> R,
+{
+    const STACK_SEGS: usize = 16;
+
+    if relative.contains('~') {
+        let owned = crate::json_pointer::parse(relative);
+        let seg_refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        return f(&seg_refs);
+    }
+    if relative.is_empty() {
+        return f(&[]);
+    }
+    if relative == "/" {
+        // RFC 6901: "/" decodes to a single empty reference token. The old
+        // `json_pointer::parse("/")` path returned `vec![""]`; the fast path
+        // must match so trailing-slash requests still surface as `InvalidPath`
+        // rather than silently serving the whole struct.
+        return f(&[""]);
+    }
+
+    let trimmed = relative.strip_prefix('/').unwrap_or(relative);
+    let mut stack: [&str; STACK_SEGS] = [""; STACK_SEGS];
+    let mut count = 0usize;
+    let mut overflow: Option<Vec<&str>> = None;
+    for seg in trimmed.split('/') {
+        if let Some(v) = overflow.as_mut() {
+            v.push(seg);
+        } else if count < STACK_SEGS {
+            stack[count] = seg;
+            count += 1;
+        } else {
+            let mut v = Vec::with_capacity(STACK_SEGS + 4);
+            v.extend_from_slice(&stack);
+            v.push(seg);
+            overflow = Some(v);
+        }
+    }
+    match overflow.as_deref() {
+        Some(v) => f(v),
+        None => f(&stack[..count]),
+    }
+}
+
+/// A response buffer sized for one leaf read.
+///
+/// The frame needs the wire prefix regardless, and a scalar or short-string leaf
+/// read — the case the encode-in-place path exists for — fits in the rest, so
+/// the encode comes for free out of the one allocation and the result already
+/// satisfies [`Message::into_wire_bytes`]'s in-place condition
+/// (`capacity >= HEADER_SIZE + query + body`).
+fn response_buffer(req: &Message) -> Vec<u8> {
+    /// Body allowance reserved on top of the wire prefix.
+    const LEAF_BODY_HINT: usize = 64;
+    Vec::with_capacity(HEADER_SIZE + req.query.len() + LEAF_BODY_HINT)
+}
+
+/// Run a `RepeStruct::repe_handle_into` call against an exclusive borrow and map
+/// the result back to a `Message`.
 ///
 /// The handler encodes through [`RepeStruct::repe_handle_into`], writing the
-/// response body straight into `buf` rather than returning a
+/// response body straight into the buffer rather than returning a
 /// [`serde_json::Value`] for this function to re-serialize. The buffer is then
 /// grown by the wire prefix so [`Message::into_wire_bytes`] reuses it instead of
 /// allocating a frame, making a leaf read one allocation end to end.
@@ -1891,64 +2039,46 @@ fn dispatch_struct_segments<T>(
     relative: &str,
     body: Option<Value>,
     req: &Message,
-) -> Result<Message, RepeError>
+) -> Message
 where
     T: RepeStruct + ?Sized,
 {
-    const STACK_SEGS: usize = 16;
-    /// Body allowance reserved on top of the wire prefix. The frame needs the
-    /// prefix regardless, and a scalar or short-string leaf read — the case this
-    /// path exists for — fits in the rest, so the encode comes for free out of
-    /// the one allocation and the result already satisfies
-    /// [`Message::into_wire_bytes`]'s in-place condition
-    /// (`capacity >= HEADER_SIZE + query + body`).
-    const LEAF_BODY_HINT: usize = 64;
-
-    let mut buf = Vec::with_capacity(HEADER_SIZE + req.query.len() + LEAF_BODY_HINT);
+    let mut buf = response_buffer(req);
     let mut out = ResponseBody::new(&mut buf);
-
-    let result = if !relative.contains('~') {
-        if relative.is_empty() {
-            handler.repe_handle_into(&[], body, &mut out)
-        } else if relative == "/" {
-            // RFC 6901: "/" decodes to a single empty reference token. The
-            // old `json_pointer::parse("/")` path returned `vec![""]`; the
-            // fast path must match so trailing-slash requests still surface
-            // as `InvalidPath` rather than silently serving the whole struct.
-            handler.repe_handle_into(&[""], body, &mut out)
-        } else {
-            let trimmed = relative.strip_prefix('/').unwrap_or(relative);
-            let mut stack: [&str; STACK_SEGS] = [""; STACK_SEGS];
-            let mut count = 0usize;
-            let mut overflow: Option<Vec<&str>> = None;
-            for seg in trimmed.split('/') {
-                if let Some(v) = overflow.as_mut() {
-                    v.push(seg);
-                } else if count < STACK_SEGS {
-                    stack[count] = seg;
-                    count += 1;
-                } else {
-                    let mut v = Vec::with_capacity(STACK_SEGS + 4);
-                    v.extend_from_slice(&stack);
-                    v.push(seg);
-                    overflow = Some(v);
-                }
-            }
-            match overflow.as_deref() {
-                Some(v) => handler.repe_handle_into(v, body, &mut out),
-                None => handler.repe_handle_into(&stack[..count], body, &mut out),
-            }
-        }
-    } else {
-        let owned = crate::json_pointer::parse(relative);
-        let seg_refs: Vec<&str> = owned.iter().map(String::as_str).collect();
-        handler.repe_handle_into(&seg_refs, body, &mut out)
-    };
-
+    let result = with_segments(relative, |segments| {
+        handler.repe_handle_into(segments, body, &mut out)
+    });
     let body_format = out.format();
+    finish_struct_response(req, buf, body_format, result)
+}
+
+/// The shared-borrow counterpart: attempt the same read through
+/// [`RepeStruct::repe_read_into`], and report `None` if the struct declined
+/// because the path needs exclusive access.
+fn read_struct_segments<T>(handler: &T, relative: &str, req: &Message) -> Option<Message>
+where
+    T: RepeStruct + ?Sized,
+{
+    let mut buf = response_buffer(req);
+    let mut out = ResponseBody::new(&mut buf);
+    let result = with_segments(relative, |segments| {
+        handler.repe_read_into(segments, &mut out)
+    })?;
+    let body_format = out.format();
+    Some(finish_struct_response(req, buf, body_format, result))
+}
+
+/// Turn what a dispatch left in `buf` into the response frame, shared by the
+/// exclusive and shared paths so an error reads the same either way.
+fn finish_struct_response(
+    req: &Message,
+    buf: Vec<u8>,
+    body_format: BodyFormat,
+    result: StructResult<()>,
+) -> Message {
     match result {
-        Ok(()) => Ok(create_body_response_unstamped(req, buf, body_format)),
-        Err(err) => Ok(create_error_response_like(req, err.code(), err.to_string())),
+        Ok(()) => create_body_response_unstamped(req, buf, body_format),
+        Err(err) => create_error_response_like(req, err.code(), err.to_string()),
     }
 }
 
