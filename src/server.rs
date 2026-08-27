@@ -246,8 +246,40 @@ impl<H: HandlerErased> HandlerErased for OffReaderHandler<H> {
         self.0.handle_with_ctx(req, ctx)
     }
 
+    /// Forwarded, so wrapping a handler that overrides the borrowing path does
+    /// not quietly cost it. Only the WebSocket server reads
+    /// [`execution`](Self::execution), and it materializes an owned request
+    /// before moving the call off the reader; the TCP and async servers take
+    /// this path and are unaffected by the wrapper.
+    fn handle_view(&self, view: &MessageView, ctx: &CallContext) -> Result<Message, RepeError> {
+        self.0.handle_view(view, ctx)
+    }
+
     fn execution(&self) -> Execution {
         Execution::OffReader
+    }
+}
+
+/// Lets an already-erased handler be wrapped again — by
+/// [`OffReaderHandler`], for [`Router::register_fallback_blocking`], which
+/// receives an `Arc<dyn HandlerErased>` rather than a concrete type.
+///
+/// Every method forwards, `execution` included, so the wrapper decides.
+impl HandlerErased for Arc<dyn HandlerErased> {
+    fn handle(&self, req: &Message) -> Result<Message, RepeError> {
+        (**self).handle(req)
+    }
+
+    fn handle_with_ctx(&self, req: &Message, ctx: &CallContext) -> Result<Message, RepeError> {
+        (**self).handle_with_ctx(req, ctx)
+    }
+
+    fn handle_view(&self, view: &MessageView, ctx: &CallContext) -> Result<Message, RepeError> {
+        (**self).handle_view(view, ctx)
+    }
+
+    fn execution(&self) -> Execution {
+        (**self).execution()
     }
 }
 
@@ -970,6 +1002,9 @@ pub struct Router {
     inner: Arc<HashMap<String, RouterMapEntry>>,
     structs: Arc<Vec<StructEntry>>,
     registries: Arc<Vec<RegistryEntry>>,
+    /// Handler for requests that match no registered route, if one was set.
+    /// Resolved last by [`Router::get`], so it costs nothing on the hit path.
+    fallback: Option<RouterMapEntry>,
     middlewares: Arc<Vec<Arc<dyn Middleware>>>,
 }
 
@@ -979,6 +1014,7 @@ impl Router {
             inner: Arc::new(HashMap::new()),
             structs: Arc::new(Vec::new()),
             registries: Arc::new(Vec::new()),
+            fallback: None,
             middlewares: Arc::new(Vec::new()),
         }
     }
@@ -1028,6 +1064,100 @@ impl Router {
     pub fn with_erased_handler(mut self, path: &str, handler: Arc<dyn HandlerErased>) -> Self {
         self.insert_route(path, handler);
         self
+    }
+
+    /// Serve requests that match no registered route with `handler`, instead of
+    /// answering [`ErrorCode::MethodNotFound`].
+    ///
+    /// This is the hook for a routing table that does not exist yet when the
+    /// router is built. `Router`'s registrars all run before
+    /// [`Server::serve`](crate::server::Server::serve) — `with_*` consume
+    /// `self`, `register_*` take `&mut self` — so a path discovered at runtime
+    /// has nowhere to go. A fallback is where it goes: a plugin host that
+    /// `dlopen`s libraries on demand and dispatches by their claimed
+    /// `root_path` (see `repe::plugin::host`), a proxy to another node, a
+    /// registry mounted after startup.
+    ///
+    /// It is resolved **last**, after the fixed routes, the mounted registries,
+    /// and the mounted structs, so a static route is never slowed down by it. It
+    /// is wrapped in the active middleware pipeline exactly like every other
+    /// route, so middleware sees fallback-served requests too — which is more
+    /// than middleware could do before, since a pipeline is attached per route
+    /// and so never ran on a miss at all.
+    ///
+    /// The handler owns every miss it is given, including the paths it does not
+    /// want: nothing else will answer them, so a handler that does not claim the
+    /// request must frame [`ErrorCode::MethodNotFound`] itself.
+    ///
+    /// **A mount answers for its whole prefix, misses included.** A registry or
+    /// struct mounted at `/x` frames its own `MethodNotFound` for `/x/absent`,
+    /// and the fallback is never consulted — resolution stops at the first
+    /// prefix that matches. A fallback sees only paths no mount covers, so a
+    /// plugin whose root overlaps a mounted struct is shadowed by it.
+    ///
+    /// ```
+    /// use repe::{Message, QueryFormat, constants::ErrorCode, error::RepeError};
+    /// use repe::message::create_error_response_like;
+    /// use repe::server::{HandlerErased, Router};
+    /// use std::sync::Arc;
+    ///
+    /// struct Dynamic;
+    /// impl HandlerErased for Dynamic {
+    ///     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
+    ///         let path = req.query_str().unwrap_or("");
+    ///         if let Some(rest) = path.strip_prefix("/dynamic/") {
+    ///             return Ok(Message::builder()
+    ///                 .id(req.header.id)
+    ///                 .body_json(&rest)?
+    ///                 .build());
+    ///         }
+    ///         // Not ours: the router no longer frames this for us.
+    ///         Ok(create_error_response_like(
+    ///             req,
+    ///             ErrorCode::MethodNotFound,
+    ///             format!("Method not found: {path}"),
+    ///         ))
+    ///     }
+    /// }
+    ///
+    /// let router = Router::new().with_fallback(Arc::new(Dynamic));
+    /// assert!(router.get("/dynamic/anything").is_some());
+    /// ```
+    pub fn with_fallback(mut self, handler: Arc<dyn HandlerErased>) -> Self {
+        self.register_fallback(handler);
+        self
+    }
+
+    /// Register the miss handler in-place, replacing any previous one.
+    ///
+    /// See [`with_fallback`](Self::with_fallback) for what a fallback is and
+    /// when it runs.
+    pub fn register_fallback(&mut self, handler: Arc<dyn HandlerErased>) {
+        let dispatched = wrap_with_middlewares(&handler, &self.middlewares);
+        self.fallback = Some(RouterMapEntry {
+            raw: handler,
+            dispatched,
+        });
+    }
+
+    /// Off-reader variant of [`with_fallback`](Self::with_fallback): on the
+    /// WebSocket server the handler runs on a blocking thread (see
+    /// [`Execution::OffReader`]) so the reader stays free to decode further
+    /// inbound frames while it runs or parks. On the TCP servers it behaves
+    /// exactly like [`with_fallback`](Self::with_fallback).
+    ///
+    /// This is the one to reach for when the miss handler leaves the process —
+    /// a plugin call across a C ABI, a proxied request to another node — since
+    /// neither has a bound this server knows.
+    pub fn with_fallback_blocking(mut self, handler: Arc<dyn HandlerErased>) -> Self {
+        self.register_fallback_blocking(handler);
+        self
+    }
+
+    /// In-place counterpart of
+    /// [`with_fallback_blocking`](Self::with_fallback_blocking).
+    pub fn register_fallback_blocking(&mut self, handler: Arc<dyn HandlerErased>) {
+        self.register_fallback(Arc::new(OffReaderHandler(handler)));
     }
 
     /// Attach a middleware that runs before handlers and can short-circuit requests.
@@ -1097,6 +1227,10 @@ impl Router {
             })
             .collect();
         self.structs = Arc::new(rebuilt_structs);
+
+        if let Some(entry) = &mut self.fallback {
+            entry.dispatched = wrap_with_middlewares(&entry.raw, &self.middlewares);
+        }
 
         arc
     }
@@ -1429,6 +1563,13 @@ impl Router {
         registry
     }
 
+    /// Resolve the handler that serves `path`: a fixed route, then a mounted
+    /// registry or struct whose prefix covers it, then the
+    /// [`fallback`](Self::with_fallback) if one is registered.
+    ///
+    /// `None` means the request is a `MethodNotFound`. Registering a fallback
+    /// therefore makes this return `Some` for every path, which is the point of
+    /// one: the fallback decides what it does not serve.
     pub fn get(&self, path: &str) -> Option<Arc<dyn HandlerErased>> {
         if let Some(entry) = self.inner.get(path) {
             return Some(Arc::clone(&entry.dispatched));
@@ -1436,9 +1577,11 @@ impl Router {
         if let Some(entry) = self.registries.iter().find(|entry| entry.matches(path)) {
             return Some(Arc::clone(&entry.dispatched));
         }
-        self.structs
-            .iter()
-            .find(|entry| entry.matches(path))
+        if let Some(entry) = self.structs.iter().find(|entry| entry.matches(path)) {
+            return Some(Arc::clone(&entry.dispatched));
+        }
+        self.fallback
+            .as_ref()
             .map(|entry| Arc::clone(&entry.dispatched))
     }
 
@@ -2882,6 +3025,255 @@ mod tests {
         assert_eq!(
             Message::from_slice(&response).unwrap().query_str().unwrap(),
             "/elsewhere"
+        );
+    }
+    // ---------------------------------------------------------------------
+    // `Router::with_fallback` — dispatch for routes that do not exist yet
+    // ---------------------------------------------------------------------
+
+    /// Answers anything under `/dynamic`, and frames `MethodNotFound` for the
+    /// rest — the shape a plugin host has, where the claimed prefix is known
+    /// only at run time.
+    struct DynamicPrefix;
+
+    impl HandlerErased for DynamicPrefix {
+        fn handle(&self, req: &Message) -> Result<Message, RepeError> {
+            let path = req.query_str().unwrap_or("").to_string();
+            if path == "/dynamic" || path.starts_with("/dynamic/") {
+                return Ok(Message::builder()
+                    .id(req.header.id)
+                    .body_json(&path)
+                    .unwrap()
+                    .build());
+            }
+            Ok(create_error_response_like(
+                req,
+                ErrorCode::MethodNotFound,
+                format!("Method not found: {path}"),
+            ))
+        }
+    }
+
+    fn served_path(router: &Router, path: &str) -> Message {
+        let response = router
+            .call(&call_request(path, &serde_json::json!(null), false))
+            .expect("a non-notify request produces a response");
+        Message::from_slice(&response).unwrap()
+    }
+
+    #[test]
+    fn a_fallback_serves_a_path_no_route_claims() {
+        let router = echo_router().with_fallback(Arc::new(DynamicPrefix));
+        let message = served_path(&router, "/dynamic/thing");
+        assert!(!message.is_error());
+        assert_eq!(message.json_body::<String>().unwrap(), "/dynamic/thing");
+    }
+
+    #[test]
+    fn a_fallback_does_not_shadow_a_registered_route() {
+        // Resolution order is the whole design: a fallback is a miss handler,
+        // not an override. `/echo` must still reach the route that claims it.
+        let router = echo_router().with_fallback(Arc::new(DynamicPrefix));
+        let message = served_path(&router, "/echo");
+        assert!(!message.is_error());
+        assert_eq!(
+            message.json_body::<serde_json::Value>().unwrap(),
+            serde_json::json!(null)
+        );
+    }
+
+    #[test]
+    fn a_fallback_does_not_shadow_a_mounted_registry_or_struct() {
+        #[derive(Default)]
+        struct Counter {
+            value: i64,
+        }
+
+        impl RepeStruct for Counter {
+            fn repe_handle(
+                &mut self,
+                segments: &[&str],
+                _body: Option<Value>,
+            ) -> crate::structs::StructResult<Option<Value>> {
+                assert_eq!(segments, ["value"]);
+                Ok(Some(serde_json::json!(self.value)))
+            }
+        }
+
+        let registry = Arc::new(Registry::new());
+        registry
+            .register_value("/flag", serde_json::json!(true))
+            .unwrap();
+
+        let router = Router::new()
+            .with_registry("/reg", registry)
+            .with_struct_shared::<Counter, _>(
+                "/counter",
+                Arc::new(Mutex::new(Counter { value: 5 })),
+            )
+            .with_fallback(Arc::new(DynamicPrefix));
+
+        assert!(!served_path(&router, "/reg/flag").is_error());
+        assert_eq!(
+            served_path(&router, "/counter/value")
+                .json_body::<i64>()
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            served_path(&router, "/dynamic/x")
+                .json_body::<String>()
+                .unwrap(),
+            "/dynamic/x"
+        );
+    }
+
+    #[test]
+    fn a_fallback_frames_its_own_method_not_found() {
+        // Once a fallback is registered the router never frames the miss itself,
+        // so the handler owns the paths it declines as well as the ones it takes.
+        let router = echo_router().with_fallback(Arc::new(DynamicPrefix));
+        let message = served_path(&router, "/nothing/here");
+        assert_eq!(message.error_code(), Some(ErrorCode::MethodNotFound));
+        assert_eq!(message.header.id, 11);
+    }
+
+    #[test]
+    fn a_fallback_honors_notify_semantics() {
+        let router = echo_router().with_fallback(Arc::new(DynamicPrefix));
+        assert!(
+            router
+                .call(&call_request("/dynamic/x", &serde_json::json!(null), true))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn middleware_wraps_the_fallback_whichever_order_they_are_registered() {
+        struct Blocker;
+        impl Middleware for Blocker {
+            fn handle(&self, req: &Message, _next: Next<'_>) -> Result<Message, RepeError> {
+                Ok(create_error_response_like(
+                    req,
+                    ErrorCode::Timeout,
+                    "blocked",
+                ))
+            }
+        }
+
+        for router in [
+            Router::new()
+                .with_middleware(Blocker)
+                .with_fallback(Arc::new(DynamicPrefix)),
+            Router::new()
+                .with_fallback(Arc::new(DynamicPrefix))
+                .with_middleware(Blocker),
+        ] {
+            assert_eq!(
+                served_path(&router, "/dynamic/x").error_code(),
+                Some(ErrorCode::Timeout),
+                "the fallback is wrapped in the pipeline like any other route"
+            );
+        }
+    }
+
+    #[test]
+    fn a_delegating_middleware_chain_still_reaches_the_fallback() {
+        // The half a short-circuiting middleware cannot show: that the pipeline
+        // *terminates* at the fallback handler. This is what breaks if the
+        // rebuild in `register_middleware` ever wraps `dispatched` instead of
+        // `raw`, or drops the fallback's `raw` on the way through.
+        struct Tag(&'static str, Arc<Mutex<Vec<&'static str>>>);
+        impl Middleware for Tag {
+            fn handle(&self, req: &Message, next: Next<'_>) -> Result<Message, RepeError> {
+                self.1.lock().unwrap().push(self.0);
+                next.run(req)
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let router = Router::new()
+            .with_middleware(Tag("outer", Arc::clone(&seen)))
+            .with_fallback(Arc::new(DynamicPrefix))
+            .with_middleware(Tag("inner", Arc::clone(&seen)));
+
+        let message = served_path(&router, "/dynamic/reached");
+        assert!(!message.is_error());
+        assert_eq!(
+            message.json_body::<String>().unwrap(),
+            "/dynamic/reached",
+            "the chain ran through to the fallback handler"
+        );
+        assert_eq!(*seen.lock().unwrap(), ["outer", "inner"]);
+    }
+
+    #[test]
+    fn a_miss_inside_a_mounted_prefix_never_reaches_the_fallback() {
+        // The limit of the feature, and the thing most likely to surprise: a
+        // mounted registry or struct answers for its whole prefix, misses
+        // included. A fallback only sees paths no mount covers, so a plugin
+        // whose root overlaps a mounted struct is shadowed by it.
+        struct Counting(Arc<AtomicUsize>);
+        impl HandlerErased for Counting {
+            fn handle(&self, req: &Message) -> Result<Message, RepeError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(Message::builder().id(req.header.id).build())
+            }
+        }
+
+        let registry = Arc::new(Registry::new());
+        registry
+            .register_value("/flag", serde_json::json!(true))
+            .unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let router = Router::new()
+            .with_registry("/reg", registry)
+            .with_fallback(Arc::new(Counting(Arc::clone(&hits))));
+
+        // A read, not a write: a registry *write* to an unknown pointer creates it.
+        let read = Message::builder()
+            .id(11)
+            .query_str("/reg/nope")
+            .query_format(crate::constants::QueryFormat::JsonPointer)
+            .build()
+            .to_vec();
+        let message = Message::from_slice(&router.call(&read).unwrap()).unwrap();
+        assert_eq!(message.error_code(), Some(ErrorCode::MethodNotFound));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "the mount framed its own miss; the fallback was never consulted"
+        );
+    }
+
+    #[test]
+    fn a_blocking_fallback_dispatches_off_the_reader() {
+        let router = Router::new().with_fallback_blocking(Arc::new(DynamicPrefix));
+        assert_eq!(
+            router.get("/dynamic/x").unwrap().execution(),
+            Execution::OffReader
+        );
+        // And it still serves: the wrapper delegates rather than replacing.
+        assert_eq!(
+            served_path(&router, "/dynamic/x")
+                .json_body::<String>()
+                .unwrap(),
+            "/dynamic/x"
+        );
+    }
+
+    #[test]
+    fn registering_a_fallback_twice_replaces_the_first() {
+        let mut router = echo_router();
+        router.register_fallback(Arc::new(DynamicPrefix));
+        router.register_fallback(Arc::new(JsonHandler(|_: Value| {
+            Ok(serde_json::json!("second"))
+        })));
+        assert_eq!(
+            served_path(&router, "/dynamic/x")
+                .json_body::<String>()
+                .unwrap(),
+            "second"
         );
     }
 }

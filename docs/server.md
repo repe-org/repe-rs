@@ -34,6 +34,24 @@ server.serve(listener)?;
 
 Router keys must be JSON Pointer paths (e.g. `/ping`, `/echo`). Raw-binary queries are rejected with `Invalid query`. Missing routes return `MethodNotFound` with the requested path.
 
+### Routes that do not exist yet
+
+Every registrar runs before `Server::serve`, so a path discovered at run time has nowhere to go. `Router::with_fallback(handler)` is where it goes: a handler invoked on a miss, resolved **last** — after the fixed routes, the mounted registries, and the mounted structs — so a static route is never slowed down by it, and wrapped in the middleware pipeline like any other route.
+
+```rust
+let router = Router::new()
+    .with("/ping", |_v| Ok(json!({"pong": true})))
+    .with_fallback(Arc::new(dynamic_table));
+```
+
+It is the natural mount for anything whose table is built while the server runs: a [plugin](plugins.md#mounting-a-plugin-on-a-router) loaded on demand, a proxy to another node, a registry mounted after startup. There was no way to do this before, not even an awkward one — middleware is attached per route, so on a miss no pipeline exists and none of it runs.
+
+The handler owns every miss it is given: nothing else will answer, so one that does not claim the request has to frame `MethodNotFound` itself — which is also what lets it decline a path and say so.
+
+**A mount answers for its whole prefix, misses included.** A registry or struct mounted at `/x` frames its own `MethodNotFound` for `/x/absent`; resolution stops at the first prefix that matches and the fallback is never reached. A fallback sees only paths no mount covers, so a plugin whose claimed root overlaps a mounted struct is shadowed by it.
+
+A fallback takes an `Arc<dyn HandlerErased>`: it receives the raw request and returns a whole `Message`, because deciding what to do with a miss usually starts with reading the query. `with_fallback_blocking` is the off-reader variant, for a miss handler that leaves the process — a plugin call across a C ABI, a proxied request to another node — where the WebSocket server should not tie up its reader task waiting.
+
 ### Unknown request-body keys
 
 repe-rs ignores object keys it does not recognize when decoding a request body into a typed handler (`with_typed`) or a registered struct, across both JSON and BEVE. This is a deliberate, guaranteed forward-compatibility property, not an accident of the codec: a newer client can add an optional field to a request and an older server built against this crate decodes the rest and drops the unknown key rather than rejecting the call. See [Schema Evolution](protocol.md#schema-evolution) for the protocol stance.
@@ -166,6 +184,48 @@ It has a boundary in each direction, and the second one matters:
 
 Resolving either would need type information a macro does not have.
 
+### Field-shaped endpoints
+
+Some values look like fields to a client and are not fields at all: a register in different units, a value derived from two others, a setting the hardware holds rather than the struct. `#[repe(get = "...")]` and `#[repe(set = "...")]` publish one endpoint served by a getter/setter pair:
+
+```rust
+#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+#[repe(methods)]
+struct Synthesizer {
+    phase_step: u32,
+    sample_rate_mhz: f64,
+}
+
+#[repe::methods]
+impl Synthesizer {
+    #[repe(get = "mix_freq_mhz")]
+    fn mix_freq_mhz(&self) -> f64 {
+        self.phase_step as f64 * self.sample_rate_mhz / 4096.0
+    }
+
+    #[repe(set = "mix_freq_mhz")]
+    fn set_mix_freq_mhz(&mut self, mhz: f64) {
+        self.phase_step = (mhz * 4096.0 / self.sample_rate_mhz).round() as u32;
+    }
+
+    /// No setter: read-only, with nothing extra to say.
+    #[repe(get = "firmware")]
+    fn firmware(&self) -> &'static str { "1.4.2" }
+}
+```
+
+`/mix_freq_mhz` now behaves exactly like a field: a bodiless request reads it, a request with a body writes it, a write is acknowledged with `null`, and the whole-object read lists its **value** rather than a signature string. Publishing the same thing as methods would mean `/get_mix_freq_mhz` and `/set_mix_freq_mhz`, which is a different path and a different shape.
+
+The two halves need not sit next to each other, and the rules are the ones the shape implies:
+
+- a getter takes no arguments and returns the value; a setter takes exactly one argument and returns `()` or `Result<(), E>`;
+- either half may be fallible, and `Err` becomes an error frame as it does for any published method;
+- a getter with **no** setter is read-only, and a write to it returns `InvalidBody` — the same refusal `#[repe(readonly)]` gives, without a no-op setter written to stand in for one;
+- a setter with no getter is a compile error: the whole-object listing would have no value to show for the endpoint;
+- `#[repe(typed)]` composes, on the getter, exactly as it does on a field.
+
+`#[repe(skip)]` and `#[repe(rename = "...")]` are rejected here rather than silently ignored: the endpoint is the name given to `get`/`set`, and skipping half a pair has no meaning. Accessor endpoints take part in the same collision check as fields and methods.
+
 ### Reflection, and its floor
 
 Adding a **field** to the struct, or a **method** to the annotated block, adds the endpoint. Nothing restates a signature, so the served surface cannot fall behind the type.
@@ -200,6 +260,8 @@ It supports the same arities and the same `Result` mapping, and the two forms ma
 | `#[repe(readonly)]` | reads succeed, writes return `InvalidBody` |
 | `#[repe(nested)]` | descend into a field that is itself a `RepeStruct` |
 | `#[repe(typed)]` | encode a numeric slice as a BEVE typed array |
+
+For a field-shaped endpoint with no field behind it, see [Field-shaped endpoints](#field-shaped-endpoints).
 
 `#[repe(typed)]` routes a numeric array or `Vec` field to the bulk encoder behind [`MessageBuilder::body_typed_slice`](numeric-bodies.md) — one `copy_nonoverlapping` rather than a per-element serde walk, and byte-identical to what Glaze emits for the same array. That response carries `BodyFormat::Beve`; decode it with `Message::decode_typed_slice`. Writes to the field are unaffected and still take JSON. Inside the whole-object read the frame is already committed to JSON, so the field appears there as an ordinary JSON array; the typed encoding is what you get by reading the field on its own, which is the case it exists for.
 

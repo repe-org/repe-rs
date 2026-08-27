@@ -110,6 +110,26 @@ pub trait RepeMethods: MethodsDeclared {
     /// `(endpoint, signature)` pairs published in the whole-struct listing.
     const REPE_METHOD_SIGNATURES: &'static [(&'static str, &'static str)];
 
+    /// Endpoints in this table that are **field-shaped**: served by a
+    /// getter/setter pair (`#[repe(get = "...")]` / `#[repe(set = "...")]`)
+    /// rather than by an argument list.
+    ///
+    /// They are deliberately absent from
+    /// [`REPE_METHOD_SIGNATURES`](Self::REPE_METHOD_SIGNATURES), because they
+    /// have no signature to publish: a client reads and writes one the way it
+    /// reads and writes a field, so the whole-struct listing shows each one's
+    /// current value rather than a signature string. The derived listing reads
+    /// those values back through [`repe_call`](Self::repe_call).
+    ///
+    /// Defaults to empty, so a hand-written impl need not mention it. One
+    /// invariant comes with listing a name here, and the derived listing relies
+    /// on it: [`repe_call`](Self::repe_call) must answer
+    /// `segments = &[name], body = None` with `Ok(Some(value))`. A name the
+    /// table cannot dispatch turns every whole-struct read into that name's
+    /// error. `#[repe::methods]` upholds it by construction, because it emits
+    /// this list from the getters it generated arms for.
+    const REPE_ACCESSOR_ENDPOINTS: &'static [&'static str] = &[];
+
     /// Invoke the method named by `segments[0]`.
     ///
     /// `segments` is the remaining path relative to the struct root, so error
@@ -228,11 +248,15 @@ pub struct ResponseBody<'a> {
     /// True while this body is a value *inside* an enclosing JSON object, where
     /// the frame format is already committed to JSON.
     ///
-    /// Unreachable from generated code: the derive only hands out a nested body
-    /// for a `#[repe(nested)]` field, whose child is always entered with empty
-    /// segments and so always takes its own object branch. The flag is here for
-    /// hand-written `repe_handle_into` impls, which can call anything from
-    /// anywhere; a JSON-array fallback beats corrupting the frame.
+    /// Reached from generated code by exactly one path: the whole-struct listing
+    /// writes each accessor endpoint's value through
+    /// [`ObjectBody::entry_with`], so a `#[repe(typed)]` getter listed inside
+    /// the object emits a JSON array rather than switching the enclosing frame
+    /// to BEVE. (A `#[repe(nested)]` field also gets a nested body, but its
+    /// child is always entered with empty segments and so always takes its own
+    /// object branch.) The flag also covers hand-written `repe_handle_into`
+    /// impls, which can call anything from anywhere; a JSON-array fallback beats
+    /// corrupting the frame.
     nested: bool,
 }
 
@@ -442,27 +466,69 @@ fn write_optional(
     }
 }
 
-/// Compile-time check that no `#[repe::methods]` endpoint shadows a field.
+/// Compile-time check that the three sets of endpoints on one struct do not
+/// overlap.
 ///
 /// The two macros cannot see each other's input, so the derive emits a call to
-/// this against its own field names and the generated
-/// [`RepeMethods::REPE_METHOD_SIGNATURES`]. Without it a collision is silent and
-/// costly: the field wins dispatch, the method becomes permanently unreachable,
-/// and the whole-struct listing emits the same key twice.
+/// this against everything *it* publishes — fields, plus any method named in a
+/// struct-level `#[repe(methods(..))]` list — and the two generated
+/// [`RepeMethods`] tables. Without it a collision is silent and costly: one
+/// declaration wins dispatch, the other becomes permanently unreachable, and
+/// the whole-struct listing emits the same key twice. The two listings do not
+/// even agree on that last part, since a `serde_json::Map` deduplicates the key
+/// and the streaming encoder does not.
 ///
 /// Collisions the macros *can* see on their own — two fields, two listed
-/// methods, a field against a listed method, two methods in one impl block — are
-/// rejected at macro time with a message naming the endpoint.
-pub const fn assert_no_endpoint_collision(fields: &[&str], methods: &[(&str, &str)]) {
+/// methods, a field against a listed method, two endpoints in one
+/// `#[repe::methods]` block — are rejected at macro time with a message naming
+/// the endpoint and pointing at the second declaration.
+///
+/// The third pairing, methods against accessors, is unreachable from a
+/// generated table for the same reason; it is checked because a hand-written
+/// [`RepeMethods`] impl can produce it.
+pub const fn assert_no_endpoint_collision(
+    declared: &[&str],
+    methods: &[(&str, &str)],
+    accessors: &[&str],
+) {
     let mut i = 0;
     while i < methods.len() {
         let mut j = 0;
-        while j < fields.len() {
-            if const_str_eq(methods[i].0, fields[j]) {
+        while j < declared.len() {
+            if const_str_eq(methods[i].0, declared[j]) {
                 panic!(
-                    "a `#[repe::methods]` method and a field of the same struct share an \
-                     endpoint name: the field would win dispatch and the method could never \
-                     be called. Rename one with `#[repe(rename = \"...\")]`."
+                    "a `#[repe::methods]` method and an endpoint declared on the struct itself \
+                     share a name: the struct's declaration wins dispatch and the method could \
+                     never be called. Rename one with `#[repe(rename = \"...\")]`."
+                );
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+
+    let mut i = 0;
+    while i < accessors.len() {
+        let mut j = 0;
+        while j < declared.len() {
+            if const_str_eq(accessors[i], declared[j]) {
+                panic!(
+                    "a `#[repe(get = \"...\")]` accessor and an endpoint declared on the struct \
+                     itself share a name: the struct's declaration wins dispatch and the accessor \
+                     could never be called. Rename the struct's with \
+                     `#[repe(rename = \"...\")]`, or give the accessor a different endpoint."
+                );
+            }
+            j += 1;
+        }
+
+        let mut j = 0;
+        while j < methods.len() {
+            if const_str_eq(accessors[i], methods[j].0) {
+                panic!(
+                    "a `#[repe::methods]` method and a `#[repe(get = \"...\")]` accessor in the \
+                     same table share an endpoint name: one of them is unreachable, and the \
+                     whole-struct listing would show the endpoint twice."
                 );
             }
             j += 1;

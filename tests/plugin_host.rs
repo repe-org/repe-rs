@@ -21,6 +21,8 @@ use std::process::Command;
 use repe::constants::{ErrorCode, QueryFormat};
 use repe::message::Message;
 use repe::plugin::host::{HostError, Plugin};
+use repe::server::Router;
+use std::sync::Arc;
 
 /// Build the plugin example as a `cdylib` and return the artifact's path.
 ///
@@ -230,6 +232,86 @@ fn a_real_shared_library_loads_and_serves() {
         6,
         "both handles drive one instance, so the state is shared"
     );
+
+    // --- mounted on a router, which is what `with_fallback` is for ---------
+    // The seam the two halves meet at: the router resolves its own routes
+    // first and hands every miss to the plugin, which claims what is under
+    // its root and declines the rest. Scoped so the extra handle goes away
+    // before the shutdown below.
+    {
+        // SAFETY: as above — the same library, already resident.
+        let mounted = unsafe { Plugin::load(&path) }.expect("already resident");
+        let router = Router::new()
+            .with_json("/local", |_| Ok(serde_json::json!("served by the host")))
+            .with_fallback(Arc::new(mounted));
+
+        // A route the host owns is untouched by the fallback.
+        let message = parse(
+            &router
+                .call(&write("/local", 11, &serde_json::Value::Null))
+                .unwrap(),
+        );
+        assert_eq!(message.json_body::<String>().unwrap(), "served by the host");
+
+        // Under the plugin's root, the plugin's own frame comes back whole —
+        // body, id, and the query it echoed.
+        let message = parse(&router.call(&read("/instrument/channel", 12)).unwrap());
+        assert_eq!(message.json_body::<u32>().unwrap(), 6);
+        assert_eq!(message.header.id, 12);
+        assert_eq!(message.query_utf8(), "/instrument/channel");
+
+        // A BEVE body survives the round trip through the router as well.
+        let message = parse(&router.call(&read("/instrument/samples", 13)).unwrap());
+        assert_eq!(message.decode_typed_slice::<f64>().unwrap().len(), 8);
+
+        // Outside the plugin's root nobody claims the path, and the caller is
+        // told so rather than left waiting.
+        let message = parse(&router.call(&read("/elsewhere", 14)).unwrap());
+        assert_eq!(message.error_code(), Some(ErrorCode::MethodNotFound));
+
+        // A path the plugin claims but does not serve is refused by the plugin,
+        // and that frame is forwarded rather than replaced. The two are told
+        // apart by their text: the struct mounted at the plugin's root frames
+        // its own miss, where the host's disclaim above says "Method not found".
+        let frame = router
+            .call(&read("/instrument/absent", 141))
+            .expect("answered");
+        let message = Message::from_slice(&frame).unwrap();
+        assert_eq!(message.error_code(), Some(ErrorCode::MethodNotFound));
+        let text = message.error_message_utf8().unwrap();
+        assert!(
+            !text.starts_with("Method not found:"),
+            "the plugin's own frame was replaced by the host's: {text:?}"
+        );
+
+        // Notify semantics carry through the mount: nothing is written back —
+        // and the notify actually reaches the plugin, which the `is_none()`
+        // alone cannot show, since dispatch discards a notify's response
+        // whatever the handler did. So gain is moved off its reset value first,
+        // and the notify is what puts it back.
+        router
+            .call(&write("/instrument/calibrate", 15, &8.0f64))
+            .expect("answered");
+        let notify = Message::builder()
+            .id(16)
+            .notify(true)
+            .query_str("/instrument/reset")
+            .query_format(QueryFormat::JsonPointer)
+            .build()
+            .to_vec();
+        assert!(router.call(&notify).is_none());
+        let frame = router
+            .call(&read("/instrument/gain", 17))
+            .expect("answered");
+        assert_eq!(
+            Message::from_slice(&frame)
+                .unwrap()
+                .json_body::<f64>()
+                .unwrap(),
+            1.0,
+            "the notify reached the plugin and reset its gain"
+        );
+    }
 
     // --- shutdown, last, because the whole process sees it -----------------
     plugin.shutdown();

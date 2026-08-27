@@ -208,18 +208,25 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
     // marker cannot compile; and the fallthrough below names `RepeMethods`, so
     // this marker without a block cannot either.
     let handshake = from_impl_block.then(|| {
-        let field_names = field_specs
+        // Everything the *derive* publishes: fields, plus any method named in a
+        // struct-level `#[repe(methods(..))]` list. Both win dispatch over the
+        // impl block's table, so both have to be in the cross-macro check —
+        // leaving the listed methods out is how a struct-list method and an
+        // impl-block accessor of the same name once compiled clean and emitted
+        // the key twice.
+        let declared: Vec<LitStr> = endpoints
             .iter()
-            .filter(|field| !field.attrs.skip)
-            .map(|field| LitStr::new(&field.endpoint, Span::call_site()));
+            .map(|(endpoint, _)| LitStr::new(endpoint, Span::call_site()))
+            .collect();
         quote! {
             impl #repe::structs::MethodsDeclared for #struct_ident {}
 
             // The cross-macro half of the collision check: neither macro sees
-            // the other's endpoint names, but the generated const does.
+            // the other's endpoint names, but the generated consts do.
             const _: () = #repe::structs::assert_no_endpoint_collision(
-                &[#(#field_names),*],
+                &[#(#declared),*],
                 <#struct_ident as #repe::structs::RepeMethods>::REPE_METHOD_SIGNATURES,
+                <#struct_ident as #repe::structs::RepeMethods>::REPE_ACCESSOR_ENDPOINTS,
             );
         }
     });
@@ -727,6 +734,38 @@ fn build_listing(
                 }
             },
         });
+        // A field-shaped endpoint is listed the way a field is: by its value.
+        // The value has to come back through `repe_call` rather than from a
+        // getter call emitted here, because this derive cannot see the impl
+        // block and so does not know a single getter's name — the endpoint list
+        // is all it has. That indirection costs a match scan per accessor, so a
+        // whole-object read of a struct with many accessors is quadratic in the
+        // endpoint count; the same read of an all-field struct is not.
+        //
+        // A getter that returns `Err` fails the whole listing, exactly as a
+        // field whose `Serialize` impl fails does. That is the field analogy
+        // held to consistently rather than an oversight, and it is why a getter
+        // meant to be listed should report a sentinel rather than an error.
+        entries.push(match sink {
+            Sink::Value => quote! {
+                for &name in <Self as #repe::structs::RepeMethods>::REPE_ACCESSOR_ENDPOINTS {
+                    let value = <Self as #repe::structs::RepeMethods>::repe_call(self, &[name], None)?;
+                    map.insert(
+                        String::from(name),
+                        value.unwrap_or(::serde_json::Value::Null),
+                    );
+                }
+            },
+            Sink::Encode => quote! {
+                for &name in <Self as #repe::structs::RepeMethods>::REPE_ACCESSOR_ENDPOINTS {
+                    __repe_obj.entry_with(name, |__repe_nested| {
+                        <Self as #repe::structs::RepeMethods>::repe_call_into(
+                            self, &[name], None, __repe_nested,
+                        )
+                    })?;
+                }
+            },
+        });
     }
 
     match sink {
@@ -932,16 +971,51 @@ fn build_method_arm(method: &MethodSpec, repe: &TokenStream2, sink: Sink) -> Tok
         }
     };
 
-    let invocation = quote! { Self::#method_ident(self #(, #bindings)*) };
     let ok_is_unit = method.ret.ok_is_unit();
     let emit_ok = if ok_is_unit {
         sink.emit_null()
     } else {
         sink.emit_value(repe, &path, quote! { __repe_ok })
     };
+    let call_and_emit = call_and_emit(
+        quote! { Self::#method_ident(self #(, #bindings)*) },
+        &method.ret,
+        emit_ok,
+        repe,
+        &path,
+    );
 
-    let call_and_emit = if method.ret.fallible {
-        let ok_pattern = if ok_is_unit {
+    quote! {
+        #key => {
+            if !tail.is_empty() {
+                return Err(#repe::StructError::InvalidSubpath {
+                    path: #repe::structs::path_from_segments(segments),
+                });
+            }
+            #decode_args
+            #call_and_emit
+        }
+    }
+}
+
+/// Call a published method and turn what it returned into a response.
+///
+/// `emit_ok` is the response for a success, written against a binding named
+/// `__repe_ok` when the `Ok` type is not `()`. A declared `Result` turns `Err`
+/// into a [`StructError::Execution`] naming `path`, rather than serializing the
+/// `Result` itself.
+///
+/// Shared by the method arms and by both halves of an accessor pair, so a
+/// getter that fails reports it exactly as a method that fails does.
+fn call_and_emit(
+    invocation: TokenStream2,
+    ret: &ReturnSpec,
+    emit_ok: TokenStream2,
+    repe: &TokenStream2,
+    path: &LitStr,
+) -> TokenStream2 {
+    if ret.fallible {
+        let ok_pattern = if ret.ok_is_unit() {
             quote! { Ok(_) }
         } else {
             quote! { Ok(__repe_ok) }
@@ -955,15 +1029,84 @@ fn build_method_arm(method: &MethodSpec, repe: &TokenStream2, sink: Sink) -> Tok
                 }),
             }
         }
-    } else if ok_is_unit {
+    } else if ret.ok_is_unit() {
+        // Braced so every branch is an *expression*, usable as a match arm body
+        // as well as a statement tail.
         quote! {
-            #invocation;
-            #emit_ok
+            {
+                #invocation;
+                #emit_ok
+            }
         }
     } else {
         quote! {
-            let __repe_ok = #invocation;
-            #emit_ok
+            {
+                let __repe_ok = #invocation;
+                #emit_ok
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Accessor arms
+// ---------------------------------------------------------------------------
+
+/// One dispatch arm for a field-shaped endpoint, shaped exactly like the arm
+/// [`build_field_arms`] emits for a real field: no body reads, a body writes,
+/// and a trailing path segment is a `InvalidSubpath` either way.
+///
+/// The only difference is where the value comes from — a getter call instead of
+/// a field read, a setter call instead of an assignment — which is the whole
+/// point of the attribute.
+fn build_accessor_arm(accessor: &AccessorSpec, repe: &TokenStream2, sink: Sink) -> TokenStream2 {
+    let key = LitStr::new(&accessor.endpoint, Span::call_site());
+    let path = LitStr::new(&format!("/{}", accessor.endpoint), Span::call_site());
+
+    let getter = &accessor.get.method_ident;
+    let emit = if accessor.typed {
+        sink.emit_typed_slice(repe, &path, quote! { __repe_ok })
+    } else {
+        sink.emit_value(repe, &path, quote! { __repe_ok })
+    };
+    let read = call_and_emit(
+        quote! { Self::#getter(self) },
+        &accessor.get.ret,
+        emit,
+        repe,
+        &path,
+    );
+
+    // A getter with no setter *is* a read-only endpoint, so the refusal is the
+    // same one `#[repe(readonly)]` produces on a field. Emitting only the
+    // rejection — never a write followed by dead code — keeps generated code
+    // clean under `#![deny(warnings)]`, as the field arms do.
+    let write = match &accessor.set {
+        None => quote! {
+            Some(_) => Err(#repe::StructError::BodyUnexpected {
+                path: #repe::structs::path_from_segments(segments),
+            }),
+        },
+        Some(set) => {
+            let setter = &set.method_ident;
+            let ty = &set.args[0].1;
+            let call = call_and_emit(
+                quote! { Self::#setter(self, __repe_arg) },
+                &set.ret,
+                sink.emit_null(),
+                repe,
+                &path,
+            );
+            quote! {
+                Some(value) => {
+                    let __repe_arg: #ty = ::serde_json::from_value(value)
+                        .map_err(|source| #repe::StructError::Deserialize {
+                            path: String::from(#path),
+                            source,
+                        })?;
+                    #call
+                }
+            }
         }
     };
 
@@ -974,8 +1117,10 @@ fn build_method_arm(method: &MethodSpec, repe: &TokenStream2, sink: Sink) -> Tok
                     path: #repe::structs::path_from_segments(segments),
                 });
             }
-            #decode_args
-            #call_and_emit
+            match body {
+                None => #read,
+                #write
+            }
         }
     }
 }
@@ -997,14 +1142,14 @@ fn expand_methods(mut item_impl: ItemImpl) -> TokenStream2 {
     }
 
     match collect_methods(&item_impl, stripped) {
-        Ok(specs) => methods_impl(&item_impl, &specs, &repe),
+        Ok(published) => methods_impl(&item_impl, &published, &repe),
         Err(err) => {
             // Emit the diagnostic *and* a table with nothing in it. Failing with
             // the error alone would drop the `RepeMethods` impl and add a second,
             // misleading "no `#[repe::methods]` impl block" error on top of the
             // real one.
             let error = err.to_compile_error();
-            let empty = methods_impl(&item_impl, &[], &repe);
+            let empty = methods_impl(&item_impl, &PublishedItems::default(), &repe);
             quote! {
                 #error
                 #empty
@@ -1013,11 +1158,79 @@ fn expand_methods(mut item_impl: ItemImpl) -> TokenStream2 {
     }
 }
 
+/// Which of the three published shapes one signature in a `#[repe::methods]`
+/// block takes.
+enum Published {
+    /// An ordinary endpoint: the request body carries the arguments.
+    Method,
+    /// The read half of a field-shaped endpoint, carrying whether the getter
+    /// asked for the BEVE typed-slice encoding.
+    Get { typed: bool },
+    /// The write half of a field-shaped endpoint.
+    Set,
+}
+
+/// A **field-shaped endpoint** backed by a getter/setter pair.
+///
+/// The wire shape is a field's — a bodiless request reads it, a request with a
+/// body writes it, and the whole-struct listing shows its value — while the
+/// implementation is two methods. That is the one endpoint shape a struct
+/// cannot express by naming a field: a value that is derived, unit-converted,
+/// or backed by a register rather than by storage.
+struct AccessorSpec {
+    endpoint: String,
+    /// The read half. Every accessor has one: without it the whole-struct
+    /// listing would have no value to show for the endpoint.
+    get: MethodSpec,
+    /// `#[repe(typed)]` on the getter: encode the value as a BEVE typed numeric
+    /// array, exactly as the field attribute of the same name does.
+    typed: bool,
+    /// The write half, absent for a read-only accessor — which is how a
+    /// read-only field-shaped endpoint is spelled: there is no setter to call,
+    /// so a write is refused the way `#[repe(readonly)]` refuses one.
+    set: Option<MethodSpec>,
+}
+
+/// Everything one `#[repe::methods]` block publishes.
+#[derive(Default)]
+struct PublishedItems {
+    methods: Vec<MethodSpec>,
+    accessors: Vec<AccessorSpec>,
+}
+
+/// Reject two `#[repe(get = "x")]` methods, or two `#[repe(set = "x")]` methods,
+/// claiming one endpoint.
+///
+/// Separate from [`reject_duplicate_endpoints`] only for the remedy: that one
+/// recommends `#[repe(rename = "...")]`, which is itself a hard error on an
+/// accessor half.
+fn reject_duplicate_accessor_half<'a>(
+    halves: &(impl Iterator<Item = &'a MethodSpec> + Clone),
+    key: &str,
+) -> syn::Result<()> {
+    let mut seen: Vec<&str> = Vec::new();
+    for spec in halves.clone() {
+        if seen.contains(&spec.endpoint.as_str()) {
+            return Err(syn::Error::new(
+                spec.method_ident.span(),
+                format!(
+                    "two methods claim `#[repe({key} = \"{endpoint}\")]`; a field-shaped \
+                     endpoint has one read half and one write half, so one of these could never \
+                     be called. Give one of them a different endpoint.",
+                    endpoint = spec.endpoint
+                ),
+            ));
+        }
+        seen.push(&spec.endpoint);
+    }
+    Ok(())
+}
+
 /// Validate every method in the block and collect what will be published.
 fn collect_methods(
     item_impl: &ItemImpl,
     stripped: Vec<syn::Result<MethodAttrs>>,
-) -> syn::Result<Vec<MethodSpec>> {
+) -> syn::Result<PublishedItems> {
     if let Some((_, path, _)) = &item_impl.trait_ {
         return Err(syn::Error::new_spanned(
             path,
@@ -1025,7 +1238,11 @@ fn collect_methods(
         ));
     }
 
-    let mut specs: Vec<MethodSpec> = Vec::new();
+    let mut methods: Vec<MethodSpec> = Vec::new();
+    // Halves arrive in source order and are paired afterwards, so the two halves
+    // of one endpoint need not sit next to each other.
+    let mut getters: Vec<(MethodSpec, bool)> = Vec::new();
+    let mut setters: Vec<MethodSpec> = Vec::new();
     let mut stripped = stripped.into_iter();
     for item in &item_impl.items {
         let ImplItem::Fn(func) = item else {
@@ -1037,33 +1254,95 @@ fn collect_methods(
         if attrs.skip {
             continue;
         }
-        if let Some(spec) = parse_impl_method(&func.sig, &func.attrs, attrs)? {
-            specs.push(spec);
+        let Some((published, spec)) = parse_impl_method(&func.sig, &func.attrs, attrs)? else {
+            continue;
+        };
+        match published {
+            Published::Method => methods.push(spec),
+            Published::Get { typed } => getters.push((spec, typed)),
+            Published::Set => setters.push(spec),
         }
     }
 
-    let endpoints: Vec<(&str, Span)> = specs
+    // Each half is checked on its own, with its own message: the generic
+    // duplicate-endpoint error recommends `#[repe(rename = "...")]`, which is a
+    // hard error on an accessor half, so it would send the reader somewhere the
+    // macro refuses to follow.
+    reject_duplicate_accessor_half(&getters.iter().map(|(spec, _)| spec), "get")?;
+    reject_duplicate_accessor_half(&setters.iter(), "set")?;
+
+    let mut accessors: Vec<AccessorSpec> = Vec::new();
+    for (get, typed) in getters {
+        let set = setters
+            .iter()
+            .position(|spec| spec.endpoint == get.endpoint)
+            .map(|index| setters.remove(index));
+        accessors.push(AccessorSpec {
+            endpoint: get.endpoint.clone(),
+            get,
+            typed,
+            set,
+        });
+    }
+    // A setter with no getter left over. Publishing it would give the endpoint a
+    // value the listing cannot show and a client cannot read back, so the shape
+    // is refused rather than half-served.
+    if let Some(orphan) = setters.first() {
+        return Err(syn::Error::new(
+            orphan.method_ident.span(),
+            format!(
+                "`#[repe(set = \"{endpoint}\")]` has no matching \
+                 `#[repe(get = \"{endpoint}\")]` in this block: a field-shaped endpoint that \
+                 cannot be read has no value for the whole-struct listing to show. Add the read \
+                 half, or publish this as an ordinary method.",
+                endpoint = orphan.endpoint
+            ),
+        ));
+    }
+
+    let endpoints: Vec<(&str, Span)> = methods
         .iter()
         .map(|spec| (spec.endpoint.as_str(), spec.method_ident.span()))
+        .chain(
+            accessors
+                .iter()
+                .map(|spec| (spec.endpoint.as_str(), spec.get.method_ident.span())),
+        )
         .collect();
     reject_duplicate_endpoints(&endpoints)?;
-    Ok(specs)
+    Ok(PublishedItems { methods, accessors })
 }
 
-/// The impl block itself plus the `RepeMethods` table for `specs`.
-fn methods_impl(item_impl: &ItemImpl, specs: &[MethodSpec], repe: &TokenStream2) -> TokenStream2 {
+/// The impl block itself plus the `RepeMethods` table for `published`.
+fn methods_impl(
+    item_impl: &ItemImpl,
+    published: &PublishedItems,
+    repe: &TokenStream2,
+) -> TokenStream2 {
     let self_ty = &item_impl.self_ty;
     let (impl_generics, _ty_generics, where_clause) = item_impl.generics.split_for_impl();
 
-    let signatures = specs.iter().map(|spec| {
+    let signatures = published.methods.iter().map(|spec| {
         let endpoint = LitStr::new(&spec.endpoint, Span::call_site());
         let signature = LitStr::new(&spec.signature_display, Span::call_site());
         quote! { (#endpoint, #signature) }
     });
+    let accessor_endpoints = published
+        .accessors
+        .iter()
+        .map(|spec| LitStr::new(&spec.endpoint, Span::call_site()));
 
     let mut bodies = Vec::new();
     for sink in [Sink::Value, Sink::Encode] {
-        let arms = build_method_arms(specs, repe, sink);
+        let arms = build_method_arms(&published.methods, repe, sink)
+            .into_iter()
+            .chain(
+                published
+                    .accessors
+                    .iter()
+                    .map(|accessor| build_accessor_arm(accessor, repe, sink)),
+            )
+            .collect::<Vec<_>>();
         let (signature, ret, unused) = match sink {
             Sink::Value => (
                 quote! {
@@ -1115,6 +1394,9 @@ fn methods_impl(item_impl: &ItemImpl, specs: &[MethodSpec], repe: &TokenStream2)
             const REPE_METHOD_SIGNATURES: &'static [(&'static str, &'static str)] =
                 &[#(#signatures),*];
 
+            const REPE_ACCESSOR_ENDPOINTS: &'static [&'static str] =
+                &[#(#accessor_endpoints),*];
+
             #(#bodies)*
         }
     }
@@ -1124,6 +1406,22 @@ fn methods_impl(item_impl: &ItemImpl, specs: &[MethodSpec], repe: &TokenStream2)
 struct MethodAttrs {
     rename: Option<String>,
     skip: bool,
+    /// `#[repe(get = "endpoint")]`: this method is the read half of the
+    /// field-shaped endpoint it names.
+    get: Option<LitStr>,
+    /// `#[repe(set = "endpoint")]`: this method is the write half.
+    set: Option<LitStr>,
+    /// `#[repe(typed)]` on a getter, the accessor twin of the field attribute.
+    /// Carries its own span, which is the only one an error about it can point
+    /// at when there is no `get`/`set` literal to blame.
+    typed: Option<Span>,
+}
+
+impl MethodAttrs {
+    /// The endpoint this method serves as an accessor half, if it is one.
+    fn accessor_endpoint(&self) -> Option<&LitStr> {
+        self.get.as_ref().or(self.set.as_ref())
+    }
 }
 
 /// Read the `#[repe(..)]` attributes off a method in a `#[repe::methods]` block
@@ -1139,11 +1437,83 @@ fn take_method_attrs(attrs: &mut Vec<Attribute>) -> syn::Result<MethodAttrs> {
             if parse_shared_meta(&meta, &mut parsed.rename, &mut parsed.skip)? {
                 return Ok(());
             }
+            if meta.path.is_ident("get") {
+                parsed.get = Some(meta.value()?.parse()?);
+                return Ok(());
+            }
+            if meta.path.is_ident("set") {
+                parsed.set = Some(meta.value()?.parse()?);
+                return Ok(());
+            }
+            if meta.path.is_ident("typed") {
+                parsed.typed = Some(meta.path.span());
+                return Ok(());
+            }
             Err(meta.error("unsupported `repe` method attribute"))
         })?;
     }
     attrs.retain(|attr| !attr.path().is_ident("repe"));
+    validate_method_attrs(&parsed)?;
     Ok(parsed)
+}
+
+/// Reject combinations of method attributes that contradict each other, before
+/// any of them reaches code generation.
+fn validate_method_attrs(attrs: &MethodAttrs) -> syn::Result<()> {
+    if let (Some(get), Some(_)) = (&attrs.get, &attrs.set) {
+        return Err(syn::Error::new_spanned(
+            get,
+            "a method is either the `get` half of a field-shaped endpoint or the `set` half, not \
+             both: one takes no arguments and returns the value, the other takes the value and \
+             returns nothing",
+        ));
+    }
+    let Some(endpoint) = attrs.accessor_endpoint() else {
+        if let Some(typed) = attrs.typed {
+            return Err(syn::Error::new(
+                typed,
+                "`#[repe(typed)]` applies to the `get` half of a field-shaped endpoint; an \
+                 ordinary method's return value is always encoded as JSON",
+            ));
+        }
+        return Ok(());
+    };
+    if attrs.skip {
+        return Err(syn::Error::new_spanned(
+            endpoint,
+            "`#[repe(skip)]` and `#[repe(get/set)]` contradict each other: one withholds the \
+             method from the served surface, the other publishes it",
+        ));
+    }
+    if attrs.rename.is_some() {
+        return Err(syn::Error::new_spanned(
+            endpoint,
+            "`#[repe(rename = \"...\")]` has nothing to rename here: the endpoint of a \
+             field-shaped accessor is the name given to `get`/`set`",
+        ));
+    }
+    if attrs.typed.is_some() && attrs.set.is_some() {
+        return Err(syn::Error::new_spanned(
+            endpoint,
+            "`#[repe(typed)]` describes how a value is *encoded* into a response, so it belongs \
+             on the `get` half; a `set` decodes whatever the client sent",
+        ));
+    }
+    let value = endpoint.value();
+    if value.is_empty() {
+        return Err(syn::Error::new_spanned(
+            endpoint,
+            "a field-shaped endpoint needs a name",
+        ));
+    }
+    if value.contains('/') {
+        return Err(syn::Error::new_spanned(
+            endpoint,
+            "a field-shaped endpoint is one path segment below the struct root, so it cannot \
+             contain `/`",
+        ));
+    }
+    Ok(())
 }
 
 /// Turn one signature from a `#[repe::methods]` block into a published method,
@@ -1152,10 +1522,17 @@ fn parse_impl_method(
     sig: &Signature,
     remaining_attrs: &[Attribute],
     attrs: MethodAttrs,
-) -> syn::Result<Option<MethodSpec>> {
+) -> syn::Result<Option<(Published, MethodSpec)>> {
     let Some(FnArg::Receiver(receiver)) = sig.inputs.first() else {
         // An associated function has no instance to dispatch on. `Self::new()`
         // and friends belong in the block; they are simply not endpoints.
+        if let Some(endpoint) = attrs.accessor_endpoint() {
+            return Err(syn::Error::new_spanned(
+                endpoint,
+                "a field-shaped endpoint is served by a method on the instance, so its halves \
+                 need a `&self` or `&mut self` receiver",
+            ));
+        }
         return Ok(None);
     };
 
@@ -1258,15 +1635,64 @@ fn parse_impl_method(
     }
     let ret = classify_return(&ret_ty);
     let signature_display = build_signature_string(kind, &args, &ret);
-    let endpoint = attrs.rename.unwrap_or_else(|| sig.ident.to_string());
 
-    Ok(Some(MethodSpec {
-        endpoint,
-        method_ident: sig.ident.clone(),
-        args,
-        ret,
-        signature_display,
-    }))
+    let (published, endpoint) = match (&attrs.get, &attrs.set) {
+        (Some(name), _) => {
+            if !args.is_empty() {
+                return Err(syn::Error::new_spanned(
+                    &sig.inputs,
+                    "the `get` half of a field-shaped endpoint takes no arguments: a client reads \
+                     it the way it reads a field, with no request body to decode them from",
+                ));
+            }
+            if ret.ok_is_unit() {
+                return Err(syn::Error::new_spanned(
+                    &sig.output,
+                    "the `get` half of a field-shaped endpoint has to return the value; a read \
+                     that yields nothing has nothing to publish",
+                ));
+            }
+            (
+                Published::Get {
+                    typed: attrs.typed.is_some(),
+                },
+                name.value(),
+            )
+        }
+        (None, Some(name)) => {
+            if args.len() != 1 {
+                return Err(syn::Error::new_spanned(
+                    &sig.inputs,
+                    "the `set` half of a field-shaped endpoint takes exactly one argument: the \
+                     request body *is* the new value, as it is for a field write",
+                ));
+            }
+            if !ret.ok_is_unit() {
+                return Err(syn::Error::new_spanned(
+                    &sig.output,
+                    "the `set` half of a field-shaped endpoint returns nothing (or \
+                     `Result<(), E>`): a field write is acknowledged with `null`, so a returned \
+                     value would be silently dropped",
+                ));
+            }
+            (Published::Set, name.value())
+        }
+        (None, None) => (
+            Published::Method,
+            attrs.rename.unwrap_or_else(|| sig.ident.to_string()),
+        ),
+    };
+
+    Ok(Some((
+        published,
+        MethodSpec {
+            endpoint,
+            method_ident: sig.ident.clone(),
+            args,
+            ret,
+            signature_display,
+        },
+    )))
 }
 
 // ---------------------------------------------------------------------------

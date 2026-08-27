@@ -1136,9 +1136,26 @@ pub fn create_error_response_like(
     code: ErrorCode,
     msg: impl AsRef<str>,
 ) -> Message {
+    create_error_response_for(request.header.id, &request.query, code, msg)
+}
+
+/// [`create_error_response_like`] against a request's id and query rather than
+/// the whole request.
+///
+/// Those two fields are all an error response takes from a request; everything
+/// else in it comes from [`create_error_message`]. A caller holding them
+/// separately — a borrowed [`MessageView`], or a handler that has already split
+/// them out — reaches this directly instead of materializing a `Message` for two
+/// fields to be read back out of.
+pub fn create_error_response_for(
+    id: u64,
+    query: &[u8],
+    code: ErrorCode,
+    msg: impl AsRef<str>,
+) -> Message {
     let mut err = create_error_message(code, msg.as_ref());
-    err.header.id = request.header.id;
-    err.query = request.query.clone();
+    err.header.id = id;
+    err.query = query.to_vec();
     err.header.query_length = err.query.len() as u64;
     err.header.length = HEADER_SIZE as u64 + err.header.query_length + err.header.body_length;
     err
