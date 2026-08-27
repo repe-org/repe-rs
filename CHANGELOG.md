@@ -19,7 +19,7 @@
 
   Reads carry a strong `ETag` (FNV-1a/64, so instances behind one load balancer agree) plus `Vary: Accept` and a configurable `Cache-Control`, so a conditional `GET` costs a `304` with no body. Bodies negotiate JSON against BEVE on both legs. Failures answer as RFC 9457 problem details carrying the originating REPE error code.
 
-  Safety defaults assume an unauthenticated deployment: `read_only`, `allow_root_write`, and `accept_beve_bodies` are all off unless asked for. The last of these is not a preference — `beve` 8's deserializer has no recursion limit, so a few KB of nested array tags overflow the stack, and a Rust stack overflow aborts the process rather than unwinding. BEVE responses are unaffected. `serve` caps concurrent connections and applies a header-read timeout, so idle-connection floods cannot walk the process to its descriptor limit.
+  Safety defaults assume an unauthenticated deployment: `read_only` and `allow_root_write` are both off unless asked for. `serve` caps concurrent connections and bounds each request with a timeout, so idle-connection floods and half-sent bodies cannot walk the process to its descriptor limit.
 
   `If-Match` is honored on writes (strong comparison, `412` on failure), so the validators reads hand out are usable for optimistic concurrency. Error responses carry `Cache-Control: no-store`, since RFC 9111 makes 404 and 405 heuristically cacheable and a cached 405 outlives the `Allow` it advertised. `OPTIONS *` reports the server-wide method set.
 
@@ -28,6 +28,15 @@
 - **`Registry::write_if` / `Registry::call`.** A conditional write whose comparison and write are one critical section, and a dispatch that is committed to calling a function rather than re-deciding from the body. `dispatch` gives neither: evaluating a validator with a separate read and then writing is check-then-act, and a caller that already resolved "this is a value" races anyone registering a function at that pointer in between — losing by handing its write payload to a function as arguments.
 
 - **`Registry::is_function`.** Whether a pointer names a registered function rather than a value. The registry decides read-vs-write-vs-call from the body alone, which is right for REPE; a caller that must commit to a verb before it has a body needs the distinction up front, and probing it with a read is not a substitute because a read of a function returns a descriptor a stored value could equally well contain.
+
+### Changed
+- **`beve` moves to 9.** A security release: the decoders had no recursion limit, and nesting is declared by the input rather than by the destination type, so a few KB of nested array tags recursed until the thread stack was gone. That is not an ordinary parse failure — a Rust stack overflow *aborts* rather than unwinding, so no `Result` carried it and the per-connection `catch_unwind` in the servers could not contain it. One anonymous request took down every other connection the process was serving. Input nested past `beve::MAX_RECURSION_DEPTH` (128) is now refused, and repe answers it with `ErrorCode::ParseError` like any other malformed body.
+
+  `beve::Error` also becomes `#[non_exhaustive]` in that release. repe only wraps it (`RepeError::Beve`), so nothing in the public API changes, but a downstream crate matching it exhaustively needs a wildcard arm.
+
+  Nothing else in beve 9 reaches repe: the `mat` feature it also moves is not enabled here.
+
+- **`RestConfig::accept_beve_bodies` now defaults to `true`.** Its entire reason for being off was the decoder above, which is fixed; a nested body is now a `400` rather than a dead process. The knob stays, because refusing a media type you do not document is a legitimate policy, but it is no longer a safety default.
 
 ### Fixed
 - **The derive macros now work in this crate's own examples and doc-tests.** `proc_macro_crate` reports `FoundCrate::Itself` for every target that is not an integration test, so the generated paths were `crate::…` — correct for the library, wrong inside an example, where `crate` is the example. The macros now emit `::repe`, which `extern crate self as repe;` in `lib.rs` makes resolve from inside the library too. No effect on downstream crates, which were already on the `::repe` path.

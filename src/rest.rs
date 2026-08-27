@@ -140,18 +140,20 @@ pub struct RestConfig {
     /// grow the in-memory tree without bound. A gateway that legitimately
     /// accepts writes to known leaves almost never wants that too.
     pub allow_root_write: bool,
-    /// Accept BEVE request *bodies*. Defaults to `false`.
+    /// Accept BEVE request *bodies*. Defaults to `true`.
     ///
-    /// BEVE responses are always available — encoding is driven by the server's
-    /// own data and is not the hazard. Decoding is: as of `beve` 8, the
-    /// deserializer has no recursion limit, so a few kilobytes of nested array
-    /// tags overflow the thread stack, and a Rust stack overflow aborts the
-    /// process rather than unwinding into the per-connection catch. `serde_json`
-    /// caps its own recursion depth, so the JSON leg does not have this problem.
+    /// This was off by default while `beve` 8's deserializer had no recursion
+    /// limit: a few kilobytes of nested array tags overflowed the thread stack,
+    /// and a Rust stack overflow aborts the process rather than unwinding into
+    /// the per-connection catch, so one anonymous request took down every other
+    /// connection with it. `beve` 9 bounds nesting at `beve::MAX_RECURSION_DEPTH`
+    /// and reports the refusal as an ordinary error, which this gateway answers
+    /// with a `400` like any other malformed body. BEVE responses were never
+    /// affected — encoding is driven by the server's own data.
     ///
-    /// Off by default because this facade's whole premise is anonymous callers.
-    /// Turn it on for a gateway whose clients are already trusted — and prefer
-    /// pointing binary clients at the REPE leg, which is what they are for.
+    /// Still a knob, because content negotiation is policy: a gateway that
+    /// publishes a JSON-only contract can turn it off and refuse the media type
+    /// outright rather than accept a representation it does not document.
     pub accept_beve_bodies: bool,
     /// Maximum connections served concurrently by [`serve`](RestGateway::serve).
     /// Defaults to 1024.
@@ -186,7 +188,7 @@ impl Default for RestConfig {
             application_error_status: 500,
             read_only: false,
             allow_root_write: false,
-            accept_beve_bodies: false,
+            accept_beve_bodies: true,
             max_connections: 1024,
             request_timeout: Some(Duration::from_secs(30)),
         }
@@ -1440,14 +1442,10 @@ mod tests {
     }
 
     #[test]
-    fn a_beve_request_body_is_accepted_when_enabled() {
-        let gateway = gateway_with(RestConfig {
-            accept_beve_bodies: true,
-            ..RestConfig::default()
-        });
+    fn a_beve_request_body_is_accepted_by_default() {
         let body = beve::to_vec(&json!({ "a": 20, "b": 22 })).unwrap();
         let response =
-            gateway.respond(RestRequest::new("POST", "/api/v1/add").with_body(MEDIA_BEVE, &body));
+            gateway().respond(RestRequest::new("POST", "/api/v1/add").with_body(MEDIA_BEVE, &body));
         assert_eq!(response.status, 200);
         assert_eq!(json_body(&response), json!({ "result": 42 }));
     }
@@ -1674,21 +1672,39 @@ mod tests {
     // -- policy guards ------------------------------------------------------
 
     #[test]
-    fn beve_request_bodies_are_refused_unless_enabled() {
-        // The default matters more than usual here: `beve` 8 has no recursion
-        // limit, so a few KB of nested array tags overflow the stack, and a
-        // stack overflow aborts the process rather than unwinding into the
-        // per-connection catch. Anonymous callers do not get that decoder.
+    fn beve_request_bodies_are_refused_when_the_knob_is_off() {
+        let gateway = gateway_with(RestConfig {
+            accept_beve_bodies: false,
+            ..RestConfig::default()
+        });
         let body = beve::to_vec(&json!({ "a": 1, "b": 2 })).unwrap();
         let response =
-            gateway().respond(RestRequest::new("POST", "/api/v1/add").with_body(MEDIA_BEVE, &body));
+            gateway.respond(RestRequest::new("POST", "/api/v1/add").with_body(MEDIA_BEVE, &body));
         assert_eq!(response.status, 415);
 
-        // Responses are unaffected: encoding is driven by the server's own data.
+        // Responses are unaffected: encoding is driven by the server's own data,
+        // so the knob is about what the gateway accepts, not what it publishes.
         let read =
-            gateway().respond(RestRequest::new("GET", "/api/v1/config").with_accept(MEDIA_BEVE));
+            gateway.respond(RestRequest::new("GET", "/api/v1/config").with_accept(MEDIA_BEVE));
         assert_eq!(read.status, 200);
         assert_eq!(read.content_type, Some(MEDIA_BEVE));
+    }
+
+    #[test]
+    fn a_deeply_nested_beve_body_is_answered_rather_than_aborting() {
+        // Why BEVE bodies are on by default again. Nesting is declared by the
+        // input, so before `beve` 9 this was a few KB of anonymous request that
+        // aborted the process — a stack overflow does not unwind, so no `catch`
+        // in the gateway or in hyper could contain it. It is now an ordinary
+        // malformed body: 400, connection intact, every other request served.
+        let mut body = Vec::new();
+        for _ in 0..20_000 {
+            body.extend_from_slice(&[0x05, 0x04]);
+        }
+        body.extend_from_slice(&[0x05, 0x00]);
+        let response =
+            gateway().respond(RestRequest::new("POST", "/api/v1/add").with_body(MEDIA_BEVE, &body));
+        assert_eq!(response.status, 400);
     }
 
     #[test]

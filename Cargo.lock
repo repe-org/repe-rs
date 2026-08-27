@@ -111,9 +111,9 @@ dependencies = [
 
 [[package]]
 name = "beve"
-version = "8.0.0"
+version = "9.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5f36df50ad76787ac7d894b612ae9f312c32b21c432596937ef5f31cb8a992f"
+checksum = "12b20e4ea089380c789e48447fa9545f621d815320dc27804e6cdfe263349608"
 dependencies = [
  "bytemuck",
  "half",
