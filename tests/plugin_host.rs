@@ -28,57 +28,56 @@ use repe::plugin::host::{HostError, Plugin};
 /// declared `crate-type = ["cdylib"]`, so an ordinary `cargo test` never
 /// produces it, and a test that silently skipped when it was absent would report
 /// success having checked nothing.
+///
+/// The path comes from cargo's own JSON output rather than from arithmetic on
+/// `current_exe`. Deriving it looks easy and is not: nightly cargo builds test
+/// binaries into `<target>/debug/build/<pkg>/<hash>/out/`, where counting
+/// parents finds a hash where a profile name should be. Asking cargo removes the
+/// guess, and the profile with it — the plugin is built with the default one
+/// whatever this test was compiled with, since all it has to do is load.
 fn plugin_library() -> PathBuf {
-    // `<target>/<profile>/deps/<this test binary>`, so two levels up is the
-    // profile directory and three is the target directory. Deriving both from
-    // the running binary rather than assuming `target/debug` is what keeps this
-    // working under `--release`, a custom `CARGO_TARGET_DIR`, or a workspace.
-    let test_binary = std::env::current_exe().expect("the running test has a path");
-    let profile_dir = test_binary
-        .parent()
-        .and_then(Path::parent)
-        .expect("a test binary lives in <target>/<profile>/deps")
-        .to_path_buf();
-    let target_dir = profile_dir
-        .parent()
-        .expect("<profile> lives in <target>")
-        .to_path_buf();
-    let profile = profile_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .expect("the profile directory is named");
-
-    let mut cargo = Command::new(env!("CARGO"));
-    cargo
+    let output = Command::new(env!("CARGO"))
         .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .args(["build", "--features", "plugin", "--example", "repe_plugin"])
-        .arg("--target-dir")
-        .arg(&target_dir);
-    // Cargo's profile directory is named `debug` for the `dev` profile and after
-    // the profile itself otherwise.
-    match profile {
-        "debug" => {}
-        "release" => {
-            cargo.arg("--release");
-        }
-        custom => {
-            cargo.args(["--profile", custom]);
-        }
-    }
-
-    let status = cargo
-        .status()
+        .args([
+            "build",
+            "--features",
+            "plugin",
+            "--example",
+            "repe_plugin",
+            "--message-format=json-render-diagnostics",
+        ])
+        .output()
         .expect("cargo is on PATH inside a cargo test");
-    assert!(status.success(), "building the plugin example failed");
+    assert!(
+        output.status.success(),
+        "building the plugin example failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-    let library = profile_dir.join("examples").join(format!(
-        "{}repe_plugin{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
-    ));
+    // One `compiler-artifact` line per built target; the example's carries the
+    // shared library among its `filenames`. Matching on the suffix rather than
+    // taking the first is what keeps this right on a platform that emits an
+    // import library beside the `.dll`.
+    let library = String::from_utf8(output.stdout)
+        .expect("cargo's JSON output is UTF-8")
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|message| message["reason"] == "compiler-artifact")
+        .filter(|message| message["target"]["name"] == "repe_plugin")
+        .filter_map(|message| {
+            message["filenames"]
+                .as_array()?
+                .iter()
+                .filter_map(|name| name.as_str())
+                .find(|name| name.ends_with(std::env::consts::DLL_SUFFIX))
+                .map(PathBuf::from)
+        })
+        .next_back()
+        .expect("the plugin example reports a shared library among its artifacts");
+
     assert!(
         library.is_file(),
-        "the plugin example built but left no library at {}",
+        "cargo reported an artifact that is not there: {}",
         library.display()
     );
     library
