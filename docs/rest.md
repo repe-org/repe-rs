@@ -31,17 +31,20 @@ gateway.serve(listener).await
 
 TLS and identity are both out of scope. Put this behind a terminator that already handles certificate rotation, ALPN, and authentication — an ingress, an API gateway, a sidecar. `RestConfig` reduces blast radius; it is not an access-control system, and the defaults assume something in front is doing that job.
 
-Three defaults exist specifically to keep an unauthenticated deployment from being worse than it looks:
+Two defaults exist specifically to keep an unauthenticated deployment from being worse than it looks:
 
 - **`read_only`** (default `false`) answers every mutation with `405`. Reads are what this facade is for — the safe, cacheable, CDN-frontable half. A gateway that only publishes state should say so here rather than trust an upstream to filter methods.
 - **`allow_root_write`** (default `false`) refuses a `PUT` at the mount itself. The registry treats the empty pointer as a *merge* of the request object into the root, so such a write introduces keys the caller chose rather than assigning a value at a path the caller named — it can inject arbitrary state and grow the in-memory tree without bound. That is a different hazard from writing a known leaf, so it is a separate decision.
-- **`accept_beve_bodies`** (default `false`) refuses BEVE request bodies with `415`. See below.
 
-### Why BEVE request bodies are opt-in
+A third, **`accept_beve_bodies`**, defaults to `true` but is worth knowing about: see below.
 
-As of `beve` 8 the deserializer has no recursion limit. A few kilobytes of nested array tags overflow the thread stack, and a Rust stack overflow **aborts the process** rather than unwinding into the per-connection catch — so one unauthenticated request takes down the gateway and anything co-hosted with it. `serde_json` caps its own recursion depth, so the JSON leg does not have this problem, and `max_body_bytes` is three orders of magnitude too loose to help.
+### Why `accept_beve_bodies` exists
 
-BEVE *responses* are unaffected and always available: encoding is driven by the server's own data, not by an anonymous caller. Turn the request leg on only for a gateway whose clients are already trusted, and prefer pointing binary clients at the REPE leg, which is what it is for.
+It was off by default while `beve` 8's deserializer had no recursion limit. Nesting is declared by the input, so a few kilobytes of nested array tags overflowed the thread stack, and a Rust stack overflow **aborts the process** rather than unwinding into the per-connection catch — one unauthenticated request took down the gateway and anything co-hosted with it. `max_body_bytes` was three orders of magnitude too loose to help.
+
+`beve` 9 bounds nesting at `beve::MAX_RECURSION_DEPTH` and reports the refusal as an ordinary error, which the gateway answers with `400` like any other malformed body, so the default is now `true`. It remains a knob because content negotiation is policy: a gateway that publishes a JSON-only contract can turn it off and refuse `application/x-beve` with `415` rather than accept a representation it does not document.
+
+BEVE *responses* are unaffected either way and always available: encoding is driven by the server's own data, not by an anonymous caller.
 
 ## Why the translation is mechanical
 

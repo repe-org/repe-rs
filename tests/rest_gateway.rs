@@ -255,13 +255,7 @@ async fn a_call_round_trips_through_the_function() {
 
 #[tokio::test]
 async fn beve_is_negotiated_on_both_legs() {
-    // BEVE *bodies* are opt-in (see `RestConfig::accept_beve_bodies`); BEVE
-    // responses are not, and this exercises both legs.
-    let (addr, _registry) = start(RestConfig {
-        accept_beve_bodies: true,
-        ..RestConfig::default()
-    })
-    .await;
+    let (addr, _registry) = start(RestConfig::default()).await;
     let mut stream = connect(addr).await;
 
     let read = send(
