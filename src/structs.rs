@@ -116,12 +116,13 @@ pub trait RepeStruct: Send + Sync {
     ///   decline surfaces partway through an object: it rewinds the whole
     ///   object, so propagating its `None` is all a caller has to do.
     ///
-    /// A derived impl serves a listing only when nothing in it has to be
-    /// *invoked* — a struct with a field-shaped endpoint declines the whole
-    /// listing up front — because a decline discovered later would leave the
-    /// entries before it run twice, once here and once on the exclusive retry.
-    /// A hand-written impl that invokes anything before it can decide owes the
-    /// same care.
+    /// A derived impl settles the whole-object listing before it writes or
+    /// invokes anything, through
+    /// [`repe_listing_declines`](Self::repe_listing_declines) — because a
+    /// decline discovered later would leave the entries before it run twice,
+    /// once here and once on the exclusive retry, and a rewind cannot undo a
+    /// call. A hand-written impl that invokes anything before it can decide owes
+    /// the same care.
     fn repe_read_into(
         &self,
         segments: &[&str],
@@ -129,6 +130,39 @@ pub trait RepeStruct: Send + Sync {
     ) -> Option<StructResult<()>> {
         let _ = (segments, out);
         None
+    }
+
+    /// Whether a shared whole-object listing of this struct declines — asked
+    /// **before** the listing writes or invokes anything.
+    ///
+    /// A listing is the one read that composes many others, so a decline
+    /// discovered partway through is not recoverable: the exclusive retry
+    /// re-runs the entries before it, and an entry that was *invoked* rather
+    /// than serialized runs a second time. Rewinding the response buffer undoes
+    /// the bytes; it cannot undo a call.
+    ///
+    /// So the answer has to be available at the top, and it has to cover the
+    /// whole subtree — a parent's listing composes its children's, so a child
+    /// that declines takes the parent's listing with it. That is why this is on
+    /// [`RepeStruct`] rather than only on
+    /// [`RepeMethods::REPE_LISTING_NEEDS_EXCLUSIVE`], which answers the same
+    /// question about one method table's accessors and nothing beneath them. A
+    /// derived impl returns that const OR'd with every `#[repe(nested)]` child's
+    /// answer, so the whole tree is settled before the first byte is written.
+    ///
+    /// The default is `true`, which is the accurate answer for the default
+    /// [`repe_read_into`](Self::repe_read_into): it declines every path,
+    /// listings included. A hand-written impl that overrides `repe_read_into` to
+    /// serve a listing should override this too, or every derived struct nesting
+    /// it gives up its own shared listing.
+    ///
+    /// **Overriding it is a promise**, and it is the promise the invariant rests
+    /// on: returning `false` asserts that `repe_read_into(&[], ..)` answers
+    /// `Some(..)`. Breaking it still yields a correct response — the listing
+    /// rewinds and the exclusive path retries — but anything the shared attempt
+    /// had already invoked runs twice.
+    fn repe_listing_declines(&self) -> bool {
+        true
     }
 }
 
@@ -175,6 +209,39 @@ pub trait RepeMethods: MethodsDeclared {
     /// listing asks the same question of `repe_call_read_into`, where a `None`
     /// is not a failure — it declines the whole listing to the exclusive path.
     const REPE_ACCESSOR_ENDPOINTS: &'static [&'static str] = &[];
+
+    /// Whether the whole-struct listing must be served exclusively because some
+    /// entry in it can only be read through `&mut self`.
+    ///
+    /// This is the one question the shared listing has to settle **before** it
+    /// runs anything, and it is why it is a `const` rather than a check per
+    /// entry. A listing is the one read that composes many others; a decline
+    /// discovered partway through leaves the entries before it already invoked,
+    /// and the exclusive retry invokes them again. A `&self` getter over a read
+    /// counter would report the second call.
+    ///
+    /// Only the getter half of a field-shaped endpoint can force it. Fields
+    /// serialize, published signatures are string literals, and a nested child
+    /// declines before writing anything of its own — none of those is a *call*.
+    /// So this is `true` exactly when some accessor's getter takes `&mut self`.
+    ///
+    /// The default is the conservative one: any accessor at all forces the
+    /// exclusive path, which is what a hand-written table gets for free and what
+    /// this crate did for every table before the receiver was carried here.
+    /// `#[repe::methods]` overrides it with the answer it computed from the
+    /// receivers it has already seen, so a struct whose computed values are pure
+    /// reads keeps its shared listing — and so does every ancestor that nests
+    /// it, since a child's decline propagates.
+    ///
+    /// **Overriding it is a promise.** Setting it to `false` asserts that
+    /// [`repe_call_read_into`](Self::repe_call_read_into) answers
+    /// `segments = &[name], body = None` with `Some(..)` for every name in
+    /// [`REPE_ACCESSOR_ENDPOINTS`](Self::REPE_ACCESSOR_ENDPOINTS). A table that
+    /// breaks that promise still produces a correct response — the listing
+    /// rewinds and retries exclusively — but the getters that ran before the
+    /// decline run a second time, which is the double invocation this const
+    /// exists to rule out.
+    const REPE_LISTING_NEEDS_EXCLUSIVE: bool = !Self::REPE_ACCESSOR_ENDPOINTS.is_empty();
 
     /// Invoke the method named by `segments[0]`.
     ///
