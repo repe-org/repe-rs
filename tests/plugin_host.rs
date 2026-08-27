@@ -20,7 +20,7 @@ use std::process::Command;
 
 use repe::constants::{ErrorCode, QueryFormat};
 use repe::message::Message;
-use repe::plugin::host::{HostError, Plugin};
+use repe::plugin::host::{HostError, LoadOrigin, Plugin};
 use repe::server::Router;
 use std::sync::Arc;
 
@@ -118,6 +118,11 @@ fn a_real_shared_library_loads_and_serves() {
     let plugin = unsafe { Plugin::load(&path) }.expect("the example is a conforming plugin");
 
     // --- what crossed the boundary at load time --------------------------
+    assert_eq!(
+        plugin.load_origin(),
+        LoadOrigin::Mapped,
+        "nothing in this binary links the plugin, so this load mapped it"
+    );
     assert_eq!(plugin.root_path(), "/instrument");
     assert_eq!(plugin.interface_version(), 3);
     // The macro defaults these to the manifest's own name and version, so the
@@ -223,6 +228,12 @@ fn a_real_shared_library_loads_and_serves() {
     //
     // SAFETY: as above — the same library, already resident.
     let second = unsafe { Plugin::load(&path) }.expect("a second load is not a failure");
+    assert_eq!(
+        second.load_origin(),
+        LoadOrigin::AlreadyResident,
+        "the second load reached the resident copy; a host that reports it as a \
+         successful reload is reporting a no-op"
+    );
     let response = second
         .call(&read("/instrument/channel", 9))
         .unwrap()
@@ -241,6 +252,7 @@ fn a_real_shared_library_loads_and_serves() {
     {
         // SAFETY: as above — the same library, already resident.
         let mounted = unsafe { Plugin::load(&path) }.expect("already resident");
+        assert_eq!(mounted.load_origin(), LoadOrigin::AlreadyResident);
         let router = Router::new()
             .with_json("/local", |_| Ok(serde_json::json!("served by the host")))
             .with_fallback(Arc::new(mounted));
@@ -339,6 +351,44 @@ fn a_real_shared_library_loads_and_serves() {
         matches!(error, HostError::InitFailed { code, .. } if code == 1),
         "the refusal comes from the plugin's own initializer, got {error}"
     );
+}
+
+/// The other half of [`Plugin::load_origin`]: it answers about *this path*,
+/// not about the plugin, so a build published under a new path is a fresh load
+/// even though an identical binary is already resident.
+///
+/// This one is safe to run beside the test above, unlike a second load of the
+/// same path: a copy at a different path is a different image, with its own
+/// statics and its own initializer, so nothing it does is visible to the
+/// original mapping.
+#[test]
+fn a_copy_at_a_new_path_is_a_fresh_load() {
+    let original = plugin_library();
+    // Next to the original so any relative runtime search path still resolves,
+    // and named for the test so a stale copy is recognizable in `target/`.
+    let copy = original.with_file_name(format!(
+        "repe_plugin_fresh_path_copy{}",
+        std::env::consts::DLL_SUFFIX
+    ));
+    std::fs::copy(&original, &copy).expect("the target directory is writable");
+
+    // SAFETY: a byte-for-byte copy of this repository's own plugin example.
+    let plugin = unsafe { Plugin::load(&copy) }.expect("the copy is the same conforming plugin");
+    assert_eq!(
+        plugin.load_origin(),
+        LoadOrigin::Mapped,
+        "a path the loader has never seen is a fresh load, whatever is resident \
+         under another name"
+    );
+    assert_eq!(plugin.root_path(), "/instrument");
+
+    // And the second load of *that* path is resident, exactly as for the
+    // original — which is what makes the flag about the path and not about the
+    // file's contents.
+    //
+    // SAFETY: as above — the same library, now resident.
+    let again = unsafe { Plugin::load(&copy) }.expect("a second load is not a failure");
+    assert_eq!(again.load_origin(), LoadOrigin::AlreadyResident);
 }
 
 #[test]

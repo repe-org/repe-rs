@@ -50,6 +50,21 @@ The handler owns every miss it is given: nothing else will answer, so one that d
 
 **A mount answers for its whole prefix, misses included.** A registry or struct mounted at `/x` frames its own `MethodNotFound` for `/x/absent`; resolution stops at the first prefix that matches and the fallback is never reached. A fallback sees only paths no mount covers, so a plugin whose claimed root overlaps a mounted struct is shadowed by it.
 
+That has a degenerate case worth knowing before it is met: **a mount at the empty root matches every path**, so it does not merely narrow the fallback, it makes it unreachable. That is the ordinary registration for a service ported from Glaze's `glz::asio_server::on(*this)`, where the whole object hangs off the top level and the path shape is the client contract, so the root cannot be moved to buy the fallback back.
+
+`Router::with_mount_fallthrough()` is the answer: a mount that would frame `MethodNotFound` hands the request to the fallback instead.
+
+```rust
+let (router, state) = Router::new().with_struct_rw("", instrument);
+let router = router
+    .with_fallback(Arc::new(plugin_table))
+    .with_mount_fallthrough();
+```
+
+The rule is uniform — a mount's miss is still a miss, at the empty root or at any prefix — and nothing is reordered: a fixed route still beats a mount, and a mount still beats the fallback for a path it serves. Registration order does not matter; the composition is rebuilt whenever the mounts, the fallback, the middleware chain, or the flag changes. Middleware wraps the composite rather than each half, so a request that falls through runs the pipeline once.
+
+Two things it does not change. The fallback still owns every miss it is given, so one that does not claim the request must still frame `MethodNotFound` itself; and the mount's own diagnostic for the path is replaced by whatever the fallback frames. It is opt-in for that second reason — a host that mounts at a prefix may prefer the mount's more specific error.
+
 A fallback takes an `Arc<dyn HandlerErased>`: it receives the raw request and returns a whole `Message`, because deciding what to do with a miss usually starts with reading the query. `with_fallback_blocking` is the off-reader variant, for a miss handler that leaves the process — a plugin call across a C ABI, a proxied request to another node — where the WebSocket server should not tie up its reader task waiting.
 
 ### Unknown request-body keys
@@ -297,19 +312,26 @@ Under that registration a `/instrument/gain` read runs concurrently with any oth
 - every field read, at any depth through `#[repe(nested)]`;
 - a `#[repe::methods]` method taking `&self` and no arguments;
 - the getter half of a field-shaped endpoint, when that getter takes `&self`;
-- the whole-object listing, when nothing in it has to be *invoked* — see below.
+- the whole-object listing, when nothing anywhere beneath it has to be *invoked* through `&mut self` — see below.
 
 Everything else — every write, every `&mut self` method, a `&mut self` getter — **declines**: the shared attempt returns without writing anything, and the router retakes the lock exclusively and dispatches exactly as it always did. Declining is invisible from the outside; the answer is the same frame either way.
 
 `with_struct` puts the value behind a `Mutex`, which has no shared mode. There the shared path is compiled out entirely rather than acquiring the same lock twice, so a mutex-backed struct dispatches exactly as it did before.
 
-#### A listing never invokes a getter
+#### A listing decides at the top, or not at all
 
 A whole-object read is the one read that composes many others, so a decline discovered partway through would leave the entries before it already executed — and the exclusive retry then executes them again. A `&self` getter over a read counter would report the second call.
 
-So a struct that publishes any field-shaped endpoint declines its whole-object listing outright, before writing or calling anything. Everything left in a shared listing is serialization, which re-runs harmlessly. Reading one of those endpoints on its own is unaffected: that decision comes from the receiver, before anything is called.
+So the listing settles the question before it writes or calls anything, and it settles it for the **whole subtree**. Two things can force the decline:
 
-The trade is deliberate. A struct with accessors keeps the shared path for every individual read and gives it up only for the whole-object read, which is a discovery request rather than a hot one — and is [already quadratic in the accessor count](#field-shaped-endpoints) for the same reason.
+- an accessor on the struct itself whose getter takes `&mut self` — fields serialize and published methods are listed by their signature, so a getter is the only listing entry that is *invoked*;
+- a `#[repe(nested)]` child that declines, at any depth, since a parent's listing composes its children's.
+
+The subtree half is not optional. A child is listed before the parent's own accessors are read, so a parent that only checked its own getters would list a child, invoke that child's getters, and *then* discover a later sibling declining — leaving the retry to invoke them a second time. Rewinding the response buffer undoes the bytes; it cannot undo a call.
+
+So a struct whose getters all take `&self`, and whose children are the same — the ordinary case, and the only one for a register read — keeps its shared whole-object listing, with each accessor's current value in it. One `&mut self` getter anywhere beneath gives it up. Reading an individual endpoint is unaffected either way; that decision comes from the receiver, before anything is called.
+
+Two overridables carry it, both defaulting to the conservative answer. `RepeMethods::REPE_LISTING_NEEDS_EXCLUSIVE` is the per-table half — any accessor at all, unless `#[repe::methods]` computed otherwise from the receivers it has seen. `RepeStruct::repe_listing_declines` is the subtree half, which a parent asks of each child; it defaults to `true`, the accurate answer for the default `repe_read_into`, which declines everything. A hand-written impl that serves listings shared should override it, or every derived struct nesting it gives up its own listing. Overriding either is a promise: break it and the response is still correct — the listing rewinds and retries exclusively — but whatever the shared attempt had already invoked runs twice.
 
 #### Two things that change for callers
 

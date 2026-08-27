@@ -887,6 +887,74 @@ fn wrap_with_middlewares(
     }
 }
 
+/// A mount composed with the router's fallback: dispatch the mount, and when
+/// the mount answers [`ErrorCode::MethodNotFound`], dispatch the fallback
+/// instead of returning that miss to the client.
+///
+/// This is what [`Router::with_mount_fallthrough`] switches on. It is built at
+/// registration time, so dispatch costs one `Arc::clone` out of the router and
+/// one comparison of the mount's response code — there is no per-request
+/// resolution work, and nothing extra is allocated on the hit path.
+///
+/// The composite is what the middleware pipeline wraps, not each half, so a
+/// request that falls through runs the pipeline once rather than twice.
+struct MountFallthrough {
+    mount: Arc<dyn HandlerErased>,
+    fallback: Arc<dyn HandlerErased>,
+}
+
+impl MountFallthrough {
+    /// Run `dispatch` against the mount, and against the fallback instead when
+    /// the mount answers `MethodNotFound`.
+    ///
+    /// The three [`HandlerErased`] entry points differ only in which method they
+    /// call, so they share this rather than repeating the rule three times and
+    /// leaving two of the copies for a future edit to miss.
+    fn or_fallback(
+        &self,
+        dispatch: impl Fn(&dyn HandlerErased) -> Result<Message, RepeError>,
+    ) -> Result<Message, RepeError> {
+        // A mount frames its own miss as an `Ok` error response, so the code is
+        // in the header; a handler that returns `Err` has the same code read out
+        // of it, since the dispatch layer would frame the two identically a
+        // moment later.
+        let outcome = dispatch(self.mount.as_ref());
+        let declined = match &outcome {
+            Ok(response) => response.header.ec == ErrorCode::MethodNotFound as u32,
+            Err(err) => err.to_error_code() == ErrorCode::MethodNotFound,
+        };
+        if declined {
+            return dispatch(self.fallback.as_ref());
+        }
+        outcome
+    }
+}
+
+impl HandlerErased for MountFallthrough {
+    fn handle(&self, req: &Message) -> Result<Message, RepeError> {
+        self.or_fallback(|handler| handler.handle(req))
+    }
+
+    fn handle_with_ctx(&self, req: &Message, ctx: &CallContext) -> Result<Message, RepeError> {
+        self.or_fallback(|handler| handler.handle_with_ctx(req, ctx))
+    }
+
+    fn handle_view(&self, view: &MessageView, ctx: &CallContext) -> Result<Message, RepeError> {
+        self.or_fallback(|handler| handler.handle_view(view, ctx))
+    }
+
+    fn execution(&self) -> Execution {
+        // Which half runs is not known until the mount has answered, and by
+        // then the reader has already been committed. So the composite asks for
+        // the stronger of the two: a blocking fallback keeps its off-reader
+        // dispatch even behind a mount that would have run inline.
+        match (self.mount.execution(), self.fallback.execution()) {
+            (Execution::Inline, Execution::Inline) => Execution::Inline,
+            _ => Execution::OffReader,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum LockError {
     Poisoned(String),
@@ -1048,6 +1116,10 @@ pub struct Router {
     /// Resolved last by [`Router::get`], so it costs nothing on the hit path.
     fallback: Option<RouterMapEntry>,
     middlewares: Arc<Vec<Arc<dyn Middleware>>>,
+    /// Whether a mount that would answer `MethodNotFound` defers to the
+    /// fallback instead. Off by default; see
+    /// [`with_mount_fallthrough`](Router::with_mount_fallthrough).
+    mount_fallthrough: bool,
 }
 
 impl Router {
@@ -1058,7 +1130,48 @@ impl Router {
             registries: Arc::new(Vec::new()),
             fallback: None,
             middlewares: Arc::new(Vec::new()),
+            mount_fallthrough: false,
         }
+    }
+
+    /// Build the dispatched form of a mount: composed with the fallback when
+    /// [`with_mount_fallthrough`](Self::with_mount_fallthrough) is on, then
+    /// wrapped in the active middleware pipeline.
+    ///
+    /// Every registrar that builds a [`RegistryEntry`] or a [`StructEntry`] goes
+    /// through here, and so does every rebuild, which is what lets registration
+    /// order not matter.
+    fn mount_dispatched(&self, raw: &Arc<dyn HandlerErased>) -> Arc<dyn HandlerErased> {
+        let composed = match (self.mount_fallthrough, &self.fallback) {
+            (true, Some(fallback)) => Arc::new(MountFallthrough {
+                mount: Arc::clone(raw),
+                fallback: Arc::clone(&fallback.raw),
+            }) as Arc<dyn HandlerErased>,
+            _ => Arc::clone(raw),
+        };
+        wrap_with_middlewares(&composed, &self.middlewares)
+    }
+
+    /// Rebuild the `dispatched` slot of every mounted registry and struct.
+    ///
+    /// Run whenever an input to [`mount_dispatched`](Self::mount_dispatched)
+    /// changes — the fallback, the middleware chain, or the fall-through flag —
+    /// so a mount registered before any of them still ends up composed with it.
+    fn rebuild_mount_dispatch(&mut self) {
+        // Clone the entries and replace one field, rather than rebuilding each
+        // from its parts: a field added to either entry type later is carried
+        // through here without anyone having to remember this function exists.
+        let mut registries = (*self.registries).clone();
+        for entry in &mut registries {
+            entry.dispatched = self.mount_dispatched(&entry.raw);
+        }
+        self.registries = Arc::new(registries);
+
+        let mut structs = (*self.structs).clone();
+        for entry in &mut structs {
+            entry.dispatched = self.mount_dispatched(&entry.raw);
+        }
+        self.structs = Arc::new(structs);
     }
 
     /// Insert a raw handler into `self.inner`, pre-wrapping it in the active
@@ -1135,7 +1248,11 @@ impl Router {
     /// struct mounted at `/x` frames its own `MethodNotFound` for `/x/absent`,
     /// and the fallback is never consulted — resolution stops at the first
     /// prefix that matches. A fallback sees only paths no mount covers, so a
-    /// plugin whose root overlaps a mounted struct is shadowed by it.
+    /// plugin whose root overlaps a mounted struct is shadowed by it. A mount at
+    /// the *empty* root matches every path and so shadows the fallback
+    /// completely; [`with_mount_fallthrough`](Self::with_mount_fallthrough)
+    /// turns a mount's miss back into a miss, which is what that registration
+    /// needs.
     ///
     /// ```
     /// use repe::{Message, QueryFormat, constants::ErrorCode, error::RepeError};
@@ -1180,6 +1297,11 @@ impl Router {
             raw: handler,
             dispatched,
         });
+        // Under `with_mount_fallthrough` the mounts hold a clone of the
+        // fallback, so replacing it has to reach them. Unconditional, so the
+        // invariant is the simple one — every input change rebuilds — at a cost
+        // of one `Arc::clone` per mount at builder time.
+        self.rebuild_mount_dispatch();
     }
 
     /// Off-reader variant of [`with_fallback`](Self::with_fallback): on the
@@ -1200,6 +1322,134 @@ impl Router {
     /// [`with_fallback_blocking`](Self::with_fallback_blocking).
     pub fn register_fallback_blocking(&mut self, handler: Arc<dyn HandlerErased>) {
         self.register_fallback(Arc::new(OffReaderHandler(handler)));
+    }
+
+    /// Let a mounted registry or struct defer to the
+    /// [`fallback`](Self::with_fallback) instead of framing
+    /// [`ErrorCode::MethodNotFound`] itself.
+    ///
+    /// Without this, a mount answers for its whole prefix, misses included: a
+    /// struct mounted at `/x` frames its own miss for `/x/absent` and the
+    /// fallback never sees it. That is the right default for a mount at a
+    /// prefix — the mount is the authority on what lives under its root — but it
+    /// has a degenerate case. **A mount at the empty root matches every path**,
+    /// so it shadows the fallback for every request the router will ever see,
+    /// and the fallback becomes unreachable rather than merely narrowed. An
+    /// object published at the top level is the ordinary shape for a service
+    /// ported from Glaze's `glz::asio_server::on(*this)`, so this is reached by
+    /// the common registration, not an exotic one.
+    ///
+    /// With it on, a mount that would answer `MethodNotFound` hands the request
+    /// to the fallback instead. The rule is uniform — a mount's miss is still a
+    /// miss, at the empty root or at any prefix — and it does not reorder
+    /// anything: a mount that *does* serve the path still answers it, and a
+    /// fixed route registered with [`with_json`](Self::with_json) and friends
+    /// still wins over both.
+    ///
+    /// Registration order does not matter. The composition is rebuilt whenever
+    /// the fallback, the middleware chain, or this flag changes, so
+    /// `with_mount_fallthrough()` may come before or after the mounts and the
+    /// fallback it affects. Middleware wraps the composite rather than each
+    /// half, so a request that falls through runs the pipeline once.
+    ///
+    /// Three consequences worth stating:
+    ///
+    /// * **The fallback still owns every miss it is given**, exactly as it does
+    ///   for a path no mount covers. What changes is which requests reach it,
+    ///   not what it owes them.
+    /// * **The mount's own diagnostic is replaced**, which is why this is
+    ///   opt-in: `path is not below struct root` and the derive's `InvalidPath`
+    ///   name the mount and the path, where the fallback's refusal is whatever
+    ///   the fallback frames. A host that mounts only at prefixes may prefer the
+    ///   more specific message.
+    /// * **The trigger is the error code, not the reason.** Any answer a mount
+    ///   frames as `MethodNotFound` falls through — including a registry
+    ///   callable that deliberately returns that code, whose answer the fallback
+    ///   then supersedes. A handler that means "this exists and refused you"
+    ///   should say so with a different code.
+    ///
+    /// A mount's miss goes to the fallback, never to the next matching mount:
+    /// resolution still stops at the first prefix that matches.
+    ///
+    /// ```
+    /// use repe::{Message, QueryFormat, constants::ErrorCode, error::RepeError};
+    /// use repe::message::create_error_response_like;
+    /// use repe::server::{HandlerErased, Router};
+    /// use repe::structs::{RepeStruct, StructError, StructResult};
+    /// use std::sync::Arc;
+    ///
+    /// struct Root;
+    /// impl RepeStruct for Root {
+    ///     fn repe_handle(
+    ///         &mut self,
+    ///         segments: &[&str],
+    ///         _body: Option<serde_json::Value>,
+    ///     ) -> StructResult<Option<serde_json::Value>> {
+    ///         match segments {
+    ///             ["voltages"] => Ok(Some(serde_json::json!([1, 2, 3]))),
+    ///             _ => Err(StructError::InvalidPath {
+    ///                 path: repe::structs::path_from_segments(segments),
+    ///             }),
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// struct Plugins;
+    /// impl HandlerErased for Plugins {
+    ///     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
+    ///         let path = req.query_str().unwrap_or("");
+    ///         if path.starts_with("/plugins/") {
+    ///             return Ok(Message::builder().id(req.header.id).body_json(&path)?.build());
+    ///         }
+    ///         Ok(create_error_response_like(
+    ///             req,
+    ///             ErrorCode::MethodNotFound,
+    ///             format!("Method not found: {path}"),
+    ///         ))
+    ///     }
+    /// }
+    ///
+    /// // The struct is mounted at the root, so it matches `/plugins/x` too.
+    /// let (router, _root) = Router::new().with_struct("", Root);
+    /// let router = router
+    ///     .with_fallback(Arc::new(Plugins))
+    ///     .with_mount_fallthrough();
+    ///
+    /// let ask = |path: &str| {
+    ///     let request = Message::builder()
+    ///         .id(1)
+    ///         .query_str(path)
+    ///         .query_format(QueryFormat::JsonPointer)
+    ///         .build()
+    ///         .to_vec();
+    ///     Message::from_slice(&router.call(&request).unwrap()).unwrap()
+    /// };
+    ///
+    /// // Served by the struct, as before.
+    /// assert_eq!(ask("/voltages").header.ec, 0);
+    /// // The struct has nothing here, so the fallback answers it.
+    /// assert_eq!(ask("/plugins/audio").header.ec, 0);
+    /// // And a path neither claims is still a miss.
+    /// assert_eq!(ask("/nowhere").header.ec, ErrorCode::MethodNotFound as u32);
+    /// ```
+    pub fn with_mount_fallthrough(mut self) -> Self {
+        self.set_mount_fallthrough(true);
+        self
+    }
+
+    /// In-place counterpart of
+    /// [`with_mount_fallthrough`](Self::with_mount_fallthrough), and the way to
+    /// turn the behavior back off.
+    ///
+    /// `set_` rather than the `register_` the other in-place forms use: those
+    /// add a handler, this flips a mode, and a `register_` that took a `bool`
+    /// would read as registering one.
+    pub fn set_mount_fallthrough(&mut self, enabled: bool) {
+        if self.mount_fallthrough == enabled {
+            return;
+        }
+        self.mount_fallthrough = enabled;
+        self.rebuild_mount_dispatch();
     }
 
     /// Attach a middleware that runs before handlers and can short-circuit requests.
@@ -1248,31 +1498,11 @@ impl Router {
             .collect();
         self.inner = Arc::new(rebuilt_map);
 
-        let rebuilt_registries: Vec<RegistryEntry> = self
-            .registries
-            .iter()
-            .map(|entry| RegistryEntry {
-                prefix: entry.prefix.clone(),
-                raw: Arc::clone(&entry.raw),
-                dispatched: wrap_with_middlewares(&entry.raw, &self.middlewares),
-            })
-            .collect();
-        self.registries = Arc::new(rebuilt_registries);
-
-        let rebuilt_structs: Vec<StructEntry> = self
-            .structs
-            .iter()
-            .map(|entry| StructEntry {
-                root: entry.root.clone(),
-                raw: Arc::clone(&entry.raw),
-                dispatched: wrap_with_middlewares(&entry.raw, &self.middlewares),
-            })
-            .collect();
-        self.structs = Arc::new(rebuilt_structs);
-
         if let Some(entry) = &mut self.fallback {
             entry.dispatched = wrap_with_middlewares(&entry.raw, &self.middlewares);
         }
+
+        self.rebuild_mount_dispatch();
 
         arc
     }
@@ -1540,7 +1770,7 @@ impl Router {
         // built once at registration so dispatch is a clone of this Arc, not
         // a fresh allocation.
         let raw: Arc<dyn HandlerErased> = registered;
-        let dispatched = wrap_with_middlewares(&raw, &self.middlewares);
+        let dispatched = self.mount_dispatched(&raw);
         let entry = StructEntry {
             root,
             raw,
@@ -1625,7 +1855,7 @@ impl Router {
         // handler is built once at registration so dispatch is a clone of this
         // Arc, not a fresh allocation.
         let raw: Arc<dyn HandlerErased> = registered;
-        let dispatched = wrap_with_middlewares(&raw, &self.middlewares);
+        let dispatched = self.mount_dispatched(&raw);
         let entry = RegistryEntry {
             prefix,
             raw,
@@ -1644,6 +1874,11 @@ impl Router {
     /// `None` means the request is a `MethodNotFound`. Registering a fallback
     /// therefore makes this return `Some` for every path, which is the point of
     /// one: the fallback decides what it does not serve.
+    ///
+    /// Under [`with_mount_fallthrough`](Self::with_mount_fallthrough) a mount's
+    /// deferral to the fallback happens *inside* the handler this returns, not
+    /// here — resolution still stops at the first prefix that matches, and the
+    /// handler it yields is the mount composed with the fallback.
     pub fn get(&self, path: &str) -> Option<Arc<dyn HandlerErased>> {
         if let Some(entry) = self.inner.get(path) {
             return Some(Arc::clone(&entry.dispatched));
@@ -3184,6 +3419,17 @@ mod tests {
         }
     }
 
+    /// Counts what reaches it and answers with an empty body. Used to prove a
+    /// fallback was, or was not, consulted.
+    struct Counting(Arc<AtomicUsize>);
+
+    impl HandlerErased for Counting {
+        fn handle(&self, req: &Message) -> Result<Message, RepeError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Message::builder().id(req.header.id).build())
+        }
+    }
+
     fn served_path(router: &Router, path: &str) -> Message {
         let response = router
             .call(&call_request(path, &serde_json::json!(null), false))
@@ -3343,14 +3589,6 @@ mod tests {
         // mounted registry or struct answers for its whole prefix, misses
         // included. A fallback only sees paths no mount covers, so a plugin
         // whose root overlaps a mounted struct is shadowed by it.
-        struct Counting(Arc<AtomicUsize>);
-        impl HandlerErased for Counting {
-            fn handle(&self, req: &Message) -> Result<Message, RepeError> {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                Ok(Message::builder().id(req.header.id).build())
-            }
-        }
-
         let registry = Arc::new(Registry::new());
         registry
             .register_value("/flag", serde_json::json!(true))
@@ -3373,6 +3611,256 @@ mod tests {
             hits.load(Ordering::SeqCst),
             0,
             "the mount framed its own miss; the fallback was never consulted"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // `Router::with_mount_fallthrough` — a mount's miss is still a miss
+    // ---------------------------------------------------------------------
+
+    /// A struct published at the top level, the shape a service ported from
+    /// Glaze's `glz::asio_server::on(*this)` arrives in. It serves `/value` and
+    /// refuses everything else the way the derive does.
+    #[derive(Default)]
+    struct RootObject;
+
+    impl RepeStruct for RootObject {
+        fn repe_handle(
+            &mut self,
+            segments: &[&str],
+            _body: Option<Value>,
+        ) -> crate::structs::StructResult<Option<Value>> {
+            match segments {
+                ["value"] => Ok(Some(serde_json::json!(7))),
+                _ => Err(crate::structs::StructError::InvalidPath {
+                    path: crate::structs::path_from_segments(segments),
+                }),
+            }
+        }
+    }
+
+    fn root_mounted_router() -> Router {
+        Router::new().with_struct_shared::<RootObject, _>("", Arc::new(Mutex::new(RootObject)))
+    }
+
+    #[test]
+    fn an_empty_root_mount_shadows_the_fallback_completely() {
+        // The degenerate case of "a mount answers for its whole prefix": an
+        // empty root matches every path, so without fall-through the fallback is
+        // not merely narrowed, it is unreachable.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let router = root_mounted_router().with_fallback(Arc::new(Counting(Arc::clone(&hits))));
+        assert!(served_path(&router, "/dynamic/x").is_error());
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn mount_fallthrough_hands_an_empty_root_mount_s_miss_to_the_fallback() {
+        let router = root_mounted_router()
+            .with_fallback(Arc::new(DynamicPrefix))
+            .with_mount_fallthrough();
+
+        // Still the mount's, and answered by it.
+        assert_eq!(
+            served_path(&router, "/value").json_body::<i64>().unwrap(),
+            7
+        );
+        // Not the mount's, so the fallback gets it.
+        assert_eq!(
+            served_path(&router, "/dynamic/x")
+                .json_body::<String>()
+                .unwrap(),
+            "/dynamic/x"
+        );
+        // Neither claims it, and the fallback still owns the refusal.
+        assert_eq!(
+            served_path(&router, "/nowhere").error_code(),
+            Some(ErrorCode::MethodNotFound)
+        );
+    }
+
+    #[test]
+    fn mount_fallthrough_does_not_reorder_fixed_routes_over_mounts() {
+        // The rule is "a mount's miss is a miss", not "the fallback wins": a
+        // fixed route still beats the mount, and the mount still beats the
+        // fallback for a path it serves.
+        let mut router = root_mounted_router();
+        router.insert_route("/echo", Arc::new(JsonHandler(Ok)));
+        let router = router
+            .with_fallback(Arc::new(DynamicPrefix))
+            .with_mount_fallthrough();
+
+        assert!(!served_path(&router, "/echo").is_error());
+        assert_eq!(
+            served_path(&router, "/value").json_body::<i64>().unwrap(),
+            7
+        );
+    }
+
+    #[test]
+    fn mount_fallthrough_applies_whichever_order_it_is_registered() {
+        // Every input to the composition — the mounts, the fallback, the flag —
+        // can arrive in any order, because each one rebuilds the mounts.
+        let build_in_order = |order: u8| {
+            let mut router = Router::new();
+            for step in 0..3u8 {
+                match (order + step) % 3 {
+                    0 => {
+                        router.register_struct_shared::<RootObject, _>(
+                            "",
+                            Arc::new(Mutex::new(RootObject)),
+                        );
+                    }
+                    1 => router.register_fallback(Arc::new(DynamicPrefix)),
+                    _ => router.set_mount_fallthrough(true),
+                }
+            }
+            router
+        };
+
+        for order in 0..3u8 {
+            let router = build_in_order(order);
+            assert_eq!(
+                served_path(&router, "/dynamic/x")
+                    .json_body::<String>()
+                    .unwrap(),
+                "/dynamic/x",
+                "registration order {order} did not compose the fallback in"
+            );
+            assert_eq!(
+                served_path(&router, "/value").json_body::<i64>().unwrap(),
+                7
+            );
+        }
+    }
+
+    #[test]
+    fn mount_fallthrough_defers_a_registry_miss_too() {
+        // Not struct-specific: a registry mounted at a prefix defers the same way.
+        let registry = Arc::new(Registry::new());
+        registry
+            .register_value("/flag", serde_json::json!(true))
+            .unwrap();
+        let router = Router::new()
+            .with_registry("/reg", registry)
+            .with_fallback(Arc::new(DynamicPrefix))
+            .with_mount_fallthrough();
+
+        assert!(!served_path(&router, "/reg/flag").is_error());
+        // A read, not a write: a registry write to an unknown pointer creates it.
+        let read = Message::builder()
+            .id(11)
+            .query_str("/reg/nope")
+            .query_format(crate::constants::QueryFormat::JsonPointer)
+            .build()
+            .to_vec();
+        let message = Message::from_slice(&router.call(&read).unwrap()).unwrap();
+        assert_eq!(
+            message.error_code(),
+            Some(ErrorCode::MethodNotFound),
+            "the fallback answered, and it refuses this path too"
+        );
+    }
+
+    #[test]
+    fn mount_fallthrough_runs_the_middleware_pipeline_once() {
+        // Middleware wraps the composite rather than each half, so a request
+        // that falls through is not billed twice for the pipeline.
+        struct CountingMiddleware(Arc<AtomicUsize>);
+        impl Middleware for CountingMiddleware {
+            fn handle(&self, req: &Message, next: Next<'_>) -> Result<Message, RepeError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                next.run(req)
+            }
+        }
+
+        let runs = Arc::new(AtomicUsize::new(0));
+        let router = root_mounted_router()
+            .with_fallback(Arc::new(DynamicPrefix))
+            .with_mount_fallthrough()
+            .with_middleware(CountingMiddleware(Arc::clone(&runs)));
+
+        assert_eq!(
+            served_path(&router, "/dynamic/x")
+                .json_body::<String>()
+                .unwrap(),
+            "/dynamic/x"
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn mount_fallthrough_defers_through_every_dispatch_entry_point() {
+        // `Router::call` takes the borrowing `handle_view` path, so it is the
+        // only one of the three the tests above exercise. The owned entry points
+        // are what the WebSocket server's off-reader path and any hand-written
+        // carrier reach, and they have to defer identically.
+        let router = root_mounted_router()
+            .with_fallback(Arc::new(DynamicPrefix))
+            .with_mount_fallthrough();
+        let handler = router
+            .get("/dynamic/x")
+            .expect("the mount matches the root");
+        let request =
+            Message::from_slice(&call_request("/dynamic/x", &serde_json::json!(null), false))
+                .unwrap();
+
+        for (entry, response) in [
+            ("handle", handler.handle(&request).unwrap()),
+            (
+                "handle_with_ctx",
+                handler
+                    .handle_with_ctx(&request, &CallContext::detached("/dynamic/x"))
+                    .unwrap(),
+            ),
+        ] {
+            assert_eq!(
+                response.json_body::<String>().unwrap(),
+                "/dynamic/x",
+                "`{entry}` did not reach the fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn a_blocking_fallback_keeps_its_off_reader_dispatch_behind_a_mount() {
+        // The composite cannot know which half will run until the mount has
+        // answered, by which time the reader is committed — so it asks for the
+        // stronger of the two.
+        let router = root_mounted_router()
+            .with_fallback_blocking(Arc::new(DynamicPrefix))
+            .with_mount_fallthrough();
+        assert_eq!(
+            router.get("/dynamic/x").unwrap().execution(),
+            Execution::OffReader
+        );
+    }
+
+    #[test]
+    fn set_mount_fallthrough_false_gives_the_prefix_back_to_the_mount() {
+        let mut router = root_mounted_router()
+            .with_fallback(Arc::new(DynamicPrefix))
+            .with_mount_fallthrough();
+        assert!(!served_path(&router, "/dynamic/x").is_error());
+
+        router.set_mount_fallthrough(false);
+        assert!(
+            served_path(&router, "/dynamic/x").is_error(),
+            "the mount owns its whole prefix again"
+        );
+    }
+
+    #[test]
+    fn mount_fallthrough_without_a_fallback_changes_nothing() {
+        let router = root_mounted_router().with_mount_fallthrough();
+        assert_eq!(
+            served_path(&router, "/value").json_body::<i64>().unwrap(),
+            7
+        );
+        assert_eq!(
+            served_path(&router, "/dynamic/x").error_code(),
+            Some(ErrorCode::MethodNotFound),
+            "there is nothing to defer to, so the mount frames the miss"
         );
     }
 

@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **`Router::with_mount_fallthrough` — a mount's miss is still a miss.** A mounted registry or struct answers for its whole prefix, misses included, which is right at a prefix and degenerate at the root: a struct mounted at `""` matches every path, so it does not narrow a `with_fallback` handler, it makes it unreachable. With this on, a mount that would frame `MethodNotFound` hands the request to the fallback instead. Nothing is reordered, and registration order does not matter. Opt-in, because it replaces the mount's own diagnostic for paths it does not serve — and because the trigger is the error code, so a handler that deliberately answers `MethodNotFound` is superseded too.
+
+- **`plugin::host::Plugin::load_origin`.** Whether the load mapped the library, reached a copy already resident, or could not be asked. `dlopen` refcounts by path, so reloading a resident path reads no file and runs no initializer; until now the two were indistinguishable, and a hot-reload endpoint reported success for a load that changed nothing. Answered with an `RTLD_NOLOAD` probe (`GetModuleHandleExW` on Windows); `LoadOrigin::Unknown` covers the four unix targets whose loader has no such flag. The ABI's `ALREADY_INITIALIZED` is still not this signal — a lazily-initializing plugin returns it on a genuine first load.
+
+### Changed
+- **A whole-object listing gives up the shared guard only when it has to.** It used to decline whenever the struct published any field-shaped endpoint, so one `#[repe(get)]` cost the shared listing of that struct and, transitively, of every struct nesting it. The listing must still decide before it invokes anything — a decline found partway through would run the getters before it twice — but the question is now whether any getter takes `&mut self`, asked across the whole subtree. A struct whose computed values are pure reads keeps its shared listing, with each accessor's value in it, and so does every ancestor. Two defaulted overridables carry it: `RepeMethods::REPE_LISTING_NEEDS_EXCLUSIVE` for one method table's accessors, and `RepeStruct::repe_listing_declines` for the subtree a parent composes. No frame changes.
+
 ## [9.0.0] - 2026-08-27
 
 ### Added

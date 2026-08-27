@@ -338,14 +338,16 @@ fn every_shareable_read_proceeds_while_a_read_guard_is_held() {
     // exclusive path had to serve would block here rather than answer. This is
     // the set the equivalence test cannot distinguish on its own.
     //
-    // `/inst` itself is absent deliberately: `Instrument` publishes field-shaped
-    // endpoints, so its whole-object listing declines. See
-    // `a_listing_with_a_field_shaped_endpoint_declines`.
+    // `/inst` itself is here: `Instrument` publishes field-shaped endpoints, but
+    // both getters take `&self`, so nothing in its listing can decline and the
+    // listing is served shared. What forces the exclusive path is a `&mut self`
+    // getter, not an accessor — see `a_listing_with_a_mutating_getter_declines`.
     let state = Arc::new(RwLock::new(instrument()));
     let router = Router::new().with_struct_shared::<Instrument, _>("/inst", Arc::clone(&state));
     let held = state.read().expect("the lock is not poisoned");
 
     for path in [
+        "/inst",
         "/inst/firmware",
         "/inst/gains",
         "/inst/odd~1name~0x",
@@ -571,6 +573,41 @@ struct Meter {
     samples: AtomicU32,
 }
 
+/// A struct whose only accessor is a `&self` getter **with a side effect**, so
+/// its own listing is served shared *and invokes something*. That combination is
+/// what makes a nested decline elsewhere in the tree observable, and it is the
+/// shape `Meter` cannot provide — `Meter` has a `&mut self` getter of its own, so
+/// it declines before `sample` is ever reached.
+#[derive(Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+#[repe(methods)]
+struct Tally {
+    label: String,
+    #[repe(skip)]
+    #[serde(skip)]
+    reads: AtomicU32,
+}
+
+#[repe::methods]
+impl Tally {
+    /// `&self`, and counts anyway — interior mutability is what makes a read
+    /// counter possible and a double invocation visible.
+    #[repe(get = "count")]
+    fn count(&self) -> u32 {
+        self.reads.fetch_add(1, Ordering::SeqCst) + 1
+    }
+}
+
+impl Clone for Tally {
+    /// `AtomicU32` is not `Clone`, and the count is per-instance anyway: a clone
+    /// starts its own tally rather than inheriting one.
+    fn clone(&self) -> Self {
+        Self {
+            label: self.label.clone(),
+            reads: AtomicU32::new(self.reads.load(Ordering::SeqCst)),
+        }
+    }
+}
+
 #[repe::methods]
 impl Meter {
     #[repe(get = "sample")]
@@ -610,26 +647,233 @@ fn a_listing_invokes_each_getter_exactly_once() {
 }
 
 #[test]
-fn a_listing_with_a_field_shaped_endpoint_declines() {
-    // The trade the rule above buys: a struct with an accessor gives up the
-    // shared listing, though every one of its individual reads keeps it.
-    let state = Arc::new(RwLock::new(instrument()));
-    let router = Router::new().with_struct_shared::<Instrument, _>("/inst", Arc::clone(&state));
+fn a_listing_with_a_mutating_getter_declines() {
+    // What the rule above actually costs, and it is narrower than "a struct with
+    // an accessor": `Meter::calibration` takes `&mut self`, so a decline is
+    // reachable partway through the listing and the whole listing declines at
+    // the top instead. A struct whose getters all read keeps its shared listing
+    // — that is `a_listing_whose_getters_only_read_is_served_shared`.
+    let state = Arc::new(RwLock::new(Meter::default()));
+    let router = Router::new().with_struct_shared::<Meter, _>("/m", Arc::clone(&state));
 
     let held = state.read().expect("the lock is not poisoned");
     let (tx, rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
-        let _ = tx.send(router.call(&read("/inst")));
+        let _ = tx.send(router.call(&read("/m")));
     });
     assert!(
         rx.recv_timeout(Duration::from_millis(200)).is_err(),
-        "a listing that would have to invoke a getter takes the exclusive guard"
+        "a listing that could decline partway through takes the exclusive guard"
     );
     drop(held);
 
     rx.recv_timeout(Duration::from_secs(10))
         .expect("the listing completes once the guard is released");
     worker.join().expect("the worker thread finishes");
+}
+
+#[test]
+fn a_listing_whose_getters_only_read_carries_their_values() {
+    // That this listing is served *shared* is pinned by the `/inst` entry in
+    // `every_shareable_read_proceeds_while_a_read_guard_is_held`, which is the
+    // systematic place for it. What is left to check is the content: a shared
+    // listing shows each accessor's value, not a signature, and not nothing.
+    let router = Router::new()
+        .with_struct_shared::<Instrument, _>("/inst", Arc::new(RwLock::new(instrument())));
+
+    let value = answer(&router, &read("/inst"))
+        .json_body::<serde_json::Value>()
+        .expect("the listing body is valid JSON");
+    assert_eq!(value["channel_hz"], 6.0e6);
+    assert_eq!(value["trims"], serde_json::json!([0.5, 1.25, 2.0]));
+    assert_eq!(
+        value["identify"], "fn(&self) -> String",
+        "a published method is still listed by its signature, not its result"
+    );
+}
+
+/// An ancestor of a struct that publishes field-shaped endpoints. The decline is
+/// transitive, so this is what a getter's receiver costs — or does not cost —
+/// two levels up.
+///
+/// The field order is load-bearing: `meter` is listed *before* `counter`, so a
+/// listing that decided per struct rather than per subtree would invoke
+/// `Meter::sample` and only then discover that `Counter` declines. See
+/// `a_declining_sibling_does_not_make_an_earlier_getter_run_twice`.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+struct Bench {
+    site: String,
+    #[repe(nested)]
+    inst: Instrument,
+    #[repe(nested)]
+    tally: Tally,
+    #[repe(nested)]
+    counter: Counter,
+}
+
+/// A hand-written `RepeStruct`: it overrides neither `repe_read_into` nor
+/// `repe_listing_declines`, so it declines every shared read and says so. This
+/// is the ordinary shape — most hand-written impls are exactly this — and it is
+/// the second way a nested child can force a parent's listing exclusive, with no
+/// accessor anywhere in sight.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct Manual {
+    note: String,
+}
+
+impl RepeStruct for Manual {
+    fn repe_handle(
+        &mut self,
+        segments: &[&str],
+        _body: Option<serde_json::Value>,
+    ) -> repe::structs::StructResult<Option<serde_json::Value>> {
+        match segments {
+            [] => Ok(Some(serde_json::json!({ "note": self.note }))),
+            ["note"] => Ok(Some(serde_json::json!(self.note))),
+            _ => Err(repe::structs::StructError::InvalidPath {
+                path: repe::structs::path_from_segments(segments),
+            }),
+        }
+    }
+}
+
+/// `tally` before `manual`, for the same reason `Bench` orders its fields.
+#[derive(Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+struct Console {
+    #[repe(nested)]
+    tally: Tally,
+    #[repe(nested)]
+    manual: Manual,
+}
+
+#[test]
+fn a_hand_written_child_declines_its_parent_s_listing_before_anything_runs() {
+    // A hand-written child that never overrides `repe_read_into` declines every
+    // shared read, and it declines *late* — after the parent has already listed
+    // the siblings before it. `repe_listing_declines` defaults to `true` so the
+    // parent asks and gives up first, rather than discovering it partway.
+    for (kind, router) in [
+        (
+            "Mutex",
+            Router::new()
+                .with_struct_shared::<Console, _>("/c", Arc::new(Mutex::new(Console::default()))),
+        ),
+        (
+            "RwLock",
+            Router::new()
+                .with_struct_shared::<Console, _>("/c", Arc::new(RwLock::new(Console::default()))),
+        ),
+    ] {
+        let value = answer(&router, &read("/c"))
+            .json_body::<serde_json::Value>()
+            .expect("the listing body is valid JSON");
+        assert_eq!(
+            value["tally"]["count"], 1,
+            "under a {kind} a getter ran twice because a hand-written sibling \
+             declined after it"
+        );
+    }
+}
+
+fn bench() -> Bench {
+    Bench {
+        site: String::from("lab-3"),
+        inst: instrument(),
+        tally: Tally::default(),
+        counter: Counter::default(),
+    }
+}
+
+#[test]
+fn a_declining_sibling_does_not_make_an_earlier_getter_run_twice() {
+    // The invariant `a_listing_invokes_each_getter_exactly_once` pins for one
+    // struct, held across nesting — which is where it is easy to lose, because
+    // the guard that enforces it is emitted per struct while the hazard spans
+    // the whole subtree.
+    //
+    // `/bench` lists `tally` before `counter`. `Tally::count` is a `&self` getter
+    // over a read counter, and `Tally`'s own listing is served shared — so a
+    // listing that served `tally` and only then found `counter` declining would
+    // rewind the bytes, retry exclusively, and call `count` a second time. The
+    // first read of the object would report 2. The whole listing has to decline
+    // before `tally` is ever reached.
+    //
+    // The body is identical either way, so nothing but the count catches this.
+    for (kind, router) in [
+        (
+            "Mutex",
+            Router::new().with_struct_shared::<Bench, _>("/bench", Arc::new(Mutex::new(bench()))),
+        ),
+        (
+            "RwLock",
+            Router::new().with_struct_shared::<Bench, _>("/bench", Arc::new(RwLock::new(bench()))),
+        ),
+    ] {
+        let value = answer(&router, &read("/bench"))
+            .json_body::<serde_json::Value>()
+            .expect("the listing body is valid JSON");
+        assert_eq!(
+            value["tally"]["count"], 1,
+            "under a {kind} a nested getter ran twice for one listing read"
+        );
+    }
+}
+
+#[test]
+fn a_child_s_reading_getters_leave_its_ancestor_s_listing_shared() {
+    let state = Arc::new(RwLock::new(bench()));
+    let router = Router::new().with_struct_shared::<Bench, _>("/bench", Arc::clone(&state));
+
+    // `/bench/inst` nests only `&self` getters, so the parent of *that* subtree
+    // is served shared.
+    let held = state.read().expect("the lock is not poisoned");
+    let frame = try_off_thread(Duration::from_secs(10), {
+        let router = router.clone();
+        move || router.call(&read("/bench/inst"))
+    })
+    .expect("a nested listing with nothing that can decline must not wait")
+    .expect("a non-notify request is answered");
+    assert!(!Message::from_slice(&frame).unwrap().is_error());
+
+    // `/bench` itself nests `Counter`, whose getter is `&mut self`, so the whole
+    // listing still declines: the decline is transitive, and has to be.
+    let (tx, rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let _ = tx.send(router.call(&read("/bench")));
+    });
+    assert!(
+        rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "a child that can decline still declines its ancestor's listing"
+    );
+    drop(held);
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("the listing completes once the guard is released");
+    worker.join().expect("the worker thread finishes");
+}
+
+#[test]
+fn a_bench_listing_answers_the_same_either_way() {
+    // The oracle for the fixture above: the declining listing must still produce
+    // the exclusive path's frame exactly.
+    let exclusive =
+        Router::new().with_struct_shared::<Bench, _>("/bench", Arc::new(Mutex::new(bench())));
+    let shared =
+        Router::new().with_struct_shared::<Bench, _>("/bench", Arc::new(RwLock::new(bench())));
+
+    for path in [
+        "/bench",
+        "/bench/inst",
+        "/bench/tally",
+        "/bench/counter",
+        "/bench/site",
+    ] {
+        let request = read(path);
+        assert_eq!(
+            exclusive.call(&request),
+            shared.call(&request),
+            "reading `{path}` must answer the same whichever guard served it"
+        );
+    }
 }
 
 #[test]

@@ -55,7 +55,7 @@ plugin = []
 # crate *building* a plugin should not acquire a loader it will never call.
 # Enables `plugin` because the host is built on the same layouts and the same
 # version constant. Off on wasm32 for the same reason `plugin` is: no loader.
-plugin-host = ["plugin", "dep:libloading"]
+plugin-host = ["plugin", "dep:libloading", "dep:libc"]
 # REST facade over a `Registry`: an HTTP/1.1 + HTTP/2 gateway that maps HTTP
 # verbs onto the registry's read / write / call trichotomy, so public clients get
 # curl, OpenAPI, and edge caching while REPE clients keep the binary fast path.
@@ -196,6 +196,17 @@ libloading = { version = "0.8", optional = true }
 hyper = { version = "1", optional = true, default-features = false, features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", optional = true, default-features = false, features = ["server-auto", "tokio"] }
 http-body-util = { version = "0.1", optional = true }
+
+# `RTLD_NOLOAD`, for the `plugin-host` resident probe behind
+# `Plugin::is_first_handle`. libloading deliberately exposes only the `dlopen`
+# flags POSIX specifies, and this one is an extension each platform spells with
+# a different value — precisely the per-target table libc maintains and this
+# crate should not. Unix-only: the Windows half of the probe is
+# `GetModuleHandleExW`, which libloading does expose, so nothing there needs
+# this. Declared `optional` and reached through `plugin-host`'s `dep:libc`,
+# which resolves to nothing off Unix.
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = { version = "0.3", optional = true }

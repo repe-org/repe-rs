@@ -1051,6 +1051,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "js-sys",
+ "libc",
  "libloading",
  "parking_lot",
  "rand 0.8.5",

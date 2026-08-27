@@ -33,7 +33,7 @@ use std::process::ExitCode;
 
 use repe::constants::{ErrorCode, QueryFormat};
 use repe::message::{Message, MessageView};
-use repe::plugin::host::{HostError, Plugin};
+use repe::plugin::host::{HostError, LoadOrigin, Plugin};
 use repe::server::Router;
 
 /// Failures seen so far. Every check runs, so one bad expectation reports all of
@@ -98,11 +98,12 @@ fn run(path: &str) -> Result<u32, HostError> {
 
     println!("metadata");
     println!(
-        "       name='{}' version='{}' root='{}' abi={}",
+        "       name='{}' version='{}' root='{}' abi={} origin={:?}",
         plugin.name(),
         plugin.version(),
         root,
-        plugin.interface_version()
+        plugin.interface_version(),
+        plugin.load_origin()
     );
     // `load` refuses anything that fails these, so reaching here is the check.
     // Restated so the output says what was established rather than only what
@@ -238,6 +239,12 @@ fn run(path: &str) -> Result<u32, HostError> {
         //
         // SAFETY: as above; the library is already resident.
         let mounted = unsafe { Plugin::load(path) }?;
+        // And it says so. A host that reloads a path it was handed reports this
+        // rather than a success, since nothing was read and nothing changed.
+        checks.check(
+            mounted.load_origin() == LoadOrigin::AlreadyResident,
+            "a second load of one path reports itself as already resident",
+        );
         // `_blocking`: a plugin call enters a library this process did not
         // build, for a time nothing here bounds, so on the WebSocket server it
         // belongs off the reader task. On the TCP servers the two are the same.

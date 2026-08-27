@@ -314,6 +314,22 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
             })),
         }
     };
+    // The same terms the listing's own guard is built from, published so a
+    // parent that nests this struct can settle its listing before writing
+    // anything. `false` when there is nothing to ask about, which is a plain
+    // struct of leaf fields.
+    let decline_terms = listing_decline_terms(&field_specs, from_impl_block, &repe);
+    let listing_declines = if decline_terms.is_empty() {
+        quote! { false }
+    } else {
+        quote! { #(#decline_terms)||* }
+    };
+    bodies.push(quote! {
+        fn repe_listing_declines(&self) -> bool {
+            #listing_declines
+        }
+    });
+
     bodies.push(quote! {
         fn repe_read_into(
             &self,
@@ -1176,14 +1192,19 @@ fn build_accessor_arm(accessor: &AccessorSpec, repe: &TokenStream2, sink: Sink) 
 // path serves it at all. `tests/shared_reads.rs` pins the rest by reading one
 // struct through both and comparing frames.
 //
-// One rule governs what may run here: **a listing never invokes a published
-// method.** A listing is the one read that composes many others, so a decline
-// discovered partway through would leave the entries before it already
-// executed, and the exclusive retry then executes them again — a `&self` getter
-// over a read counter would report the second call. Getters are the only
-// listing entries that are invoked rather than serialized, so a struct with any
-// field-shaped endpoint declines its listing at the top, before writing or
-// calling anything. What is left is serialization, which re-runs harmlessly.
+// One rule governs what may run here: **a listing settles whether it can be
+// served before it invokes anything.** A listing is the one read that composes
+// many others, so a decline discovered partway through would leave the entries
+// before it already executed, and the exclusive retry then executes them again
+// — a `&self` getter over a read counter would report the second call. Rewinding
+// the response buffer undoes the bytes; it cannot undo a call.
+//
+// Two things can force that decline, and the guard has to ask about both:
+// an accessor on this struct whose getter takes `&mut self`, and a
+// `#[repe(nested)]` child that declines at any depth. `listing_decline_terms`
+// builds the question; `RepeStruct::repe_listing_declines` is how a parent asks
+// it of a child. Once the guard passes, nothing left in the listing can decline.
+//
 // Reading one of those endpoints on its own is unaffected: that arm decides
 // from the receiver, before it calls anything.
 
@@ -1321,24 +1342,72 @@ fn build_read_accessor_arm(accessor: &AccessorSpec, repe: &TokenStream2) -> Toke
     )
 }
 
+/// The terms of "a shared whole-object listing of this struct declines",
+/// OR'd together by both places that need the answer: the guard at the top of
+/// the listing, and the `RepeStruct::repe_listing_declines` this struct
+/// publishes for any parent that nests it.
+///
+/// Two things can force a listing exclusive, and they are not the same thing:
+///
+/// * an accessor on **this** struct whose getter takes `&mut self`, which
+///   `#[repe::methods]` reports as `REPE_LISTING_NEEDS_EXCLUSIVE`; and
+/// * a `#[repe(nested)]` child that declines, at any depth — the parent's
+///   listing composes the child's, so the child's refusal is the parent's.
+///
+/// The second is why this cannot be read off `RepeMethods` alone. A child is
+/// listed *before* this struct's own accessors are read, so a child discovered
+/// to decline partway through would leave those already invoked — and the
+/// exclusive retry invokes them again. Asking every child up front is what makes
+/// the guard's promise ("nothing after this point can decline") true rather than
+/// true by accident of declaration order.
+///
+/// An empty result means the constant `false`: a struct of plain fields, or one
+/// whose nesting and accessors all read shared. The caller emits no guard at all
+/// for that, so the common case costs nothing.
+fn listing_decline_terms(
+    fields: &[FieldSpec],
+    from_impl_block: bool,
+    repe: &TokenStream2,
+) -> Vec<TokenStream2> {
+    let mut terms = Vec::new();
+    if from_impl_block {
+        terms.push(quote! {
+            <Self as #repe::structs::RepeMethods>::REPE_LISTING_NEEDS_EXCLUSIVE
+        });
+    }
+    for field in fields {
+        if field.attrs.skip || !field.attrs.nested {
+            continue;
+        }
+        let ident = &field.ident;
+        let ty = &field.ty;
+        terms.push(quote! {
+            <#ty as #repe::RepeStruct>::repe_listing_declines(&self.#ident)
+        });
+    }
+    terms
+}
+
 /// The whole-struct listing, read through a shared borrow.
 ///
-/// Serialization only: see the rule at the top of this section. The one entry
-/// that can still decline is a nested child, which declines before writing
-/// anything of its own, and `ObjectBody::entry_try_with` rewinds the object it
-/// was building — so a `None` from here leaves the response body exactly as it
-/// was found, which is what `RepeStruct::repe_read_into` promises.
+/// Guarded up front, then unconditional: see the rule at the top of this
+/// section. Past the guard no entry can decline, so the `entry_try_with` rewinds
+/// below are the safety net for a hand-written table that overrode the guard's
+/// inputs and got them wrong — and even then a `None` from here leaves the
+/// response body exactly as it was found, which is what
+/// `RepeStruct::repe_read_into` promises.
 fn build_read_listing(
     fields: &[FieldSpec],
     methods: &[MethodSpec],
     from_impl_block: bool,
     repe: &TokenStream2,
 ) -> TokenStream2 {
-    // A constant, so for a table with no field-shaped endpoints this folds away
-    // and the listing is served shared as it stands.
-    let guard = from_impl_block.then(|| {
+    // Settled before anything is written or called, and for the whole subtree —
+    // see `listing_decline_terms`. Every term folds to a constant, and a struct
+    // with no terms at all gets no guard emitted.
+    let guard = (!listing_decline_terms(fields, from_impl_block, repe).is_empty()).then(|| {
         quote! {
-            if !<Self as #repe::structs::RepeMethods>::REPE_ACCESSOR_ENDPOINTS.is_empty() {
+            if <Self as #repe::RepeStruct>::repe_listing_declines(self) {
                 return None;
             }
         }
@@ -1386,6 +1455,28 @@ fn build_read_listing(
         entries.push(quote! {
             for &(name, signature) in <Self as #repe::structs::RepeMethods>::REPE_METHOD_SIGNATURES {
                 if let Err(__repe_err) = __repe_obj.entry(name, &signature) {
+                    return Some(Err(__repe_err));
+                }
+            }
+        });
+        // A field-shaped endpoint is listed by its value, exactly as the
+        // exclusive listing lists it, and reached the same indirect way: this
+        // derive cannot see the impl block, so the endpoint list is all it has
+        // to name a getter by.
+        //
+        // Emitted last, after every entry that could have declined — though by
+        // the guard above none of them can, so the `?` on a `None` is the safety
+        // net for a hand-written table whose `REPE_LISTING_NEEDS_EXCLUSIVE`
+        // disagrees with its `repe_call_read_into`, not a path a derived one
+        // takes. `entry_try_with` rewinds the object it was building, so even
+        // then the response body is left as `repe_read_into` found it.
+        entries.push(quote! {
+            for &name in <Self as #repe::structs::RepeMethods>::REPE_ACCESSOR_ENDPOINTS {
+                if let Err(__repe_err) = __repe_obj.entry_try_with(name, |__repe_nested| {
+                    <Self as #repe::structs::RepeMethods>::repe_call_read_into(
+                        self, &[name], __repe_nested,
+                    )
+                })? {
                     return Some(Err(__repe_err));
                 }
             }
@@ -1609,6 +1700,17 @@ fn methods_impl(
         .accessors
         .iter()
         .map(|spec| LitStr::new(&spec.endpoint, Span::call_site()));
+    // The shared whole-struct listing reads every accessor back through
+    // `repe_call_read_into`, which serves a getter only when it takes `&self`.
+    // One `&mut self` getter is enough to make a decline possible partway
+    // through the listing, and a decline discovered there would leave the
+    // getters before it invoked twice — so the listing declines at the top
+    // instead. Every getter being `&self` means no entry can decline, which is
+    // what lets the listing be served shared.
+    let listing_needs_exclusive = published
+        .accessors
+        .iter()
+        .any(|spec| !matches!(spec.get.receiver, ReceiverKind::Ref));
 
     let mut bodies = Vec::new();
     for sink in [Sink::Value, Sink::Encode] {
@@ -1709,6 +1811,8 @@ fn methods_impl(
 
             const REPE_ACCESSOR_ENDPOINTS: &'static [&'static str] =
                 &[#(#accessor_endpoints),*];
+
+            const REPE_LISTING_NEEDS_EXCLUSIVE: bool = #listing_needs_exclusive;
 
             #(#bodies)*
         }

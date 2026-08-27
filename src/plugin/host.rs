@@ -59,7 +59,10 @@
 //!   refcounts by path, so re-loading a library that is already resident hands
 //!   back the resident one. A host that replaces a plugin binary in place and
 //!   reloads it will serve the old code with no error anywhere. Publish each
-//!   build under its own path if reload has to mean anything.
+//!   build under its own path if reload has to mean anything — and where the
+//!   path is not the host's to choose, [`Plugin::load_origin`] says which of the
+//!   two happened, so a reload endpoint handed the wrong path can report a no-op
+//!   instead of a success.
 //! * **Two [`Plugin`] values for one path are two handles to one instance.**
 //!   They share the plugin's state, its initialization, and its shutdown.
 //!
@@ -234,6 +237,42 @@ pub enum HostError {
     },
 }
 
+/// What a [`Plugin::load`] did to the library it names.
+///
+/// `dlopen` refcounts by path, so a load either maps the library or reaches a
+/// copy the process already had. Both produce a working [`Plugin`], and without
+/// this they are indistinguishable in every observable one has — which is how a
+/// hot-reload endpoint comes to report success for a load that read no file.
+///
+/// `#[non_exhaustive]` because the set of answers is the loader's, not this
+/// crate's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LoadOrigin {
+    /// The load mapped the library: the file was read and, if the plugin exports
+    /// one, its initializer ran for the first time.
+    Mapped,
+    /// The library was already resident. No file was read, no initializer ran,
+    /// and a binary rebuilt in place at that path was not picked up.
+    ///
+    /// Not an error: the handle works, and it shares the plugin's state and
+    /// initialization with every other handle to the same path. It is the *load*
+    /// that was a no-op, which is the thing a host needs to be able to say.
+    AlreadyResident,
+    /// This platform's dynamic loader cannot be asked.
+    ///
+    /// The probe is `RTLD_NOLOAD`, which POSIX does not require and which
+    /// OpenBSD, Haiku, AIX and VxWorks do not provide. Everywhere this crate is
+    /// built and tested — Linux, macOS, the BSDs that have the flag, and Windows
+    /// via `GetModuleHandleExW` — answers [`Mapped`](Self::Mapped) or
+    /// [`AlreadyResident`](Self::AlreadyResident).
+    ///
+    /// A host should report it as "cannot tell" rather than folding it into
+    /// either answer; that is the whole reason it is a variant instead of a
+    /// convenient default.
+    Unknown,
+}
+
 /// `repe_plugin_interface_version`.
 type InterfaceVersionFn = unsafe extern "C" fn() -> u32;
 /// `repe_plugin_info`.
@@ -274,6 +313,7 @@ struct PluginAbi {
 /// library, which is the process.
 pub struct Plugin {
     path: PathBuf,
+    origin: LoadOrigin,
     interface_version: u32,
     name: String,
     version: String,
@@ -325,6 +365,11 @@ impl Plugin {
     pub unsafe fn load(path: impl AsRef<Path>) -> Result<Self, HostError> {
         let path = path.as_ref().to_path_buf();
 
+        // Before the open, because after it the answer is always "resident".
+        // This is what [`load_origin`](Self::load_origin) reports, and the only
+        // point at which the distinction is observable.
+        let origin = probe_origin(&path);
+
         let library = match unsafe { open(&path) } {
             Ok(library) => library,
             Err(source) => return Err(HostError::Load { path, source }),
@@ -362,7 +407,7 @@ impl Plugin {
 
         // SAFETY: every pointer above came from `dlsym` on this library, which
         // is now resident for the life of the process.
-        unsafe { Self::from_abi(path, abi) }
+        unsafe { Self::from_abi(path, abi, origin) }
     }
 
     /// The version handshake, the metadata read, and initialization.
@@ -371,7 +416,11 @@ impl Plugin {
     ///
     /// The function pointers in `abi` must be valid for the life of the process
     /// and must have the signatures `plugin.h` declares.
-    unsafe fn from_abi(path: PathBuf, abi: PluginAbi) -> Result<Self, HostError> {
+    unsafe fn from_abi(
+        path: PathBuf,
+        abi: PluginAbi,
+        origin: LoadOrigin,
+    ) -> Result<Self, HostError> {
         // First, and before anything whose meaning depends on it. `plugin.h` is
         // explicit that the version governs whether the metadata struct's layout
         // can be trusted, which is why it is a standalone function.
@@ -452,6 +501,7 @@ impl Plugin {
 
         Ok(Self {
             path,
+            origin,
             interface_version,
             name,
             version,
@@ -464,6 +514,37 @@ impl Plugin {
     /// The path this plugin was loaded from.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Whether this [`load`](Self::load) mapped the library, reached a copy the
+    /// process already had resident, or could not be asked. See [`LoadOrigin`]
+    /// for what each answer means, and the [module docs](self) for why the
+    /// library is never unloaded and what a deployment does about it.
+    ///
+    /// Do not confuse [`LoadOrigin::AlreadyResident`] with the ABI's
+    /// `REPE_ERROR_ALREADY_INITIALIZED`: a plugin that initializes lazily
+    /// returns that on a genuine first load, so it answers a different question
+    /// and answers this one wrongly.
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use repe::plugin::host::{LoadOrigin, Plugin};
+    ///
+    /// // SAFETY: a plugin built against `glaze/rpc/repe/plugin.h`.
+    /// let plugin = unsafe { Plugin::load("libinstrument.so") }?;
+    /// match plugin.load_origin() {
+    ///     LoadOrigin::Mapped => println!("loaded {}", plugin.name()),
+    ///     // Report the reload as a no-op rather than as a success.
+    ///     LoadOrigin::AlreadyResident => println!(
+    ///         "{} was already resident; the file on disk was not read",
+    ///         plugin.path().display()
+    ///     ),
+    ///     _ => println!("this platform cannot say whether the file was read"),
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub fn load_origin(&self) -> LoadOrigin {
+        self.origin
     }
 
     /// The ABI version the plugin reported, which is within
@@ -805,6 +886,86 @@ unsafe fn open(path: &Path) -> Result<Library, libloading::Error> {
     }
 }
 
+/// Ask the dynamic loader whether the library at `path` is already resident.
+///
+/// The probe behind [`Plugin::load_origin`], and the only point at which the
+/// question can be asked: after the real open the answer is always yes.
+///
+/// It takes a reference to the library and releases it again, which is the one
+/// `dlclose` this module permits. The invariant is that nothing is ever
+/// *unmapped*, not that `dlclose` is never spelled: the library was already
+/// resident before the probe, so returning the count to what it was cannot reach
+/// zero. A library that is not resident is never opened here at all — that is
+/// what `RTLD_NOLOAD` means.
+///
+/// The `cfg` names the four unix targets whose loader has no `RTLD_NOLOAD`.
+/// POSIX does not require the flag, so this is a property of the platform rather
+/// than a gap in `libc`, and it is why [`LoadOrigin::Unknown`] exists at all.
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "openbsd",
+        target_os = "haiku",
+        target_os = "aix",
+        target_os = "vxworks"
+    ))
+))]
+fn probe_origin(path: &Path) -> LoadOrigin {
+    use libloading::os::unix::{Library, RTLD_LAZY, RTLD_LOCAL};
+
+    // `RTLD_LAZY` rather than `RTLD_NOW`: with `RTLD_NOLOAD` nothing is mapped,
+    // so there is nothing to bind, and asking for eager binding on a probe would
+    // only give the loader work to refuse. Neither flag promotes anything on an
+    // object that is already resident.
+    //
+    // Only `RTLD_NOLOAD` comes from `libc` — libloading carries the two POSIX
+    // flags itself, including a fallback for targets whose values it does not
+    // know.
+    //
+    // SAFETY: `RTLD_NOLOAD` cannot map a library, so no initializer runs here
+    // and none of `dlopen`'s usual provenance obligations apply. The handle is
+    // dropped without a symbol ever being resolved through it.
+    let resident =
+        unsafe { Library::open(Some(path), libc::RTLD_NOLOAD | RTLD_LAZY | RTLD_LOCAL) }.is_ok();
+    if resident {
+        LoadOrigin::AlreadyResident
+    } else {
+        LoadOrigin::Mapped
+    }
+}
+
+/// The unix targets with no `RTLD_NOLOAD`. Nothing here can distinguish the two
+/// outcomes, and saying so is better than picking one.
+#[cfg(all(
+    unix,
+    any(
+        target_os = "openbsd",
+        target_os = "haiku",
+        target_os = "aix",
+        target_os = "vxworks"
+    )
+))]
+fn probe_origin(_path: &Path) -> LoadOrigin {
+    LoadOrigin::Unknown
+}
+
+/// Windows counterpart of the `RTLD_NOLOAD` probe.
+///
+/// `GetModuleHandleExW` takes a reference to an already-loaded module and fails
+/// rather than loading one, which is the same question; dropping the handle
+/// releases that reference, exactly as on Unix. Note that it matches on module
+/// name when `path` carries no directory, so a host that wants the answer to be
+/// about a specific file should hand [`Plugin::load`] a full path — which is
+/// what a deployment publishing each build under its own path does anyway.
+#[cfg(not(unix))]
+fn probe_origin(path: &Path) -> LoadOrigin {
+    if libloading::os::windows::Library::open_already_loaded(path).is_ok() {
+        LoadOrigin::AlreadyResident
+    } else {
+        LoadOrigin::Mapped
+    }
+}
+
 /// Resolve a symbol `plugin.h` marks required.
 fn required<T: Copy>(library: &Library, path: &Path, symbol: &'static str) -> Result<T, HostError> {
     // SAFETY: the caller of `load` warranted that this library implements
@@ -931,7 +1092,7 @@ mod tests {
     fn load(abi: PluginAbi) -> Result<Plugin, HostError> {
         // SAFETY: every pointer is a `fn` item in this binary, so it is valid
         // for the life of the process and has the declared signature.
-        unsafe { Plugin::from_abi(PathBuf::from("in-process"), abi) }
+        unsafe { Plugin::from_abi(PathBuf::from("in-process"), abi, LoadOrigin::Mapped) }
     }
 
     fn request(path: &str, body: &serde_json::Value, notify: bool) -> Vec<u8> {
