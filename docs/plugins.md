@@ -70,9 +70,27 @@ One case a host controls: **do not pass a previous response back as the next req
 
 `plugin.h` permits concurrent calls from multiple threads, each with its own response buffer, and this implementation honors that.
 
-Whether the *work* runs concurrently depends on what the router holds. A router built with `with_struct` puts the value behind a `Mutex`, so every call against it — including a pure field read — serializes. A plugin whose handlers block on hardware, under a host running several threads, will queue unrelated reads behind them. Long-running work belongs on an owning worker thread with handlers that enqueue and return.
+Whether the *work* runs concurrently depends on what the router holds. A router built with `with_struct` puts the value behind a `Mutex`, so every call against it — including a pure field read — serializes. Use `with_struct_rw` instead and reads share the guard:
 
-A panicking handler leaves that mutex poisoned, which surfaces as an error response rather than a second panic: the plugin degrades to answering errors instead of taking the host down with it. How far it degrades is worth stating plainly — `std` never clears poison, so every later request under that root, including a read of an unrelated field, answers with an error for the life of the host process. One panicking method retires the whole object, and there is no recovery short of restarting the host. A plugin that must survive a handler bug should publish its state through individual handlers rather than `with_struct`.
+```rust
+use repe::server::Router;
+
+# #[derive(Default, serde::Serialize, serde::Deserialize, repe::RepeStruct)]
+# struct Instrument { gain: f64 }
+#[repe::plugin(root = "/instrument")]
+fn build() -> Router {
+    Router::new().with_struct_rw("/instrument", Instrument::default()).0
+}
+```
+
+That is what `examples/repe_plugin.rs` does, and it is the shape a plugin should ship: the ABI promises concurrent calls, and this is what makes the promise hold for reads. See [Reads share the guard](server.md#reads-share-the-guard) for exactly which endpoints qualify. Writes and `&mut self` methods still take the lock exclusively, so a handler that blocks on hardware still queues everything behind it — long-running work belongs on an owning worker thread with handlers that enqueue and return.
+
+A panicking handler answers with an error response rather than a second panic, so the plugin degrades instead of taking the host down with it. How far it degrades depends on which guard the handler held, and the difference is worth stating plainly:
+
+- A **`&mut self`** handler (or any handler under a `Mutex`) poisons the lock. `std` never clears poison, so every later request under that root, including a read of an unrelated field, answers with an error for the life of the host process. One panicking method retires the whole object, and there is no recovery short of restarting the host.
+- A **`&self`** handler under an `RwLock` does not. `std::sync::RwLock` poisons only on a panic while the write guard is held, so a panicking read leaves the object serving.
+
+A plugin that must survive a `&mut self` handler bug should publish its state through individual handlers rather than a registered struct.
 
 ## Deployment requirements
 

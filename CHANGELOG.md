@@ -27,6 +27,20 @@
 
 - **`plugin::host::Plugin` implements `HandlerErased`.** A loaded plugin mounts on a router in one line (`Router::new().with_fallback_blocking(plugin.clone())`), with the frame marshalling between the router's decoded request and the ABI's byte buffers handled by the crate. The plugin's own error frames pass through unchanged; only a plugin that breaks the ABI — answering with nothing, or with a frame that does not parse — becomes an `InternalError` response, so the caller is answered either way. Which plugins are in the table, and when, stays the application's.
 
+- **Reads share the guard.** Struct dispatch took an exclusive lock for every request, so a `/version` read queued behind whatever long-running call held the object, and swapping in an `RwLock` changed nothing. A bodiless request — a read, by REPE's own frame-level distinction — now goes through `&self` where the derive can reach the value that way: every field at any nesting depth, a `#[repe::methods]` method taking `&self` and no arguments, the getter half of a field-shaped endpoint with a `&self` getter, and the whole-object listing when nothing in it has to be *invoked*. Everything else declines and is served exclusively as before, identically and invisibly.
+
+  `Router::with_struct_rw` is `with_struct` behind an `RwLock`, which is the registration that turns any of this on; `with_struct` and its `Mutex` are unchanged, and there the shared path is compiled out rather than taking the same lock twice.
+
+  A listing declines outright when the struct publishes any field-shaped endpoint. It is the one read that composes many others, so a decline discovered partway through would leave the getters before it called twice — once here and once on the exclusive retry — and a `&self` getter over a read counter would report the second call. Individual reads of those endpoints are unaffected.
+
+  This is what makes a plugin honor the concurrency its own ABI advertises, so `examples/repe_plugin.rs` now registers its object that way.
+
+  Three additions carry it, all defaulted: `Lockable::with_read` (`None` unless the lock has a shared mode), `RepeStruct::repe_read_into`, and `RepeMethods::repe_call_read_into`. A hand-written impl that overrides none of them behaves exactly as it did.
+
+  Two consequences worth knowing. Two `&self` methods on one object now run at the same time, where the exclusive guard used to give them mutual exclusion for free. And a panic under a shared guard no longer poisons the lock, so a panicking `&self` handler no longer retires the object for the life of the process; a `&mut self` one still does.
+
+  One source break: a `#[repe(methods(..))]` entry declared `&self` is now *called* through a shared borrow, so declaring a `&mut self` method as `&self` is a compile error rather than a lie the listing repeated.
+
 - **Field-shaped endpoints: `#[repe(get = "...")]` / `#[repe(set = "...")]`.** One endpoint served by a getter/setter pair, for a value that reads and writes like a field but is computed — a register in different units, a value derived from two others. It behaves as a field on the wire, listing its **value** in the whole-object read rather than a signature string, where publishing the same thing as methods would have changed the path. A getter with no setter is read-only, so a pair of real getters and no-op setters is no longer how a read-only computed value is spelled. `#[repe(typed)]` composes on the getter, either half may be fallible, and a setter with no getter is a compile error rather than an endpoint the listing cannot show.
 
 - **Plugin-ABI interop coverage, both directions.** `interop/cpp/plugin_host.cpp` is a C++ Glaze host that `dlopen`s the Rust plugin example; `interop/cpp/example_plugin.cpp` is a C++ Glaze plugin that the Rust host `dlopen`s. Both run in the existing `interop` CI job against the same pinned Glaze tag as the wire-format fixtures. One direction alone would leave one implementation agreeing with itself, which it does by construction even when both of its ends misread the same clause of the header.

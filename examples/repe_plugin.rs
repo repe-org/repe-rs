@@ -91,6 +91,13 @@ impl Instrument {
 /// The function stays callable, which is the point: the same router that goes
 /// over the ABI can be driven directly by an in-process test, with no `dlopen`
 /// and no host in the loop.
+///
+/// `with_struct_rw` is the part worth copying. `plugin.h` permits a host to call
+/// `repe_plugin_call` from several threads at once, and `with_struct`'s default
+/// `Mutex` would serialize every one of them — a `/gain` read included. Behind
+/// the `RwLock` this registers, reads (`identify` and every field) share the
+/// guard; only `calibrate` and `reset`, which take `&mut self`, take it
+/// exclusively.
 #[repe::plugin(root = "/instrument")]
 fn build() -> Router {
     let instrument = Instrument {
@@ -99,5 +106,5 @@ fn build() -> Router {
         firmware: "1.4.2".to_string(),
         samples: [0.0; 8],
     };
-    Router::new().with_struct("/instrument", instrument).0
+    Router::new().with_struct_rw("/instrument", instrument).0
 }

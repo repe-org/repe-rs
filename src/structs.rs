@@ -88,6 +88,48 @@ pub trait RepeStruct: Send + Sync {
         let value = self.repe_handle(segments, body)?;
         write_optional(out, segments, value)
     }
+
+    /// Serve a **read** through a shared borrow, or decline it.
+    ///
+    /// A read is a request with no body — REPE separates the two at the frame
+    /// level — so there is no `body` parameter here and no state to change. The
+    /// router tries this first for every bodiless request against a struct
+    /// registered behind a lock that has a shared mode, which is what keeps a
+    /// `/version` read from queueing behind a half-second method call on the
+    /// same object.
+    ///
+    /// Return `None` for any path this borrow cannot serve: a write-shaped
+    /// endpoint, a `&mut self` method, a nested field whose child declined. The
+    /// router then retakes the lock exclusively and dispatches through
+    /// [`repe_handle_into`](Self::repe_handle_into), so declining costs
+    /// correctness nothing — it is the default, and a hand-written impl that
+    /// never overrides this behaves exactly as it did before the path existed.
+    ///
+    /// Two obligations come with overriding it:
+    ///
+    /// * **Answer identically.** Whatever this returns for a path is what the
+    ///   client sees; the exclusive path is not consulted afterwards. Decline
+    ///   rather than approximate.
+    /// * **Write nothing when declining.** A `None` return must leave `out` as
+    ///   it was found, so the exclusive attempt starts from an empty body.
+    ///   [`ObjectBody::entry_try_with`] exists to make that mechanical when the
+    ///   decline surfaces partway through an object: it rewinds the whole
+    ///   object, so propagating its `None` is all a caller has to do.
+    ///
+    /// A derived impl serves a listing only when nothing in it has to be
+    /// *invoked* — a struct with a field-shaped endpoint declines the whole
+    /// listing up front — because a decline discovered later would leave the
+    /// entries before it run twice, once here and once on the exclusive retry.
+    /// A hand-written impl that invokes anything before it can decide owes the
+    /// same care.
+    fn repe_read_into(
+        &self,
+        segments: &[&str],
+        out: &mut ResponseBody<'_>,
+    ) -> Option<StructResult<()>> {
+        let _ = (segments, out);
+        None
+    }
 }
 
 /// Method table for a struct whose methods are declared with `#[repe::methods]`
@@ -119,7 +161,9 @@ pub trait RepeMethods: MethodsDeclared {
     /// have no signature to publish: a client reads and writes one the way it
     /// reads and writes a field, so the whole-struct listing shows each one's
     /// current value rather than a signature string. The derived listing reads
-    /// those values back through [`repe_call`](Self::repe_call).
+    /// those values back through [`repe_call`](Self::repe_call), or through
+    /// [`repe_call_read_into`](Self::repe_call_read_into) when it is being
+    /// served under a shared borrow.
     ///
     /// Defaults to empty, so a hand-written impl need not mention it. One
     /// invariant comes with listing a name here, and the derived listing relies
@@ -127,7 +171,9 @@ pub trait RepeMethods: MethodsDeclared {
     /// `segments = &[name], body = None` with `Ok(Some(value))`. A name the
     /// table cannot dispatch turns every whole-struct read into that name's
     /// error. `#[repe::methods]` upholds it by construction, because it emits
-    /// this list from the getters it generated arms for.
+    /// this list from the getters it generated arms for. The shared-borrow
+    /// listing asks the same question of `repe_call_read_into`, where a `None`
+    /// is not a failure — it declines the whole listing to the exclusive path.
     const REPE_ACCESSOR_ENDPOINTS: &'static [&'static str] = &[];
 
     /// Invoke the method named by `segments[0]`.
@@ -147,6 +193,21 @@ pub trait RepeMethods: MethodsDeclared {
     ) -> StructResult<()> {
         let value = self.repe_call(segments, body)?;
         write_optional(out, segments, value)
+    }
+
+    /// Shared-borrow counterpart of [`repe_call_into`](Self::repe_call_into),
+    /// mirroring [`RepeStruct::repe_read_into`] and carrying the same two
+    /// obligations: answer identically, or decline without writing.
+    ///
+    /// `#[repe::methods]` serves a `&self` method taking no arguments and the
+    /// getter half of a `&self` accessor here, and declines everything else.
+    fn repe_call_read_into(
+        &self,
+        segments: &[&str],
+        out: &mut ResponseBody<'_>,
+    ) -> Option<StructResult<()>> {
+        let _ = (segments, out);
+        None
     }
 }
 
@@ -250,13 +311,13 @@ pub struct ResponseBody<'a> {
     ///
     /// Reached from generated code by exactly one path: the whole-struct listing
     /// writes each accessor endpoint's value through
-    /// [`ObjectBody::entry_with`], so a `#[repe(typed)]` getter listed inside
-    /// the object emits a JSON array rather than switching the enclosing frame
-    /// to BEVE. (A `#[repe(nested)]` field also gets a nested body, but its
-    /// child is always entered with empty segments and so always takes its own
-    /// object branch.) The flag also covers hand-written `repe_handle_into`
-    /// impls, which can call anything from anywhere; a JSON-array fallback beats
-    /// corrupting the frame.
+    /// [`ObjectBody::entry_with`] or [`ObjectBody::entry_try_with`], so a
+    /// `#[repe(typed)]` getter listed inside the object emits a JSON array
+    /// rather than switching the enclosing frame to BEVE. (A `#[repe(nested)]`
+    /// field also gets a nested body, but its child is always entered with empty
+    /// segments and so always takes its own object branch.) The flag also covers
+    /// hand-written `repe_handle_into` impls, which can call anything from
+    /// anywhere; a JSON-array fallback beats corrupting the frame.
     nested: bool,
 }
 
@@ -364,11 +425,12 @@ impl<'a> ResponseBody<'a> {
 /// A JSON object body being written key by key. Created by
 /// [`ResponseBody::object`]; call [`finish`](Self::finish) to close it.
 ///
-/// An entry that fails rewinds the buffer past the opening brace, so a partly
-/// written object is never left behind for a caller that recovers from the
-/// error. Dropping without calling [`finish`](Self::finish) is the same
-/// situation and leaves nothing behind either, since the only way out without
-/// finishing is an error that has already rewound.
+/// An entry that fails — or that [`entry_try_with`](Self::entry_try_with)
+/// declines — rewinds the buffer past the opening brace, so a partly written
+/// object is never left behind for a caller that recovers from it. Dropping
+/// without calling [`finish`](Self::finish) is the same situation and leaves
+/// nothing behind either, since both ways out without finishing have already
+/// rewound.
 pub struct ObjectBody<'a> {
     buf: &'a mut Vec<u8>,
     /// Buffer length before the opening brace, to rewind to on failure.
@@ -438,6 +500,36 @@ impl ObjectBody<'_> {
             };
             f(&mut body)
         })
+    }
+
+    /// [`entry_with`](Self::entry_with) for a value the source may decline to
+    /// produce, as [`RepeStruct::repe_read_into`] declines a path that needs
+    /// exclusive access.
+    ///
+    /// `None` rewinds the whole object, exactly as an `Err` does, so a caller
+    /// that declines in turn leaves the buffer as it found it without a second
+    /// step. Dropping the object without calling [`finish`](Self::finish) then
+    /// leaves nothing behind, because the only ways out without finishing are
+    /// an error and a decline, and both have already rewound.
+    pub fn entry_try_with<F>(&mut self, key: &str, f: F) -> Option<StructResult<()>>
+    where
+        F: FnOnce(&mut ResponseBody<'_>) -> Option<StructResult<()>>,
+    {
+        let outcome = match self.key(key) {
+            Ok(()) => {
+                let mut body = ResponseBody {
+                    buf: self.buf,
+                    format: BodyFormat::Json,
+                    nested: true,
+                };
+                f(&mut body)
+            }
+            Err(err) => Some(Err(err)),
+        };
+        if !matches!(outcome, Some(Ok(()))) {
+            self.buf.truncate(self.start);
+        }
+        outcome
     }
 
     /// Close the object.
