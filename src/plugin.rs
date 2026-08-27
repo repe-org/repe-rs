@@ -40,32 +40,23 @@
 //! * **`size == 0` still carries a non-null `data`.** Glaze's helper returns
 //!   `std::string::data()`, which is never null; a C++ host that builds a
 //!   `std::string_view` or `std::string` from a null pointer with length 0 is
-//!   undefined behavior even though it works in practice. [`RepeBuffer::empty`]
-//!   points at a static byte so the host sees what it sees from a C++ plugin.
+//!   undefined behavior even though it works in practice. This crate points at a
+//!   static byte instead, so the host sees what it sees from a C++ plugin.
 //! * **A notify request answers with `size == 0`.** REPE notifies produce no
 //!   response, and a host must read zero size as "send nothing" rather than as
 //!   an error.
 //!
-//! # Deployment requirements
+//! # Build with `panic = "unwind"`
 //!
-//! These are load-bearing, and each one fails in a way that is hard to trace
-//! back to its cause:
+//! The generated `repe_plugin_call` wraps dispatch in [`catch_unwind`] so a
+//! panicking handler becomes an [`InternalError`](ErrorCode::InternalError)
+//! response instead of killing the host. Under `panic = "abort"` — routinely set
+//! on embedded targets to shrink binaries — that guard is inert and any handler
+//! bug takes the whole process down.
 //!
-//! * **Build with `panic = "unwind"`.** The generated `repe_plugin_call` wraps
-//!   dispatch in [`catch_unwind`] so a panicking handler becomes an
-//!   [`InternalError`](ErrorCode::InternalError) response instead of killing the
-//!   host. Under `panic = "abort"` — routinely set on embedded targets to shrink
-//!   binaries — that guard is inert and any handler bug takes the whole process
-//!   down.
-//! * **Hosts should not `dlclose` a Rust plugin.** The response buffer is a
-//!   thread-local, and on glibc unloading a library while threads that touched
-//!   its TLS are still alive leaves destructor addresses pointing into unmapped
-//!   memory. The crash lands at thread exit, arbitrarily far from the unload. A
-//!   host that hot-reloads plugins should leak the handle and accept the
-//!   address-space growth.
-//! * **One plugin per `cdylib`.** `dlsym` resolves by name, so the five exported
-//!   symbols are global. Invoking the macro twice in one library is a duplicate
-//!   symbol error at link time.
+//! The rest of what a *host* has to get right (not `dlclose`ing a Rust plugin,
+//! one plugin per `cdylib`) is in the plugin guide rather than here, since none
+//! of it is visible from the API.
 //!
 //! # Concurrency
 //!
@@ -82,7 +73,12 @@
 //!
 //! A panicking handler leaves that `Mutex` poisoned, which the crate reports as a
 //! `LockError::Poisoned` error response rather than a second panic — so the
-//! plugin degrades to answering errors instead of taking the host with it.
+//! plugin degrades to answering errors instead of taking the host with it. Note
+//! *how far* it degrades: `std` never clears poison, so every later request under
+//! that root, including a read of an unrelated field, answers with an error for
+//! the life of the host process. One panicking method retires the whole object.
+//! A plugin that must survive a handler bug should not publish its state through
+//! [`with_struct`](Router::with_struct).
 
 use std::cell::RefCell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -140,7 +136,7 @@ static EMPTY_RESPONSE_ANCHOR: u8 = 0;
 
 impl RepeBuffer {
     /// The empty response: `size == 0` with a valid, non-null `data`.
-    pub fn empty() -> Self {
+    fn empty() -> Self {
         Self {
             data: (&raw const EMPTY_RESPONSE_ANCHOR).cast::<c_char>(),
             size: 0,
@@ -322,12 +318,21 @@ impl PluginRuntime {
 
     /// Body of `repe_plugin_shutdown`: refuse further work.
     ///
-    /// The router is not dropped. A host may still hold a response buffer
-    /// borrowed from a thread-local, and the ABI has no point at which those
-    /// are known to be released, so tearing the state down would trade a
-    /// contract violation for a use-after-free. Subsequent calls answer with an
-    /// error frame, which turns a host that ignores its own contract into a
+    /// The router is not dropped, which diverges from the header's "release all
+    /// resources" and is worth knowing when writing a plugin: a `Drop` on
+    /// anything the router owns — a device handle, a worker thread — does not
+    /// run here.
+    ///
+    /// It cannot run here. `plugin.h` permits concurrent calls, so a call that
+    /// passed the shutdown check on another thread is still holding `&Router`
+    /// at this instant, and `OnceLock` offers no way to take the value back out
+    /// through a shared reference. Dropping it would trade a contract violation
+    /// for a use-after-free. Subsequent calls answer with an error frame
+    /// instead, which turns a host that ignores its own contract into a
     /// diagnosable fault rather than a silent one.
+    ///
+    /// A plugin that must release something at shutdown should own it behind
+    /// its own handle rather than expect this to do it.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
     }
@@ -560,6 +565,13 @@ fn with_response_buffer(f: impl FnOnce(&mut Vec<u8>) -> RepeBuffer) -> RepeBuffe
 ///
 /// Compares addresses only — never dereferences, and never holds a borrow across
 /// the dispatch that follows.
+///
+/// It has to run *before* [`with_response_buffer`] rather than inside it, which
+/// looks like a redundant second thread-local lookup and is not: that closure
+/// receives `&mut Vec<u8>`, and forming a unique reference to the very
+/// allocation `request` is borrowed from is the aliasing violation being
+/// detected. The check must therefore be made through a shared borrow, before
+/// any `&mut` to the buffer exists.
 fn aliases_response_buffer(request: &[u8]) -> bool {
     RESPONSE
         .try_with(|cell| {

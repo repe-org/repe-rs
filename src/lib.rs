@@ -67,7 +67,8 @@ pub use repe_derive::RepeStruct;
 /// C-ABI plugin, generating the five symbols a host resolves after `dlopen`.
 ///
 /// Lives in the macro namespace, so `#[repe::plugin(..)]` names this while
-/// `repe::plugin::..` names the [`plugin`] module holding the ABI types.
+/// `repe::plugin::..` names the [`plugin`](mod@crate::plugin) module holding the
+/// ABI types.
 /// See that module for the buffer contract and deployment requirements.
 #[cfg(all(feature = "plugin", not(target_arch = "wasm32")))]
 pub use repe_derive::plugin;

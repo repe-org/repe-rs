@@ -1413,6 +1413,12 @@ fn expand_plugin(args: PluginArgs, item_fn: syn::ItemFn) -> syn::Result<TokenStr
              through a C ABI that has nothing to pass",
         ));
     }
+    if !item_fn.sig.generics.params.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &item_fn.sig.generics,
+            "`#[repe::plugin]` applies to a non-generic function: the exports are one fixed              set of symbols, so there is no parameter for the host to choose",
+        ));
+    }
     if item_fn.sig.asyncness.is_some() {
         return Err(syn::Error::new_spanned(
             &item_fn.sig,
@@ -1420,10 +1426,6 @@ fn expand_plugin(args: PluginArgs, item_fn: syn::ItemFn) -> syn::Result<TokenStr
              synchronous, with no runtime on the host side of the ABI to drive a future",
         ));
     }
-    // No check on the return type: `PluginRuntime::new` takes `fn() -> Router`
-    // and is handed `#build`, whose span is the user's function name, so a wrong
-    // one already reports itself there — accurately, which a check here could
-    // not, since an attribute macro sees a written type and never a resolved one.
 
     let build = &item_fn.sig.ident;
 

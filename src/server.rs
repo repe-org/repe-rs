@@ -1,7 +1,7 @@
 use crate::constants::{BodyFormat, ErrorCode, HEADER_SIZE};
 use crate::error::RepeError;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::io::{read_message_into, write_message_streaming};
+use crate::io::read_message_into;
 use crate::message::{
     Message, MessageView, create_body_response_unstamped, create_error_response_like,
     create_error_response_unstamped_view, create_response_unstamped,
@@ -1458,7 +1458,7 @@ impl Router {
     /// `None` as "write nothing", not as an error.
     ///
     /// Use it for any carrier the crate does not ship a server for: the C-ABI
-    /// [`plugin`](crate::plugin) surface (where it is literally the body of
+    /// [`plugin`](mod@crate::plugin) surface (where it is literally the body of
     /// `repe_plugin_call`), a shared-memory or in-process transport, a foreign
     /// event loop, or a test that wants to exercise routing without a socket.
     ///
@@ -1506,23 +1506,11 @@ impl Router {
                 let Some(response) = route_request_view(self, &view) else {
                     return false;
                 };
-                // The response leaves its query empty for the carrier to fill,
-                // so it is framed rather than written directly: the echoed query
-                // is a borrowed slice of `request`, not part of the response.
-                //
-                // The `expect` is not a swallowed error. `write_message_streaming`
-                // is generic over [`Write`], and `Vec<u8>`'s impl returns `Ok`
-                // unconditionally (it can abort on allocation failure, which is
-                // not an `Err`), so there is no reachable failure to propagate.
-                let echo = crate::message::response_echo_query(&response, view.query);
-                write_message_streaming(
-                    out,
-                    response.header,
-                    echo,
-                    response.body.len() as u64,
-                    |w| w.write_all(&response.body),
-                )
-                .expect("`Vec<u8>` as a `Write` sink is infallible");
+                // The `expect` is not a swallowed error: `Vec<u8>`'s `Write`
+                // impl returns `Ok` unconditionally, so there is no reachable
+                // failure to propagate.
+                crate::server_request::write_view_response(out, &response, view.query)
+                    .expect("`Vec<u8>` as a `Write` sink is infallible");
                 true
             }
             Err(err) => {
@@ -1960,17 +1948,7 @@ fn handle_connection(
         }
         let view = MessageView::from_slice(&buf)?;
         if let Some(resp) = route_request_view(&router, &view) {
-            // Echo the request query (a borrowed slice of `buf`) unless the
-            // handler set its own — matching the owned path's stamp rule — so no
-            // query buffer is copied into the response on the common path.
-            let echo = crate::message::response_echo_query(&resp, view.query);
-            write_message_streaming(
-                &mut writer,
-                resp.header,
-                echo,
-                resp.body.len() as u64,
-                |w| w.write_all(&resp.body),
-            )?;
+            crate::server_request::write_view_response(&mut writer, &resp, view.query)?;
             writer.flush()?;
         }
     }

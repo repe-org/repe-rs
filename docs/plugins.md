@@ -67,7 +67,7 @@ One case a host controls: **do not pass a previous response back as the next req
 
 Whether the *work* runs concurrently depends on what the router holds. A router built with `with_struct` puts the value behind a `Mutex`, so every call against it — including a pure field read — serializes. A plugin whose handlers block on hardware, under a host running several threads, will queue unrelated reads behind them. Long-running work belongs on an owning worker thread with handlers that enqueue and return.
 
-A panicking handler leaves that mutex poisoned, which surfaces as an error response rather than a second panic: the plugin degrades to answering errors instead of taking the host down with it.
+A panicking handler leaves that mutex poisoned, which surfaces as an error response rather than a second panic: the plugin degrades to answering errors instead of taking the host down with it. How far it degrades is worth stating plainly — `std` never clears poison, so every later request under that root, including a read of an unrelated field, answers with an error for the life of the host process. One panicking method retires the whole object, and there is no recovery short of restarting the host. A plugin that must survive a handler bug should publish its state through individual handlers rather than `with_struct`.
 
 ## Deployment requirements
 

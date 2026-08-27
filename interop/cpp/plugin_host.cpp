@@ -141,6 +141,14 @@ int main(int argc, char** argv)
    std::cout << "version\n";
    check(abi.interface_version() == REPE_PLUGIN_INTERFACE_VERSION,
          "plugin reports the interface version this host was built against");
+   if (abi.interface_version() != REPE_PLUGIN_INTERFACE_VERSION) {
+      // Fatal, not merely recorded. `plugin.h` is explicit that the version is
+      // checked *before* the struct layout is interpreted: reading a
+      // `repe_plugin_data` written by a different version is what the standalone
+      // version function exists to prevent, and this file is the reference for
+      // the sequence.
+      return 1;
+   }
 
    // --- metadata ------------------------------------------------------------
    std::cout << "metadata\n";
