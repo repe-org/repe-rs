@@ -53,9 +53,11 @@ A complete example, built as a real shared library on every CI run, is in [`exam
 Two details are easy to get wrong in a hand-written shim, and both are silent when wrong:
 
 - **`size == 0` still carries a non-null `data`.** Glaze's helper returns `std::string::data()`, which is never null. A C++ host that builds a `std::string_view` from a null pointer with length 0 is undefined behavior even though it appears to work. This crate points at a static byte instead.
-- **A notify answers with `size == 0`.** REPE notifies produce no response, and a host must read zero size as "send nothing" rather than as an error.
+- **A notify answers with `size == 0`.** REPE notifies produce no response, and a host must read zero size as "send nothing" rather than as an error. This holds even when the handler panicked: an error frame in reply to a notify is a frame no client is awaiting.
 
 Failures never cross the boundary as unwinding — including a call made from a `thread_local` destructor during thread teardown, when the plugin's own thread-local buffer may already be gone. A panicking handler, a malformed frame, an out-of-range `request_size`, and a call after shutdown all come back as REPE error responses with an `id` of `0`.
+
+A panicking **constructor** is latched, not retried: every later call answers with the same error rather than running it again. `repe_plugin_init` is optional in this ABI, so a plugin whose constructor fails is otherwise re-entered once per request for the life of the host — repeating whatever it had already claimed (a device handle, a worker thread, a lock file) before it panicked.
 
 One case a host controls: **do not pass a previous response back as the next request.** It aliases the buffer being written, and the plugin refuses it rather than serving it.
 

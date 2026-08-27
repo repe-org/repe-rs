@@ -91,7 +91,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use core::ffi::c_char;
 
-use crate::constants::ErrorCode;
+use crate::constants::{ErrorCode, HEADER_SIZE};
+use crate::header::Header;
 use crate::message::create_error_message;
 use crate::server::Router;
 
@@ -274,6 +275,17 @@ pub struct PluginRuntime {
     router: OnceLock<Router>,
     build: fn() -> Router,
     shutdown: AtomicBool,
+    /// Set once the constructor has panicked with no router to show for it.
+    ///
+    /// `OnceLock` does not latch a failed initialization, and a host is not
+    /// obliged to call `repe_plugin_init` at all — `plugin.h` says "the host
+    /// assumes initialization is handled lazily" — so without this the
+    /// constructor is re-entered on every request for the life of the process.
+    /// A constructor that panics *after* claiming something (opening a device,
+    /// spawning a worker, taking a lock file) would repeat that side effect
+    /// once per request. The constructor is a plain `fn() -> Router` with no
+    /// input, so a second attempt has nothing new to succeed with.
+    build_failed: AtomicBool,
 }
 
 impl PluginRuntime {
@@ -287,6 +299,7 @@ impl PluginRuntime {
             router: OnceLock::new(),
             build,
             shutdown: AtomicBool::new(false),
+            build_failed: AtomicBool::new(false),
         }
     }
 
@@ -335,6 +348,15 @@ impl PluginRuntime {
     /// `RefUnwindSafe`. A panicking constructor leaves the `OnceLock` empty
     /// rather than half-initialized, so nothing observes a broken value.
     fn get_or_build(&self) -> Option<(&Router, bool)> {
+        // Both fast paths before the guard: an already-built router is the
+        // common case, and a latched failure must not re-enter the constructor.
+        if let Some(router) = self.router.get() {
+            return Some((router, false));
+        }
+        if self.build_failed.load(Ordering::Acquire) {
+            return None;
+        }
+
         let mut built_here = false;
         let guarded = catch_unwind(AssertUnwindSafe(|| {
             self.router.get_or_init(|| {
@@ -347,7 +369,13 @@ impl PluginRuntime {
             // Our constructor panicked. Another thread may still have won the
             // race and initialized it since, in which case the plugin is usable
             // and reporting otherwise would strand a working router.
-            Err(_) => self.router.get().map(|router| (router, false)),
+            Err(_) => match self.router.get() {
+                Some(router) => Some((router, false)),
+                None => {
+                    self.build_failed.store(true, Ordering::Release);
+                    None
+                }
+            },
         }
     }
 
@@ -370,12 +398,27 @@ impl PluginRuntime {
         }));
         match dispatched {
             Ok(buffer) => buffer,
-            // The unwind ran the `RefMut`'s destructor on the way out, so this
-            // thread's buffer is free again and can carry the report.
-            Err(_) => error_response(
-                ErrorCode::InternalError,
-                "repe plugin: handler panicked while serving the request",
-            ),
+            Err(_) => {
+                // The dispatch that would have honored the notify flag never
+                // returned, so read the flag here. Answering a notify would put
+                // an unsolicited id-0 error frame on the wire for a request no
+                // client is awaiting — the one place in this file where a
+                // non-empty response to a notify is not simply unavoidable,
+                // because the frame did parse.
+                //
+                // SAFETY: the caller's pointer is valid for the whole call, and
+                // the request cannot alias the response buffer — that is
+                // rejected before dispatch, so reaching a panic rules it out.
+                if unsafe { requested_notify(request, request_size) } {
+                    return RepeBuffer::empty();
+                }
+                // The unwind ran the `RefMut`'s destructor on the way out, so
+                // this thread's buffer is free again and can carry the report.
+                error_response(
+                    ErrorCode::InternalError,
+                    "repe plugin: handler panicked while serving the request",
+                )
+            }
         }
     }
 
@@ -456,6 +499,31 @@ impl PluginRuntime {
             }
         })
     }
+}
+
+/// Whether the frame at `request` set the notify flag.
+///
+/// Only the fixed header is read, and only the flag is taken from it, so a
+/// frame whose *payload* lengths are nonsense still answers this question
+/// correctly. Anything unreadable answers `false`: a request that cannot be
+/// shown to be a notify is treated as awaiting a response, which errs toward a
+/// caller receiving a frame it ignores rather than one waiting forever.
+///
+/// # Safety
+///
+/// As [`PluginRuntime::call`]: `request` must point to `request_size` readable
+/// bytes, or be null with a `request_size` of 0.
+unsafe fn requested_notify(request: *const c_char, request_size: u64) -> bool {
+    let Ok(size) = usize::try_from(request_size) else {
+        return false;
+    };
+    if request.is_null() || size < HEADER_SIZE || size > isize::MAX as usize {
+        return false;
+    }
+    // SAFETY: non-null, at least `HEADER_SIZE` readable bytes, per the caller's
+    // obligation. `u8` has no alignment requirement.
+    let header = unsafe { std::slice::from_raw_parts(request.cast::<u8>(), HEADER_SIZE) };
+    Header::decode(header).is_ok_and(|header| header.notify != 0)
 }
 
 /// Run `f` against this thread's response buffer, falling back to the static
@@ -609,6 +677,58 @@ mod tests {
         let message = Message::from_slice(&response).unwrap();
         assert_eq!(message.error_code(), Some(ErrorCode::InternalError));
         assert!(message.error_message_utf8().unwrap().contains("panicked"));
+    }
+
+    #[test]
+    fn a_notify_to_a_panicking_handler_answers_nothing() {
+        // The panic guard sits outside dispatch, so the notify flag that
+        // `route_request_view` would have honored is never read there. Left
+        // unhandled, this puts an unsolicited id-0 error frame on the wire for a
+        // request no client is awaiting.
+        let runtime = PluginRuntime::new(router);
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let response = call(&runtime, &request("/boom", &serde_json::json!(null), true));
+        std::panic::set_hook(previous);
+
+        assert!(
+            response.is_empty(),
+            "a notify gets no response even when the handler panics, got {} bytes",
+            response.len()
+        );
+    }
+
+    #[test]
+    fn a_panicking_constructor_is_not_re_entered_on_every_call() {
+        // `OnceLock` does not latch a failed initialization, and a host need
+        // never call `repe_plugin_init`, so an unlatched failure re-runs the
+        // constructor once per request for the life of the process — repeating
+        // whatever it had claimed before it panicked.
+        static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+        fn explode() -> Router {
+            ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+            panic!("constructor exploded")
+        }
+
+        let runtime = PluginRuntime::new(explode);
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let frame = request("/double", &serde_json::json!(1), false);
+        for _ in 0..5 {
+            let response = call(&runtime, &frame);
+            let message = Message::from_slice(&response).unwrap();
+            assert_eq!(message.error_code(), Some(ErrorCode::InternalError));
+        }
+        // Init after the latch reports the failure rather than trying again.
+        let result = runtime.init();
+        std::panic::set_hook(previous);
+
+        assert_eq!(result, RepeResult::InitFailed);
+        assert_eq!(
+            ATTEMPTS.load(Ordering::SeqCst),
+            1,
+            "the constructor ran more than once"
+        );
     }
 
     #[test]
