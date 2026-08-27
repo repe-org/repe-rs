@@ -59,6 +59,12 @@ async fn send(
     stream.write_all(body).await.unwrap();
     stream.flush().await.unwrap();
 
+    read_response(stream, method).await
+}
+
+/// Read exactly one response off `stream`. Split out from [`send`] so a test
+/// can write its own request bytes — or deliberately fail to.
+async fn read_response(stream: &mut TcpStream, method: &str) -> HttpResponse {
     // Head first: read until the blank line that ends the header block.
     let mut buffer = Vec::new();
     let head_end = loop {
@@ -380,4 +386,79 @@ async fn one_connection_serves_many_requests() {
         let read = send(&mut stream, "GET", "/api/v1/counter", &[], b"").await;
         assert_eq!(read.json(), json!(expected));
     }
+}
+
+/// A client that promises a body and never sends it must not hold its
+/// connection — and its slot under `max_connections` — indefinitely.
+///
+/// Without a bound on the body read, a few hundred sockets costing an attacker
+/// almost nothing stop the gateway from accepting anything at all. The header
+/// timeout does not cover this: the head here is complete and well-formed.
+#[tokio::test]
+async fn a_promised_body_that_never_arrives_is_timed_out() {
+    let (addr, _registry) = start(RestConfig {
+        request_timeout: Some(std::time::Duration::from_millis(300)),
+        ..RestConfig::default()
+    })
+    .await;
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            b"PUT /api/v1/counter HTTP/1.1\r\nHost: test\r\n\
+              Content-Type: application/json\r\nContent-Length: 100\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    stream.flush().await.unwrap();
+
+    // No body follows. The gateway must answer on its own rather than wait.
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_response(&mut stream, "PUT"),
+    )
+    .await
+    .expect("the gateway held the connection past its own request timeout");
+    assert_eq!(response.status, 408);
+    assert_eq!(
+        response.header("connection"),
+        Some("close"),
+        "the promised body is still unread, so the stream is not at a message boundary"
+    );
+}
+
+/// The slot that request took must come back, or a handful of stalled clients
+/// would still be an outage even with the timeout in place.
+#[tokio::test]
+async fn a_timed_out_connection_releases_its_slot() {
+    let (addr, _registry) = start(RestConfig {
+        request_timeout: Some(std::time::Duration::from_millis(200)),
+        max_connections: 2,
+        ..RestConfig::default()
+    })
+    .await;
+
+    let mut stalled = Vec::new();
+    for _ in 0..2 {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(
+                b"PUT /api/v1/counter HTTP/1.1\r\nHost: test\r\n\
+                  Content-Type: application/json\r\nContent-Length: 100\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+        stalled.push(stream);
+    }
+
+    // Every slot is now held by a client that will never finish its request.
+    // Once they time out, an ordinary read has to get through.
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        send(&mut stream, "GET", "/api/v1/counter", &[], b"").await
+    })
+    .await
+    .expect("stalled connections kept the gateway from serving");
+    assert_eq!(response.status, 200);
 }

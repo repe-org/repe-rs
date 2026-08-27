@@ -114,6 +114,10 @@ $ curl -s -o /dev/null -w '%{http_code}\n' -X PUT -d 1 \
 
 Comparison is strong (RFC 9110 §13.1.1), so a `W/`-prefixed weak validator never satisfies it — unlike `If-None-Match`, which uses weak comparison. `If-Match: *` requires only that the resource exist. A tag from either representation is accepted, since the client's tag came from whichever one it negotiated and changing the value changes both encodings.
 
+`If-None-Match` works on `PUT` too, where `*` is the create-only idiom (RFC 9110 §13.1.2): the write happens only if nothing is there yet, and is `412` otherwise.
+
+Both are evaluated *inside* the registry's write lock, not before it. Comparing a validator with a separate read and then writing is check-then-act — two clients holding the same tag would each see it match and both write, so the lost update the precondition exists to prevent would happen anyway. This is the guarantee that makes the validators usable for real optimistic concurrency rather than as a courtesy check.
+
 ## Content negotiation
 
 JSON by default, BEVE on request, independently on each leg:
@@ -156,9 +160,11 @@ An application error defaults to 500 because the gateway cannot know whether a g
 
 ## Configuration
 
-`RestConfig` carries the policy: `max_body_bytes` (default 1 MiB, answering `413`), `cache_control`, `application_error_status`, the three safety defaults above, and `max_connections` (default 1024). The body limit bounds the facade, not the protocol: a REST body is buffered whole before it can be decoded, so an unbounded limit is an unbounded allocation driven by an anonymous caller. Bulk payloads belong on the REPE leg, which streams.
+`RestConfig` carries the policy: `max_body_bytes` (default 1 MiB, answering `413`), `cache_control`, `application_error_status`, the three safety defaults above, `max_connections` (default 1024), and `request_timeout` (default 30 s). Note that the first two multiply: at the defaults, 1024 connections each buffering up to 1 MiB is 1 GiB of request bodies in flight. The body limit bounds the facade, not the protocol: a REST body is buffered whole before it can be decoded, so an unbounded limit is an unbounded allocation driven by an anonymous caller. Bulk payloads belong on the REPE leg, which streams.
 
-`max_connections` bounds concurrency in `serve`: past the cap it stops accepting, so a burst waits in the listen backlog rather than in the descriptor table. Connections also get a 30-second header-read timeout, without which a client that connects and sends nothing holds a task and a descriptor indefinitely — which is how an idle-connection flood reaches the process descriptor limit without ever sending a valid request.
+`max_connections` bounds concurrency in `serve`: past the cap it stops accepting, so a burst waits in the listen backlog rather than in the descriptor table. Two timeouts keep a slot from being held indefinitely, and both are needed. The 30-second header-read timeout covers a client that connects and sends nothing. `request_timeout` covers the other half: a client that sends a complete, well-formed head promising a `Content-Length` and then sends no body is past the header timeout and otherwise unbounded, so a few hundred sockets would hold every slot at almost no cost to the sender. Expiry answers `408` and closes the connection, since the promised body is still unread and the stream is no longer at a message boundary.
+
+An `accept` failure that is not about a single connection — descriptor exhaustion is the one that matters, and Rust reports it as `Uncategorized` rather than a matchable kind — is retried with a backoff capped at one second. `serve` does not give up on the listener: staying down after the flood has drained would defeat the point of bounding it.
 
 ## Testing without a socket
 

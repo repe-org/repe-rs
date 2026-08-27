@@ -25,6 +25,8 @@
 
   `RestGateway::respond` is the whole mapping with no transport involved — the REST-side counterpart to `Router::call` — so `serve` is a thin hyper shim over it and any other HTTP stack can be one too.
 
+- **`Registry::write_if` / `Registry::call`.** A conditional write whose comparison and write are one critical section, and a dispatch that is committed to calling a function rather than re-deciding from the body. `dispatch` gives neither: evaluating a validator with a separate read and then writing is check-then-act, and a caller that already resolved "this is a value" races anyone registering a function at that pointer in between — losing by handing its write payload to a function as arguments.
+
 - **`Registry::is_function`.** Whether a pointer names a registered function rather than a value. The registry decides read-vs-write-vs-call from the body alone, which is right for REPE; a caller that must commit to a verb before it has a body needs the distinction up front, and probing it with a read is not a substitute because a read of a function returns a descriptor a stored value could equally well contain.
 
 ### Fixed

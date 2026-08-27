@@ -52,6 +52,7 @@ use crate::constants::ErrorCode;
 use crate::registry::{Registry, RegistryError};
 use serde_json::{Value, json};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// `application/json`, the default representation on both legs.
 pub const MEDIA_JSON: &str = "application/json";
@@ -161,6 +162,20 @@ pub struct RestConfig {
     /// until a connection finishes, which leaves the backlog to absorb the
     /// spike instead of the descriptor table.
     pub max_connections: usize,
+    /// Maximum time [`serve`](RestGateway::serve) gives one request, from the
+    /// moment its head is parsed to the moment a response is produced. Answers
+    /// `408` and closes the connection on expiry. Defaults to 30 seconds;
+    /// `None` disables it.
+    ///
+    /// A header-read timeout alone does not bound a request. A client that
+    /// sends a complete, well-formed head promising `Content-Length: 100` and
+    /// then sends no body holds its connection — and its slot under
+    /// [`max_connections`](Self::max_connections) — for as long as it likes.
+    /// A few hundred such sockets, costing an attacker almost nothing, stop the
+    /// gateway from accepting anything at all. This is what bounds the body
+    /// read, which is the half of a request the head timeout has already
+    /// stopped watching.
+    pub request_timeout: Option<Duration>,
 }
 
 impl Default for RestConfig {
@@ -173,6 +188,7 @@ impl Default for RestConfig {
             allow_root_write: false,
             accept_beve_bodies: false,
             max_connections: 1024,
+            request_timeout: Some(Duration::from_secs(30)),
         }
     }
 }
@@ -364,8 +380,13 @@ impl RestGateway {
         // RFC 9110 §9.3.7: `OPTIONS *` asks about the server as a whole rather
         // than a resource, so it never reaches the mount or the pointer mapping.
         if request.method == "OPTIONS" && path == "*" {
+            let allow = if self.config.read_only {
+                ALLOW_READ_ONLY
+            } else {
+                ALLOW_SERVER
+            };
             return RestResponse {
-                allow: Some(ALLOW_SERVER),
+                allow: Some(allow),
                 ..RestResponse::empty(204)
             };
         }
@@ -400,7 +421,7 @@ impl RestGateway {
                         allow,
                         "this path is a value; a POST would write it, which is idempotent — use PUT",
                     ),
-                    "PUT" | "POST" => self.write_or_call(&pointer, request, allow),
+                    "PUT" | "POST" => self.write_or_call(&pointer, request, allow, is_function),
                     "OPTIONS" => RestResponse {
                         allow: Some(allow),
                         ..RestResponse::empty(204)
@@ -468,6 +489,7 @@ impl RestGateway {
         pointer: &str,
         request: RestRequest<'_>,
         allow: &'static str,
+        is_function: bool,
     ) -> RestResponse {
         if self.config.read_only {
             return method_not_allowed(allow, "this gateway is configured read-only");
@@ -477,7 +499,7 @@ impl RestGateway {
         // the caller's object into the tree rather than an assignment at a path
         // the caller named. That admits arbitrary new keys and unbounded growth,
         // so it is its own decision rather than part of "writes are allowed".
-        if pointer.is_empty() && !self.config.allow_root_write {
+        if crate::registry::addresses_root(pointer) && !self.config.allow_root_write {
             return method_not_allowed(
                 ALLOW_READ_ONLY,
                 "a write at the mount root would merge arbitrary keys into the registry; \
@@ -503,16 +525,6 @@ impl RestGateway {
             }
         };
 
-        // RFC 9110 §13.1.1: an `If-Match` that evaluates to false MUST NOT be
-        // performed. A gateway that hands out strong validators on every read
-        // and then ignores them on the write leg gives a client doing ordinary
-        // optimistic concurrency a silent lost update.
-        if let Some(header) = request.if_match
-            && let Some(failed) = self.if_match_fails(pointer, header)
-        {
-            return failed;
-        }
-
         let payload = match decode(request.body, repr) {
             Ok(payload) => payload,
             Err(detail) => {
@@ -520,9 +532,27 @@ impl RestGateway {
             }
         };
 
-        let value = match self.registry.dispatch(pointer, Some(payload)) {
-            Ok(value) => value,
-            Err(err) => return self.problem_for(err),
+        // The verb was resolved against the target kind before we got here, so
+        // dispatch stays committed to it. `Registry::dispatch` would re-decide
+        // from the body alone, which reopens the window between the two: a
+        // pointer that gains a function turns this PUT into a call taking the
+        // write payload as arguments, and one that loses a function turns this
+        // POST into a write.
+        let value = if is_function {
+            match self.registry.call(
+                pointer,
+                Some(payload),
+                &crate::CallContext::detached(pointer),
+            ) {
+                Ok(value) => value,
+                Err(err) => return self.problem_for(err),
+            }
+        } else {
+            match self.conditional_write(pointer, payload, &request) {
+                Ok(Some(value)) => value,
+                Ok(None) => return precondition_failed(),
+                Err(err) => return self.problem_for(err),
+            }
         };
 
         let (body, media) = match encode(&value, negotiate(request.accept)) {
@@ -544,35 +574,44 @@ impl RestGateway {
         }
     }
 
-    /// `Some(412)` when an `If-Match` precondition fails, `None` when it passes.
+    /// Write `payload`, honoring `If-Match` and `If-None-Match`.
     ///
-    /// Compared against the current value in *both* representations, because the
-    /// tag the client holds came from whichever one it negotiated on its read.
-    /// That cannot wrongly admit a stale write: changing the value changes both
-    /// encodings, so a match in either proves the state is unchanged.
-    fn if_match_fails(&self, pointer: &str, header: &str) -> Option<RestResponse> {
-        let failed = || {
-            Some(RestResponse::problem(
-                412,
-                "the If-Match precondition failed: the resource has changed or does not exist",
-                None,
-            ))
-        };
-
-        // No current representation: `*` and every tag alike fail, since there
-        // is nothing for the precondition to have matched.
-        let Ok(current) = self.registry.dispatch(pointer, None) else {
-            return failed();
-        };
-
-        if header.split(',').any(|candidate| candidate.trim() == "*") {
-            return None;
+    /// `Ok(None)` means a precondition failed and nothing was written.
+    ///
+    /// The comparison runs *inside* the registry's write lock rather than
+    /// before it. Evaluating a validator with a separate read and then writing
+    /// is check-then-act: two clients holding the same tag both see it match and
+    /// both write, so the lost update the precondition exists to prevent happens
+    /// anyway. RFC 9110 §13.1 asks for the evaluation and the action to be
+    /// atomic for exactly this reason.
+    fn conditional_write(
+        &self,
+        pointer: &str,
+        payload: Value,
+        request: &RestRequest<'_>,
+    ) -> Result<Option<Value>, RegistryError> {
+        let if_match = request.if_match;
+        let if_none_match = request.if_none_match;
+        if if_match.is_none() && if_none_match.is_none() {
+            return self.registry.write_if(pointer, payload, |_| true);
         }
 
-        let matched = [Repr::Json, Repr::Beve].into_iter().any(|repr| {
-            encode(&current, repr).is_ok_and(|(body, _)| if_match_matches(header, &etag_for(&body)))
-        });
-        if matched { None } else { failed() }
+        self.registry.write_if(pointer, payload, |current| {
+            // §13.1.1 (`If-Match`) and §13.1.2 (`If-None-Match`) are evaluated
+            // against the same observation of the resource, so a caller may send
+            // both and get a coherent answer.
+            if let Some(header) = if_match
+                && !precondition_present(current, header, if_match_matches)
+            {
+                return false;
+            }
+            if let Some(header) = if_none_match
+                && precondition_present(current, header, if_none_match_matches)
+            {
+                return false;
+            }
+            true
+        })
     }
 
     /// Pick a request-body representation from `Content-Type`. A missing header
@@ -803,6 +842,40 @@ fn etag_for(body: &[u8]) -> String {
     format!("\"{hash:016x}\"")
 }
 
+/// Evaluate one precondition header against the resource's current state.
+///
+/// `true` means the header's condition *holds* — `If-Match` matched, or
+/// `If-None-Match` found a match. `*` means "any current representation", so it
+/// holds exactly when the resource exists.
+///
+/// A tag is compared against both representations, because the tag the client
+/// holds came from whichever one it negotiated on its read. That cannot wrongly
+/// admit a stale write: changing the value changes both encodings, so a match in
+/// either proves the state is unchanged.
+fn precondition_present(
+    current: Option<&Value>,
+    header: &str,
+    matches: fn(&str, &str) -> bool,
+) -> bool {
+    let Some(current) = current else {
+        return false;
+    };
+    if header.split(',').any(|candidate| candidate.trim() == "*") {
+        return true;
+    }
+    [Repr::Json, Repr::Beve]
+        .into_iter()
+        .any(|repr| encode(current, repr).is_ok_and(|(body, _)| matches(header, &etag_for(&body))))
+}
+
+fn precondition_failed() -> RestResponse {
+    RestResponse::problem(
+        412,
+        "a precondition failed: the resource has changed, or does not exist, or already exists",
+        None,
+    )
+}
+
 /// `If-Match` uses the *strong* comparison function (RFC 9110 §13.1.1), so a
 /// weak validator never satisfies it — unlike [`if_none_match_matches`].
 fn if_match_matches(header: &str, etag: &str) -> bool {
@@ -841,11 +914,15 @@ use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use std::convert::Infallible;
-use std::time::Duration;
 
 impl RestGateway {
-    /// Serve this gateway on `listener` until the accept loop fails
-    /// unrecoverably.
+    /// Serve this gateway on `listener` until the process ends.
+    ///
+    /// The accept loop does not give up: a failure that is not about one
+    /// connection — descriptor exhaustion being the one that matters — is
+    /// retried with a capped backoff rather than surfaced, because a gateway
+    /// that stays down after the flood causing it has drained is the outcome
+    /// the cap exists to prevent.
     ///
     /// Both HTTP/1.1 and HTTP/2 are served on the one listener via hyper's
     /// protocol-detecting builder: HTTP/2 for a client that arrives with prior
@@ -860,11 +937,13 @@ impl RestGateway {
     ///
     /// At most [`RestConfig::max_connections`] connections are served at once.
     /// Past that, `serve` stops accepting until one finishes, so a burst waits
-    /// in the listen backlog rather than in the descriptor table.
+    /// in the listen backlog rather than in the descriptor table. That cap is
+    /// only as good as the bound on how long one connection can hold its slot,
+    /// which is [`RestConfig::request_timeout`].
     pub async fn serve(self, listener: tokio::net::TcpListener) -> std::io::Result<()> {
         let gateway = Arc::new(self);
         let permits = Arc::new(tokio::sync::Semaphore::new(gateway.config.max_connections));
-        let mut consecutive_failures = 0u32;
+        let mut backoff = ACCEPT_BACKOFF;
 
         loop {
             // Taken before `accept`, so a full gateway leaves connections in the
@@ -877,17 +956,24 @@ impl RestGateway {
 
             let stream = match listener.accept().await {
                 Ok((stream, _peer)) => {
-                    consecutive_failures = 0;
+                    backoff = ACCEPT_BACKOFF;
                     stream
                 }
                 // The connection died between the backlog and here. Routine.
                 Err(err) if is_per_connection_accept_error(&err) => continue,
-                Err(err) => {
-                    consecutive_failures += 1;
-                    if consecutive_failures > MAX_CONSECUTIVE_ACCEPT_FAILURES {
-                        return Err(err);
-                    }
-                    tokio::time::sleep(ACCEPT_BACKOFF).await;
+                Err(_) => {
+                    // Everything else is treated as descriptor pressure, which
+                    // is what `EMFILE`/`ENFILE` are — and Rust maps both to
+                    // `Uncategorized`, so they cannot be matched by kind. Back
+                    // off and keep trying rather than counting to a ceiling and
+                    // returning: the whole point of surviving a descriptor
+                    // flood is to still be serving once the attacker
+                    // disconnects, and a loop that gives up after N failures
+                    // stays down instead. Held connections drain on their own,
+                    // and the backoff caps the spin at one attempt per
+                    // `MAX_ACCEPT_BACKOFF`.
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_ACCEPT_BACKOFF);
                     continue;
                 }
             };
@@ -896,7 +982,15 @@ impl RestGateway {
             tokio::spawn(async move {
                 let service = hyper::service::service_fn(move |request: Request<Incoming>| {
                     let gateway = Arc::clone(&gateway);
-                    async move { Ok::<_, Infallible>(gateway.handle(request).await) }
+                    async move {
+                        let response = match gateway.config.request_timeout {
+                            Some(limit) => tokio::time::timeout(limit, gateway.handle(request))
+                                .await
+                                .unwrap_or_else(|_| request_timeout_response()),
+                            None => gateway.handle(request).await,
+                        };
+                        Ok::<_, Infallible>(response)
+                    }
                 });
                 let mut builder = auto::Builder::new(TokioExecutor::new());
                 // Without a header timeout a client that connects and sends
@@ -983,13 +1077,16 @@ impl RestGateway {
 /// dropped. Bounds slowloris, which is otherwise a descriptor leak.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long to wait before retrying `accept` after a failure that is not about
-/// one connection, so the retry is a pause rather than a busy loop.
+/// First pause after an `accept` failure that is not about one connection, so
+/// the retry is a pause rather than a busy loop. Doubles up to
+/// [`MAX_ACCEPT_BACKOFF`] while failures continue, and resets on the next
+/// successful accept.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 
-/// How many such failures in a row before [`RestGateway::serve`] concludes the
-/// listener itself is dead and surfaces the error.
-const MAX_CONSECUTIVE_ACCEPT_FAILURES: u32 = 64;
+/// Ceiling for that pause. Bounds the spin under sustained descriptor pressure
+/// without ever giving up on the listener, which would leave the gateway down
+/// after the condition that caused it has cleared.
+const MAX_ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Whether an `accept` failure was about the connection rather than the process.
 ///
@@ -1007,6 +1104,25 @@ fn is_per_connection_accept_error(err: &std::io::Error) -> bool {
         err.kind(),
         ErrorKind::ConnectionAborted | ErrorKind::ConnectionReset | ErrorKind::Interrupted
     )
+}
+
+/// The answer to a request that outlived [`RestConfig::request_timeout`].
+///
+/// `408` rather than `503`: the request itself did not arrive in time, which is
+/// what the client can act on. `Connection: close` because the body it promised
+/// is still unread, so the stream is no longer at a message boundary and the
+/// connection cannot be reused.
+fn request_timeout_response() -> Response<Full<Bytes>> {
+    let mut response = to_hyper(RestResponse::problem(
+        408,
+        "the request was not completed within the gateway's time limit",
+        None,
+    ));
+    response.headers_mut().insert(
+        hyper::header::CONNECTION,
+        hyper::header::HeaderValue::from_static("close"),
+    );
+    response
 }
 
 fn to_hyper(response: RestResponse) -> Response<Full<Bytes>> {
@@ -1696,6 +1812,168 @@ mod tests {
                 .with_if_match(&format!("W/{tag}")),
         );
         assert_eq!(response.status, 412);
+    }
+
+    #[test]
+    fn a_doubled_slash_does_not_reach_the_root() {
+        // `//` maps to the pointer `"/"`, which is not the empty string but is
+        // the root as far as `parse_pointer` is concerned. Two definitions of
+        // "root" meant the policy check tested one and the write took the other.
+        let gateway = gateway();
+        for target in ["/api/v1", "/api/v1/", "/api/v1//"] {
+            let response = gateway
+                .respond(RestRequest::new("PUT", target).with_body(MEDIA_JSON, br#"{"x":1}"#));
+            assert_eq!(response.status, 405, "{target}");
+        }
+        assert!(
+            gateway.registry().read_value("/x").is_err(),
+            "the root was written through one of the spellings above"
+        );
+    }
+
+    #[test]
+    fn a_permitted_root_write_still_works_through_every_spelling() {
+        for target in ["/api/v1", "/api/v1/", "/api/v1//"] {
+            let gateway = gateway_with(RestConfig {
+                allow_root_write: true,
+                ..RestConfig::default()
+            });
+            let response = gateway
+                .respond(RestRequest::new("PUT", target).with_body(MEDIA_JSON, br#"{"x":1}"#));
+            assert_eq!(response.status, 200, "{target}");
+            assert_eq!(gateway.registry().read_value("/x").unwrap(), json!(1));
+        }
+    }
+
+    #[test]
+    fn if_none_match_star_refuses_to_overwrite() {
+        // RFC 9110 §13.1.2: `If-None-Match: *` on a write means create-only.
+        // Ignoring it tells a client its create succeeded while it silently
+        // clobbered someone else's state.
+        let gateway = gateway();
+        let response = gateway.respond(
+            RestRequest {
+                if_none_match: Some("*"),
+                ..RestRequest::new("PUT", "/api/v1/counter")
+            }
+            .with_body(MEDIA_JSON, b"99"),
+        );
+        assert_eq!(response.status, 412);
+        assert_eq!(gateway.registry().read_value("/counter").unwrap(), json!(7));
+    }
+
+    #[test]
+    fn if_none_match_star_permits_a_create() {
+        let gateway = gateway();
+        let response = gateway.respond(
+            RestRequest {
+                if_none_match: Some("*"),
+                ..RestRequest::new("PUT", "/api/v1/fresh")
+            }
+            .with_body(MEDIA_JSON, b"1"),
+        );
+        assert_eq!(response.status, 200);
+        assert_eq!(gateway.registry().read_value("/fresh").unwrap(), json!(1));
+    }
+
+    #[test]
+    fn if_none_match_with_a_tag_refuses_a_matching_write() {
+        let gateway = gateway();
+        let tag = gateway
+            .respond(RestRequest::new("GET", "/api/v1/counter"))
+            .etag
+            .unwrap();
+        let response = gateway.respond(
+            RestRequest {
+                if_none_match: Some(&tag),
+                ..RestRequest::new("PUT", "/api/v1/counter")
+            }
+            .with_body(MEDIA_JSON, b"99"),
+        );
+        assert_eq!(response.status, 412);
+        assert_eq!(gateway.registry().read_value("/counter").unwrap(), json!(7));
+    }
+
+    #[test]
+    fn exactly_one_racing_conditional_write_wins() {
+        // The lost update `If-Match` exists to prevent. Evaluated before the
+        // write rather than within it, every thread here sees the tag it
+        // expected and several writes land.
+        let gateway = Arc::new(gateway());
+        let tag = gateway
+            .respond(RestRequest::new("GET", "/api/v1/counter"))
+            .etag
+            .unwrap();
+
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        std::thread::scope(|scope| {
+            for worker in 0..16 {
+                let gateway = Arc::clone(&gateway);
+                let accepted = Arc::clone(&accepted);
+                let barrier = Arc::clone(&barrier);
+                let tag = tag.clone();
+                scope.spawn(move || {
+                    let body = worker.to_string();
+                    barrier.wait();
+                    let response = gateway.respond(
+                        RestRequest {
+                            if_match: Some(&tag),
+                            ..RestRequest::new("PUT", "/api/v1/counter")
+                        }
+                        .with_body(MEDIA_JSON, body.as_bytes()),
+                    );
+                    if response.status == 200 {
+                        accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "more than one writer saw the same validator match"
+        );
+    }
+
+    #[test]
+    fn options_star_respects_read_only() {
+        let gateway = gateway_with(RestConfig {
+            read_only: true,
+            ..RestConfig::default()
+        });
+        let response = gateway.respond(RestRequest::new("OPTIONS", "*"));
+        assert_eq!(response.status, 204);
+        assert_eq!(response.allow, Some(ALLOW_READ_ONLY));
+    }
+
+    #[test]
+    fn a_write_never_becomes_a_call_and_a_call_never_becomes_a_write() {
+        // The verb is resolved against the target kind before dispatch, so
+        // dispatch must stay committed to it rather than re-deciding from the
+        // body — which is what leaves a window for the target to change kind.
+        let registry = Arc::new(Registry::new());
+        registry.register_value("/value", json!(1)).unwrap();
+        registry
+            .register_function("/function", |_| Ok(json!("called")))
+            .unwrap();
+
+        assert!(
+            registry.write_if("/function", json!(2), |_| true).is_err(),
+            "a write reached a function"
+        );
+        assert!(
+            registry
+                .call(
+                    "/value",
+                    Some(json!(2)),
+                    &crate::CallContext::detached("/value")
+                )
+                .is_err(),
+            "a call reached a value"
+        );
+        assert_eq!(registry.read_value("/value").unwrap(), json!(1));
     }
 
     #[test]
