@@ -122,6 +122,8 @@ A `with_typed_slice_ref` route is a drop-in superset of `with_typed_slice`: it s
 | Flag | Effect |
 | --- | --- |
 | `rest` | `RestGateway`: a REST facade over a `Registry`, served on HTTP/1.1 and HTTP/2. |
+| `plugin` | `#[repe::plugin]`: export a `Router` as a C-ABI plugin a REPE host loads. |
+| `plugin-host` | `plugin::host::Plugin`: load and drive a plugin, including a C++ one. |
 | `websocket` | Native `WebSocketClient`, `WebSocketServer`, and `proxy_connection`. |
 | `websocket-wasm` | Browser `WasmClient` on `wasm32-unknown-unknown`. |
 | `fleet-udp` | UDP fanout via `UniUdpFleet`. |
@@ -129,7 +131,7 @@ A `with_typed_slice_ref` route is a drop-in superset of `with_typed_slice`: it s
 | `parking-lot` | `Lockable` impls for `parking_lot::Mutex` / `RwLock`. |
 | `cli` | Builds the `repe` command-line client (pulls in `clap` and `websocket`). |
 
-`fleet-udp`, `value-stream`, and `rest` are native-only: on `wasm32-unknown-unknown` their modules and their non-portable dependencies both compile away, so enabling any of them there is inert rather than a build failure. That matters for a workspace hoisting one shared feature set across a native server and a browser client, since Cargo features are additive and the wasm member cannot subtract one.
+`fleet-udp`, `value-stream`, `rest`, `plugin`, and `plugin-host` are native-only: on `wasm32-unknown-unknown` their modules and their non-portable dependencies both compile away, so enabling any of them there is inert rather than a build failure. That matters for a workspace hoisting one shared feature set across a native server and a browser client, since Cargo features are additive and the wasm member cannot subtract one.
 
 ## Documentation
 

@@ -65,14 +65,12 @@ The reverse direction — a repe-produced body with an extra key decoding on a G
 
 ## The plugin ABI
 
-Beyond the wire format, the two implementations share a **C plugin ABI**
-(`glaze/rpc/repe/plugin.h`), and it is pinned the same way and against the same
-Glaze tag: `interop/cpp/plugin_host.cpp` is a C++ REPE host that `dlopen`s the
-Rust plugin example and drives it, encoding every request and decoding every
-response with Glaze rather than by hand. It runs in the same CI job, and it fails
-if the exported symbols, the metadata struct's layout, or the response-buffer
-contract diverge. See [Plugins](plugins.md) for the ABI itself and
-`interop/README.md` for how to run it locally.
+Beyond the wire format, the two implementations share a **C plugin ABI** (`glaze/rpc/repe/plugin.h`), and it is pinned the same way and against the same Glaze tag — in both directions, because each implementation ships both a plugin and a host:
+
+- `interop/cpp/plugin_host.cpp` is a C++ REPE host that `dlopen`s the Rust plugin example and drives it, encoding every request and decoding every response with Glaze rather than by hand.
+- `interop/cpp/example_plugin.cpp` is a C++ Glaze plugin that the Rust host (`examples/plugin_host.rs`) `dlopen`s and drives.
+
+Both run in the same CI job, and they fail if the exported symbols, the metadata struct's layout, or the response-buffer contract diverge. Running only one direction would leave one implementation agreeing with itself, which it does by construction even when both of its ends misread the same clause. See [Plugins](plugins.md) for the ABI itself and `interop/README.md` for how to run them locally.
 
 ## A note on BEVE variants
 

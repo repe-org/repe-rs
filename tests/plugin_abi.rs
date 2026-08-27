@@ -6,9 +6,9 @@
 //! functions behind it. The dispatch logic underneath has its own unit tests in
 //! `src/plugin.rs`; what those cannot cover is whether the exports resolve.
 //!
-//! A `dlopen`ing host is deliberately not built here: that is the other half of
-//! the ABI and belongs with the host implementation, which does not live in this
-//! crate yet.
+//! No `dlopen` happens here: these call the generated exports directly, in this
+//! process. The loading half is `tests/plugin_host.rs`, which builds the plugin
+//! example as a real `cdylib` and drives it through `repe::plugin::host`.
 
 #![cfg(all(feature = "plugin", not(target_arch = "wasm32")))]
 

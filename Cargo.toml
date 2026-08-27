@@ -50,6 +50,12 @@ cli = ["websocket", "dep:clap", "dep:clap_complete"]
 # not be held to that. Off on wasm32, where the module is `not(wasm32)` in
 # lib.rs: there is no dynamic loader for it to be loaded by.
 plugin = []
+# The other side of that ABI: `dlopen` a plugin and drive it. Pulls in
+# `libloading` for the loader, which is why it is not folded into `plugin` — a
+# crate *building* a plugin should not acquire a loader it will never call.
+# Enables `plugin` because the host is built on the same layouts and the same
+# version constant. Off on wasm32 for the same reason `plugin` is: no loader.
+plugin-host = ["plugin", "dep:libloading"]
 # REST facade over a `Registry`: an HTTP/1.1 + HTTP/2 gateway that maps HTTP
 # verbs onto the registry's read / write / call trichotomy, so public clients get
 # curl, OpenAPI, and edge caching while REPE clients keep the binary fast path.
@@ -88,6 +94,13 @@ required-features = ["websocket"]
 name = "repe_plugin"
 crate-type = ["cdylib"]
 required-features = ["plugin"]
+
+# The mirror of `repe_plugin`: a host rather than a plugin. Takes a library path
+# on argv, so one binary drives a Rust plugin or a C++ Glaze one — which is what
+# the interop job uses it for.
+[[example]]
+name = "plugin_host"
+required-features = ["plugin-host"]
 
 [[example]]
 name = "rest_gateway"
@@ -165,6 +178,16 @@ uniudp = { version = "1.2.1", optional = true }
 # That made `value-stream` unusable in a *workspace* feature union, since Cargo
 # features are additive and an inheriting wasm32 crate cannot subtract one.
 zstd = { version = "0.13", optional = true }
+
+# The `plugin-host` feature's dynamic loader. Target-gated because there is no
+# dynamic loader on wasm32-unknown-unknown, matching the `not(wasm32)` gate the
+# `plugin` module already carries in lib.rs.
+#
+# Preferred over hand-declaring `dlopen`/`dlsym`, which would work on Unix and
+# only on Unix: `libloading` carries the Windows `LoadLibraryW` path, the
+# thread-safety caveats around `dlerror`, and the platform quirks in symbol
+# lookup that a host would otherwise rediscover one platform at a time.
+libloading = { version = "0.8", optional = true }
 
 # The `rest` feature's HTTP layer. `hyper` with `http1` + `http2` so the gateway
 # serves both over one listener via hyper-util's auto builder: HTTP/2 for clients
