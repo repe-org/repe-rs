@@ -19,7 +19,7 @@ Requires the `plugin` feature. The library must be a `cdylib` — that is what p
 crate-type = ["cdylib"]
 
 [dependencies]
-repe = { version = "8", features = ["plugin"] }
+repe = { version = "9", features = ["plugin"] }
 ```
 
 ```rust

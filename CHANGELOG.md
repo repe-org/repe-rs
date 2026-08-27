@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [9.0.0] - 2026-08-27
 
 ### Added
 - **`Router::call` / `Router::call_into` — transport-free dispatch.** One serialized REPE request frame in, one response frame out, with no socket involved. This is the work the built-in servers do between reading a frame and writing one back: version and query-format validation, handler resolution, notify semantics (`None` means *send nothing*), `MethodNotFound` framing, and the response query echo. Reaching it through `Router::get` plus `HandlerErased::handle` meant reimplementing all five per carrier. `call_into` writes into a caller-owned buffer so a carrier holding one buffer per connection or per thread allocates nothing per request.
@@ -39,7 +39,7 @@
 
   Two consequences worth knowing. Two `&self` methods on one object now run at the same time, where the exclusive guard used to give them mutual exclusion for free. And a panic under a shared guard no longer poisons the lock, so a panicking `&self` handler no longer retires the object for the life of the process; a `&mut self` one still does.
 
-  One source break: a `#[repe(methods(..))]` entry declared `&self` is now *called* through a shared borrow, so declaring a `&mut self` method as `&self` is a compile error rather than a lie the listing repeated.
+  **BREAKING**, in one narrow way: a `#[repe(methods(..))]` entry declared `&self` is now *called* through a shared borrow, so declaring a `&mut self` method as `&self` is a compile error rather than a lie the listing repeated.
 
 - **Field-shaped endpoints: `#[repe(get = "...")]` / `#[repe(set = "...")]`.** One endpoint served by a getter/setter pair, for a value that reads and writes like a field but is computed — a register in different units, a value derived from two others. It behaves as a field on the wire, listing its **value** in the whole-object read rather than a signature string, where publishing the same thing as methods would have changed the path. A getter with no setter is read-only, so a pair of real getters and no-op setters is no longer how a read-only computed value is spelled. `#[repe(typed)]` composes on the getter, either half may be fallible, and a setter with no getter is a compile error rather than an endpoint the listing cannot show.
 
@@ -64,15 +64,17 @@
 - **`Registry::is_function`.** Whether a pointer names a registered function rather than a value. The registry decides read-vs-write-vs-call from the body alone, which is right for REPE; a caller that must commit to a verb before it has a body needs the distinction up front, and probing it with a read is not a substitute because a read of a function returns a descriptor a stored value could equally well contain.
 
 ### Changed
-- **`beve` moves to 9.** A security release: the decoders had no recursion limit, and nesting is declared by the input rather than by the destination type, so a few KB of nested array tags recursed until the thread stack was gone. That is not an ordinary parse failure — a Rust stack overflow *aborts* rather than unwinding, so no `Result` carried it and the per-connection `catch_unwind` in the servers could not contain it. One anonymous request took down every other connection the process was serving. Input nested past `beve::MAX_RECURSION_DEPTH` (128) is now refused, and repe answers it with `ErrorCode::ParseError` like any other malformed body.
+- **BREAKING: `beve` moves to 9.** As in every previous beve major, beve types appear in repe's public API (`RepeError::Beve(beve::Error)`, the re-exported `beve::{BeveTypedSlice, Complex}`, and the `T: beve::BeveTypedSlice` bounds on the typed/complex surfaces), so a beve major is a repe major; downstreams that also depend on `beve` directly must move to `beve 9`. MSRV is unchanged at 1.96.1. It is a security release: the decoders had no recursion limit, and nesting is declared by the input rather than by the destination type, so a few KB of nested array tags recursed until the thread stack was gone. That is not an ordinary parse failure — a Rust stack overflow *aborts* rather than unwinding, so no `Result` carried it and the per-connection `catch_unwind` in the servers could not contain it. One anonymous request took down every other connection the process was serving. Input nested past `beve::MAX_RECURSION_DEPTH` (128) is now refused, and repe answers it with `ErrorCode::ParseError` like any other malformed body.
 
-  `beve::Error` also becomes `#[non_exhaustive]` in that release. repe only wraps it (`RepeError::Beve`), so nothing in the public API changes, but a downstream crate matching it exhaustively needs a wildcard arm.
+  `beve::Error` also becomes `#[non_exhaustive]` in that release. repe only wraps it (`RepeError::Beve`), so no repe signature changes, but a downstream crate matching `beve::Error` exhaustively needs a wildcard arm.
 
   Nothing else in beve 9 reaches repe: the `mat` feature it also moves is not enabled here.
 
 - **`RestConfig::accept_beve_bodies` now defaults to `true`.** Its entire reason for being off was the decoder above, which is fixed; a nested body is now a `400` rather than a dead process. The knob stays, because refusing a media type you do not document is a legitimate policy, but it is no longer a safety default.
 
-- **`structs::assert_no_endpoint_collision` takes a third argument.** It now checks all three endpoint sets on a struct against each other — what the derive publishes, `REPE_METHOD_SIGNATURES`, and the new `REPE_ACCESSOR_ENDPOINTS` — and the derive passes struct-level `#[repe(methods(..))]` endpoints into the first, which it previously omitted. The function exists to be called from macro expansion; regenerating with the matching derive is the whole migration.
+- **BREAKING: `structs::assert_no_endpoint_collision` takes a third argument.** It now checks all three endpoint sets on a struct against each other — what the derive publishes, `REPE_METHOD_SIGNATURES`, and the new `REPE_ACCESSOR_ENDPOINTS` — and the derive passes struct-level `#[repe(methods(..))]` endpoints into the first, which it previously omitted. The function exists to be called from macro expansion; regenerating with the matching derive is the whole migration.
+
+- **`repe-derive` is now `0.3.0`**, and `repe` requires it. The macro crate gained field-shaped endpoints and the shared read path, and its generated code names items that only exist in `repe` 9.0.0, so the two move together. Nothing to do unless you depend on `repe-derive` directly, which is not the supported way to reach it — use `repe::RepeStruct` / `repe::methods`.
 
 ### Fixed
 - **A struct-level `#[repe(methods(..))]` endpoint could shadow an impl-block one silently.** The cross-macro collision check only saw *field* names, so a method listed on the struct and a method of the same name in the `#[repe::methods]` block both compiled: one became unreachable and the whole-object listing emitted the key twice — as two different values, since a `serde_json::Map` deduplicates the key and the streaming encoder does not. Both are now rejected at compile time.

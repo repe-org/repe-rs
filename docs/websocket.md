@@ -66,7 +66,7 @@ One difference: it returns a `futures_channel::mpsc::UnboundedReceiver<Message>`
 
 ```toml
 [dependencies]
-repe = { version = "8", features = ["websocket-wasm"] }
+repe = { version = "9", features = ["websocket-wasm"] }
 futures-channel = "0.3"       # only to name UnboundedReceiver in a struct or signature
 futures-util = "0.3"          # StreamExt::next; needs default features, unlike repe's own build of it
 wasm-bindgen-futures = "0.4"  # spawn_local

@@ -24,7 +24,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-repe = "8"
+repe = "9"
 ```
 
 Or run `cargo add repe`.
