@@ -130,6 +130,41 @@ Use it rather than `query.starts_with(p.root_path())`: the separator has to be p
 
 `load` refuses a `root_path` that is relative or carries a trailing separator, because either one matches nothing and does it silently: the plugin loads, reports healthy, and every request under it comes back method-not-found. An **empty** root is accepted — it is what Glaze's registry reports for an object published at the top level — and claims every absolute query.
 
+### Mounting a plugin on a router
+
+`Plugin` implements `HandlerErased`, so a plugin can be served straight from a `Router` — the frame marshalling between the router's decoded request and the ABI's byte buffers is the crate's, not the application's:
+
+```rust
+use repe::plugin::host::Plugin;
+use repe::server::Router;
+use std::sync::Arc;
+
+// SAFETY: loading a native library runs its initializers.
+let plugin = Arc::new(unsafe { Plugin::load("libinstrument.so") }?);
+let router = Router::new()
+    .with_json("/host/version", |_| Ok(serde_json::json!(env!("CARGO_PKG_VERSION"))))
+    .with_fallback_blocking(plugin.clone());
+```
+
+`Router::with_fallback` registers a handler for requests no route claims, and it is resolved **last** — after the fixed routes, the mounted registries, and the mounted structs — so nothing static is slowed down by it and a host route always wins. That is what makes it the mount point for a table that does not exist yet when the router is built: plugins loaded on demand, a proxy to another node, a registry mounted after startup.
+
+Use the `_blocking` variant for a plugin, as above: `repe_plugin_call` enters a library this process did not build, for a time nothing here bounds, so on the WebSocket server it belongs off the reader task. On the TCP servers the two are identical.
+
+Mounted as the fallback, a single `Plugin` answers what `claims` matches and frames `MethodNotFound` for the rest, since by then nobody else is left to serve it. For several plugins the fallback is the host's own handler: it owns the table, consults `claims`, and calls through to the plugin it picked. Which plugins are in that table, and when, stays the application's — see [What is deliberately not here](#what-is-deliberately-not-here).
+
+A plugin's own error frames pass through unchanged — an unknown method under its root, a handler that failed, a body it rejected. Only a plugin that breaks the ABI — answering a call with nothing, or with a frame that does not parse — is turned into an `InternalError` response, so the caller gets an answer either way.
+
+One thing a mount does **not** cover: a registry or struct mounted at a prefix answers for that whole prefix, misses included. If a mounted struct sits at `/instrument` and a plugin claims the same root, the struct wins every path under it and the plugin is never reached. Give them separate roots.
+
+`shutdown` consumes the handle, so keep the typed `Arc<Plugin>` as above and hand the router a clone: `Arc::try_unwrap` does not apply to the `Arc<dyn HandlerErased>` the router holds, because `dyn HandlerErased` is not `Sized`.
+
+```rust
+drop(router);
+Arc::try_unwrap(plugin).expect("no other holders").shutdown();
+```
+
+A plugin meant to live as long as the process needs none of that.
+
 ### The library is never unloaded
 
 `load` leaks its handle, and dropping a `Plugin` unloads nothing. That is the only correct behavior available — see the `dlclose` bullet above — and it has consequences worth planning for rather than discovering:

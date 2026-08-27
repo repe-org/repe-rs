@@ -34,6 +34,7 @@ use std::process::ExitCode;
 use repe::constants::{ErrorCode, QueryFormat};
 use repe::message::{Message, MessageView};
 use repe::plugin::host::{HostError, Plugin};
+use repe::server::Router;
 
 /// Failures seen so far. Every check runs, so one bad expectation reports all of
 /// them rather than only the first.
@@ -221,6 +222,75 @@ fn run(path: &str) -> Result<u32, HostError> {
         checks.check(
             message.header.id == 0,
             "the id is 0, because it could not be read",
+        );
+    }
+
+    println!("mounted on a router");
+    {
+        // The other way to host a plugin: hand it to `Router::with_fallback` and
+        // let the router resolve its own routes first. `Plugin` implements
+        // `HandlerErased`, so the mount is one line and the frame marshalling is
+        // the crate's rather than the application's.
+        //
+        // A second `Plugin::load` of the same path reaches the same instance —
+        // `dlopen` refcounts by path and nothing is ever unloaded — so this
+        // shares state with the handle above rather than starting a new plugin.
+        //
+        // SAFETY: as above; the library is already resident.
+        let mounted = unsafe { Plugin::load(path) }?;
+        // `_blocking`: a plugin call enters a library this process did not
+        // build, for a time nothing here bounds, so on the WebSocket server it
+        // belongs off the reader task. On the TCP servers the two are the same.
+        let router = Router::new()
+            .with_json("/host/ping", |_| Ok(serde_json::json!("pong")))
+            .with_fallback_blocking(std::sync::Arc::new(mounted));
+
+        let frame = router
+            .call(&write("/host/ping", 8, &serde_json::Value::Null))
+            .expect("the host route answers");
+        let message = Message::from_slice(&frame).expect("the response is a REPE frame");
+        checks.check(
+            message
+                .json_body::<String>()
+                .is_ok_and(|pong| pong == "pong"),
+            "a route the host owns is not shadowed by the fallback",
+        );
+
+        let frame = router
+            .call(&read(&format!("{root}/channel"), 9))
+            .expect("the plugin answers through the router");
+        let message = Message::from_slice(&frame).expect("the response is a REPE frame");
+        checks.check(
+            message.json_body::<u32>().is_ok_and(|channel| channel == 6),
+            "a request under the plugin's root reaches the plugin",
+        );
+        checks.check(message.header.id == 9, "the mounted response keeps the id");
+
+        let frame = router
+            .call(&read("/not/claimed/by/anyone", 10))
+            .expect("a declined path is answered rather than dropped");
+        let message = Message::from_slice(&frame).expect("the response is a REPE frame");
+        checks.check(
+            message.error_code() == Some(ErrorCode::MethodNotFound),
+            "a path outside the plugin's root is method_not_found",
+        );
+
+        // A notify must reach the plugin, not merely produce no response: the
+        // dispatch layer discards a notify's response whatever the handler did,
+        // so `is_none()` on its own would pass even if the plugin were skipped.
+        // `calibrate` moves gain off its reset value; the notify puts it back.
+        router.call(&write(&format!("{root}/calibrate"), 11, &8.0f64));
+        checks.check(
+            router.call(&notify(&format!("{root}/reset"), 12)).is_none(),
+            "notify semantics carry through the mount",
+        );
+        let frame = router
+            .call(&read(&format!("{root}/gain"), 13))
+            .expect("answered");
+        let message = Message::from_slice(&frame).expect("the response is a REPE frame");
+        checks.check(
+            message.json_body::<f64>().is_ok_and(|gain| gain == 1.0),
+            "the notify reached the plugin and reset its gain",
         );
     }
 

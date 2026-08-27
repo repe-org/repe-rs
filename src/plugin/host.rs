@@ -37,7 +37,7 @@
 //!
 //! Routing is the seam between the two. A host dispatches to a plugin with
 //! [`Plugin::claims`], against a query that
-//! [`MessageView`](crate::message::MessageView) reads out of a frame without
+//! [`MessageView`] reads out of a frame without
 //! decoding the body.
 //!
 //! # The library is never unloaded
@@ -86,6 +86,12 @@ use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 use libloading::Library;
+
+use crate::constants::ErrorCode;
+use crate::error::RepeError;
+use crate::message::{Message, MessageView, create_error_response_for};
+use crate::peer::CallContext;
+use crate::server::HandlerErased;
 
 use super::{REPE_PLUGIN_INTERFACE_VERSION, RepeBuffer, RepePluginData, RepeResult};
 
@@ -610,6 +616,154 @@ impl Plugin {
     }
 }
 
+/// Serve a plugin's endpoints from a [`Router`], which is what mounting one on
+/// [`Router::with_fallback`] needs.
+///
+/// The router hands a handler a decoded request and expects a decoded response;
+/// the plugin ABI moves whole REPE frames. This impl is that translation, and
+/// nothing more — it does not decide *which* plugin a request belongs to, which
+/// is the host's table to keep. The usual shape is a fallback handler that owns
+/// the table, consults [`claims`](Plugin::claims), and calls through to the
+/// plugin it picked; for the single-plugin case the plugin can be the fallback
+/// itself, and [`claims`](Plugin::claims) is then what decides whether to answer
+/// or to frame a [`MethodNotFound`](ErrorCode::MethodNotFound).
+///
+/// ```no_run
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// use repe::plugin::host::Plugin;
+/// use repe::server::Router;
+/// use std::sync::Arc;
+///
+/// // SAFETY: loading a native library runs its initializers.
+/// let plugin = unsafe { Plugin::load("libinstrument.so") }?;
+/// // Typed `Arc`, so the handle can be reclaimed for `shutdown` later; the
+/// // clone handed to the router coerces to `Arc<dyn HandlerErased>`.
+/// let plugin = Arc::new(plugin);
+/// let router = Router::new().with_fallback_blocking(plugin.clone());
+/// # let _ = router;
+/// # Ok(()) }
+/// ```
+///
+/// [`with_fallback_blocking`](crate::server::Router::with_fallback_blocking)
+/// rather than `with_fallback`: `repe_plugin_call` enters a library this process
+/// did not build, for an unbounded time, so on the WebSocket server it belongs
+/// off the reader task. On the TCP servers the two are the same.
+///
+/// One consequence of sharing a plugin with a router: [`shutdown`](Plugin::shutdown)
+/// consumes the handle. Reclaiming it needs the **typed** `Arc<Plugin>` above —
+/// `Arc::try_unwrap` cannot be applied to the `Arc<dyn HandlerErased>` the
+/// router holds, because `dyn HandlerErased` is not `Sized`:
+///
+/// ```no_run
+/// # use repe::plugin::host::Plugin;
+/// # use repe::server::Router;
+/// # use std::sync::Arc;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let plugin = Arc::new(unsafe { Plugin::load("libinstrument.so") }?);
+/// # let router = Router::new().with_fallback_blocking(plugin.clone());
+/// drop(router);
+/// Arc::try_unwrap(plugin)
+///     .expect("the router was the only other holder")
+///     .shutdown();
+/// # Ok(()) }
+/// ```
+///
+/// A plugin that is meant to live as long as the process needs none of that.
+///
+/// A request the plugin refuses — an unknown method under its root, a handler
+/// that failed — comes back as the plugin's own error frame and is forwarded
+/// unchanged. Only a plugin that breaks the ABI, by answering a call with
+/// nothing or with a frame that does not parse, is turned into an
+/// [`InternalError`](ErrorCode::InternalError) here: the client asked this
+/// server a question, and it gets an answer either way.
+///
+/// [`Router`]: crate::server::Router
+/// [`Router::with_fallback`]: crate::server::Router::with_fallback
+impl HandlerErased for Plugin {
+    fn handle(&self, req: &Message) -> Result<Message, RepeError> {
+        if !self.claims(req.query_str().unwrap_or("")) {
+            return Ok(self.disclaim(req.header.id, &req.query));
+        }
+        let mut frame = Vec::with_capacity(req.serialized_len());
+        req.write_to(&mut frame)?;
+        Ok(self.forward(req.header, &req.query, &frame))
+    }
+
+    fn handle_view(&self, view: &MessageView, _ctx: &CallContext) -> Result<Message, RepeError> {
+        // The frame has to be reassembled either way — the ABI takes bytes — but
+        // it is assembled straight from the borrowed view, so the owned
+        // `Message` the default `handle_view` would have materialized first is
+        // never built. The result is byte-identical to what `handle` produces:
+        // `Header::decode` has already rejected any frame whose `length`
+        // disagrees with its query and body lengths, so recomputing them here
+        // cannot change them.
+        if !self.claims(std::str::from_utf8(view.query).unwrap_or("")) {
+            return Ok(self.disclaim(view.header.id, view.query));
+        }
+        let mut frame =
+            Vec::with_capacity(crate::constants::HEADER_SIZE + view.query.len() + view.body.len());
+        crate::io::write_message_streaming(
+            &mut frame,
+            view.header,
+            view.query,
+            view.body.len() as u64,
+            |w| std::io::Write::write_all(w, view.body),
+        )?;
+        Ok(self.forward(view.header, view.query, &frame))
+    }
+}
+
+impl Plugin {
+    /// Frame the error response for a request whose path this plugin does not
+    /// claim.
+    ///
+    /// The router has already missed everything else by the time a fallback
+    /// runs, so there is nobody left to hand the request to. Answering here
+    /// costs no FFI call, gives one uniform message, and keeps the reply for a
+    /// path this plugin never claimed from depending on a foreign library.
+    fn disclaim(&self, id: u64, query: &[u8]) -> Message {
+        create_error_response_for(
+            id,
+            query,
+            ErrorCode::MethodNotFound,
+            format!("Method not found: {}", String::from_utf8_lossy(query)),
+        )
+    }
+
+    /// Hand `frame` to the plugin and turn what comes back into a response.
+    ///
+    /// `header` and `query` are the request's, and are all an error response
+    /// takes from it.
+    fn forward(&self, header: crate::header::Header, query: &[u8], frame: &[u8]) -> Message {
+        let error = |code, message| create_error_response_for(header.id, query, code, message);
+        let mut response = Vec::new();
+        match self.call_into(frame, &mut response) {
+            Ok(true) => match Message::from_slice(&response) {
+                Ok(message) => message,
+                Err(err) => error(
+                    ErrorCode::InternalError,
+                    format!(
+                        "plugin `{}` answered with a frame that does not parse: {err}",
+                        self.name
+                    ),
+                ),
+            },
+            // No response. That is correct for a notify, where the caller
+            // discards whatever is returned here; for anything else the plugin
+            // dropped a request that was awaiting an answer.
+            Ok(false) if header.notify == 1 => Message::builder().id(header.id).build(),
+            Ok(false) => error(
+                ErrorCode::InternalError,
+                format!(
+                    "plugin `{}` returned no response to a request that expects one",
+                    self.name
+                ),
+            ),
+            Err(err) => error(ErrorCode::InternalError, err.to_string()),
+        }
+    }
+}
+
 impl std::fmt::Debug for Plugin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Plugin")
@@ -715,6 +869,8 @@ mod tests {
     use crate::message::Message;
     use crate::plugin::PluginRuntime;
     use crate::server::Router;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A plugin that behaves, implemented in-process.
     ///
@@ -1132,6 +1288,169 @@ mod tests {
             plugin.call(&request("/example/double", &serde_json::json!(1), false)),
             Err(HostError::ResponseTooLarge { size: u64::MAX })
         ));
+    }
+
+    // ---------------------------------------------------------------------
+    // `HandlerErased` — the plugin mounted on a router
+    // ---------------------------------------------------------------------
+
+    /// Drive the mounted plugin the way a carrier does: through
+    /// [`Router::call`], which exercises the borrowing `handle_view` path.
+    fn through_router(plugin: Plugin, request: &[u8]) -> Option<Message> {
+        let router = Router::new().with_fallback(Arc::new(plugin));
+        router
+            .call(request)
+            .map(|frame| Message::from_slice(&frame).expect("a REPE frame comes back"))
+    }
+
+    #[test]
+    fn a_mounted_plugin_serves_what_it_claims() {
+        let response = through_router(
+            load(abi()).unwrap(),
+            &request("/example/double", &serde_json::json!(21), false),
+        )
+        .expect("a non-notify request is answered");
+        assert_eq!(response.json_body::<i64>().unwrap(), 42);
+        assert_eq!(response.header.id, 7);
+    }
+
+    #[test]
+    fn a_mounted_plugin_declines_a_path_outside_its_root() {
+        // The router has already missed everything else by the time a fallback
+        // runs, so a path the plugin does not claim has nobody left to serve it.
+        // Answering is the only thing that does not strand the caller.
+        let response = through_router(
+            load(abi()).unwrap(),
+            &request("/elsewhere", &serde_json::json!(1), false),
+        )
+        .expect("a declined path is still answered");
+        assert_eq!(response.error_code(), Some(ErrorCode::MethodNotFound));
+        assert!(
+            response
+                .error_message_utf8()
+                .is_some_and(|text| text.contains("/elsewhere"))
+        );
+    }
+
+    #[test]
+    fn a_mounted_plugin_forwards_a_notify_without_answering() {
+        // `is_none()` alone would pass even if the plugin were never called:
+        // the dispatch layer discards a notify's response whatever the handler
+        // did. So the plugin records the call and the test reads it back.
+        static SEEN: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn counting(request: *const c_char, size: u64) -> RepeBuffer {
+            SEEN.fetch_add(1, Ordering::SeqCst);
+            // SAFETY: the host hands over a live slice for the call's duration.
+            unsafe { good::call(request, size) }
+        }
+
+        let plugin = load(PluginAbi {
+            call: counting,
+            ..abi()
+        })
+        .unwrap();
+        let before = SEEN.load(Ordering::SeqCst);
+        assert!(
+            through_router(
+                plugin,
+                &request("/example/double", &serde_json::json!(1), true),
+            )
+            .is_none()
+        );
+        assert_eq!(
+            SEEN.load(Ordering::SeqCst),
+            before + 1,
+            "the notify reached the plugin rather than being dropped at the mount"
+        );
+    }
+
+    #[test]
+    fn a_plugin_that_answers_nothing_to_a_real_request_is_an_internal_error() {
+        // Silence is correct for a notify and a broken promise for anything
+        // else. A host that passed it through would hang the caller, so the
+        // ABI breach is named where it happened.
+        unsafe extern "C" fn silent(_: *const c_char, _: u64) -> RepeBuffer {
+            RepeBuffer {
+                data: std::ptr::null(),
+                size: 0,
+            }
+        }
+
+        let plugin = load(PluginAbi {
+            call: silent,
+            ..abi()
+        })
+        .unwrap();
+        let response = through_router(
+            plugin,
+            &request("/example/double", &serde_json::json!(1), false),
+        )
+        .expect("the caller is told rather than left waiting");
+        assert_eq!(response.error_code(), Some(ErrorCode::InternalError));
+    }
+
+    #[test]
+    fn a_plugin_answer_that_is_not_a_frame_is_an_internal_error() {
+        unsafe extern "C" fn garbage(_: *const c_char, _: u64) -> RepeBuffer {
+            static JUNK: &[u8] = b"not a repe frame";
+            RepeBuffer {
+                data: JUNK.as_ptr().cast::<c_char>(),
+                size: JUNK.len() as u64,
+            }
+        }
+
+        let plugin = load(PluginAbi {
+            call: garbage,
+            ..abi()
+        })
+        .unwrap();
+        let response = through_router(
+            plugin,
+            &request("/example/double", &serde_json::json!(1), false),
+        )
+        .expect("answered");
+        assert_eq!(response.error_code(), Some(ErrorCode::InternalError));
+    }
+
+    #[test]
+    fn a_mounted_plugin_s_own_error_frame_is_forwarded_unchanged() {
+        // The distinction the declining test above cannot make: a request the
+        // plugin *claims* and then refuses is answered by the plugin, and that
+        // frame belongs to whoever sent the request. The host forwards it
+        // rather than replacing it with one of its own.
+        //
+        // A bodiless request to a `with_json` route is the clearest case: the
+        // plugin answers `InvalidBody`, which the host has no way to produce —
+        // it frames only `MethodNotFound` and `InternalError`.
+        let bodiless = Message::builder()
+            .id(7)
+            .query_str("/example/double")
+            .query_format(QueryFormat::JsonPointer)
+            .build()
+            .to_vec();
+        let response = through_router(load(abi()).unwrap(), &bodiless).expect("answered");
+        assert_eq!(response.error_code(), Some(ErrorCode::InvalidBody));
+        assert_eq!(response.header.id, 7);
+    }
+
+    #[test]
+    fn the_owning_and_borrowing_dispatch_paths_agree() {
+        // `handle` frames from an owned `Message`, `handle_view` from a borrowed
+        // view; both have to produce the same answer, and only one of them is on
+        // the path `Router::call` takes.
+        let plugin = load(abi()).unwrap();
+        let frame = request("/example/double", &serde_json::json!(21), false);
+        let owned = Message::from_slice(&frame).unwrap();
+        let view = MessageView::from_slice(&frame).unwrap();
+
+        let by_message = plugin.handle(&owned).unwrap();
+        let by_view = plugin
+            .handle_view(&view, &CallContext::detached("/example/double"))
+            .unwrap();
+        assert_eq!(by_message.body, by_view.body);
+        assert_eq!(by_message.header.ec, by_view.header.ec);
+        assert_eq!(by_message.header.id, by_view.header.id);
     }
 
     #[test]

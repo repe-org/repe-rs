@@ -120,7 +120,9 @@ What this pins that the direction above cannot:
 - a response buffer owned by Glaze's thread-local `std::string`, copied out by
   the host before the borrow expires;
 - both optional lifecycle symbols present, which is the branch a plugin that
-  omits them cannot exercise.
+  omits them cannot exercise;
+- the C++ plugin mounted on a Rust `Router` through `with_fallback`, so the
+  `HandlerErased` bridge is exercised against a plugin this crate did not build.
 
 The same host binary drives the Rust plugin too, which is worth doing while
 editing either of them — though CI does not, since that pairing is one
