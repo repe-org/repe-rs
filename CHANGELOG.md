@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- **A 48-byte frame could panic the parser (security).** `query_length` and `body_length` are attacker-controlled `u64`s read off the wire, and the framed total `48 + query_length + body_length` was summed unchecked. With `query_length = u64::MAX - 47` the sum wraps to `0`, which the header's own `length` field can be set to match — so the frame decoded, and slicing the query out of it computed `buf[48..0]` and panicked.
+
+  Neither the TCP nor the async server catches unwinds, so one such frame took down the connection thread; under `panic = "abort"` it takes the process. `Header::decode` now rejects a total that does not fit both `u64` and the target's address space, with the new `RepeError::FrameLengthOverflow`. That single check is what makes every later `query_length as usize` in the crate safe, including on 32-bit targets such as `wasm32`.
+
 ## [8.1.0] - 2026-08-25
 
 ### Added

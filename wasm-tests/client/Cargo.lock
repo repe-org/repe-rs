@@ -292,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "repe"
-version = "8.0.0"
+version = "8.1.0"
 dependencies = [
  "beve",
  "futures-channel",
@@ -310,7 +310,7 @@ dependencies = [
 
 [[package]]
 name = "repe-derive"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",

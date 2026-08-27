@@ -92,7 +92,21 @@ impl Header {
         // value, so a future REPE revision can assign meaning to these bits
         // without breaking this receiver.
 
-        let expected = HEADER_SIZE as u64 + query_length + body_length;
+        // Checked, and checked against `usize` as well as `u64`: both lengths
+        // come straight off the wire, and an unchecked sum wraps to a small
+        // total that the `length` field can be crafted to agree with — after
+        // which slicing code downstream computes an end offset below its own
+        // start. Rejecting here is what lets every `as usize` on these fields
+        // elsewhere in the crate stay a plain cast: a header that decodes has a
+        // framed total this target can address.
+        let expected = (HEADER_SIZE as u64)
+            .checked_add(query_length)
+            .and_then(|total| total.checked_add(body_length))
+            .filter(|total| usize::try_from(*total).is_ok())
+            .ok_or(RepeError::FrameLengthOverflow {
+                query_length,
+                body_length,
+            })?;
         if length != expected {
             return Err(RepeError::LengthMismatch {
                 expected,
