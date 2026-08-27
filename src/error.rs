@@ -19,6 +19,20 @@ pub enum RepeError {
     LengthMismatch { expected: u64, got: u64 },
     #[error("buffer too small: need {need} bytes, have {have}")]
     BufferTooSmall { need: usize, have: usize },
+    /// A header advertised query and body lengths whose framed total cannot be
+    /// represented, so no buffer could ever hold the message it describes.
+    ///
+    /// Both lengths are attacker-controlled `u64`s read straight off the wire.
+    /// Summing them with the 48-byte header unchecked wraps, and a wrapped total
+    /// can be made to agree with the header's own `length` field, which is how a
+    /// 48-byte frame reaches slicing code with bounds that run backwards. This
+    /// rejects the frame at the header instead, so every later `as usize` in the
+    /// crate is operating on a total that fits both `u64` and this target's
+    /// address space.
+    #[error(
+        "frame lengths are not representable: 48-byte header + query {query_length} + body {body_length}"
+    )]
+    FrameLengthOverflow { query_length: u64, body_length: u64 },
     #[error("response id mismatch: expected {expected}, got {got}")]
     ResponseIdMismatch { expected: u64, got: u64 },
     #[error("io error: {0}")]
@@ -63,6 +77,7 @@ impl RepeError {
             RepeError::InvalidHeaderLength(_) => ErrorCode::InvalidHeader,
             RepeError::LengthMismatch { .. } => ErrorCode::InvalidHeader,
             RepeError::BufferTooSmall { .. } => ErrorCode::ParseError,
+            RepeError::FrameLengthOverflow { .. } => ErrorCode::InvalidHeader,
             RepeError::ResponseIdMismatch { .. } => ErrorCode::InvalidHeader,
             RepeError::Io(_) => ErrorCode::ParseError,
             RepeError::Json(_) => ErrorCode::ParseError,

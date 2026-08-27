@@ -16,7 +16,14 @@ impl Message {
     pub fn new(header: Header, query: Vec<u8>, body: Vec<u8>) -> Result<Self, RepeError> {
         if header.query_length != query.len() as u64 || header.body_length != body.len() as u64 {
             return Err(RepeError::LengthMismatch {
-                expected: HEADER_SIZE as u64 + header.query_length + header.body_length,
+                // Saturating: these are the caller's own advertised lengths, and
+                // this arm is already reporting that they are wrong. A `u64` sum
+                // that wraps here would turn a bad-input report into a panic in
+                // debug builds, for no gain — the number only has to be large
+                // enough to show the mismatch.
+                expected: (HEADER_SIZE as u64)
+                    .saturating_add(header.query_length)
+                    .saturating_add(header.body_length),
                 got: HEADER_SIZE as u64 + query.len() as u64 + body.len() as u64,
             });
         }

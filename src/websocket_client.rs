@@ -888,6 +888,13 @@ fn clone_fatal_error_for_waiter(err: &RepeError, request_id: u64) -> RepeError {
             need: *need,
             have: *have,
         },
+        RepeError::FrameLengthOverflow {
+            query_length,
+            body_length,
+        } => RepeError::FrameLengthOverflow {
+            query_length: *query_length,
+            body_length: *body_length,
+        },
         RepeError::ResponseIdMismatch { expected, got } => RepeError::ResponseIdMismatch {
             expected: *expected,
             got: *got,
