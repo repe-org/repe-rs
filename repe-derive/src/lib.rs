@@ -322,7 +322,7 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
         // `DeserializeOwned`. A type holding live handles has no JSON that
         // produces one, and the alternative was a hand-written `Deserialize`
         // that always errors on every such type.
-        let root_write = if struct_attrs.readonly {
+        let root_write = if struct_attrs.no_replace {
             quote! {
                 if body.is_some() {
                     return Err(#repe::StructError::BodyUnexpected {
@@ -424,7 +424,7 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
     // A whole-object write needs `&mut self`, so it declines — unless the struct
     // is read-only, where the refusal itself is servable and there is no reason
     // to take the exclusive lock to give it.
-    let shared_root_write = if struct_attrs.readonly {
+    let shared_root_write = if struct_attrs.no_replace {
         quote! {
             if body.is_some() {
                 return Some(Err(#repe::StructError::BodyUnexpected {
@@ -696,14 +696,19 @@ struct StructAttrs {
     /// `DeserializeOwned`. A type holding an open socket or a file handle has no
     /// JSON that produces one, and hand-writing a `Deserialize` that
     /// always errors trades a compile error for a runtime one and is boilerplate
-    /// on every such type. This is *not* the field-level `#[repe(readonly)]`
-    /// applied one level up: that one is recursive, refusing every write
-    /// *through* the field, whereas this governs the empty-segments arm alone
-    /// and leaves fields and children writable. It emits only the rejection, and
-    /// never the assignment followed by dead code, because a crate under
-    /// `#![deny(warnings)]` must not be broken by `unreachable_code` on
-    /// generated code.
-    readonly: bool,
+    /// on every such type. It emits only the rejection, and never the assignment
+    /// followed by dead code, because a crate under `#![deny(warnings)]` must
+    /// not be broken by `unreachable_code` on generated code.
+    ///
+    /// Named for the operation it refuses rather than `readonly`, because the
+    /// two are different statements: `readonly` on a field says *this subtree is
+    /// not writable*, recursively, while this says *this type cannot be rebuilt
+    /// from a body* and leaves every field writable. One word for both would
+    /// read as correct and mean the wrong thing one level up, and it would
+    /// spend the spelling that the recursive meaning should have if a struct
+    /// ever wants it. `#[repe(readonly)]` on a struct is rejected outright,
+    /// pointing here.
+    no_replace: bool,
     /// `#[repe(listing_order("a", "b", ..))]`: the key order of the
     /// whole-object listing, given in full.
     ///
@@ -736,16 +741,32 @@ struct ListingOrder {
 fn parse_struct_attrs(attrs: &[Attribute]) -> syn::Result<StructAttrs> {
     let mut methods = Vec::new();
     let mut methods_from_impl_block = false;
-    let mut readonly = false;
+    let mut no_replace = false;
     let mut listing_order: Option<ListingOrder> = None;
     for attr in attrs {
         if !attr.path().is_ident("repe") {
             continue;
         }
         attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("readonly") {
-                readonly = true;
+            if meta.path.is_ident("no_replace") {
+                no_replace = true;
                 return Ok(());
+            }
+            if meta.path.is_ident("readonly") {
+                // Deliberately an error rather than an alias. On a field
+                // `readonly` is recursive — it refuses every write *through*
+                // the field — and letting the same word mean "refuses only the
+                // whole-object write" one level up is a trap that reads as
+                // correct. The recursive meaning has no spelling on a struct
+                // today; leaving the word unclaimed is what keeps it available
+                // for one.
+                return Err(meta.error(
+                    "`#[repe(readonly)]` is a field attribute, and on a field it is recursive: \
+                     it refuses every write through the field. A struct wanting that marks its \
+                     fields. To refuse a write of the *whole* object while its fields stay \
+                     writable — which also drops the `Self: DeserializeOwned` requirement, for a \
+                     type no JSON describes — use `#[repe(no_replace)]`.",
+                ));
             }
             if meta.path.is_ident("listing_order") {
                 let span = meta.path.span();
@@ -787,7 +808,7 @@ fn parse_struct_attrs(attrs: &[Attribute]) -> syn::Result<StructAttrs> {
     Ok(StructAttrs {
         methods,
         methods_from_impl_block,
-        readonly,
+        no_replace,
         listing_order,
     })
 }
@@ -2124,7 +2145,7 @@ fn shared_body_terms(
 ) -> Vec<TokenStream2> {
     // A refusal that needs no state, or a call that needs no mutation: both are
     // answers this struct can give without the write guard.
-    if struct_attrs.readonly
+    if struct_attrs.no_replace
         || struct_attrs
             .methods
             .iter()
@@ -3123,6 +3144,41 @@ mod tests {
             msg.contains("two ways to descend into one field"),
             "the message should name the choice between them, got: {msg}"
         );
+    }
+
+    #[test]
+    fn readonly_on_a_struct_is_rejected_and_points_at_no_replace() {
+        // The word is deliberately unclaimed at struct level: on a field it is
+        // recursive, and the recursive meaning is the one a struct should get
+        // if it ever gets one.
+        let attrs: Vec<syn::Attribute> = vec![parse_quote! { #[repe(readonly)] }];
+        let msg = match parse_struct_attrs(&attrs) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("`readonly` on a struct is supposed to be rejected"),
+        };
+        assert!(
+            msg.contains("no_replace") && msg.contains("recursive"),
+            "the message should name the replacement and say why the two differ, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn no_replace_on_a_struct_is_accepted() {
+        let attrs: Vec<syn::Attribute> = vec![parse_quote! { #[repe(no_replace)] }];
+        let Ok(parsed) = parse_struct_attrs(&attrs) else {
+            panic!("`no_replace` is supposed to be accepted");
+        };
+        assert!(parsed.no_replace);
+    }
+
+    #[test]
+    fn readonly_on_a_field_is_still_accepted() {
+        // Unchanged, and the reason the struct-level spelling had to move.
+        let field: syn::Field = parse_quote! { #[repe(readonly)] a: u64 };
+        let Ok(spec) = parse_field(&field) else {
+            panic!("`readonly` on a field is supposed to be accepted");
+        };
+        assert!(spec.attrs.readonly);
     }
 
     #[test]

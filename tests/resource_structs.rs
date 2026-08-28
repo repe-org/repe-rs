@@ -15,9 +15,11 @@
 //!   workaround was a hand-written `Deserialize` that always errors — a runtime
 //!   refusal in place of a compile-time one, restated on every such type.
 //!
-//! `#[repe(readonly)]` on the struct closes the second, and closes it the way the
-//! field attribute of the same name does: by emitting *only* the refusal, so the
-//! assignment that forced the bound is never generated.
+//! `#[repe(no_replace)]` closes the second, by emitting *only* the refusal so
+//! the assignment that forced the bound is never generated. It is spelled apart
+//! from `#[repe(readonly)]` deliberately: that one, on a field, refuses every
+//! write *through* the field, while this refuses one operation on the whole
+//! object and leaves every field writable.
 //!
 //! A third shape sits alongside them: a child that may not be there at all.
 //! `RepeStruct for Option<T>` is carried by the crate because a host cannot write
@@ -119,9 +121,9 @@ struct Counter {
 }
 
 /// The root. No `Deserialize` impl anywhere on it — that this file compiles is
-/// half of what `#[repe(readonly)]` is for.
+/// half of what `#[repe(no_replace)]` is for.
 #[derive(Default, Serialize, RepeStruct)]
-#[repe(readonly)]
+#[repe(no_replace)]
 struct Service {
     version: u32,
     #[repe(nested)]
@@ -295,7 +297,7 @@ fn a_per_field_write_below_a_child_is_unchanged() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_whole_object_write_against_a_readonly_struct_is_refused() {
+fn a_whole_object_write_against_a_no_replace_struct_is_refused() {
     for (kind, router) in routers(service) {
         let message = answer(&router, &write("/service", &json!({ "version": 9 })));
         assert_eq!(
@@ -313,7 +315,10 @@ fn every_write_answers_the_same_under_both_locks() {
     // path produced a frame must not be visible in it.
     let [(_, exclusive), (_, shared)] = routers(service);
     for (name, request) in [
-        ("readonly root", write("/service", &json!({ "version": 9 }))),
+        (
+            "no_replace root",
+            write("/service", &json!({ "version": 9 })),
+        ),
         ("field write", write("/service/version", &9u32)),
         (
             "whole child apply",
@@ -354,7 +359,10 @@ fn a_readonly_refusal_is_served_without_the_exclusive_guard() {
     let held = state.read().expect("the lock is not poisoned");
 
     for (name, request) in [
-        ("readonly root", write("/service", &json!({ "version": 9 }))),
+        (
+            "no_replace root",
+            write("/service", &json!({ "version": 9 })),
+        ),
         (
             "readonly child, whole",
             write("/service/fixed", &json!({ "ticks": 9, "source": "x" })),
@@ -407,7 +415,7 @@ fn readonly_on_a_nested_field_refuses_every_write_through_it() {
 }
 
 #[test]
-fn a_readonly_struct_still_reads_and_still_writes_its_parts() {
+fn a_no_replace_struct_still_reads_and_still_writes_its_parts() {
     for (kind, router) in routers(service) {
         assert_eq!(
             body(&router, &read("/service")),
@@ -418,14 +426,14 @@ fn a_readonly_struct_still_reads_and_still_writes_its_parts() {
                 "aux": null,
                 "fixed": { "ticks": 1, "source": "static" },
             }),
-            "under a {kind} the listing is unaffected by `#[repe(readonly)]`"
+            "under a {kind} the listing is unaffected by `#[repe(no_replace)]`"
         );
         answer(&router, &write("/service/version", &9u32));
         assert_eq!(
             body(&router, &read("/service/version")),
             json!(9),
-            "under a {kind} `#[repe(readonly)]` on the struct governs the whole object, not \
-             its fields"
+            "under a {kind} `#[repe(no_replace)]` refuses one operation on the whole object, \
+             and leaves its fields writable"
         );
     }
 }
@@ -603,7 +611,7 @@ fn presence_is_not_settable_through_the_child_s_own_path() {
     drop(held);
 
     // And the whole-object write at the parent is a different operation: it
-    // replaces the field, `null` included. `Service` is `#[repe(readonly)]`, so
+    // replaces the field, `null` included. `Service` is `#[repe(no_replace)]`, so
     // that path is refused here for its own reason; a nested child under a
     // writable parent still replaces.
     assert_eq!(

@@ -1305,8 +1305,8 @@ mod shared_serves_bodies {
     }
 
     #[derive(Default, serde::Serialize, serde::Deserialize, RepeStruct)]
-    #[repe(readonly)]
-    struct ReadonlyStruct {
+    #[repe(no_replace)]
+    struct NoReplaceStruct {
         a: u64,
     }
 
@@ -1414,8 +1414,8 @@ mod shared_serves_bodies {
             "a readonly field refuses a write under the shared borrow"
         );
         assert!(
-            serves::<ReadonlyStruct>(),
-            "a readonly struct refuses a whole-object write under it too"
+            serves::<NoReplaceStruct>(),
+            "a `no_replace` struct refuses a whole-object write under it too"
         );
 
         // A call, not a mutation: the reason the receiver decides.
