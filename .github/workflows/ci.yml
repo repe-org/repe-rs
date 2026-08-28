@@ -66,12 +66,15 @@ jobs:
       - name: Clippy (core, no features)
         run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
 
-      # Guards the target-gating of `zstd` and `uniudp`. Enabling `value-stream`
-      # or `fleet-udp` on wasm32 used to fail in a *build script* — zstd-sys
-      # compiling `huf_decompress_amd64.S`, mio rejecting the target — which no
-      # job here reached, so a workspace could not hoist either feature into a
-      # feature set shared with a browser client. `--lib` skips the `cli` bin;
-      # everything else stays covered as new features are added.
+      # Guards the target-gating of `zstandard` and `uniudp`. Enabling
+      # `value-stream` or `fleet-udp` on wasm32 used to fail in a *build script*
+      # — zstd-sys compiling `huf_decompress_amd64.S`, mio rejecting the target —
+      # which no job here reached, so a workspace could not hoist either feature
+      # into a feature set shared with a browser client. `value-stream` now
+      # compresses with the pure-Rust `zstandard`, which has no build script at
+      # all; the gate stays so the dep tracks the `not(wasm32)` module it serves.
+      # `--lib` skips the `cli` bin; everything else stays covered as new
+      # features are added.
       - name: Clippy (all features, lib only)
         run: cargo clippy --all-features --lib --target wasm32-unknown-unknown -- -D warnings
 

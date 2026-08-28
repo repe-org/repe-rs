@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- **`value-stream` compresses with [`zstandard`](https://crates.io/crates/zstandard) instead of `zstd`.** A pure-Rust implementation of the same format: no `cc`, no build script, no C toolchain to arrange for a cross-compile. The wire is unchanged, and the integration tests still decode produced frames with the reference C `zstd` (kept as a dev-dependency) to hold that. `StreamOpts::zstd_level` keeps its name, meaning, and default.
+
+  The dep stays under `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]`, but now only to match the `not(wasm32)` gate `value_stream` already carries in `lib.rs` — the module is std threads and blocking channels — rather than because a build script refused the target outright.
+
 ## [10.0.0] - 2026-08-28
 
 A **major** release: the shared-borrow trait methods change shape, and a whole-child write now descends.
