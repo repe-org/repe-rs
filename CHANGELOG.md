@@ -1,8 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## [10.0.0] - 2026-08-28
 
-Next release is a **major**: the shared-borrow trait methods change shape, and a whole-child write now descends.
+A **major** release: the shared-borrow trait methods change shape, and a whole-child write now descends.
 
 ### Added
 - **New crate: `repe-core`.** The `RepeStruct` surface on its own — the trait, `RepeMethods`, `StructError`, `ResponseBody`, and the protocol constants those name. A crate that only *declares* a served type can now derive against it without pulling in the server, the client, or the transport, which a crate with a deliberately light dependency list could not do before. `repe` re-exports all of it at the paths it has always had (`repe::structs::*`, `repe::constants::*`), and `#[derive(RepeStruct)]` resolves against whichever of the two crates is in scope. Nothing moved for a caller of `repe`.
