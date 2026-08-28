@@ -173,6 +173,8 @@ A method's arguments are deserialized from the request body:
 | 1 | *is* the argument |
 | 2+ | an array of N values, positionally, **or** an object keyed by parameter name |
 
+In the object form a missing key decodes as `null`, so a parameter typed `Option<T>` may be omitted and arrives as `None`. Omitting a parameter that is not optional is an `InvalidBody` error naming it — `deserialization error for /blend(right)` — rather than a silent default.
+
 ```rust
 #[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
 #[repe(methods)]
