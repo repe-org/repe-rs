@@ -1,16 +1,25 @@
-//! Reads served through a shared borrow.
+//! Requests served through a shared borrow.
 //!
 //! Struct dispatch used to take an exclusive guard for every request, so a
 //! `/version` read queued behind whatever long-running call happened to hold the
-//! object. A bodiless request — a read, by REPE's own frame-level distinction —
-//! now goes to `RepeStruct::repe_read_into` first when the lock has a shared
-//! mode, and only falls back to the exclusive path when the struct declines.
+//! object. Every request now goes to `RepeStruct::repe_shared_into` first when
+//! the lock has a shared mode, and only falls back to the exclusive path when
+//! the struct declines.
 //!
-//! Two things have to hold, and both are pinned here: a read that *can* be
-//! served shared genuinely is (proved by holding a read guard, or by two reads
-//! meeting inside one handler), and every read answers byte-for-byte the same
-//! whichever path served it (proved by running each path against a `Mutex`,
-//! which has no shared mode and so always dispatches the old way).
+//! **What decides is the receiver, not the frame.** The first version of this
+//! asked the frame — a request with no body is a read — which is REPE's own
+//! distinction and the wrong one here: a `&self` method taking arguments carries
+//! a body, so it took the write guard and stalled every read of the object for
+//! as long as it ran. One long-running `&self` call turned a sub-millisecond
+//! `/version` read into one that waited for the whole call. The receiver is
+//! known where the dispatch arms are generated, so it is the receiver that
+//! answers.
+//!
+//! Two things have to hold, and both are pinned here: a request that *can* be
+//! served shared genuinely is (proved by holding a read guard, or by two calls
+//! meeting inside one handler), and every request answers byte-for-byte the same
+//! whichever path served it (proved by running each against a `Mutex`, which has
+//! no shared mode and so always dispatches the old way).
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
@@ -85,6 +94,32 @@ impl Instrument {
     /// A `&self` method with nothing to return, which is the one read the
     /// encoding path answers with a bare `null`.
     fn ping(&self) {}
+
+    /// A `&self` method that takes an argument — the shape the frame-level rule
+    /// got wrong. It carries a body, so REPE's frame distinction calls it a
+    /// write; it takes `&self`, so it is a call and mutates nothing.
+    fn scale(&self, factor: f64) -> Vec<f64> {
+        self.gains.iter().map(|gain| gain * factor).collect()
+    }
+
+    /// The same with two arguments, so `MethodArgs` decoding — positional and
+    /// name-keyed both — is on the shared path as well as the exclusive one.
+    fn window(&self, lo: usize, hi: usize) -> Vec<f64> {
+        self.gains
+            .get(lo..hi)
+            .map(<[f64]>::to_vec)
+            .unwrap_or_default()
+    }
+
+    /// `&self`, takes an argument, and can fail: the shared path has to turn an
+    /// `Err` from an argument-taking call into the same error frame.
+    fn verify(&self, expected: String) -> Result<(), String> {
+        if expected == self.firmware {
+            Ok(())
+        } else {
+            Err(format!("firmware is {firmware}", firmware = self.firmware))
+        }
+    }
 
     /// The same, fallible.
     fn check(&self) -> Result<(), String> {
@@ -221,6 +256,54 @@ const READ_PATHS: &[&str] = &[
     "/inst/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q/r",
 ];
 
+/// Every body-carrying shape the fixtures publish, in a fixed sequence so both
+/// routers walk the same state transitions and can be compared frame for frame.
+///
+/// Half of these are now served by the shared borrow — every `&self` call — and
+/// half still take the exclusive guard. Which is which must not be visible in
+/// the answer.
+fn write_frames() -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        // Served shared: `&self`, arguments and all.
+        ("scale", write("/inst/scale", &2.0f64)),
+        (
+            "window positional",
+            write("/inst/window", &serde_json::json!([0, 2])),
+        ),
+        (
+            "window named",
+            write("/inst/window", &serde_json::json!({ "lo": 1, "hi": 3 })),
+        ),
+        ("verify ok", write("/inst/verify", &"4.2.0")),
+        ("verify err", write("/inst/verify", &"0.0.0")),
+        // A method taking no arguments ignores a body, on either path.
+        ("identify with a body", write("/inst/identify", &1u32)),
+        // Still exclusive: writes and `&mut self` calls.
+        ("field write", write("/inst/channel", &9u32)),
+        ("accessor write", write("/inst/channel_hz", &8.0e6f64)),
+        ("mutating call", write("/inst/calibrate", &9.0f64)),
+        (
+            "whole child write",
+            write(
+                "/inst/clock",
+                &serde_json::json!({ "ticks": 5, "source": "pps" }),
+            ),
+        ),
+        ("nested field write", write("/inst/clock/ticks", &7u64)),
+        // Errors, which must also not depend on the guard that produced them.
+        (
+            "scale with a bad body",
+            write("/inst/scale", &"not a number"),
+        ),
+        (
+            "window too short",
+            write("/inst/window", &serde_json::json!([1])),
+        ),
+        ("subpath below a leaf", write("/inst/gains/0", &1.0f64)),
+        ("unknown path", write("/inst/missing", &1u32)),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // The two paths agree
 // ---------------------------------------------------------------------------
@@ -238,6 +321,23 @@ fn every_read_answers_the_same_under_a_mutex_and_an_rwlock() {
             exclusive.call(&request),
             shared.call(&request),
             "reading `{path}` through a shared guard must produce the frame the exclusive guard \
+             produces, byte for byte"
+        );
+    }
+}
+
+#[test]
+fn every_write_answers_the_same_under_a_mutex_and_an_rwlock() {
+    let exclusive = Router::new()
+        .with_struct_shared::<Instrument, _>("/inst", Arc::new(Mutex::new(instrument())));
+    let shared = Router::new()
+        .with_struct_shared::<Instrument, _>("/inst", Arc::new(RwLock::new(instrument())));
+
+    for (name, request) in write_frames() {
+        assert_eq!(
+            exclusive.call(&request),
+            shared.call(&request),
+            "`{name}` through a shared guard must produce the frame the exclusive guard \
              produces, byte for byte"
         );
     }
@@ -374,6 +474,37 @@ fn every_shareable_read_proceeds_while_a_read_guard_is_held() {
 }
 
 #[test]
+fn a_self_call_carrying_arguments_proceeds_while_a_read_guard_is_held() {
+    // The frame carries a body, so REPE's frame-level distinction calls each of
+    // these a write. The receiver says otherwise, and the receiver is what the
+    // generated arm reads. Anything still deciding from the frame would block
+    // here rather than answer.
+    let state = Arc::new(RwLock::new(instrument()));
+    let router = Router::new().with_struct_shared::<Instrument, _>("/inst", Arc::clone(&state));
+    let held = state.read().expect("the lock is not poisoned");
+
+    for (name, request) in [
+        ("scale", write("/inst/scale", &2.0f64)),
+        ("window", write("/inst/window", &serde_json::json!([0, 2]))),
+        ("verify", write("/inst/verify", &"4.2.0")),
+    ] {
+        let router = router.clone();
+        let frame = try_off_thread(Duration::from_secs(10), move || router.call(&request))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "`{name}` takes `&self`, so carrying a body must not put it behind the \
+                        exclusive guard"
+                )
+            })
+            .expect("a non-notify request is answered");
+        let message = Message::from_slice(&frame).expect("the response is a REPE frame");
+        assert!(!message.is_error(), "`{name}` answered with an error");
+    }
+
+    drop(held);
+}
+
+#[test]
 fn a_write_still_waits_for_the_exclusive_guard() {
     let state = Arc::new(RwLock::new(instrument()));
     let router = Router::new().with_struct_shared::<Instrument, _>("/inst", Arc::clone(&state));
@@ -393,6 +524,38 @@ fn a_write_still_waits_for_the_exclusive_guard() {
         .expect("the write completes once the guard is released");
     worker.join().expect("the worker thread finishes");
     assert_eq!(state.read().unwrap().channel, 9);
+}
+
+#[test]
+fn a_mutating_call_carrying_arguments_still_waits_for_the_exclusive_guard() {
+    // The other half of the rule. `calibrate` takes `&mut self`, so the shared
+    // attempt declines it — without taking the body, which is what lets the
+    // exclusive retry dispatch the same request rather than a bodiless one.
+    let state = Arc::new(RwLock::new(instrument()));
+    let router = Router::new().with_struct_shared::<Instrument, _>("/inst", Arc::clone(&state));
+
+    let held = state.read().expect("the lock is not poisoned");
+    let (tx, rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let _ = tx.send(router.call(&write("/inst/calibrate", &9.0f64)));
+    });
+    assert!(
+        rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "a `&mut self` method cannot run under a shared borrow, arguments or not"
+    );
+    drop(held);
+
+    let frame = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the call completes once the guard is released")
+        .expect("a non-notify request is answered");
+    let message = Message::from_slice(&frame).expect("the response is a REPE frame");
+    assert_eq!(
+        message.json_body::<f64>().unwrap(),
+        4.5,
+        "the exclusive retry must see the body the shared attempt declined to take"
+    );
+    worker.join().expect("the worker thread finishes");
 }
 
 #[test]
@@ -472,6 +635,70 @@ fn two_reads_of_one_struct_run_at_the_same_time() {
         let message = Message::from_slice(&frame).expect("the response is a REPE frame");
         assert_eq!(message.json_body::<u32>().unwrap(), 7);
     }
+}
+
+/// The two barriers the slow-call test below meets at: one to prove the call is
+/// genuinely inside the handler before the read is attempted, one to let it
+/// finish afterwards.
+fn slow_call_gates() -> &'static (Barrier, Barrier) {
+    static GATES: OnceLock<(Barrier, Barrier)> = OnceLock::new();
+    GATES.get_or_init(|| (Barrier::new(2), Barrier::new(2)))
+}
+
+/// The friction this rule exists to remove, in miniature: a `&self` call that
+/// takes arguments and runs for a long time, next to a plain read of the same
+/// object.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+#[repe(methods)]
+struct Slow {
+    version: String,
+}
+
+#[repe::methods]
+impl Slow {
+    /// Stands in for a call that runs for a long time: `&self`, takes a list of
+    /// arguments, and does not return until the test says so.
+    fn summarize(&self, items: Vec<u32>) -> usize {
+        slow_call_gates().0.wait();
+        slow_call_gates().1.wait();
+        items.len()
+    }
+}
+
+#[test]
+fn a_version_read_is_answered_while_a_slow_self_call_runs() {
+    let router = Router::new().with_struct_shared::<Slow, _>(
+        "/slow",
+        Arc::new(RwLock::new(Slow {
+            version: String::from("4.2.0"),
+        })),
+    );
+
+    let running = {
+        let router = router.clone();
+        std::thread::spawn(move || {
+            router.call(&write("/slow/summarize", &serde_json::json!([1, 2, 3])))
+        })
+    };
+    // The call is inside the handler from here on, so a read that answers below
+    // answered *during* it rather than before it started.
+    slow_call_gates().0.wait();
+
+    let frame = try_off_thread(Duration::from_secs(10), move || {
+        router.call(&read("/slow/version"))
+    })
+    .expect("a `/version` read must not queue behind a long `&self` call")
+    .expect("a non-notify request is answered");
+    let message = Message::from_slice(&frame).expect("the response is a REPE frame");
+    assert_eq!(message.json_body::<String>().unwrap(), "4.2.0");
+
+    slow_call_gates().1.wait();
+    let frame = running
+        .join()
+        .expect("the worker thread finishes")
+        .expect("a non-notify request is answered");
+    let message = Message::from_slice(&frame).expect("the response is a REPE frame");
+    assert_eq!(message.json_body::<usize>().unwrap(), 3);
 }
 
 // ---------------------------------------------------------------------------
@@ -711,7 +938,7 @@ struct Bench {
     counter: Counter,
 }
 
-/// A hand-written `RepeStruct`: it overrides neither `repe_read_into` nor
+/// A hand-written `RepeStruct`: it overrides neither `repe_shared_into` nor
 /// `repe_listing_declines`, so it declines every shared read and says so. This
 /// is the ordinary shape — most hand-written impls are exactly this — and it is
 /// the second way a nested child can force a parent's listing exclusive, with no
@@ -748,7 +975,7 @@ struct Console {
 
 #[test]
 fn a_hand_written_child_declines_its_parent_s_listing_before_anything_runs() {
-    // A hand-written child that never overrides `repe_read_into` declines every
+    // A hand-written child that never overrides `repe_shared_into` declines every
     // shared read, and it declines *late* — after the parent has already listed
     // the siblings before it. `repe_listing_declines` defaults to `true` so the
     // parent asks and gives up first, rather than discovering it partway.
@@ -849,6 +1076,46 @@ fn a_child_s_reading_getters_leave_its_ancestor_s_listing_shared() {
     rx.recv_timeout(Duration::from_secs(10))
         .expect("the listing completes once the guard is released");
     worker.join().expect("the worker thread finishes");
+}
+
+#[test]
+fn a_call_below_a_nested_child_answers_the_same_either_way() {
+    // A nested child is handed the body *borrow*, so the obligation to leave it
+    // alone when declining is one level deeper than the arm that states it. This
+    // is where a child that took the body and then declined would show: the
+    // exclusive retry would see `None` and answer `BodyExpected` instead.
+    let exclusive =
+        Router::new().with_struct_shared::<Bench, _>("/bench", Arc::new(Mutex::new(bench())));
+    let shared =
+        Router::new().with_struct_shared::<Bench, _>("/bench", Arc::new(RwLock::new(bench())));
+
+    for (name, request) in [
+        // `&self` with arguments, two levels down: served shared.
+        ("nested scale", write("/bench/inst/scale", &2.0f64)),
+        // `&mut self` with arguments: the child declines, and the exclusive
+        // retry has to receive the same body.
+        ("nested calibrate", write("/bench/inst/calibrate", &9.0f64)),
+        // A field write below the child, for the same reason.
+        ("nested field write", write("/bench/inst/channel", &11u32)),
+    ] {
+        assert_eq!(
+            exclusive.call(&request),
+            shared.call(&request),
+            "`{name}` must answer the same whichever guard served it"
+        );
+    }
+
+    // And the mutation actually landed, rather than the declined attempt eating
+    // the body on the way through.
+    for (kind, router) in [("Mutex", exclusive), ("RwLock", shared)] {
+        assert_eq!(
+            answer(&router, &read("/bench/inst/channel"))
+                .json_body::<u32>()
+                .unwrap(),
+            11,
+            "under a {kind} the write below the nested child took effect"
+        );
+    }
 }
 
 #[test]

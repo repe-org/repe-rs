@@ -1,0 +1,25 @@
+[package]
+name = "repe-core"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.96.1"
+description = "Core types for serving a Rust struct over the REPE RPC protocol, without the server, client, or transport"
+license = "MIT"
+repository = "https://github.com/repe-org/repe-rs"
+documentation = "https://docs.rs/repe-core"
+readme = "README.md"
+keywords = ["rpc", "protocol", "repe", "json"]
+categories = ["network-programming", "encoding"]
+include = ["/Cargo.toml", "/README.md", "/LICENSE", "/src/**", "/tests/**"]
+
+[dependencies]
+# The typed-numeric body encoding `ResponseBody::write_typed_slice` produces.
+# Pinned to the major `repe` pins, since the two share one `ResponseBody`.
+beve = "9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+# Re-exported, so a crate implementing `RepeStruct` needs one dependency rather
+# than two. The derive resolves its generated paths against whichever of `repe`
+# and `repe-core` it finds, so the same macro serves both.
+repe-derive = { path = "../repe-derive", version = "0.5.0" }

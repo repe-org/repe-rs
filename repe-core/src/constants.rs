@@ -137,3 +137,22 @@ impl core::convert::TryFrom<u16> for BodyFormat {
         })
     }
 }
+
+impl std::fmt::Display for ErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            ErrorCode::Ok => "OK",
+            ErrorCode::VersionMismatch => "Version mismatch",
+            ErrorCode::InvalidHeader => "Invalid header",
+            ErrorCode::InvalidQuery => "Invalid query",
+            ErrorCode::InvalidBody => "Invalid body",
+            ErrorCode::ParseError => "Parse error",
+            ErrorCode::MethodNotFound => "Method not found",
+            ErrorCode::Timeout => "Timeout",
+            ErrorCode::ResourceExhausted => "Resource exhausted",
+            ErrorCode::InternalError => "Internal error",
+            ErrorCode::ApplicationErrorBase => "Application error",
+        };
+        f.write_str(s)
+    }
+}

@@ -61,6 +61,13 @@ pub fn methods(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// below takes a `Sink` and emits the response through these four methods — so
 /// the pair stays in lockstep by construction, and a reader can check the whole
 /// difference between the two paths in one place.
+///
+/// They agree on *what* each path answers with, not on key order: a
+/// `serde_json::Map` sorts its keys unless the graph enables
+/// `serde_json/preserve_order`, so the `Value` form can carry neither
+/// declaration order nor `#[repe(listing_order(..))]`. The router calls
+/// `repe_handle_into`, so every frame a client sees carries the order; see
+/// `build_listing`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Sink {
     /// `RepeStruct::repe_handle` / `RepeMethods::repe_call`.
@@ -199,6 +206,16 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
 
     let from_impl_block = struct_attrs.methods_from_impl_block;
 
+    if let Some(order) = &struct_attrs.listing_order {
+        validate_listing_order(order, &endpoints, from_impl_block)?;
+    }
+    let entries = listing_entries(
+        &field_specs,
+        &struct_attrs.methods,
+        from_impl_block,
+        struct_attrs.listing_order.as_ref(),
+    );
+
     // The compile-time handshake, both directions. `MethodsDeclared` is a
     // supertrait of `RepeMethods`, so a `#[repe::methods]` block without this
     // marker cannot compile; and the fallthrough below names `RepeMethods`, so
@@ -214,6 +231,27 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
             .iter()
             .map(|(endpoint, _)| LitStr::new(endpoint, Span::call_site()))
             .collect();
+        // The other half of `validate_listing_order`. The derive rejects every
+        // mistake it can name; the impl block's endpoints are not among them,
+        // and the two generated tables are the only place they are visible.
+        let order_check = struct_attrs.listing_order.as_ref().map(|order| {
+            let keys = &order.keys;
+            // A const-eval failure is reported at the span of the *call
+            // expression*, which is the span of its leading token — and that
+            // token is the crate path, emitted at call site. Without respanning
+            // it, an order that omits an impl-block endpoint would point at
+            // `#[derive(RepeStruct)]` rather than at the attribute that named
+            // the wrong set.
+            let assert = respan(quote! { #repe::structs::assert_listing_order }, order.span);
+            quote_spanned! { order.span=>
+                const _: () = #assert(
+                    &[#(#keys),*],
+                    &[#(#declared),*],
+                    <#struct_ident as #repe::structs::RepeMethods>::REPE_METHOD_SIGNATURES,
+                    <#struct_ident as #repe::structs::RepeMethods>::REPE_ACCESSOR_ENDPOINTS,
+                );
+            }
+        });
         quote! {
             impl #repe::structs::MethodsDeclared for #struct_ident {}
 
@@ -224,17 +262,31 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 <#struct_ident as #repe::structs::RepeMethods>::REPE_METHOD_SIGNATURES,
                 <#struct_ident as #repe::structs::RepeMethods>::REPE_ACCESSOR_ENDPOINTS,
             );
+
+            #order_check
         }
     });
+
+    // The same terms the listing's guard is built from, published so a parent
+    // that nests this struct can settle its listing before writing anything.
+    // Empty means the constant `false`, which is a plain struct of leaf fields —
+    // the common case, which then carries no guard at all.
+    let decline_terms = listing_decline_terms(&field_specs, from_impl_block, &repe);
+    let listing_declines = if decline_terms.is_empty() {
+        quote! { false }
+    } else {
+        quote! { #(#decline_terms)||* }
+    };
 
     let mut bodies = Vec::new();
     for sink in [Sink::Value, Sink::Encode] {
         let listing = build_listing(
-            &field_specs,
-            &struct_attrs.methods,
-            from_impl_block,
+            &entries,
             &repe,
-            sink,
+            match sink {
+                Sink::Value => ListingSink::Value,
+                Sink::Encode => ListingSink::Encode,
+            },
         );
         let field_arms = build_field_arms(&field_specs, &repe, sink);
         let method_arms = build_method_arms(&struct_attrs.methods, &repe, sink);
@@ -251,7 +303,33 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 }),
             }
         };
-        let root_write_ack = sink.emit_null();
+        // The whole-object write. `#[repe(readonly)]` on the struct emits *only*
+        // the refusal — never the assignment followed by dead code — which is
+        // the point beyond the refusal itself: `from_value::<Self>` is then
+        // never generated, so the struct is not required to be
+        // `DeserializeOwned`. A type holding live handles has no JSON that
+        // produces one, and the alternative was a hand-written `Deserialize`
+        // that always errors on every such type.
+        let root_write = if struct_attrs.readonly {
+            quote! {
+                if body.is_some() {
+                    return Err(#repe::StructError::BodyUnexpected {
+                        path: String::from(""),
+                    });
+                }
+            }
+        } else {
+            let root_write_ack = sink.emit_null();
+            quote! {
+                if let Some(value) = body {
+                    *self = ::serde_json::from_value(value).map_err(|source| #repe::StructError::Deserialize {
+                        path: String::from(""),
+                        source,
+                    })?;
+                    return #root_write_ack;
+                }
+            }
+        };
         let (signature, ret) = match sink {
             Sink::Value => (
                 quote! {
@@ -279,13 +357,7 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
         bodies.push(quote! {
             #signature -> #ret {
                 if segments.is_empty() {
-                    if let Some(value) = body {
-                        *self = ::serde_json::from_value(value).map_err(|source| #repe::StructError::Deserialize {
-                            path: String::from(""),
-                            source,
-                        })?;
-                        return #root_write_ack;
-                    }
+                    #root_write
                     return #listing;
                 }
 
@@ -299,13 +371,35 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
         });
     }
 
-    let read_listing =
-        build_read_listing(&field_specs, &struct_attrs.methods, from_impl_block, &repe);
-    let read_field_arms = build_read_field_arms(&field_specs, &repe);
-    let read_method_arms = build_read_method_arms(&struct_attrs.methods, &repe);
-    let read_fallthrough = if from_impl_block {
+    // Settled before the shared listing writes or calls anything, and for the
+    // whole subtree — see `listing_decline_terms`. Past it no entry can decline,
+    // so the `entry_try_with` rewinds inside are the safety net for a
+    // hand-written table that got the guard's inputs wrong, not a path a derived
+    // listing takes. Every term folds to a constant, and a struct with none gets
+    // no guard emitted.
+    let shared_listing = {
+        let listing = build_listing(&entries, &repe, ListingSink::Shared);
+        let guard = (!decline_terms.is_empty()).then(|| {
+            quote! {
+                if <Self as #repe::RepeStruct>::repe_listing_declines(self) {
+                    return None;
+                }
+            }
+        });
         quote! {
-            _ => <Self as #repe::structs::RepeMethods>::repe_call_read_into(self, segments, out),
+            {
+                #guard
+                #listing
+            }
+        }
+    };
+    let shared_field_arms = build_shared_field_arms(&field_specs, &repe);
+    let shared_method_arms = build_shared_method_arms(&struct_attrs.methods, &repe);
+    let shared_fallthrough = if from_impl_block {
+        quote! {
+            _ => <Self as #repe::structs::RepeMethods>::repe_call_shared_into(
+                self, segments, body, out,
+            ),
         }
     } else {
         quote! {
@@ -314,15 +408,23 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
             })),
         }
     };
-    // The same terms the listing's own guard is built from, published so a
-    // parent that nests this struct can settle its listing before writing
-    // anything. `false` when there is nothing to ask about, which is a plain
-    // struct of leaf fields.
-    let decline_terms = listing_decline_terms(&field_specs, from_impl_block, &repe);
-    let listing_declines = if decline_terms.is_empty() {
-        quote! { false }
+    // A whole-object write needs `&mut self`, so it declines — unless the struct
+    // is read-only, where the refusal itself is servable and there is no reason
+    // to take the exclusive lock to give it.
+    let shared_root_write = if struct_attrs.readonly {
+        quote! {
+            if body.is_some() {
+                return Some(Err(#repe::StructError::BodyUnexpected {
+                    path: String::from(""),
+                }));
+            }
+        }
     } else {
-        quote! { #(#decline_terms)||* }
+        quote! {
+            if body.is_some() {
+                return None;
+            }
+        }
     };
     bodies.push(quote! {
         fn repe_listing_declines(&self) -> bool {
@@ -331,20 +433,22 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
     });
 
     bodies.push(quote! {
-        fn repe_read_into(
+        fn repe_shared_into(
             &self,
             segments: &[&str],
+            body: &mut Option<::serde_json::Value>,
             out: &mut #repe::structs::ResponseBody<'_>,
         ) -> Option<#repe::structs::StructResult<()>> {
             if segments.is_empty() {
-                return #read_listing;
+                #shared_root_write
+                return #shared_listing;
             }
 
             let (head, tail) = segments.split_first().unwrap();
             match *head {
-                #(#read_field_arms)*
-                #(#read_method_arms)*
-                #read_fallthrough
+                #(#shared_field_arms)*
+                #(#shared_method_arms)*
+                #shared_fallthrough
             }
         }
     });
@@ -358,29 +462,53 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
     })
 }
 
+/// Re-span every token of `tokens`, which here is always a path: a shallow walk
+/// covers it because a path carries no delimited groups.
+fn respan(tokens: TokenStream2, span: Span) -> TokenStream2 {
+    tokens
+        .into_iter()
+        .map(|mut tree| {
+            tree.set_span(span);
+            tree
+        })
+        .collect()
+}
+
+/// The crate root the generated paths hang off: `::repe`, or `::repe_core` for a
+/// crate that has only the core.
+///
+/// The `RepeStruct` surface lives in `repe-core` and is re-exported by `repe` at
+/// the same paths, so either name is a valid root and one macro serves both. A
+/// crate that has both wants the one it actually calls, which is why `repe` is
+/// tried first.
+///
+/// Always an absolute path, never `crate`, even when expanding inside one of the
+/// two crates. `proc_macro_crate` reports `Itself` for every target that is not
+/// an integration test (it detects those by `CARGO_TARGET_TMPDIR`), which lumps
+/// a crate's own examples and doc-tests in with its lib — and in those `crate`
+/// is the example, not the library. An `extern crate self as ..;` in each
+/// `lib.rs` makes the absolute path resolve from inside the lib too, so one
+/// spelling is correct for all four cases.
 fn repe_crate_path() -> TokenStream2 {
-    match crate_name("repe") {
-        // `::repe`, not `crate`, even when expanding inside repe itself.
-        // `proc_macro_crate` reports `Itself` for every target that is not an
-        // integration test (it detects those by `CARGO_TARGET_TMPDIR`), which
-        // lumps repe's own examples and doc-tests in with its lib — and in those
-        // `crate` is the example, not repe. `extern crate self as repe;` in
-        // `lib.rs` makes this path resolve from inside the lib too, so one
-        // spelling is correct for all four cases.
-        Ok(FoundCrate::Itself) => quote!(::repe),
-        Ok(FoundCrate::Name(name)) => {
-            let ident = Ident::new(&name, Span::call_site());
-            quote!(::#ident)
-        }
-        Err(_) => quote!(::repe),
+    for (package, itself) in [("repe", "repe"), ("repe-core", "repe_core")] {
+        let name = match crate_name(package) {
+            Ok(FoundCrate::Itself) => String::from(itself),
+            Ok(FoundCrate::Name(name)) => name,
+            // Not a dependency of the crate being expanded. Try the other.
+            Err(_) => continue,
+        };
+        let ident = Ident::new(&name, Span::call_site());
+        return quote!(::#ident);
     }
+    // Neither resolved — no manifest to read, most likely. `repe` is the name
+    // the overwhelming majority of callers depend on.
+    quote!(::repe)
 }
 
 /// Reject two declarations claiming the same endpoint, pointing at the second.
 fn reject_duplicate_endpoints(endpoints: &[(&str, Span)]) -> syn::Result<()> {
     for (index, (name, _)) in endpoints.iter().enumerate() {
-        if let Some((_, span)) = endpoints[..index].iter().find(|(prior, _)| prior == name) {
-            let _ = span;
+        if endpoints[..index].iter().any(|(prior, _)| prior == name) {
             return Err(syn::Error::new(
                 endpoints[index].1,
                 format!(
@@ -403,6 +531,15 @@ struct FieldAttrs {
     rename: Option<String>,
     skip: bool,
     nested: bool,
+    /// `#[repe(nested_serde)]`: descend into a field that implements only
+    /// `Serialize` + `DeserializeOwned`, by walking a `serde_json::Value` of it.
+    ///
+    /// The escape hatch for a type whose own crate cannot depend on this one —
+    /// a pure-logic crate with a no-I/O charter, or a third-party type there is
+    /// no way to annotate. `#[repe(nested)]` is the better answer wherever the
+    /// type *can* implement `RepeStruct`, since it descends without
+    /// materializing anything.
+    nested_serde: bool,
     readonly: bool,
     typed: bool,
 }
@@ -453,6 +590,10 @@ fn parse_field(field: &Field) -> syn::Result<FieldSpec> {
                 attrs.nested = true;
                 return Ok(());
             }
+            if meta.path.is_ident("nested_serde") {
+                attrs.nested_serde = true;
+                return Ok(());
+            }
             if meta.path.is_ident("readonly") {
                 attrs.readonly = true;
                 return Ok(());
@@ -465,10 +606,19 @@ fn parse_field(field: &Field) -> syn::Result<FieldSpec> {
         })?;
     }
 
-    if attrs.typed && attrs.nested {
+    if attrs.typed && (attrs.nested || attrs.nested_serde) {
         return Err(syn::Error::new(
             field.span(),
             "`#[repe(typed)]` encodes a numeric slice as a BEVE typed array, which a nested struct is not",
+        ));
+    }
+    if attrs.nested && attrs.nested_serde {
+        return Err(syn::Error::new(
+            field.span(),
+            "`#[repe(nested)]` and `#[repe(nested_serde)]` are two ways to descend into one \
+             field: the first asks the child's own `RepeStruct` impl, the second walks a \
+             `serde_json::Value` of it. Pick the first wherever the child can implement the \
+             trait.",
         ));
     }
 
@@ -521,16 +671,80 @@ struct StructAttrs {
     /// `#[repe(methods)]` with no list: the method table comes from a
     /// `#[repe::methods]` impl block.
     methods_from_impl_block: bool,
+    /// Struct-level `#[repe(readonly)]`: a write of the *whole* object is
+    /// refused rather than deserialized into `Self`.
+    ///
+    /// The point is not only the refusal — it is that the whole-object
+    /// assignment is then never emitted, so the struct is not required to be
+    /// `DeserializeOwned`. A type holding an open socket or a file handle has no
+    /// JSON that produces one, and hand-writing a `Deserialize` that
+    /// always errors trades a compile error for a runtime one and is boilerplate
+    /// on every such type. This is the field-level `#[repe(readonly)]` applied
+    /// one level up, and it emits only the rejection for the same reason that
+    /// one does: a crate under `#![deny(warnings)]` must not be broken by
+    /// `unreachable_code` on generated code.
+    readonly: bool,
+    /// `#[repe(listing_order("a", "b", ..))]`: the key order of the
+    /// whole-object listing, given in full.
+    ///
+    /// Without it the listing appends in a fixed order — fields in declaration
+    /// order, then struct-listed methods, then the impl block's signatures, then
+    /// its field-shaped accessors — so a `#[repe(get/set)]` endpoint is always
+    /// last however its logical place reads. That is wire-visible, and it is the
+    /// one key order a `glz::object` with a `custom<setter, getter>` in the
+    /// middle cannot be reproduced in.
+    ///
+    /// Reorders emission only: it costs nothing at run time, and nothing at all
+    /// for a struct that does not use it.
+    ///
+    /// Governs the two listings that reach a client — `repe_handle_into` and
+    /// `repe_shared_into`, which the router calls. It cannot govern
+    /// `repe_handle`, whose `serde_json::Map` is a `BTreeMap` unless something
+    /// in the dependency graph enables `serde_json/preserve_order`; that form
+    /// sorts its keys and can carry no order at all, which is true of
+    /// declaration order too and is not something this attribute changed.
+    listing_order: Option<ListingOrder>,
+}
+
+/// The parsed `#[repe(listing_order(..))]` list, with the span of the attribute
+/// that carried it for the errors raised against it.
+struct ListingOrder {
+    keys: Vec<LitStr>,
+    span: Span,
 }
 
 fn parse_struct_attrs(attrs: &[Attribute]) -> syn::Result<StructAttrs> {
     let mut methods = Vec::new();
     let mut methods_from_impl_block = false;
+    let mut readonly = false;
+    let mut listing_order: Option<ListingOrder> = None;
     for attr in attrs {
         if !attr.path().is_ident("repe") {
             continue;
         }
         attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("readonly") {
+                readonly = true;
+                return Ok(());
+            }
+            if meta.path.is_ident("listing_order") {
+                let span = meta.path.span();
+                if listing_order.is_some() {
+                    return Err(meta.error(
+                        "`#[repe(listing_order(..))]` is given once and names every key; two \
+                         lists cannot both be the order",
+                    ));
+                }
+                let content;
+                syn::parenthesized!(content in meta.input);
+                let keys: Punctuated<LitStr, Token![,]> =
+                    content.parse_terminated(<LitStr as Parse>::parse, Token![,])?;
+                listing_order = Some(ListingOrder {
+                    keys: keys.into_iter().collect(),
+                    span,
+                });
+                return Ok(());
+            }
             if meta.path.is_ident("methods") {
                 if !meta.input.peek(syn::token::Paren) {
                     // Bare `#[repe(methods)]`: defer to the `#[repe::methods]`
@@ -553,6 +767,8 @@ fn parse_struct_attrs(attrs: &[Attribute]) -> syn::Result<StructAttrs> {
     Ok(StructAttrs {
         methods,
         methods_from_impl_block,
+        readonly,
+        listing_order,
     })
 }
 
@@ -696,145 +912,425 @@ fn normalize_type_string(ty: &Type) -> String {
 // Whole-struct listing
 // ---------------------------------------------------------------------------
 
+/// One key of the whole-object listing.
+///
+/// Resolved either from declaration order — fields, then struct-listed methods,
+/// then the impl block's two tables — or from `#[repe(listing_order(..))]`,
+/// which names the whole sequence. All three listings walk this one list, so
+/// they cannot disagree about what is emitted, or — for the two that can carry
+/// an order at all — about the order. See `build_listing` for the `Value` form's
+/// limitation.
+enum ListingEntry<'a> {
+    /// A field, listed by its value.
+    Field(&'a FieldSpec),
+    /// A struct-level `#[repe(methods(..))]` entry, listed by its signature
+    /// string.
+    Signature(&'a MethodSpec),
+    /// One endpoint of the `#[repe::methods]` impl block, placed by name. Which
+    /// of the block's two tables it came from is resolved in a `const` block,
+    /// since this macro cannot see the block itself.
+    ImplNamed(LitStr),
+    /// Every `REPE_METHOD_SIGNATURES` entry, in table order. Emitted only when
+    /// there is no `listing_order` placing them individually.
+    ImplSignatures,
+    /// Every `REPE_ACCESSOR_ENDPOINTS` entry, in table order. Same condition.
+    ImplAccessors,
+}
+
+/// Resolve the listing's keys, in the order they will be emitted.
+fn listing_entries<'a>(
+    fields: &'a [FieldSpec],
+    methods: &'a [MethodSpec],
+    from_impl_block: bool,
+    order: Option<&ListingOrder>,
+) -> Vec<ListingEntry<'a>> {
+    let Some(order) = order else {
+        let mut entries: Vec<ListingEntry<'a>> = fields
+            .iter()
+            .filter(|field| !field.attrs.skip)
+            .map(ListingEntry::Field)
+            .collect();
+        entries.extend(methods.iter().map(ListingEntry::Signature));
+        if from_impl_block {
+            entries.push(ListingEntry::ImplSignatures);
+            entries.push(ListingEntry::ImplAccessors);
+        }
+        return entries;
+    };
+
+    // Every name here has been checked: against the fields and listed methods at
+    // macro time, and against the impl block's tables by the `const` assertion
+    // the handshake emits. So a name this macro does not recognize is an impl
+    // block endpoint, not a typo.
+    order
+        .keys
+        .iter()
+        .map(|key| {
+            let name = key.value();
+            if let Some(field) = fields
+                .iter()
+                .find(|field| !field.attrs.skip && field.endpoint == name)
+            {
+                ListingEntry::Field(field)
+            } else if let Some(method) = methods.iter().find(|method| method.endpoint == name) {
+                ListingEntry::Signature(method)
+            } else {
+                ListingEntry::ImplNamed(key.clone())
+            }
+        })
+        .collect()
+}
+
+/// Check a `#[repe(listing_order(..))]` list against everything this macro can
+/// see: the fields, and the struct-level `#[repe(methods(..))]` entries.
+///
+/// A name the macro does not recognize is only rejected when there is no
+/// `#[repe::methods]` block to have declared it — with one, the endpoints of
+/// that block are the third source, and they are checked by the `const`
+/// assertion the handshake emits. Everything reachable here is rejected here,
+/// because only this side can name the offending key in the message.
+fn validate_listing_order(
+    order: &ListingOrder,
+    declared: &[(&str, Span)],
+    from_impl_block: bool,
+) -> syn::Result<()> {
+    let mut seen: Vec<String> = Vec::new();
+    for key in &order.keys {
+        let name = key.value();
+        if seen.contains(&name) {
+            return Err(syn::Error::new_spanned(
+                key,
+                format!(
+                    "`{name}` is named twice in `#[repe(listing_order(..))]`; the listing emits \
+                     each key once, so the second position could never be used"
+                ),
+            ));
+        }
+        if !from_impl_block && !declared.iter().any(|(endpoint, _)| *endpoint == name) {
+            return Err(syn::Error::new_spanned(
+                key,
+                format!(
+                    "`{name}` is not an endpoint on this struct, so the listing has nothing to \
+                     emit for it"
+                ),
+            ));
+        }
+        seen.push(name);
+    }
+
+    for (endpoint, span) in declared {
+        if !seen.iter().any(|name| name == endpoint) {
+            return Err(syn::Error::new(
+                *span,
+                format!(
+                    "`{endpoint}` is missing from `#[repe(listing_order(..))]`, which names the \
+                     whole-object listing's keys in full. An omitted endpoint would disappear \
+                     from every whole-object read while still answering on its own path."
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The `const` block that decides, at compile time, whether an ordered
+/// impl-block key is a published method (listed by its signature) or a
+/// field-shaped accessor (listed by its value).
+fn impl_named_signature(name: &LitStr, repe: &TokenStream2) -> TokenStream2 {
+    quote! {
+        const {
+            #repe::structs::listed_signature(
+                <Self as #repe::structs::RepeMethods>::REPE_METHOD_SIGNATURES,
+                #name,
+            )
+        }
+    }
+}
+
+/// The `"/endpoint"` literal every arm names in its error paths.
+fn endpoint_path(endpoint: &str) -> LitStr {
+    LitStr::new(&format!("/{endpoint}"), Span::call_site())
+}
+
+/// Which of the three whole-struct listings is being generated.
+///
+/// The `Value` and `Encode` forms are the two `Sink`s; `Shared` is the same
+/// entries served through `&self`, which differs only in how a failure is
+/// reported (`Some(Err(..))` rather than `?`) and in which method it calls on a
+/// child. Carrying it as a third variant rather than a second generator is what
+/// makes "the listings agree" structural: there is one walk of one entry list,
+/// so a `#[repe(listing_order(..))]` cannot reach one listing and not another.
+///
+/// This is deliberately not a variant of [`Sink`]. `Sink` also drives the
+/// dispatch *arms*, where a decline is a control-flow shape no sink can encode —
+/// there the split into a separate shared builder is the right one. A listing
+/// entry cannot decline past the guard at its top, which is what lets these
+/// three share a generator.
+#[derive(Clone, Copy)]
+enum ListingSink {
+    Value,
+    Encode,
+    Shared,
+}
+
+impl ListingSink {
+    /// Run one fallible entry, propagating a failure in this listing's shape.
+    fn attempt(self, expr: TokenStream2) -> TokenStream2 {
+        match self {
+            ListingSink::Value | ListingSink::Encode => quote! { #expr?; },
+            ListingSink::Shared => quote! {
+                if let Err(__repe_err) = #expr {
+                    return Some(Err(__repe_err));
+                }
+            },
+        }
+    }
+
+    /// The `RepeStruct` method a `#[repe(nested)]` child is listed through.
+    fn child_call(self, repe: &TokenStream2, ty: &Type, ident: &Ident) -> TokenStream2 {
+        match self {
+            ListingSink::Value => {
+                quote! { <#ty as #repe::RepeStruct>::repe_handle(&mut self.#ident, &[], None) }
+            }
+            ListingSink::Encode => quote! {
+                <#ty as #repe::RepeStruct>::repe_handle_into(
+                    &mut self.#ident, &[], None, __repe_nested,
+                )
+            },
+            ListingSink::Shared => quote! {
+                <#ty as #repe::RepeStruct>::repe_shared_into(
+                    &self.#ident, &[], &mut None, __repe_nested,
+                )
+            },
+        }
+    }
+
+    /// Prefix a child's endpoint onto any error path it produced. The shared
+    /// form has an `Option` in the way, since a child may decline.
+    fn prepend(self, repe: &TokenStream2, call: TokenStream2, key: TokenStream2) -> TokenStream2 {
+        match self {
+            ListingSink::Value | ListingSink::Encode => quote! {
+                #call.map_err(|err| #repe::structs::prepend_path(err, #key))
+            },
+            ListingSink::Shared => quote! {
+                #call.map(|__repe_result| {
+                    __repe_result.map_err(|err| #repe::structs::prepend_path(err, #key))
+                })
+            },
+        }
+    }
+
+    /// The `RepeMethods` call that reads a field-shaped endpoint's value back.
+    fn accessor_call(self, repe: &TokenStream2, name: TokenStream2) -> TokenStream2 {
+        match self {
+            ListingSink::Value => quote! {
+                <Self as #repe::structs::RepeMethods>::repe_call(self, &[#name], None)
+            },
+            ListingSink::Encode => quote! {
+                <Self as #repe::structs::RepeMethods>::repe_call_into(
+                    self, &[#name], None, __repe_nested,
+                )
+            },
+            ListingSink::Shared => quote! {
+                <Self as #repe::structs::RepeMethods>::repe_call_shared_into(
+                    self, &[#name], &mut None, __repe_nested,
+                )
+            },
+        }
+    }
+
+    /// Write one `"key": <value>` entry whose value the callee produces.
+    ///
+    /// The shared form uses `entry_try_with`, which rewinds the whole object on
+    /// a decline and propagates the `None` out of `repe_shared_into` — the
+    /// safety net for a hand-written table whose `REPE_LISTING_NEEDS_EXCLUSIVE`
+    /// disagrees with its `repe_call_shared_into`, not a path a derived listing
+    /// takes.
+    fn entry_with(self, key: TokenStream2, produce: TokenStream2) -> TokenStream2 {
+        match self {
+            ListingSink::Value => quote! {
+                map.insert(
+                    String::from(#key),
+                    (#produce)?.unwrap_or(::serde_json::Value::Null),
+                );
+            },
+            ListingSink::Encode => quote! {
+                __repe_obj.entry_with(#key, |__repe_nested| { #produce })?;
+            },
+            ListingSink::Shared => quote! {
+                if let Err(__repe_err) = __repe_obj.entry_try_with(#key, |__repe_nested| {
+                    #produce
+                })? {
+                    return Some(Err(__repe_err));
+                }
+            },
+        }
+    }
+
+    /// Write one `"key": value` entry from a value that serializes.
+    fn entry(
+        self,
+        repe: &TokenStream2,
+        key: TokenStream2,
+        value: TokenStream2,
+        path: TokenStream2,
+    ) -> TokenStream2 {
+        match self {
+            ListingSink::Value => quote! {
+                {
+                    let __repe_value = ::serde_json::to_value(&#value)
+                        .map_err(|source| #repe::StructError::Serialize {
+                            path: String::from(#path),
+                            source,
+                        })?;
+                    map.insert(String::from(#key), __repe_value);
+                }
+            },
+            ListingSink::Encode | ListingSink::Shared => {
+                self.attempt(quote! { __repe_obj.entry(#key, &#value) })
+            }
+        }
+    }
+
+    /// Open the body, run `entries`, and close it.
+    fn wrap(self, entries: &[TokenStream2]) -> TokenStream2 {
+        match self {
+            // The `Map` is a `BTreeMap` unless something in the dependency
+            // graph turns on `serde_json/preserve_order`, so this listing's key
+            // order is serde_json's and not the derive's — see `build_listing`.
+            ListingSink::Value => quote! {
+                {
+                    let mut map = ::serde_json::Map::new();
+                    #(#entries)*
+                    Ok(Some(::serde_json::Value::Object(map)))
+                }
+            },
+            ListingSink::Encode => quote! {
+                {
+                    let mut __repe_obj = out.object();
+                    #(#entries)*
+                    __repe_obj.finish();
+                    Ok(())
+                }
+            },
+            ListingSink::Shared => quote! {
+                {
+                    let mut __repe_obj = out.object();
+                    #(#entries)*
+                    __repe_obj.finish();
+                    Some(Ok(()))
+                }
+            },
+        }
+    }
+}
+
 /// The response to a read of the whole struct: every field, plus every method
 /// published as its signature string.
 ///
-/// Both sinks walk the same entries in declaration order — the `Value` form
-/// through a `serde_json::Map`, the encoding form straight into the body.
+/// All three listings — the two `Sink` bodies and the shared one — are this one
+/// walk of one resolved entry list, so they cannot disagree about *what* is
+/// emitted or in what order.
+///
+/// They can still disagree about **key order**, and one of them does: the
+/// `Value` form assembles a `serde_json::Map`, which is a `BTreeMap` unless
+/// something in the dependency graph enables `serde_json/preserve_order`, so it
+/// sorts its keys and can carry neither declaration order nor
+/// `#[repe(listing_order(..))]`. That is a property of `serde_json::Value` and
+/// not something this derive can fix; the router calls `repe_handle_into`, so
+/// the ordering governs every frame that reaches a client.
 fn build_listing(
-    fields: &[FieldSpec],
-    methods: &[MethodSpec],
-    from_impl_block: bool,
+    entries: &[ListingEntry<'_>],
     repe: &TokenStream2,
-    sink: Sink,
+    sink: ListingSink,
 ) -> TokenStream2 {
-    let mut entries = Vec::new();
+    let mut emitted = Vec::new();
 
-    for field in fields {
-        if field.attrs.skip {
-            continue;
-        }
-        let key = LitStr::new(&field.endpoint, Span::call_site());
-        let ident = &field.ident;
-        if field.attrs.nested {
-            let ty = &field.ty;
-            let method = sink.struct_method();
-            entries.push(match sink {
-                Sink::Value => quote! {
-                    {
-                        let nested = <#ty as #repe::RepeStruct>::#method(&mut self.#ident, &[], None)
-                            .map_err(|err| #repe::structs::prepend_path(err, #key))?;
-                        map.insert(String::from(#key), nested.unwrap_or(::serde_json::Value::Null));
-                    }
-                },
-                // The child writes into a *nested* body, so the frame stays
-                // JSON no matter what the child would emit on its own.
-                Sink::Encode => quote! {
-                    __repe_obj.entry_with(#key, |__repe_nested| {
-                        <#ty as #repe::RepeStruct>::#method(&mut self.#ident, &[], None, __repe_nested)
-                            .map_err(|err| #repe::structs::prepend_path(err, #key))
-                    })?;
-                },
-            });
-        } else {
-            let path = LitStr::new(&format!("/{}", field.endpoint), Span::call_site());
-            entries.push(match sink {
-                Sink::Value => quote! {
-                    {
-                        let value = ::serde_json::to_value(&self.#ident)
-                            .map_err(|source| #repe::StructError::Serialize {
-                                path: String::from(#path),
-                                source,
-                            })?;
-                        map.insert(String::from(#key), value);
-                    }
-                },
-                // A `#[repe(typed)]` field is a plain JSON array here: the frame
-                // is already committed to JSON by the enclosing object, so the
-                // typed body is reachable only by reading the field on its own.
-                Sink::Encode => quote! { __repe_obj.entry(#key, &self.#ident)?; },
-            });
-        }
-    }
-
-    for method in methods {
-        let key = LitStr::new(&method.endpoint, Span::call_site());
-        let signature = LitStr::new(&method.signature_display, Span::call_site());
-        entries.push(match sink {
-            Sink::Value => quote! {
-                map.insert(
-                    String::from(#key),
-                    ::serde_json::Value::String(String::from(#signature)),
+    for entry in entries {
+        emitted.push(match entry {
+            ListingEntry::Field(field) => {
+                let key = LitStr::new(&field.endpoint, Span::call_site());
+                let ident = &field.ident;
+                if field.attrs.nested {
+                    // The child writes into a *nested* body, so the frame stays
+                    // JSON no matter what the child would emit on its own.
+                    let call = sink.child_call(repe, &field.ty, ident);
+                    sink.entry_with(
+                        quote! { #key },
+                        sink.prepend(repe, call, quote! { #key }),
+                    )
+                } else {
+                    // A `#[repe(nested_serde)]` field lists exactly as a leaf
+                    // does: the descent it enables is a sub-path concern, and
+                    // the whole-object shape is what `Serialize` already
+                    // produces. A `#[repe(typed)]` field is a plain JSON array
+                    // here, because the enclosing object has already committed
+                    // the frame to JSON.
+                    let path = endpoint_path(&field.endpoint);
+                    sink.entry(repe, quote! { #key }, quote! { self.#ident }, quote! { #path })
+                }
+            }
+            ListingEntry::Signature(method) => {
+                let key = LitStr::new(&method.endpoint, Span::call_site());
+                let signature = LitStr::new(&method.signature_display, Span::call_site());
+                let path = endpoint_path(&method.endpoint);
+                sink.entry(repe, quote! { #key }, quote! { #signature }, quote! { #path })
+            }
+            ListingEntry::ImplNamed(name) => {
+                let resolved = impl_named_signature(name, repe);
+                let accessor =
+                    sink.entry_with(quote! { #name }, sink.accessor_call(repe, quote! { #name }));
+                let path = endpoint_path(&name.value());
+                let signature = sink.entry(
+                    repe,
+                    quote! { #name },
+                    quote! { __repe_signature },
+                    quote! { #path },
                 );
-            },
-            Sink::Encode => quote! { __repe_obj.entry(#key, &#signature)?; },
+                quote! {
+                    match #resolved {
+                        ::core::option::Option::Some(__repe_signature) => { #signature }
+                        ::core::option::Option::None => { #accessor }
+                    }
+                }
+            }
+            ListingEntry::ImplSignatures => {
+                // The endpoint's own name is the error path here; a `&str` has
+                // no failing `Serialize`, so it is never read.
+                let entry = sink.entry(repe, quote! { name }, quote! { signature }, quote! { name });
+                quote! {
+                    for &(name, signature) in <Self as #repe::structs::RepeMethods>::REPE_METHOD_SIGNATURES {
+                        #entry
+                    }
+                }
+            }
+            // A field-shaped endpoint is listed the way a field is: by its
+            // value. The value has to come back through the method table rather
+            // than from a getter call emitted here, because this derive cannot
+            // see the impl block and so does not know a single getter's name —
+            // the endpoint list is all it has. That indirection costs a match
+            // scan per accessor, so a whole-object read of a struct with many
+            // accessors is quadratic in the endpoint count; the same read of an
+            // all-field struct is not.
+            //
+            // A getter that returns `Err` fails the whole listing, exactly as a
+            // field whose `Serialize` impl fails does. That is the field analogy
+            // held to consistently rather than an oversight, and it is why a
+            // getter meant to be listed should report a sentinel rather than an
+            // error.
+            ListingEntry::ImplAccessors => {
+                let accessor =
+                    sink.entry_with(quote! { name }, sink.accessor_call(repe, quote! { name }));
+                quote! {
+                    for &name in <Self as #repe::structs::RepeMethods>::REPE_ACCESSOR_ENDPOINTS {
+                        #accessor
+                    }
+                }
+            }
         });
     }
 
-    if from_impl_block {
-        entries.push(match sink {
-            Sink::Value => quote! {
-                for &(name, signature) in <Self as #repe::structs::RepeMethods>::REPE_METHOD_SIGNATURES {
-                    map.insert(String::from(name), ::serde_json::Value::String(String::from(signature)));
-                }
-            },
-            Sink::Encode => quote! {
-                for &(name, signature) in <Self as #repe::structs::RepeMethods>::REPE_METHOD_SIGNATURES {
-                    __repe_obj.entry(name, &signature)?;
-                }
-            },
-        });
-        // A field-shaped endpoint is listed the way a field is: by its value.
-        // The value has to come back through `repe_call` rather than from a
-        // getter call emitted here, because this derive cannot see the impl
-        // block and so does not know a single getter's name — the endpoint list
-        // is all it has. That indirection costs a match scan per accessor, so a
-        // whole-object read of a struct with many accessors is quadratic in the
-        // endpoint count; the same read of an all-field struct is not.
-        //
-        // A getter that returns `Err` fails the whole listing, exactly as a
-        // field whose `Serialize` impl fails does. That is the field analogy
-        // held to consistently rather than an oversight, and it is why a getter
-        // meant to be listed should report a sentinel rather than an error.
-        entries.push(match sink {
-            Sink::Value => quote! {
-                for &name in <Self as #repe::structs::RepeMethods>::REPE_ACCESSOR_ENDPOINTS {
-                    let value = <Self as #repe::structs::RepeMethods>::repe_call(self, &[name], None)?;
-                    map.insert(
-                        String::from(name),
-                        value.unwrap_or(::serde_json::Value::Null),
-                    );
-                }
-            },
-            Sink::Encode => quote! {
-                for &name in <Self as #repe::structs::RepeMethods>::REPE_ACCESSOR_ENDPOINTS {
-                    __repe_obj.entry_with(name, |__repe_nested| {
-                        <Self as #repe::structs::RepeMethods>::repe_call_into(
-                            self, &[name], None, __repe_nested,
-                        )
-                    })?;
-                }
-            },
-        });
-    }
-
-    match sink {
-        Sink::Value => quote! {
-            {
-                let mut map = ::serde_json::Map::new();
-                #(#entries)*
-                Ok(Some(::serde_json::Value::Object(map)))
-            }
-        },
-        Sink::Encode => quote! {
-            {
-                let mut __repe_obj = out.object();
-                #(#entries)*
-                __repe_obj.finish();
-                Ok(())
-            }
-        },
-    }
+    sink.wrap(&emitted)
 }
 
 // ---------------------------------------------------------------------------
@@ -867,52 +1363,16 @@ fn build_field_arms(fields: &[FieldSpec], repe: &TokenStream2, sink: Sink) -> Ve
         }
         let key = LitStr::new(&field.endpoint, Span::call_site());
         let ident = &field.ident;
-        let path = LitStr::new(&format!("/{}", field.endpoint), Span::call_site());
-
-        // A readonly field emits *only* the rejection, never the write followed
-        // by dead code, so a crate building under `#![deny(warnings)]` is not
-        // broken by an `unreachable_code` lint on generated code.
-        let write = if field.attrs.readonly {
-            quote! {
-                Some(_) => Err(#repe::StructError::BodyUnexpected {
-                    path: #repe::structs::path_from_segments(segments),
-                }),
-            }
-        } else {
-            let ack = sink.emit_null();
-            quote! {
-                Some(value) => {
-                    self.#ident = ::serde_json::from_value(value)
-                        .map_err(|source| #repe::StructError::Deserialize {
-                            path: String::from(#path),
-                            source,
-                        })?;
-                    #ack
-                }
-            }
-        };
+        let path = endpoint_path(&field.endpoint);
+        let refuse = refuse_write(repe, Raise::Result);
+        let subpath = refuse_subpath(repe, Raise::Result);
+        let ack = sink.emit_null();
 
         if field.attrs.nested {
-            let descend = nested_dispatch(
-                &field.ty,
-                ident,
-                key.clone(),
-                quote! { tail, body },
-                repe,
-                sink,
-            );
-            let whole = nested_dispatch(
-                &field.ty,
-                ident,
-                key.clone(),
-                quote! { &[], None },
-                repe,
-                sink,
-            );
-            // Reading the child whole differs by one step: the `Value` form has
-            // to lift the child's `Option` into this struct's, the encoding form
-            // has already written it.
-            let read = match sink {
+            // Reading the child whole differs from writing it by one step in the
+            // `Value` sink: the child's `Option` has to be lifted into this
+            // struct's. The encoding sink has already written whatever there was.
+            let lift = |whole: TokenStream2| match sink {
                 Sink::Value => quote! {
                     {
                         let nested = #whole?;
@@ -921,16 +1381,127 @@ fn build_field_arms(fields: &[FieldSpec], repe: &TokenStream2, sink: Sink) -> Ve
                 },
                 Sink::Encode => whole,
             };
-            arms.push(quote! {
-                #key => {
-                    if tail.is_empty() {
-                        return match body {
-                            None => #read,
-                            #write
-                        };
-                    } else {
+
+            if field.attrs.readonly {
+                // `readonly` on a nested field refuses every write *through* it,
+                // subpaths included: the attribute says the field cannot be
+                // written, and a write below it mutates the field just as surely
+                // as a write at it.
+                let read_whole = lift(nested_dispatch(
+                    &field.ty,
+                    ident,
+                    key.clone(),
+                    quote! { &[], None },
+                    repe,
+                    sink,
+                ));
+                let read_descend = nested_dispatch(
+                    &field.ty,
+                    ident,
+                    key.clone(),
+                    quote! { tail, None },
+                    repe,
+                    sink,
+                );
+                arms.push(quote! {
+                    #key => {
+                        if body.is_some() {
+                            return #refuse;
+                        }
+                        if tail.is_empty() {
+                            return #read_whole;
+                        }
+                        return #read_descend;
+                    }
+                });
+            } else {
+                // The whole-child write descends, exactly as the whole-child
+                // read already did. Before this, a write with an empty tail
+                // replaced the child — `self.field = from_value(body)?` — and so
+                // was the one path on which a child's own `RepeStruct` impl was
+                // never consulted. That is precisely the path where a child
+                // backed by a resource has something to say: applying a partial
+                // object to live state is not the same operation as replacing a
+                // struct. A derived child's empty-segments arm is
+                // still `*self = from_value(..)`, so nothing that worked before
+                // changes; only a hand-written child gains a say.
+                let whole = lift(nested_dispatch(
+                    &field.ty,
+                    ident,
+                    key.clone(),
+                    quote! { &[], body },
+                    repe,
+                    sink,
+                ));
+                let descend = nested_dispatch(
+                    &field.ty,
+                    ident,
+                    key.clone(),
+                    quote! { tail, body },
+                    repe,
+                    sink,
+                );
+                arms.push(quote! {
+                    #key => {
+                        if tail.is_empty() {
+                            return #whole;
+                        }
                         return #descend;
                     }
+                });
+            }
+        } else if field.attrs.nested_serde {
+            // Descend by walking a `serde_json::Value` of the field. The whole
+            // point is that the field's type implements only `Serialize` +
+            // `DeserializeOwned`, so there is no child impl to ask — which is
+            // also the cost: a subpath read materializes the field, and a
+            // subpath write materializes it, edits it, and deserializes it back.
+            // A whole-field read or write pays neither.
+            let read = nested_serde_read(field, repe, sink, Raise::Result);
+            let unresolved = refuse_unresolved(repe, Raise::Result);
+            let write = if field.attrs.readonly {
+                quote! { Some(_) => #refuse, }
+            } else {
+                quote! {
+                    Some(value) => {
+                        if tail.is_empty() {
+                            self.#ident = ::serde_json::from_value(value)
+                                .map_err(|source| #repe::StructError::Deserialize {
+                                    path: String::from(#path),
+                                    source,
+                                })?;
+                            #ack
+                        } else {
+                            // The round trip a sub-path write costs, and the
+                            // reason the field's type has to survive one: the
+                            // whole child is materialized, edited, and decoded
+                            // back.
+                            let mut __repe_value = ::serde_json::to_value(&self.#ident)
+                                .map_err(|source| #repe::StructError::Serialize {
+                                    path: String::from(#path),
+                                    source,
+                                })?;
+                            if #repe::structs::serde_pointer_set(&mut __repe_value, tail, value)
+                                .is_none()
+                            {
+                                return #unresolved;
+                            }
+                            self.#ident = ::serde_json::from_value(__repe_value)
+                                .map_err(|source| #repe::StructError::Deserialize {
+                                    path: String::from(#path),
+                                    source,
+                                })?;
+                            #ack
+                        }
+                    }
+                }
+            };
+            arms.push(quote! {
+                #key => {
+                    return match body {
+                        None => { #read }
+                        #write
+                    };
                 }
             });
         } else {
@@ -939,12 +1510,24 @@ fn build_field_arms(fields: &[FieldSpec], repe: &TokenStream2, sink: Sink) -> Ve
             } else {
                 sink.emit_value(repe, &path, quote! { self.#ident })
             };
+            let write = if field.attrs.readonly {
+                quote! { Some(_) => #refuse, }
+            } else {
+                quote! {
+                    Some(value) => {
+                        self.#ident = ::serde_json::from_value(value)
+                            .map_err(|source| #repe::StructError::Deserialize {
+                                path: String::from(#path),
+                                source,
+                            })?;
+                        #ack
+                    }
+                }
+            };
             arms.push(quote! {
                 #key => {
                     if !tail.is_empty() {
-                        return Err(#repe::StructError::InvalidSubpath {
-                            path: #repe::structs::path_from_segments(segments),
-                        });
+                        return #subpath;
                     }
                     return match body {
                         None => #read,
@@ -961,6 +1544,197 @@ fn build_field_arms(fields: &[FieldSpec], repe: &TokenStream2, sink: Sink) -> Ve
 // Method arms
 // ---------------------------------------------------------------------------
 
+/// How a generated arm reports a failure.
+///
+/// The only difference between the two exclusive dispatch bodies, which return
+/// `StructResult<..>`, and the shared one, which returns
+/// `Option<StructResult<()>>` because it may decline. Everything else about
+/// decoding a method's arguments is identical, so this is what lets one
+/// generator serve both instead of two that can drift.
+#[derive(Clone, Copy)]
+enum Raise {
+    /// `StructResult<..>`: a failure is `Err`, an answer is bare.
+    Result,
+    /// `Option<StructResult<()>>`: everything is wrapped, because `None` is
+    /// reserved for a decline.
+    Shared,
+}
+
+impl Raise {
+    /// `err` as an early return.
+    fn err(self, err: TokenStream2) -> TokenStream2 {
+        let refusal = self.refuse(err);
+        quote! { return #refusal; }
+    }
+
+    /// `err` as an expression in this shape — an answer, not a decline.
+    fn refuse(self, err: TokenStream2) -> TokenStream2 {
+        match self {
+            Raise::Result => quote! { Err(#err) },
+            Raise::Shared => quote! { Some(Err(#err)) },
+        }
+    }
+
+    /// A successful `expr` in this shape.
+    fn ok(self, expr: TokenStream2) -> TokenStream2 {
+        match self {
+            Raise::Result => expr,
+            Raise::Shared => quote! { Some(#expr) },
+        }
+    }
+}
+
+/// The refusal a `#[repe(readonly)]` endpoint gives a write.
+///
+/// Emitted *instead of* the write, never before it, so a crate building under
+/// `#![deny(warnings)]` is not broken by an `unreachable_code` lint on generated
+/// code. Servable under a shared borrow as well as an exclusive one: refusing a
+/// write touches nothing, so there is no reason to take the write guard to say
+/// so.
+fn refuse_write(repe: &TokenStream2, raise: Raise) -> TokenStream2 {
+    raise.refuse(quote! {
+        #repe::StructError::BodyUnexpected {
+            path: #repe::structs::path_from_segments(segments),
+        }
+    })
+}
+
+/// The refusal for a path segment below a leaf endpoint.
+fn refuse_subpath(repe: &TokenStream2, raise: Raise) -> TokenStream2 {
+    raise.refuse(quote! {
+        #repe::StructError::InvalidSubpath {
+            path: #repe::structs::path_from_segments(segments),
+        }
+    })
+}
+
+/// The refusal for a path that does not resolve inside a
+/// `#[repe(nested_serde)]` field.
+fn refuse_unresolved(repe: &TokenStream2, raise: Raise) -> TokenStream2 {
+    raise.refuse(quote! {
+        #repe::StructError::InvalidPath {
+            path: #repe::structs::path_from_segments(segments),
+        }
+    })
+}
+
+/// The read below a `#[repe(nested_serde)]` field, which both borrow paths serve
+/// identically: serializing the field and walking the result mutates nothing.
+/// An expression, so it drops into the exclusive arm's `match body` and the
+/// shared arm's tail position unchanged.
+fn nested_serde_read(
+    field: &FieldSpec,
+    repe: &TokenStream2,
+    sink: Sink,
+    raise: Raise,
+) -> TokenStream2 {
+    let ident = &field.ident;
+    let path = endpoint_path(&field.endpoint);
+    let whole = raise.ok(sink.emit_value(repe, &path, quote! { self.#ident }));
+    let found = raise.ok(sink.emit_value(repe, &path, quote! { __repe_found }));
+    let unresolved = refuse_unresolved(repe, raise);
+    let unserializable = raise.refuse(quote! {
+        #repe::StructError::Serialize {
+            path: String::from(#path),
+            source,
+        }
+    });
+    quote! {
+        if tail.is_empty() {
+            #whole
+        } else {
+            match ::serde_json::to_value(&self.#ident) {
+                Ok(__repe_value) => match #repe::structs::serde_pointer(&__repe_value, tail) {
+                    Some(__repe_found) => #found,
+                    None => #unresolved,
+                },
+                Err(source) => #unserializable,
+            }
+        }
+    }
+}
+
+/// Bind a published method's arguments out of the request body.
+///
+/// One argument *is* the body — the shape the wire has always had. Two or more
+/// arrive as a positional array or a name-keyed object; see `MethodArgs`. A
+/// method taking none ignores whatever the body holds, which is what makes it
+/// callable from a bodiless frame.
+fn decode_method_args(
+    method: &MethodSpec,
+    bindings: &[Ident],
+    repe: &TokenStream2,
+    raise: Raise,
+) -> TokenStream2 {
+    if method.args.is_empty() {
+        return quote! { let _ = &body; };
+    }
+    let path = endpoint_path(&method.endpoint);
+    let missing = raise.err(quote! {
+        #repe::StructError::BodyExpected {
+            path: #repe::structs::path_from_segments(segments),
+        }
+    });
+    let take_body = match raise {
+        Raise::Result => quote! {
+            let value = match body {
+                Some(value) => value,
+                None => { #missing }
+            };
+        },
+        // Taken here and nowhere earlier: past this point the arm answers, so
+        // the body can no longer be owed back to the exclusive retry.
+        Raise::Shared => quote! {
+            let value = match body.take() {
+                Some(value) => value,
+                None => { #missing }
+            };
+        },
+    };
+
+    if method.args.len() == 1 {
+        let binding = &bindings[0];
+        let ty = &method.args[0].1;
+        let undecodable = raise.err(quote! {
+            #repe::StructError::Deserialize {
+                path: String::from(#path),
+                source,
+            }
+        });
+        return quote! {
+            #take_body
+            let #binding: #ty = match ::serde_json::from_value(value) {
+                Ok(__repe_value) => __repe_value,
+                Err(source) => { #undecodable }
+            };
+        };
+    }
+
+    let names: Vec<LitStr> = method
+        .args
+        .iter()
+        .map(|(ident, _)| LitStr::new(&ident.to_string(), Span::call_site()))
+        .collect();
+    let bad_args = raise.err(quote! { __repe_err });
+    let decls = method.args.iter().zip(bindings).map(|((_, ty), binding)| {
+        let bad_args = bad_args.clone();
+        quote! {
+            let #binding: #ty = match __repe_args.next_arg() {
+                Ok(__repe_value) => __repe_value,
+                Err(__repe_err) => { #bad_args }
+            };
+        }
+    });
+    quote! {
+        #take_body
+        let mut __repe_args = match #repe::structs::MethodArgs::new(#path, &[#(#names),*], value) {
+            Ok(__repe_args) => __repe_args,
+            Err(__repe_err) => { #bad_args }
+        };
+        #(#decls)*
+    }
+}
+
 fn build_method_arms(methods: &[MethodSpec], repe: &TokenStream2, sink: Sink) -> Vec<TokenStream2> {
     methods
         .iter()
@@ -970,56 +1744,15 @@ fn build_method_arms(methods: &[MethodSpec], repe: &TokenStream2, sink: Sink) ->
 
 fn build_method_arm(method: &MethodSpec, repe: &TokenStream2, sink: Sink) -> TokenStream2 {
     let key = LitStr::new(&method.endpoint, Span::call_site());
-    let path = LitStr::new(&format!("/{}", method.endpoint), Span::call_site());
+    let path = endpoint_path(&method.endpoint);
+    let subpath = refuse_subpath(repe, Raise::Result);
     let method_ident = &method.method_ident;
 
     let bindings: Vec<Ident> = (0..method.args.len())
         .map(|i| format_ident!("__repe_arg{}", i))
         .collect();
 
-    let take_body = quote! {
-        let value = match body {
-            Some(value) => value,
-            None => {
-                return Err(#repe::StructError::BodyExpected {
-                    path: #repe::structs::path_from_segments(segments),
-                });
-            }
-        };
-    };
-
-    // One argument *is* the body — the shape the wire has always had. Two or
-    // more arrive as a positional array or a name-keyed object; see `MethodArgs`.
-    let decode_args = match method.args.len() {
-        0 => quote! { let _ = &body; },
-        1 => {
-            let binding = &bindings[0];
-            let ty = &method.args[0].1;
-            quote! {
-                #take_body
-                let #binding: #ty = ::serde_json::from_value(value).map_err(|source| #repe::StructError::Deserialize {
-                    path: String::from(#path),
-                    source,
-                })?;
-            }
-        }
-        _ => {
-            let names: Vec<LitStr> = method
-                .args
-                .iter()
-                .map(|(ident, _)| LitStr::new(&ident.to_string(), Span::call_site()))
-                .collect();
-            let decls = bindings
-                .iter()
-                .zip(method.args.iter())
-                .map(|(binding, (_, ty))| quote! { let #binding: #ty = __repe_args.next_arg()?; });
-            quote! {
-                #take_body
-                let mut __repe_args = #repe::structs::MethodArgs::new(#path, &[#(#names),*], value)?;
-                #(#decls)*
-            }
-        }
-    };
+    let decode_args = decode_method_args(method, &bindings, repe, Raise::Result);
 
     let ok_is_unit = method.ret.ok_is_unit();
     let emit_ok = if ok_is_unit {
@@ -1038,9 +1771,7 @@ fn build_method_arm(method: &MethodSpec, repe: &TokenStream2, sink: Sink) -> Tok
     quote! {
         #key => {
             if !tail.is_empty() {
-                return Err(#repe::StructError::InvalidSubpath {
-                    path: #repe::structs::path_from_segments(segments),
-                });
+                return #subpath;
             }
             #decode_args
             #call_and_emit
@@ -1111,7 +1842,8 @@ fn call_and_emit(
 /// point of the attribute.
 fn build_accessor_arm(accessor: &AccessorSpec, repe: &TokenStream2, sink: Sink) -> TokenStream2 {
     let key = LitStr::new(&accessor.endpoint, Span::call_site());
-    let path = LitStr::new(&format!("/{}", accessor.endpoint), Span::call_site());
+    let path = endpoint_path(&accessor.endpoint);
+    let subpath = refuse_subpath(repe, Raise::Result);
 
     let getter = &accessor.get.method_ident;
     let emit = if accessor.typed {
@@ -1163,9 +1895,7 @@ fn build_accessor_arm(accessor: &AccessorSpec, repe: &TokenStream2, sink: Sink) 
     quote! {
         #key => {
             if !tail.is_empty() {
-                return Err(#repe::StructError::InvalidSubpath {
-                    path: #repe::structs::path_from_segments(segments),
-                });
+                return #subpath;
             }
             match body {
                 None => #read,
@@ -1176,86 +1906,155 @@ fn build_accessor_arm(accessor: &AccessorSpec, repe: &TokenStream2, sink: Sink) 
 }
 
 // ---------------------------------------------------------------------------
-// Shared-borrow read path
+// Shared-borrow path
 // ---------------------------------------------------------------------------
 //
-// `repe_read_into` and `repe_call_read_into` serve a bodiless request through
+// `repe_shared_into` and `repe_call_shared_into` serve a request through
 // `&self`, so a read does not queue behind a long-running call on the same
 // object. They are built separately from the two `&mut self` bodies rather than
-// as a third `Sink` pass, because the arm *shape* is genuinely different: there
-// is no body, so no write branch, and an arm that cannot be served under a
-// shared borrow declines instead of answering.
+// as a third `Sink` pass, because the arm *shape* is genuinely different: an arm
+// that cannot be served under a shared borrow declines instead of answering, and
+// a decline is not a value any sink can encode.
 //
 // The encoding is not duplicated. Every value below goes through the same
-// `Sink::Encode` emitter the exclusive path uses, wrapped in `Some(..)`, so the
-// two cannot disagree about how a value is serialized — only about whether this
-// path serves it at all. `tests/shared_reads.rs` pins the rest by reading one
-// struct through both and comparing frames.
+// `Sink::Encode` emitter the exclusive path uses, wrapped in `Some(..)`, and the
+// argument decoding through the same `decode_method_args`, so the two cannot
+// disagree about how a value is serialized or how a body is read — only about
+// whether this path serves it at all. `tests/shared_reads.rs` pins the rest by
+// driving one struct through both and comparing frames.
 //
-// One rule governs what may run here: **a listing settles whether it can be
-// served before it invokes anything.** A listing is the one read that composes
-// many others, so a decline discovered partway through would leave the entries
-// before it already executed, and the exclusive retry then executes them again
-// — a `&self` getter over a read counter would report the second call. Rewinding
-// the response buffer undoes the bytes; it cannot undo a call.
+// **What decides.** The receiver, not the frame. REPE separates read from write
+// at the frame level, and taking that as the borrow rule meant a `&self` method
+// carrying arguments — a long computation, an HTTP fetch, a system call — ran
+// under the write guard and stalled every read of the object for its duration. That is
+// the receiver being known at expansion and thrown away. So: a `&self` method is
+// served here whether or not it carries a body, a `&mut self` one never is, a
+// field write never is, and a nested child is asked the same question in turn.
 //
-// Two things can force that decline, and the guard has to ask about both:
-// an accessor on this struct whose getter takes `&mut self`, and a
-// `#[repe(nested)]` child that declines at any depth. `listing_decline_terms`
-// builds the question; `RepeStruct::repe_listing_declines` is how a parent asks
-// it of a child. Once the guard passes, nothing left in the listing can decline.
+// **The body.** It arrives as `&mut Option<Value>` and is taken only past the
+// last point an arm could still decline, because a decline owes the exclusive
+// retry the request it was handed. `decode_method_args` places the `take` for
+// that reason; a nested child is passed the borrow directly and holds the same
+// obligation.
 //
-// Reading one of those endpoints on its own is unaffected: that arm decides
-// from the receiver, before it calls anything.
+// **Listings settle first.** A listing is the one read that composes many
+// others, so a decline discovered partway through would leave the entries before
+// it already executed, and the exclusive retry executes them again — a `&self`
+// getter over a read counter would report the second call. Rewinding the
+// response buffer undoes the bytes; it cannot undo a call. Two things can force
+// that decline, and the guard asks about both: an accessor on this struct whose
+// getter takes `&mut self`, and a `#[repe(nested)]` child that declines at any
+// depth. `listing_decline_terms` builds the question;
+// `RepeStruct::repe_listing_declines` is how a parent asks it of a child. Once
+// the guard passes, nothing left in the listing can decline.
+//
+// Reading one of those endpoints on its own is unaffected: that arm decides from
+// the receiver, before it calls anything.
 
-/// The refusal for a path segment below a leaf endpoint.
-fn read_invalid_subpath(repe: &TokenStream2) -> TokenStream2 {
-    quote! {
-        Some(Err(#repe::StructError::InvalidSubpath {
-            path: #repe::structs::path_from_segments(segments),
-        }))
-    }
+/// One shared arm per published method: served when the receiver is `&self`,
+/// arguments and all.
+fn build_shared_method_arms(methods: &[MethodSpec], repe: &TokenStream2) -> Vec<TokenStream2> {
+    methods
+        .iter()
+        .map(|method| build_shared_method_arm(method, repe))
+        .collect()
 }
 
-/// The read arm shared by a published method and the getter half of a
-/// field-shaped endpoint: both are a zero-argument call whose result is the
-/// whole response, and both decline a `&mut self` receiver.
-fn build_read_call_arm(
-    endpoint: &str,
-    receiver: ReceiverKind,
-    invocation: TokenStream2,
-    ret: &ReturnSpec,
-    typed: bool,
-    repe: &TokenStream2,
-) -> TokenStream2 {
-    let key = LitStr::new(endpoint, Span::call_site());
-    if !matches!(receiver, ReceiverKind::Ref) {
+fn build_shared_method_arm(method: &MethodSpec, repe: &TokenStream2) -> TokenStream2 {
+    let key = LitStr::new(&method.endpoint, Span::call_site());
+    // A `&mut self` method cannot run under this borrow however the frame is
+    // shaped. Declining costs nothing: the exclusive path answers it exactly as
+    // it always has.
+    if !matches!(method.receiver, ReceiverKind::Ref) {
         return quote! { #key => None, };
     }
-    let path = LitStr::new(&format!("/{endpoint}"), Span::call_site());
-    let emit_ok = if ret.ok_is_unit() {
+    let path = endpoint_path(&method.endpoint);
+    let method_ident = &method.method_ident;
+    let bindings: Vec<Ident> = (0..method.args.len())
+        .map(|i| format_ident!("__repe_arg{}", i))
+        .collect();
+    let decode_args = decode_method_args(method, &bindings, repe, Raise::Shared);
+    let emit_ok = if method.ret.ok_is_unit() {
         Sink::Encode.emit_null()
-    } else if typed {
-        Sink::Encode.emit_typed_slice(repe, &path, quote! { __repe_ok })
     } else {
         Sink::Encode.emit_value(repe, &path, quote! { __repe_ok })
     };
-    let call = call_and_emit(invocation, ret, emit_ok, repe, &path);
-    let subpath = read_invalid_subpath(repe);
+    // Spanned at the method name, because this is the one call in the generated
+    // code whose receiver comes from a *declaration* rather than from a
+    // signature: a `#[repe(methods(..))]` entry that says `&self` for a
+    // `&mut self` method fails here, and the error has to point at that entry
+    // rather than at `#[derive(RepeStruct)]`.
+    let invocation = quote_spanned! { method_ident.span()=>
+        Self::#method_ident(self #(, #bindings)*)
+    };
+    let call = call_and_emit(invocation, &method.ret, emit_ok, repe, &path);
+    let subpath = refuse_subpath(repe, Raise::Shared);
     quote! {
         #key => {
             if !tail.is_empty() {
                 return #subpath;
             }
+            #decode_args
             Some(#call)
         }
     }
 }
 
-/// One read arm per field: a leaf serializes itself, a nested field asks its
-/// child, which may decline in turn.
-fn build_read_field_arms(fields: &[FieldSpec], repe: &TokenStream2) -> Vec<TokenStream2> {
-    let subpath = read_invalid_subpath(repe);
+/// The shared arm for a field-shaped endpoint: the getter, when it takes
+/// `&self`. A setter mutates by construction, so the write half is never served
+/// here — except the refusal a read-only accessor gives it, which mutates
+/// nothing.
+fn build_shared_accessor_arm(accessor: &AccessorSpec, repe: &TokenStream2) -> TokenStream2 {
+    let key = LitStr::new(&accessor.endpoint, Span::call_site());
+    let path = endpoint_path(&accessor.endpoint);
+    let subpath = refuse_subpath(repe, Raise::Shared);
+
+    let read = if matches!(accessor.get.receiver, ReceiverKind::Ref) {
+        let getter = &accessor.get.method_ident;
+        // No `ok_is_unit` branch, matching `build_accessor_arm`: a getter that
+        // returns nothing is rejected at `parse_impl_method`, since the listing
+        // would have no value to show for the endpoint.
+        let emit_ok = if accessor.typed {
+            Sink::Encode.emit_typed_slice(repe, &path, quote! { __repe_ok })
+        } else {
+            Sink::Encode.emit_value(repe, &path, quote! { __repe_ok })
+        };
+        let call = call_and_emit(
+            quote! { Self::#getter(self) },
+            &accessor.get.ret,
+            emit_ok,
+            repe,
+            &path,
+        );
+        quote! { Some(#call) }
+    } else {
+        quote! { None }
+    };
+
+    let write = match &accessor.set {
+        None => refuse_write(repe, Raise::Shared),
+        Some(_) => quote! { None },
+    };
+
+    quote! {
+        #key => {
+            if !tail.is_empty() {
+                return #subpath;
+            }
+            if body.is_some() {
+                return #write;
+            }
+            #read
+        }
+    }
+}
+
+/// One shared arm per field: a leaf serializes itself, a nested field asks its
+/// child, which may decline in turn, and a write declines unless the field is
+/// read-only.
+fn build_shared_field_arms(fields: &[FieldSpec], repe: &TokenStream2) -> Vec<TokenStream2> {
+    let subpath = refuse_subpath(repe, Raise::Shared);
+    let refuse = refuse_write(repe, Raise::Shared);
     let mut arms = Vec::new();
     for field in fields {
         if field.attrs.skip {
@@ -1263,18 +2062,51 @@ fn build_read_field_arms(fields: &[FieldSpec], repe: &TokenStream2) -> Vec<Token
         }
         let key = LitStr::new(&field.endpoint, Span::call_site());
         let ident = &field.ident;
-        let path = LitStr::new(&format!("/{}", field.endpoint), Span::call_site());
+        let path = endpoint_path(&field.endpoint);
+        // A write needs `&mut self` unless it is refused outright, in which case
+        // it needs nothing at all.
+        let write = if field.attrs.readonly {
+            refuse.clone()
+        } else {
+            quote! { None }
+        };
 
         if field.attrs.nested {
-            // `tail` covers both cases the exclusive path splits: empty reads
-            // the child whole, non-empty descends. Only the write branch needed
-            // them apart, and there is no write here.
+            // `tail` covers both cases the exclusive path splits: empty asks the
+            // child whole, non-empty descends. The child is handed the body
+            // borrow and the same obligation to leave it alone if it declines.
             let ty = &field.ty;
-            arms.push(quote! {
-                #key => <#ty as #repe::RepeStruct>::repe_read_into(&self.#ident, tail, out)
+            let forward = quote! {
+                <#ty as #repe::RepeStruct>::repe_shared_into(&self.#ident, tail, body, out)
                     .map(|__repe_result| {
                         __repe_result.map_err(|err| #repe::structs::prepend_path(err, #key))
-                    }),
+                    })
+            };
+            if field.attrs.readonly {
+                arms.push(quote! {
+                    #key => {
+                        if body.is_some() {
+                            return #refuse;
+                        }
+                        #forward
+                    }
+                });
+            } else {
+                arms.push(quote! { #key => #forward, });
+            }
+        } else if field.attrs.nested_serde {
+            // Every read below the field is `&self`: serializing the field and
+            // walking the result mutates nothing, so the whole descent is
+            // servable here, through the same generator the exclusive arm uses.
+            // A write is a write.
+            let read = nested_serde_read(field, repe, Sink::Encode, Raise::Shared);
+            arms.push(quote! {
+                #key => {
+                    if body.is_some() {
+                        return #write;
+                    }
+                    #read
+                }
             });
         } else {
             let read = if field.attrs.typed {
@@ -1287,59 +2119,15 @@ fn build_read_field_arms(fields: &[FieldSpec], repe: &TokenStream2) -> Vec<Token
                     if !tail.is_empty() {
                         return #subpath;
                     }
+                    if body.is_some() {
+                        return #write;
+                    }
                     Some(#read)
                 }
             });
         }
     }
     arms
-}
-
-/// One read arm per published method, served when the signature allows it.
-fn build_read_method_arms(methods: &[MethodSpec], repe: &TokenStream2) -> Vec<TokenStream2> {
-    methods
-        .iter()
-        .map(|method| {
-            // A method taking arguments reads them from a request body, and a
-            // request carrying one is a write, so the shared path never has to
-            // serve this. Declining costs nothing: the exclusive path answers
-            // it with the same `BodyExpected` it always has.
-            if !method.args.is_empty() {
-                let key = LitStr::new(&method.endpoint, Span::call_site());
-                return quote! { #key => None, };
-            }
-            let method_ident = &method.method_ident;
-            // Spanned at the method name, because this is the one call in the
-            // generated code whose receiver comes from a *declaration* rather
-            // than from a signature: a `#[repe(methods(..))]` entry that says
-            // `&self` for a `&mut self` method fails here, and the error has to
-            // point at that entry rather than at `#[derive(RepeStruct)]`.
-            let invocation = quote_spanned! { method_ident.span()=>
-                Self::#method_ident(self)
-            };
-            build_read_call_arm(
-                &method.endpoint,
-                method.receiver,
-                invocation,
-                &method.ret,
-                false,
-                repe,
-            )
-        })
-        .collect()
-}
-
-/// The read arm for a field-shaped endpoint: the getter, when it takes `&self`.
-fn build_read_accessor_arm(accessor: &AccessorSpec, repe: &TokenStream2) -> TokenStream2 {
-    let getter = &accessor.get.method_ident;
-    build_read_call_arm(
-        &accessor.endpoint,
-        accessor.get.receiver,
-        quote! { Self::#getter(self) },
-        &accessor.get.ret,
-        accessor.typed,
-        repe,
-    )
 }
 
 /// The terms of "a shared whole-object listing of this struct declines",
@@ -1360,6 +2148,9 @@ fn build_read_accessor_arm(accessor: &AccessorSpec, repe: &TokenStream2) -> Toke
 /// exclusive retry invokes them again. Asking every child up front is what makes
 /// the guard's promise ("nothing after this point can decline") true rather than
 /// true by accident of declaration order.
+///
+/// A `#[repe(nested_serde)]` field contributes no term: it is listed by
+/// `Serialize`, exactly as a leaf is, and has no impl of its own to ask.
 ///
 /// An empty result means the constant `false`: a struct of plain fields, or one
 /// whose nesting and accessors all read shared. The caller emits no guard at all
@@ -1386,112 +2177,6 @@ fn listing_decline_terms(
         });
     }
     terms
-}
-
-/// The whole-struct listing, read through a shared borrow.
-///
-/// Guarded up front, then unconditional: see the rule at the top of this
-/// section. Past the guard no entry can decline, so the `entry_try_with` rewinds
-/// below are the safety net for a hand-written table that overrode the guard's
-/// inputs and got them wrong — and even then a `None` from here leaves the
-/// response body exactly as it was found, which is what
-/// `RepeStruct::repe_read_into` promises.
-fn build_read_listing(
-    fields: &[FieldSpec],
-    methods: &[MethodSpec],
-    from_impl_block: bool,
-    repe: &TokenStream2,
-) -> TokenStream2 {
-    // Settled before anything is written or called, and for the whole subtree —
-    // see `listing_decline_terms`. Every term folds to a constant, and a struct
-    // with no terms at all gets no guard emitted.
-    let guard = (!listing_decline_terms(fields, from_impl_block, repe).is_empty()).then(|| {
-        quote! {
-            if <Self as #repe::RepeStruct>::repe_listing_declines(self) {
-                return None;
-            }
-        }
-    });
-
-    let mut entries = Vec::new();
-    for field in fields {
-        if field.attrs.skip {
-            continue;
-        }
-        let key = LitStr::new(&field.endpoint, Span::call_site());
-        let ident = &field.ident;
-        if field.attrs.nested {
-            let ty = &field.ty;
-            entries.push(quote! {
-                if let Err(__repe_err) = __repe_obj.entry_try_with(#key, |__repe_nested| {
-                    <#ty as #repe::RepeStruct>::repe_read_into(&self.#ident, &[], __repe_nested)
-                        .map(|__repe_result| {
-                            __repe_result.map_err(|err| #repe::structs::prepend_path(err, #key))
-                        })
-                })? {
-                    return Some(Err(__repe_err));
-                }
-            });
-        } else {
-            entries.push(quote! {
-                if let Err(__repe_err) = __repe_obj.entry(#key, &self.#ident) {
-                    return Some(Err(__repe_err));
-                }
-            });
-        }
-    }
-
-    for method in methods {
-        let key = LitStr::new(&method.endpoint, Span::call_site());
-        let signature = LitStr::new(&method.signature_display, Span::call_site());
-        entries.push(quote! {
-            if let Err(__repe_err) = __repe_obj.entry(#key, &#signature) {
-                return Some(Err(__repe_err));
-            }
-        });
-    }
-
-    if from_impl_block {
-        entries.push(quote! {
-            for &(name, signature) in <Self as #repe::structs::RepeMethods>::REPE_METHOD_SIGNATURES {
-                if let Err(__repe_err) = __repe_obj.entry(name, &signature) {
-                    return Some(Err(__repe_err));
-                }
-            }
-        });
-        // A field-shaped endpoint is listed by its value, exactly as the
-        // exclusive listing lists it, and reached the same indirect way: this
-        // derive cannot see the impl block, so the endpoint list is all it has
-        // to name a getter by.
-        //
-        // Emitted last, after every entry that could have declined — though by
-        // the guard above none of them can, so the `?` on a `None` is the safety
-        // net for a hand-written table whose `REPE_LISTING_NEEDS_EXCLUSIVE`
-        // disagrees with its `repe_call_read_into`, not a path a derived one
-        // takes. `entry_try_with` rewinds the object it was building, so even
-        // then the response body is left as `repe_read_into` found it.
-        entries.push(quote! {
-            for &name in <Self as #repe::structs::RepeMethods>::REPE_ACCESSOR_ENDPOINTS {
-                if let Err(__repe_err) = __repe_obj.entry_try_with(name, |__repe_nested| {
-                    <Self as #repe::structs::RepeMethods>::repe_call_read_into(
-                        self, &[name], __repe_nested,
-                    )
-                })? {
-                    return Some(Err(__repe_err));
-                }
-            }
-        });
-    }
-
-    quote! {
-        {
-            #guard
-            let mut __repe_obj = out.object();
-            #(#entries)*
-            __repe_obj.finish();
-            Some(Ok(()))
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1545,7 +2230,7 @@ enum Published {
 /// body writes it, and the whole-struct listing shows its value — while the
 /// implementation is two methods. That is the one endpoint shape a struct
 /// cannot express by naming a field: a value that is derived, unit-converted,
-/// or backed by a register rather than by storage.
+/// or backed by a resource rather than by storage.
 struct AccessorSpec {
     endpoint: String,
     /// The read half. Every accessor has one: without it the whole-struct
@@ -1701,7 +2386,7 @@ fn methods_impl(
         .iter()
         .map(|spec| LitStr::new(&spec.endpoint, Span::call_site()));
     // The shared whole-struct listing reads every accessor back through
-    // `repe_call_read_into`, which serves a getter only when it takes `&self`.
+    // `repe_call_shared_into`, which serves a getter only when it takes `&self`.
     // One `&mut self` getter is enough to make a decline possible partway
     // through the listing, and a decline discovered there would leave the
     // getters before it invoked twice — so the listing declines at the top
@@ -1764,37 +2449,38 @@ fn methods_impl(
         });
     }
 
-    let read_arms = build_read_method_arms(&published.methods, repe)
+    let shared_arms = build_shared_method_arms(&published.methods, repe)
         .into_iter()
         .chain(
             published
                 .accessors
                 .iter()
-                .map(|accessor| build_read_accessor_arm(accessor, repe)),
+                .map(|accessor| build_shared_accessor_arm(accessor, repe)),
         )
         .collect::<Vec<_>>();
-    let read_invalid_root = quote! {
+    let shared_invalid_root = quote! {
         Some(Err(#repe::StructError::InvalidPath { path: String::from("") }))
     };
-    let read_invalid_path = quote! {
+    let shared_invalid_path = quote! {
         Some(Err(#repe::StructError::InvalidPath {
             path: #repe::structs::path_from_segments(segments),
         }))
     };
     bodies.push(quote! {
-        fn repe_call_read_into(
+        fn repe_call_shared_into(
             &self,
             segments: &[&str],
+            body: &mut Option<::serde_json::Value>,
             out: &mut #repe::structs::ResponseBody<'_>,
         ) -> Option<#repe::structs::StructResult<()>> {
             let Some((head, tail)) = segments.split_first() else {
-                return #read_invalid_root;
+                return #shared_invalid_root;
             };
-            // Every arm may be a decline, in which case neither is read.
-            let _ = (&out, tail);
+            // Every arm may be a decline, in which case none of these is read.
+            let _ = (&out, tail, &body);
             match *head {
-                #(#read_arms)*
-                _ => #read_invalid_path,
+                #(#shared_arms)*
+                _ => #shared_invalid_path,
             }
         }
     });
@@ -2119,6 +2805,9 @@ fn parse_impl_method(
 
 /// Export a [`Router`] constructor as a REPE C-ABI plugin.
 ///
+/// (Every `repe` type below is linked by URL rather than by path: this is a
+/// proc-macro crate, and it does not — cannot — depend on `repe`.)
+///
 /// Applied to a zero-argument function returning a `Router`, this emits the five
 /// symbols a REPE host resolves after `dlopen` — `repe_plugin_interface_version`,
 /// `repe_plugin_info`, `repe_plugin_init`, `repe_plugin_shutdown`, and
@@ -2150,7 +2839,7 @@ fn parse_impl_method(
 /// The annotated function is left in place and stays callable, which is what
 /// lets the same router be exercised by ordinary in-process tests.
 ///
-/// [`Router`]: repe::server::Router
+/// [`Router`]: https://docs.rs/repe/latest/repe/server/struct.Router.html
 #[proc_macro_attribute]
 pub fn plugin(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut args = PluginArgs::default();

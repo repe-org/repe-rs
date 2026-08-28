@@ -1,3 +1,14 @@
+# Explicit rather than implicit. Without a `[workspace]` table the two sibling
+# crates are path dependencies and nothing more, so `--workspace` resolves to
+# this package alone and `repe-core`'s own tests — the ones that prove the trait
+# is usable with `repe` out of the graph — never run in CI.
+[workspace]
+members = ["repe-core", "repe-derive"]
+# Deliberately outside it, and now that the table is explicit it has to say so:
+# the shootout pulls in tonic/prost and is built on its own. The two
+# `wasm-tests` crates carry their own `[workspace]` tables and need no entry.
+exclude = ["bench/grpc-shootout"]
+
 [package]
 name = "repe"
 version = "9.1.0"
@@ -144,7 +155,12 @@ beve = "9"
 serde = { version = "1", features = ["derive" ] }
 serde_json = "1"
 thiserror = "1"
-repe-derive = { path = "repe-derive", version = "0.4.0" }
+repe-derive = { path = "repe-derive", version = "0.5.0" }
+# The `RepeStruct` surface, split out so a crate that only *declares* a served
+# type — a pure-logic crate with a no-I/O charter, say — can implement the trait
+# without acquiring the server, the client, and the transport. Re-exported here
+# at the paths it has always had, so nothing moved for a caller of `repe`.
+repe-core = { path = "repe-core", version = "1.0.0" }
 parking_lot = { version = "0.12", optional = true }
 # 0.3.32 for `UnboundedReceiver::try_recv`, which the `notify_slot` tests use
 # (`try_next` is deprecated there, and CI builds tests at `-D warnings`).

@@ -89,23 +89,28 @@ pub trait RepeStruct: Send + Sync {
         write_optional(out, segments, value)
     }
 
-    /// Serve a **read** through a shared borrow, or decline it.
+    /// Serve a request through a **shared** borrow, or decline it.
     ///
-    /// A read is a request with no body — REPE separates the two at the frame
-    /// level — so there is no `body` parameter here and no state to change. The
-    /// router tries this first for every bodiless request against a struct
+    /// The router tries this first for every request against a struct
     /// registered behind a lock that has a shared mode, which is what keeps a
     /// `/version` read from queueing behind a half-second method call on the
     /// same object.
     ///
-    /// Return `None` for any path this borrow cannot serve: a write-shaped
-    /// endpoint, a `&mut self` method, a nested field whose child declined. The
-    /// router then retakes the lock exclusively and dispatches through
+    /// A body-carrying frame is offered here too, and that is deliberate: REPE
+    /// separates read from write at the *frame* level, but a `&self` method
+    /// taking arguments is a call, not a mutation. Deciding from the frame
+    /// alone put a long-running `&self` call behind the write guard and
+    /// stalled every read of the object for as long as it ran. The receiver is known
+    /// where these arms are generated, so it is the receiver that decides.
+    ///
+    /// Return `None` for any path this borrow cannot serve: a field write, a
+    /// `&mut self` method, a nested field whose child declined. The router then
+    /// retakes the lock exclusively and dispatches through
     /// [`repe_handle_into`](Self::repe_handle_into), so declining costs
     /// correctness nothing — it is the default, and a hand-written impl that
     /// never overrides this behaves exactly as it did before the path existed.
     ///
-    /// Two obligations come with overriding it:
+    /// Three obligations come with overriding it:
     ///
     /// * **Answer identically.** Whatever this returns for a path is what the
     ///   client sees; the exclusive path is not consulted afterwards. Decline
@@ -115,6 +120,14 @@ pub trait RepeStruct: Send + Sync {
     ///   [`ObjectBody::entry_try_with`] exists to make that mechanical when the
     ///   decline surfaces partway through an object: it rewinds the whole
     ///   object, so propagating its `None` is all a caller has to do.
+    /// * **Leave the body alone when declining.** `body` is handed over as
+    ///   `&mut Option<Value>` rather than by value precisely so the exclusive
+    ///   retry can re-dispatch the same request without a clone. Call
+    ///   [`Option::take`] on it only once this borrow has committed to
+    ///   answering — an `Err` counts as an answer — and never on a path that
+    ///   goes on to return `None`. A body taken and then declined reaches the
+    ///   exclusive path as `None`, where it surfaces as a spurious
+    ///   [`BodyExpected`](StructError::BodyExpected).
     ///
     /// A derived impl settles the whole-object listing before it writes or
     /// invokes anything, through
@@ -123,12 +136,13 @@ pub trait RepeStruct: Send + Sync {
     /// once here and once on the exclusive retry, and a rewind cannot undo a
     /// call. A hand-written impl that invokes anything before it can decide owes
     /// the same care.
-    fn repe_read_into(
+    fn repe_shared_into(
         &self,
         segments: &[&str],
+        body: &mut Option<Value>,
         out: &mut ResponseBody<'_>,
     ) -> Option<StructResult<()>> {
-        let _ = (segments, out);
+        let _ = (segments, body, out);
         None
     }
 
@@ -151,18 +165,112 @@ pub trait RepeStruct: Send + Sync {
     /// answer, so the whole tree is settled before the first byte is written.
     ///
     /// The default is `true`, which is the accurate answer for the default
-    /// [`repe_read_into`](Self::repe_read_into): it declines every path,
-    /// listings included. A hand-written impl that overrides `repe_read_into` to
-    /// serve a listing should override this too, or every derived struct nesting
-    /// it gives up its own shared listing.
+    /// [`repe_shared_into`](Self::repe_shared_into): it declines every path,
+    /// listings included. A hand-written impl that overrides `repe_shared_into`
+    /// to serve a listing should override this too, or every derived struct
+    /// nesting it gives up its own shared listing.
     ///
     /// **Overriding it is a promise**, and it is the promise the invariant rests
-    /// on: returning `false` asserts that `repe_read_into(&[], ..)` answers
-    /// `Some(..)`. Breaking it still yields a correct response — the listing
+    /// on: returning `false` asserts that `repe_shared_into(&[], &mut None, ..)`
+    /// answers `Some(..)`. Breaking it still yields a correct response — the listing
     /// rewinds and the exclusive path retries — but anything the shared attempt
     /// had already invoked runs twice.
     fn repe_listing_declines(&self) -> bool {
         true
+    }
+}
+
+/// A **conditionally-present** child: a component that is not in every build, a
+/// subsystem that is not configured, a resource that failed to open.
+///
+/// `Option` is a foreign type and [`RepeStruct`] is this crate's trait, so a
+/// host cannot write this impl itself — its choices without one are a newtype
+/// per crate or one impl per concrete `Option<Child>`. Carrying it here is what
+/// lets `#[repe(nested)]` be put on an `Option<T>` field directly, which is
+/// where a host reaches for it first.
+///
+/// Present forwards everything to the inner value. Absent answers:
+///
+/// * a **read at the child's own path** with `null`, so a whole-object listing
+///   of the parent shows the key with nothing behind it rather than failing;
+/// * a **write, or any subpath** with [`StructError::InvalidPath`], because a
+///   silent no-op against a live resource is worse than an error — a client
+///   that configured an absent component would otherwise be told it succeeded;
+/// * [`repe_listing_declines`](RepeStruct::repe_listing_declines) with `false`
+///   when absent, since a `null` needs no exclusive borrow, and with the inner
+///   value's own answer when present.
+///
+/// This matches what Glaze publishes for an unmapped optional member, so a
+/// port's wire shape does not change with the language.
+impl<T: RepeStruct> RepeStruct for Option<T> {
+    fn repe_handle(
+        &mut self,
+        segments: &[&str],
+        body: Option<Value>,
+    ) -> StructResult<Option<Value>> {
+        match self {
+            Some(inner) => inner.repe_handle(segments, body),
+            None => absent_child(segments, body.is_some()).map(|()| None),
+        }
+    }
+
+    fn repe_handle_into(
+        &mut self,
+        segments: &[&str],
+        body: Option<Value>,
+        out: &mut ResponseBody<'_>,
+    ) -> StructResult<()> {
+        match self {
+            Some(inner) => inner.repe_handle_into(segments, body, out),
+            None => {
+                absent_child(segments, body.is_some())?;
+                out.write_null();
+                Ok(())
+            }
+        }
+    }
+
+    fn repe_shared_into(
+        &self,
+        segments: &[&str],
+        body: &mut Option<Value>,
+        out: &mut ResponseBody<'_>,
+    ) -> Option<StructResult<()>> {
+        match self {
+            Some(inner) => inner.repe_shared_into(segments, body, out),
+            // Absent is a constant: no state to borrow exclusively, so every
+            // answer above is servable here and none of them touches `body`.
+            None => Some(match absent_child(segments, body.is_some()) {
+                Ok(()) => {
+                    out.write_null();
+                    Ok(())
+                }
+                Err(err) => Err(err),
+            }),
+        }
+    }
+
+    fn repe_listing_declines(&self) -> bool {
+        match self {
+            Some(inner) => inner.repe_listing_declines(),
+            None => false,
+        }
+    }
+}
+
+/// The absent half of [`RepeStruct for Option<T>`](RepeStruct#impl-RepeStruct-for-Option<T>):
+/// `Ok(())` for the one request an absent child can answer, and
+/// [`StructError::InvalidPath`] for the rest.
+///
+/// The path is relative to the child, so a parent's
+/// [`prepend_path`] names the field the client actually asked for.
+fn absent_child(segments: &[&str], has_body: bool) -> StructResult<()> {
+    if segments.is_empty() && !has_body {
+        Ok(())
+    } else {
+        Err(StructError::InvalidPath {
+            path: path_from_segments(segments),
+        })
     }
 }
 
@@ -196,7 +304,7 @@ pub trait RepeMethods: MethodsDeclared {
     /// reads and writes a field, so the whole-struct listing shows each one's
     /// current value rather than a signature string. The derived listing reads
     /// those values back through [`repe_call`](Self::repe_call), or through
-    /// [`repe_call_read_into`](Self::repe_call_read_into) when it is being
+    /// [`repe_call_shared_into`](Self::repe_call_shared_into) when it is being
     /// served under a shared borrow.
     ///
     /// Defaults to empty, so a hand-written impl need not mention it. One
@@ -206,7 +314,7 @@ pub trait RepeMethods: MethodsDeclared {
     /// table cannot dispatch turns every whole-struct read into that name's
     /// error. `#[repe::methods]` upholds it by construction, because it emits
     /// this list from the getters it generated arms for. The shared-borrow
-    /// listing asks the same question of `repe_call_read_into`, where a `None`
+    /// listing asks the same question of `repe_call_shared_into`, where a `None`
     /// is not a failure — it declines the whole listing to the exclusive path.
     const REPE_ACCESSOR_ENDPOINTS: &'static [&'static str] = &[];
 
@@ -234,7 +342,7 @@ pub trait RepeMethods: MethodsDeclared {
     /// it, since a child's decline propagates.
     ///
     /// **Overriding it is a promise.** Setting it to `false` asserts that
-    /// [`repe_call_read_into`](Self::repe_call_read_into) answers
+    /// [`repe_call_shared_into`](Self::repe_call_shared_into) answers
     /// `segments = &[name], body = None` with `Some(..)` for every name in
     /// [`REPE_ACCESSOR_ENDPOINTS`](Self::REPE_ACCESSOR_ENDPOINTS). A table that
     /// breaks that promise still produces a correct response — the listing
@@ -263,17 +371,21 @@ pub trait RepeMethods: MethodsDeclared {
     }
 
     /// Shared-borrow counterpart of [`repe_call_into`](Self::repe_call_into),
-    /// mirroring [`RepeStruct::repe_read_into`] and carrying the same two
-    /// obligations: answer identically, or decline without writing.
+    /// mirroring [`RepeStruct::repe_shared_into`] and carrying the same three
+    /// obligations: answer identically, decline without writing, and leave
+    /// `body` in place when declining.
     ///
-    /// `#[repe::methods]` serves a `&self` method taking no arguments and the
-    /// getter half of a `&self` accessor here, and declines everything else.
-    fn repe_call_read_into(
+    /// `#[repe::methods]` serves every `&self` method here — including one
+    /// taking arguments, which is a call rather than a mutation however the
+    /// frame is shaped — along with the getter half of a `&self` accessor, and
+    /// declines everything else.
+    fn repe_call_shared_into(
         &self,
         segments: &[&str],
+        body: &mut Option<Value>,
         out: &mut ResponseBody<'_>,
     ) -> Option<StructResult<()>> {
-        let _ = (segments, out);
+        let _ = (segments, body, out);
         None
     }
 }
@@ -447,11 +559,12 @@ impl<'a> ResponseBody<'a> {
     /// Write `slice` as a BEVE typed numeric array and set the body format to
     /// [`BodyFormat::Beve`].
     ///
-    /// The bulk encode behind
-    /// [`MessageBuilder::body_typed_slice`](crate::message::MessageBuilder::body_typed_slice):
-    /// one `copy_nonoverlapping` on little-endian targets rather than a
-    /// per-element serde walk, and byte-identical to what Glaze emits for the
+    /// The same bulk encode `repe::message::MessageBuilder::body_typed_slice`
+    /// produces — one `copy_nonoverlapping` on little-endian targets rather than
+    /// a per-element serde walk, and byte-identical to what Glaze emits for the
     /// same array. This is what `#[repe(typed)]` routes a numeric field to.
+    /// (Named rather than linked: the builder lives in `repe`, which this crate
+    /// deliberately does not depend on.)
     ///
     /// Inside an enclosing object — the whole-struct listing — the frame is
     /// already committed to JSON, so the slice is written as a JSON array
@@ -570,7 +683,7 @@ impl ObjectBody<'_> {
     }
 
     /// [`entry_with`](Self::entry_with) for a value the source may decline to
-    /// produce, as [`RepeStruct::repe_read_into`] declines a path that needs
+    /// produce, as [`RepeStruct::repe_shared_into`] declines a path that needs
     /// exclusive access.
     ///
     /// `None` rewinds the whole object, exactly as an `Err` does, so a caller
@@ -652,48 +765,203 @@ pub const fn assert_no_endpoint_collision(
 ) {
     let mut i = 0;
     while i < methods.len() {
-        let mut j = 0;
-        while j < declared.len() {
-            if const_str_eq(methods[i].0, declared[j]) {
-                panic!(
-                    "a `#[repe::methods]` method and an endpoint declared on the struct itself \
-                     share a name: the struct's declaration wins dispatch and the method could \
-                     never be called. Rename one with `#[repe(rename = \"...\")]`."
-                );
-            }
-            j += 1;
+        if const_contains(declared, methods[i].0) {
+            panic!(
+                "a `#[repe::methods]` method and an endpoint declared on the struct itself \
+                 share a name: the struct's declaration wins dispatch and the method could \
+                 never be called. Rename one with `#[repe(rename = \"...\")]`."
+            );
         }
         i += 1;
     }
 
     let mut i = 0;
     while i < accessors.len() {
-        let mut j = 0;
-        while j < declared.len() {
-            if const_str_eq(accessors[i], declared[j]) {
-                panic!(
-                    "a `#[repe(get = \"...\")]` accessor and an endpoint declared on the struct \
-                     itself share a name: the struct's declaration wins dispatch and the accessor \
-                     could never be called. Rename the struct's with \
-                     `#[repe(rename = \"...\")]`, or give the accessor a different endpoint."
-                );
-            }
-            j += 1;
+        if const_contains(declared, accessors[i]) {
+            panic!(
+                "a `#[repe(get = \"...\")]` accessor and an endpoint declared on the struct \
+                 itself share a name: the struct's declaration wins dispatch and the accessor \
+                 could never be called. Rename the struct's with \
+                 `#[repe(rename = \"...\")]`, or give the accessor a different endpoint."
+            );
         }
 
-        let mut j = 0;
-        while j < methods.len() {
-            if const_str_eq(accessors[i], methods[j].0) {
-                panic!(
-                    "a `#[repe::methods]` method and a `#[repe(get = \"...\")]` accessor in the \
-                     same table share an endpoint name: one of them is unreachable, and the \
-                     whole-struct listing would show the endpoint twice."
-                );
-            }
-            j += 1;
+        if const_contains_endpoint(methods, accessors[i]) {
+            panic!(
+                "a `#[repe::methods]` method and a `#[repe(get = \"...\")]` accessor in the \
+                 same table share an endpoint name: one of them is unreachable, and the \
+                 whole-struct listing would show the endpoint twice."
+            );
         }
         i += 1;
     }
+}
+
+/// Compile-time check that a `#[repe(listing_order(..))]` list names exactly the
+/// endpoints the struct publishes.
+///
+/// The derive validates the half it can see on its own — fields and struct-level
+/// `#[repe(methods(..))]` entries — with an error that names the offending key.
+/// It cannot see the `#[repe::methods]` impl block, so the other half is checked
+/// here, where both generated tables are in scope. A `const` panic cannot name
+/// the key, which is why the derive keeps everything it can reach at macro time.
+///
+/// Both directions matter. An order naming an endpoint that does not exist would
+/// emit a key whose value came from a failed dispatch; an order omitting one
+/// would silently drop it from every whole-object read, which is the harder bug
+/// to see because the endpoint still answers on its own path.
+pub const fn assert_listing_order(
+    order: &[&str],
+    declared: &[&str],
+    methods: &[(&str, &str)],
+    accessors: &[&str],
+) {
+    // Both tables empty is the shape `#[repe::methods]` emits when the block
+    // itself failed to compile: it publishes nothing so that a real error in the
+    // block is not buried under a second, misleading one about the marker. Every
+    // key here would then look unknown, and this assertion would be exactly the
+    // extra error that recovery exists to prevent. The two completeness loops
+    // below are already vacuous in that shape, so skipping this one loses
+    // nothing a compiling block would have caught.
+    let recovering = methods.is_empty() && accessors.is_empty();
+
+    let mut i = 0;
+    while i < order.len() {
+        let known = const_contains(declared, order[i])
+            || const_contains(accessors, order[i])
+            || const_contains_endpoint(methods, order[i]);
+        if !known && !recovering {
+            panic!(
+                "`#[repe(listing_order(..))]` names a key that is not an endpoint on this \
+                 struct. It lists the whole-object listing's keys, so every name in it has to \
+                 be a field, a listed method, or an endpoint of the `#[repe::methods]` block."
+            );
+        }
+        i += 1;
+    }
+
+    let mut j = 0;
+    while j < methods.len() {
+        if !const_contains(order, methods[j].0) {
+            panic!(
+                "a `#[repe::methods]` method is missing from `#[repe(listing_order(..))]`, \
+                 which names the whole-object listing's keys in full. An omitted endpoint \
+                 would disappear from every whole-object read while still answering on its \
+                 own path."
+            );
+        }
+        j += 1;
+    }
+
+    let mut j = 0;
+    while j < accessors.len() {
+        if !const_contains(order, accessors[j]) {
+            panic!(
+                "a `#[repe(get = \"...\")]` accessor is missing from \
+                 `#[repe(listing_order(..))]`, which names the whole-object listing's keys in \
+                 full. An omitted endpoint would disappear from every whole-object read while \
+                 still answering on its own path."
+            );
+        }
+        j += 1;
+    }
+}
+
+/// The published signature for `name`, or `None` when the name belongs to a
+/// field-shaped accessor instead.
+///
+/// Called from a `const` block in the ordered listing a
+/// `#[repe(listing_order(..))]` produces: the derive cannot see the
+/// `#[repe::methods]` block, so it does not know which of the two tables an
+/// ordered key came from, but the tables themselves are constants and the
+/// question folds away before run time.
+pub const fn listed_signature(
+    methods: &[(&'static str, &'static str)],
+    name: &str,
+) -> Option<&'static str> {
+    let mut i = 0;
+    while i < methods.len() {
+        if const_str_eq(methods[i].0, name) {
+            return Some(methods[i].1);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// [`const_contains`] over the endpoint half of an `(endpoint, signature)` table.
+const fn const_contains_endpoint(methods: &[(&str, &str)], name: &str) -> bool {
+    let mut i = 0;
+    while i < methods.len() {
+        if const_str_eq(methods[i].0, name) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// `slice.contains(&name)` usable in a `const` context.
+const fn const_contains(list: &[&str], name: &str) -> bool {
+    let mut i = 0;
+    while i < list.len() {
+        if const_str_eq(list[i], name) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Resolve path `segments` against a [`serde_json::Value`], for a
+/// `#[repe(nested_serde)]` field.
+///
+/// Objects are indexed by key and arrays by decimal position, matching RFC 6901
+/// evaluation; this takes already-split segments because the struct router has
+/// them in that form and the pointer string does not exist.
+///
+/// `None` means the path does not resolve, which the caller reports as
+/// [`StructError::InvalidPath`].
+pub fn serde_pointer<'a>(value: &'a Value, segments: &[&str]) -> Option<&'a Value> {
+    let mut cursor = value;
+    for segment in segments {
+        cursor = match cursor {
+            Value::Object(map) => map.get(*segment)?,
+            Value::Array(items) => items.get(segment.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(cursor)
+}
+
+/// The mutable counterpart of [`serde_pointer`], for a write below a
+/// `#[repe(nested_serde)]` field.
+///
+/// `segments` must be non-empty: replacing the whole value is the caller's own
+/// assignment, not a walk. Every segment, the last included, has to name
+/// something that is **already there** — a key an object does not have is
+/// rejected rather than inserted, because the value is about to be deserialized
+/// back into a typed field where an invented key is either dropped or an error,
+/// and a client that misspelled one deserves to hear about it here.
+///
+/// Contrast [`crate::structs`]' sibling in `repe`'s registry, `set_pointer`,
+/// which deliberately *inserts* a missing object key: that one is building a
+/// free-form document, this one is editing a value with a type. Do not unify
+/// them.
+pub fn serde_pointer_set(value: &mut Value, segments: &[&str], new: Value) -> Option<()> {
+    if segments.is_empty() {
+        return None;
+    }
+    let mut cursor = value;
+    for segment in segments {
+        cursor = match cursor {
+            Value::Object(map) => map.get_mut(*segment)?,
+            Value::Array(items) => items.get_mut(segment.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    *cursor = new;
+    Some(())
 }
 
 /// `str` equality usable in a `const` context, which `PartialEq` is not.

@@ -202,7 +202,10 @@ fn build_message_for_udp(
             Ok(BodyFormat::Json) => builder.body_json(value)?,
             Ok(BodyFormat::Beve) => builder.body_beve(value)?,
             Ok(BodyFormat::Utf8) => builder.body_utf8(&value.to_string()),
-            Ok(BodyFormat::RawBinary) | Err(_) => builder
+            // Raw binary, an unrecognized code, and a `BodyFormat` this build
+            // does not know: send the bytes through under the code the caller
+            // asked for rather than guessing an encoding.
+            _ => builder
                 .body_bytes(serde_json::to_vec(value).map_err(RepeError::from)?)
                 .body_format_code(body_format),
         }
