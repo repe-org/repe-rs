@@ -21,7 +21,10 @@ use serde::{Deserialize, Serialize};
 struct Sample {
     count: u64,
     label: String,
-    #[repe(typed)]
+    // Under the `typed` feature this field is read as a BEVE typed array;
+    // without it, `#[repe(typed)]` is a compile error naming the feature, so the
+    // attribute has to come and go with the feature the way a dependent's would.
+    #[cfg_attr(feature = "typed", repe(typed))]
     values: Vec<f64>,
 }
 
@@ -103,6 +106,7 @@ fn a_derived_struct_dispatches_with_only_the_core_crate() {
     assert_eq!(value.label, "beta");
 }
 
+#[cfg(feature = "typed")]
 #[test]
 fn the_typed_encoding_is_reachable_from_the_core_crate() {
     // `ResponseBody::write_typed_slice` is the one place the core crate touches
@@ -112,6 +116,19 @@ fn the_typed_encoding_is_reachable_from_the_core_crate() {
     let (body, format) = dispatch(&mut value, &["values"], None).expect("a typed read");
     assert_eq!(format, BodyFormat::Beve);
     assert_eq!(beve::from_slice::<Vec<f64>>(&body).unwrap(), vec![1.0, 2.0]);
+}
+
+#[cfg(not(feature = "typed"))]
+#[test]
+fn without_the_typed_feature_a_numeric_field_is_still_served_as_json() {
+    // The default build — no beve anywhere in the graph. The field is read, and
+    // read correctly; only the encoding it is read *as* is different, and that
+    // difference is opted into rather than silently lost, because
+    // `#[repe(typed)]` without the feature does not compile.
+    let mut value = sample();
+    let (body, format) = dispatch(&mut value, &["values"], None).expect("a numeric read");
+    assert_eq!(format, BodyFormat::Json);
+    assert_eq!(body, b"[1.0,2.0]");
 }
 
 #[test]

@@ -1,0 +1,31 @@
+[package]
+name = "repe-minimal-consumer"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone rather than a member of the repe workspace, for the same reason
+# `wasm-tests/*` is: this is CI scaffolding, not part of the crate, and keeping
+# it out means `cargo test` at the root never builds it.
+#
+# Standalone is also the *point* here rather than a convenience. What this crate
+# asserts is the contents of its own `[dependencies]` table, and a workspace
+# member inherits enough of its parent's graph that the assertion would be
+# meaningless.
+[workspace]
+
+# The whole fixture. `repe-core` and `serde` — nothing else.
+#
+# `serde` is a fair ask: the source below writes `#[derive(Serialize)]`.
+# `serde_json` is not, and is deliberately absent: nothing in the source names
+# it, so the generated code must reach it through `repe_core::__private` rather
+# than through an absolute `::serde_json` path. Every test elsewhere in this
+# repo has `serde_json` in scope already, so a regression to the absolute path
+# would compile everywhere except in a real consumer's crate.
+#
+# `default-features = false` is implicit (repe-core has no default features);
+# this also therefore pins that `#[repe(typed)]` is the *only* thing behind the
+# `typed` feature, since everything below compiles without it.
+[dependencies]
+repe-core = { path = "../../repe-core" }
+serde = { version = "1", features = ["derive"] }

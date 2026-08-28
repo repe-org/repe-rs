@@ -11,7 +11,7 @@ exclude = ["bench/grpc-shootout"]
 
 [package]
 name = "repe"
-version = "10.1.0"
+version = "11.0.0"
 edition = "2024"
 rust-version = "1.96.1"
 description = "Rust implementation of the REPE RPC protocol (JSON-focused)"
@@ -156,12 +156,25 @@ beve = "9"
 serde = { version = "1", features = ["derive" ] }
 serde_json = "1"
 thiserror = "1"
-repe-derive = { path = "repe-derive", version = "0.5.0" }
+# Moves in lockstep with this crate: the generated code names items that only
+# exist alongside a matching release — `repe_shared_into` at 9.0.0, and now
+# `__private::serde_json`, which 10.x does not carry. The 0.5 -> 0.6 bump is
+# what keeps a `repe = "10"` graph (`repe-derive = "^0.5.0"`) from resolving a
+# derive that emits paths its `repe` has no module for.
+repe-derive = { path = "repe-derive", version = "0.6.0" }
 # The `RepeStruct` surface, split out so a crate that only *declares* a served
 # type — a pure-logic crate with a no-I/O charter, say — can implement the trait
 # without acquiring the server, the client, and the transport. Re-exported here
 # at the paths it has always had, so nothing moved for a caller of `repe`.
-repe-core = { path = "repe-core", version = "1.0.0" }
+#
+# `typed` is on unconditionally and is not re-exposed as a feature of `repe`.
+# It carries `beve` into `repe-core` for `ResponseBody::write_typed_slice`, and
+# `repe` already depends on `beve` directly for the builder-side half of that
+# same encoding — so here the feature costs nothing, and `#[repe(typed)]` works
+# through `repe` with no opt-in. It is off by default in `repe-core` because a
+# crate that depends on that one *directly* is doing so precisely to keep the
+# encoder out; see that crate's `[features]`.
+repe-core = { path = "repe-core", version = "2.0.0", features = ["typed"] }
 parking_lot = { version = "0.12", optional = true }
 # 0.3.32 for `UnboundedReceiver::try_recv`, which the `notify_slot` tests use
 # (`try_next` is deprecated there, and CI builds tests at `-D warnings`).
