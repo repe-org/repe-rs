@@ -3,7 +3,11 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 /// Errors produced while handling struct-backed endpoints.
+///
+/// Non-exhaustive: match with a wildcard arm, or use [`StructError::code`] to
+/// map any error onto its protocol [`ErrorCode`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum StructError {
     #[error("invalid path `{path}`")]
     InvalidPath { path: String },
@@ -53,6 +57,12 @@ pub type StructResult<T> = Result<T, StructError>;
 ///
 /// The implementation should interpret the provided JSON Pointer path segments and
 /// either return a JSON value (for reads) or mutate the struct (for writes).
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot be served over REPE: it does not implement `RepeStruct`",
+    label = "not a REPE-servable type",
+    note = "derive it with `#[derive(RepeStruct)]`, or, for a field of a type you do not own, use `#[repe(nested_serde)]` to route through its `Serialize`/`Deserialize` impls instead of `#[repe(nested)]`",
+    note = "a type in a crate that depends only on `repe-core` can derive this too; `repe` re-exports the same trait"
+)]
 pub trait RepeStruct: Send + Sync {
     /// Handle a read or write against this struct.
     ///
@@ -321,9 +331,9 @@ fn absent_child(segments: &[&str], has_body: bool) -> StructResult<()> {
 /// Implementing this by hand is supported but unusual; the macro exists so the
 /// signatures stay derived from the `impl` block.
 #[diagnostic::on_unimplemented(
-    message = "`{Self}` declares `#[repe(methods)]` but has no `#[repe::methods]` impl block",
+    message = "`{Self}` declares `#[repe(methods)]` but its impl block is not annotated",
     label = "no method table for `{Self}`",
-    note = "annotate the inherent `impl {Self}` block with `#[repe::methods]`, or drop `#[repe(methods)]` from the struct"
+    note = "annotate the inherent `impl {Self}` block with `#[repe::methods]` (or `#[repe_core::methods]` when only `repe-core` is a dependency), or drop `#[repe(methods)]` from the struct"
 )]
 pub trait RepeMethods: MethodsDeclared {
     /// `(endpoint, signature)` pairs published in the whole-struct listing.
@@ -447,27 +457,11 @@ pub trait RepeMethods: MethodsDeclared {
 /// a compile error naming the attribute that is absent, rather than a method
 /// that quietly never reaches the wire.
 #[diagnostic::on_unimplemented(
-    message = "`{Self}` has a `#[repe::methods]` impl block but does not declare it",
+    message = "`{Self}` has an annotated `methods` impl block but does not declare it",
     label = "`{Self}` is missing `#[repe(methods)]`",
     note = "add `#[repe(methods)]` next to `#[derive(RepeStruct)]` on `{Self}` so the derived router dispatches to the impl block"
 )]
 pub trait MethodsDeclared {}
-
-/// Build a fully-qualified child path from the current path segments.
-pub fn join_path(current: &[&str], segment: &str) -> String {
-    if current.is_empty() {
-        format!("/{}", segment)
-    } else {
-        let mut s = String::new();
-        for part in current {
-            s.push('/');
-            s.push_str(part);
-        }
-        s.push('/');
-        s.push_str(segment);
-        s
-    }
-}
 
 /// Build a path string from segments for error messages.
 pub fn path_from_segments(segments: &[&str]) -> String {
@@ -804,6 +798,7 @@ fn write_optional(
 /// The third pairing, methods against accessors, is unreachable from a
 /// generated table for the same reason; it is checked because a hand-written
 /// [`RepeMethods`] impl can produce it.
+#[doc(hidden)]
 pub const fn assert_no_endpoint_collision(
     declared: &[&str],
     methods: &[(&str, &str)],
@@ -813,7 +808,7 @@ pub const fn assert_no_endpoint_collision(
     while i < methods.len() {
         if const_contains(declared, methods[i].0) {
             panic!(
-                "a `#[repe::methods]` method and an endpoint declared on the struct itself \
+                "a published method and an endpoint declared on the struct itself \
                  share a name: the struct's declaration wins dispatch and the method could \
                  never be called. Rename one with `#[repe(rename = \"...\")]`."
             );
@@ -834,7 +829,7 @@ pub const fn assert_no_endpoint_collision(
 
         if listed_signature(methods, accessors[i]).is_some() {
             panic!(
-                "a `#[repe::methods]` method and a `#[repe(get = \"...\")]` accessor in the \
+                "a published method and a `#[repe(get = \"...\")]` accessor in the \
                  same table share an endpoint name: one of them is unreachable, and the \
                  whole-struct listing would show the endpoint twice."
             );
@@ -856,6 +851,7 @@ pub const fn assert_no_endpoint_collision(
 /// emit a key whose value came from a failed dispatch; an order omitting one
 /// would silently drop it from every whole-object read, which is the harder bug
 /// to see because the endpoint still answers on its own path.
+#[doc(hidden)]
 pub const fn assert_listing_order(
     order: &[&str],
     declared: &[&str],
@@ -880,7 +876,7 @@ pub const fn assert_listing_order(
             panic!(
                 "`#[repe(listing_order(..))]` names a key that is not an endpoint on this \
                  struct. It lists the whole-object listing's keys, so every name in it has to \
-                 be a field, a listed method, or an endpoint of the `#[repe::methods]` block."
+                 be a field, a listed method, or an endpoint of the annotated `methods` impl block."
             );
         }
         i += 1;
@@ -890,7 +886,7 @@ pub const fn assert_listing_order(
     while j < methods.len() {
         if !const_contains(order, methods[j].0) {
             panic!(
-                "a `#[repe::methods]` method is missing from `#[repe(listing_order(..))]`, \
+                "a method on the annotated `methods` impl block is missing from `#[repe(listing_order(..))]`, \
                  which names the whole-object listing's keys in full. An omitted endpoint \
                  would disappear from every whole-object read while still answering on its \
                  own path."
@@ -921,6 +917,7 @@ pub const fn assert_listing_order(
 /// `#[repe::methods]` block, so it does not know which of the two tables an
 /// ordered key came from, but the tables themselves are constants and the
 /// question folds away before run time.
+#[doc(hidden)]
 pub const fn listed_signature<'a>(methods: &[(&'a str, &'a str)], name: &str) -> Option<&'a str> {
     let mut i = 0;
     while i < methods.len() {

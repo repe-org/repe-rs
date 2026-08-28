@@ -109,7 +109,7 @@ impl RepeStruct for Settings {
 }
 
 /// A derived child, for the other half of the guarantee: a whole-child write
-/// atimeoutst one of these still replaces it, because that is what its own
+/// against one of these still replaces it, because that is what its own
 /// empty-segments arm does. Descending changed which impl decides, not what a
 /// derived one decides.
 #[derive(Default, Serialize, Deserialize, RepeStruct)]
@@ -193,7 +193,7 @@ fn body(router: &Router, request: &[u8]) -> Value {
 }
 
 /// One router per lock kind: a `Mutex` always takes the exclusive path, an
-/// `RwLock` tries the shared one first. Every assertion below is made atimeoutst
+/// `RwLock` tries the shared one first. Every assertion below is made against
 /// both, because which path served a request must not be visible in the answer.
 fn routers(build: fn() -> Service) -> [(&'static str, Router); 2] {
     [
@@ -227,7 +227,7 @@ fn a_whole_child_write_reaches_the_child_s_own_impl() {
             "under a {kind} the child applied one key rather than being replaced"
         );
 
-        // Applying atimeout touches only the named key: a replace would have
+        // Applying again touches only the named key: a replace would have
         // reset `retries` to the default.
         answer(
             &router,
@@ -295,7 +295,7 @@ fn a_per_field_write_below_a_child_is_unchanged() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_whole_object_write_atimeoutst_a_readonly_struct_is_refused() {
+fn a_whole_object_write_against_a_readonly_struct_is_refused() {
     for (kind, router) in routers(service) {
         let message = answer(&router, &write("/service", &json!({ "version": 9 })));
         assert_eq!(
@@ -469,7 +469,7 @@ fn an_absent_child_reads_as_null_and_refuses_everything_else() {
         assert_eq!(
             answer(&router, &write("/service/aux/ticks", &1u64)).error_code(),
             Some(ErrorCode::MethodNotFound),
-            "under a {kind} a subpath write atimeoutst an absent child is an error too"
+            "under a {kind} a subpath write against an absent child is an error too"
         );
     }
 }

@@ -261,7 +261,7 @@ impl<H: HandlerErased> HandlerErased for OffReaderHandler<H> {
 }
 
 /// Lets an already-erased handler be wrapped again — by
-/// [`OffReaderHandler`], for [`Router::register_fallback_blocking`], which
+/// `OffReaderHandler`, for [`Router::register_fallback_blocking`], which
 /// receives an `Arc<dyn HandlerErased>` rather than a concrete type.
 ///
 /// Every method forwards, `execution` included, so the wrapper decides.
@@ -2161,34 +2161,36 @@ where
         // making a second one.
         let mut buf = response_buffer(req);
 
-        // The shared attempt, which is the whole point of registering the
-        // struct behind an `RwLock`. A mutex answers `None` from a defaulted
-        // method with no work in it, so it compiles out.
-        match self.shared.with_read(|handler| {
-            shared_struct_segments(handler, relative, &mut body, &mut buf, req)
-        }) {
-            Some(Ok(Some(response))) => return Ok(response),
-            // The struct declined: this path needs `&mut self`. Nothing was
-            // written and `body` was left in place, so the exclusive attempt
-            // below starts from scratch.
-            Some(Ok(None)) => {}
-            Some(Err(err)) => return Ok(lock_error_response(req, path, err)),
-            // This lock has no shared mode.
-            None => {}
-        }
+        // One split for both attempts, for the same reason. A declining shared
+        // attempt would otherwise hand the exclusive retry the same string to
+        // re-split, and for an escaped pointer that is `json_pointer::parse`
+        // run twice — the `Vec<String>` and its `str::replace` per token, paid
+        // again to reach the identical segments.
+        let response = with_segments(relative, |segments| {
+            // The shared attempt, which is the whole point of registering the
+            // struct behind an `RwLock`. A mutex answers `None` from a defaulted
+            // method with no work in it, so it compiles out.
+            match self.shared.with_read(|handler| {
+                shared_struct_segments(handler, segments, &mut body, &mut buf, req)
+            }) {
+                Some(Ok(Some(response))) => return response,
+                // The struct declined: this path needs `&mut self`. Nothing was
+                // written and `body` was left in place, so the exclusive attempt
+                // below starts from scratch.
+                Some(Ok(None)) => {}
+                Some(Err(err)) => return lock_error_response(req, path, err),
+                // This lock has no shared mode.
+                None => {}
+            }
 
-        let mut guard = match self.shared.lock() {
-            Ok(g) => g,
-            Err(err) => return Ok(lock_error_response(req, path, err)),
-        };
+            let mut guard = match self.shared.lock() {
+                Ok(g) => g,
+                Err(err) => return lock_error_response(req, path, err),
+            };
 
-        Ok(dispatch_struct_segments(
-            &mut *guard,
-            relative,
-            body,
-            buf,
-            req,
-        ))
+            dispatch_struct_segments(&mut *guard, segments, body, buf, req)
+        });
+        Ok(response)
     }
 }
 
@@ -2286,7 +2288,7 @@ fn response_buffer(req: &Message) -> Vec<u8> {
 /// allocating a frame, making a leaf read one allocation end to end.
 fn dispatch_struct_segments<T>(
     handler: &mut T,
-    relative: &str,
+    segments: &[&str],
     body: Option<Value>,
     mut buf: Vec<u8>,
     req: &Message,
@@ -2295,9 +2297,7 @@ where
     T: RepeStruct + ?Sized,
 {
     let mut out = ResponseBody::new(&mut buf);
-    let result = with_segments(relative, |segments| {
-        handler.repe_handle_into(segments, body, &mut out)
-    });
+    let result = handler.repe_handle_into(segments, body, &mut out);
     let body_format = out.format();
     finish_struct_response(req, buf, body_format, result)
 }
@@ -2315,7 +2315,7 @@ where
 /// those bytes ahead of its own.
 fn shared_struct_segments<T>(
     handler: &T,
-    relative: &str,
+    segments: &[&str],
     body: &mut Option<Value>,
     buf: &mut Vec<u8>,
     req: &Message,
@@ -2324,9 +2324,7 @@ where
     T: RepeStruct + ?Sized,
 {
     let mut out = ResponseBody::new(buf);
-    let Some(result) = with_segments(relative, |segments| {
-        handler.repe_shared_into(segments, body, &mut out)
-    }) else {
+    let Some(result) = handler.repe_shared_into(segments, body, &mut out) else {
         buf.clear();
         return None;
     };

@@ -681,10 +681,13 @@ struct StructAttrs {
     /// `DeserializeOwned`. A type holding an open socket or a file handle has no
     /// JSON that produces one, and hand-writing a `Deserialize` that
     /// always errors trades a compile error for a runtime one and is boilerplate
-    /// on every such type. This is the field-level `#[repe(readonly)]` applied
-    /// one level up, and it emits only the rejection for the same reason that
-    /// one does: a crate under `#![deny(warnings)]` must not be broken by
-    /// `unreachable_code` on generated code.
+    /// on every such type. This is *not* the field-level `#[repe(readonly)]`
+    /// applied one level up: that one is recursive, refusing every write
+    /// *through* the field, whereas this governs the empty-segments arm alone
+    /// and leaves fields and children writable. It emits only the rejection, and
+    /// never the assignment followed by dead code, because a crate under
+    /// `#![deny(warnings)]` must not be broken by `unreachable_code` on
+    /// generated code.
     readonly: bool,
     /// `#[repe(listing_order("a", "b", ..))]`: the key order of the
     /// whole-object listing, given in full.

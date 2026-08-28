@@ -481,3 +481,53 @@ fn encoding_in_place_beats_the_value_path() {
     let in_place: serde_json::Value = serde_json::from_slice(&encode_bytes).unwrap();
     assert_eq!(in_place, via_value);
 }
+
+/// A write through an `RwLock`-registered struct: the shared attempt declines
+/// (a field write needs `&mut self`) and the exclusive retry serves it. Both
+/// attempts run against one request, so anything the pair does twice shows up
+/// here doubled.
+///
+/// The escaped path is the one that makes it visible. `with_segments` has a
+/// fast path for pointers without `~`, but an escaped pointer falls back to
+/// `json_pointer::parse`, which allocates a `Vec<String>` and runs
+/// `str::replace` twice per token. Splitting once for both attempts rather
+/// than once per attempt is the difference between paying that and paying it
+/// twice, and it is invisible on the unescaped fast path.
+#[test]
+fn struct_write_under_a_shared_lock_splits_the_pointer_once() {
+    use std::sync::{Arc, RwLock};
+
+    #[derive(Default, serde::Serialize, serde::Deserialize, repe::RepeStruct)]
+    struct Escaped {
+        #[repe(rename = "a/b")]
+        #[serde(rename = "a/b")]
+        a_b: u64,
+        plain: u64,
+    }
+
+    let router = Router::new()
+        .with_struct_shared::<Escaped, _>("/e", Arc::new(RwLock::new(Escaped::default())));
+
+    for (path, expected) in [
+        // Unescaped: the fast path splits into a stack buffer, so neither
+        // attempt allocates for segments and only the request/response pair
+        // shows up.
+        ("/e/plain", 3usize),
+        // Escaped: one `json_pointer::parse`, not two. Splitting per attempt
+        // instead of once for both costs four more (11 rather than 7): the
+        // `Vec<String>`, the owned segment, its `str::replace` pair, and the
+        // `Vec<&str>`, all paid again to reach the identical segments.
+        ("/e/a~1b", 7usize),
+    ] {
+        let wire = request(path, json!(7));
+        let mut out = Vec::new();
+        dispatch_cycle(&router, &wire, path, &mut out);
+        let (_, allocs) = count_allocs(|| dispatch_cycle(&router, &wire, path, &mut out));
+        assert_eq!(
+            allocs, expected,
+            "allocation budget for a write to `{path}` changed (was {expected}, now {allocs}); \
+             an increase here means the declining shared attempt and the exclusive retry are \
+             each doing work the other already did"
+        );
+    }
+}

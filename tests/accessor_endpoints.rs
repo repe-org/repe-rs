@@ -30,7 +30,7 @@ impl std::fmt::Display for RangeError {
 struct Budget {
     used: u32,
     total: f64,
-    channel: u32,
+    tier: u32,
     /// Backs `/reads`, and is published in its own right — the two names have
     /// to differ, and the derive refuses them if they do not.
     read_count: u32,
@@ -57,19 +57,19 @@ impl Budget {
     }
 
     /// The numeric bulk path composes, exactly as it does on a field.
-    #[repe(get = "gains", typed)]
-    fn gains(&self) -> Vec<f64> {
+    #[repe(get = "weights", typed)]
+    fn weights(&self) -> Vec<f64> {
         vec![1.0, 0.5, 0.25, 0.125]
     }
 
-    /// The write half of `/trim`. Deliberately *not* adjacent to its read half
+    /// The write half of `/offset`. Deliberately *not* adjacent to its read half
     /// below: the two are paired by endpoint name, not by position.
-    #[repe(set = "trim")]
-    fn set_trim(&mut self, trim: i32) -> Result<(), RangeError> {
-        if !(-8..=8).contains(&trim) {
-            return Err(RangeError("trim must be within ±8"));
+    #[repe(set = "offset")]
+    fn set_offset(&mut self, offset: i32) -> Result<(), RangeError> {
+        if !(-8..=8).contains(&offset) {
+            return Err(RangeError("offset must be within ±8"));
         }
-        self.channel = trim.unsigned_abs() / 2;
+        self.tier = offset.unsigned_abs() / 2;
         Ok(())
     }
 
@@ -82,18 +82,18 @@ impl Budget {
     }
 
     /// A fallible pair: both halves may refuse.
-    #[repe(get = "trim")]
-    fn trim(&self) -> Result<i32, RangeError> {
-        if self.channel > 3 {
-            return Err(RangeError("channel is not selected"));
+    #[repe(get = "offset")]
+    fn offset(&self) -> Result<i32, RangeError> {
+        if self.tier > 3 {
+            return Err(RangeError("tier is not selected"));
         }
-        Ok(self.channel as i32 * 2)
+        Ok(self.tier as i32 * 2)
     }
 
     /// An ordinary published method, unaffected by any of the above.
     fn reset(&mut self) {
         self.used = 0;
-        self.channel = 0;
+        self.tier = 0;
     }
 }
 
@@ -101,7 +101,7 @@ fn budget() -> Budget {
     Budget {
         used: 512,
         total: 4096.0,
-        channel: 1,
+        tier: 1,
         read_count: 0,
     }
 }
@@ -178,7 +178,7 @@ fn a_getter_without_a_setter_is_read_only() {
 #[test]
 fn the_typed_numeric_path_composes_with_an_accessor() {
     let router = Router::new().with_struct("", budget()).0;
-    let resp = call(&router, "/gains", &request_empty("/gains"));
+    let resp = call(&router, "/weights", &request_empty("/weights"));
     assert_eq!(resp.header.body_format, BodyFormat::Beve as u16);
     assert_eq!(
         beve::from_slice::<Vec<f64>>(&resp.body).unwrap(),
@@ -190,20 +190,20 @@ fn the_typed_numeric_path_composes_with_an_accessor() {
 fn either_half_may_fail() {
     let (router, handle) = Router::new().with_struct("", budget());
 
-    let resp = call(&router, "/trim", &request_empty("/trim"));
+    let resp = call(&router, "/offset", &request_empty("/offset"));
     assert_eq!(parse_body(&resp), json!(2));
 
-    let resp = call(&router, "/trim", &request_json("/trim", &json!(64)));
+    let resp = call(&router, "/offset", &request_json("/offset", &json!(64)));
     assert_eq!(resp.header.ec, ErrorCode::ParseError as u32);
-    assert!(String::from_utf8_lossy(&resp.body).contains("trim must be within"));
+    assert!(String::from_utf8_lossy(&resp.body).contains("offset must be within"));
     assert_eq!(
-        handle.lock().unwrap().channel,
+        handle.lock().unwrap().tier,
         1,
         "a refused write leaves the object alone"
     );
 
-    handle.lock().unwrap().channel = 9;
-    let resp = call(&router, "/trim", &request_empty("/trim"));
+    handle.lock().unwrap().tier = 9;
+    let resp = call(&router, "/offset", &request_empty("/offset"));
     assert_eq!(resp.header.ec, ErrorCode::ParseError as u32);
 }
 
@@ -240,9 +240,9 @@ fn the_whole_struct_listing_shows_accessor_values_and_method_signatures() {
     // Field-shaped endpoints list like fields: by value, not by signature.
     assert_eq!(listing["used_percent"], json!(12.5));
     assert_eq!(listing["version"], json!("1.4.2"));
-    assert_eq!(listing["trim"], json!(2));
+    assert_eq!(listing["offset"], json!(2));
     assert_eq!(
-        listing["gains"],
+        listing["weights"],
         json!([1.0, 0.5, 0.25, 0.125]),
         "the enclosing object is JSON, so a typed accessor lists as a JSON array"
     );
@@ -253,13 +253,13 @@ fn the_whole_struct_listing_shows_accessor_values_and_method_signatures() {
 
 #[test]
 fn the_two_halves_of_a_pair_need_not_be_adjacent() {
-    // `set_trim` is declared above `reads` and `trim` below it, so the pairing
+    // `set_offset` is declared above `reads` and `offset` below it, so the pairing
     // is by endpoint name rather than by position in the block.
     let (router, handle) = Router::new().with_struct("", budget());
-    call(&router, "/trim", &request_json("/trim", &json!(6)));
-    assert_eq!(handle.lock().unwrap().channel, 3);
+    call(&router, "/offset", &request_json("/offset", &json!(6)));
+    assert_eq!(handle.lock().unwrap().tier, 3);
     assert_eq!(
-        parse_body(&call(&router, "/trim", &request_empty("/trim"))),
+        parse_body(&call(&router, "/offset", &request_empty("/offset"))),
         json!(6)
     );
 }
@@ -288,11 +288,11 @@ fn a_failing_getter_fails_the_whole_object_read() {
     let (router, handle) = Router::new().with_struct("", budget());
     assert!(!call(&router, "", &request_empty("")).is_error());
 
-    handle.lock().unwrap().channel = 9; // `/trim` now refuses
+    handle.lock().unwrap().tier = 9; // `/offset` now refuses
     let listing = call(&router, "", &request_empty(""));
     assert_eq!(listing.header.ec, ErrorCode::ParseError as u32);
     assert!(
-        String::from_utf8_lossy(&listing.body).contains("channel is not selected"),
+        String::from_utf8_lossy(&listing.body).contains("tier is not selected"),
         "the listing carries the getter's own message"
     );
 }
@@ -303,22 +303,22 @@ mod nested {
     use super::*;
 
     #[derive(Debug, Default, Serialize, Deserialize, repe::RepeStruct)]
-    struct Rack {
+    struct Plan {
         label: String,
         #[repe(nested)]
         budget: Budget,
     }
 
-    fn rack() -> Rack {
-        Rack {
-            label: "rack-1".into(),
+    fn plan() -> Plan {
+        Plan {
+            label: "plan-1".into(),
             budget: budget(),
         }
     }
 
     #[test]
     fn an_accessor_is_reachable_through_a_nested_parent() {
-        let (router, handle) = Router::new().with_struct("", rack());
+        let (router, handle) = Router::new().with_struct("", plan());
 
         assert_eq!(
             parse_body(&call(
@@ -366,8 +366,8 @@ fn the_value_and_encode_paths_agree() {
         (&["used_percent"], Some(json!("fast"))), // write, wrong type
         (&["version"], None),                     // read-only accessor read
         (&["version"], Some(json!("2.0"))),       // read-only rejection
-        (&["trim"], None),                        // fallible read
-        (&["trim"], Some(json!(64))),             // fallible write, refused
+        (&["offset"], None),                      // fallible read
+        (&["offset"], Some(json!(64))),           // fallible write, refused
         (&["used_percent", "extra"], None),       // InvalidSubpath
         (&["reset"], None),                       // ordinary method, alongside
     ];
@@ -410,14 +410,16 @@ fn the_value_and_encode_paths_agree() {
 /// has.
 #[test]
 fn a_typed_accessor_is_the_one_sanctioned_divergence() {
-    let mut device = budget();
+    let mut budget = budget();
     assert_eq!(
-        device.repe_handle(&["gains"], None).unwrap(),
+        budget.repe_handle(&["weights"], None).unwrap(),
         Some(json!([1.0, 0.5, 0.25, 0.125]))
     );
 
     let mut buf = Vec::new();
     let mut out = ResponseBody::new(&mut buf);
-    device.repe_handle_into(&["gains"], None, &mut out).unwrap();
+    budget
+        .repe_handle_into(&["weights"], None, &mut out)
+        .unwrap();
     assert_eq!(out.format(), BodyFormat::Beve);
 }
