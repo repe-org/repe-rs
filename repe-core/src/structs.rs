@@ -188,6 +188,30 @@ pub trait RepeStruct: Send + Sync {
     fn repe_listing_declines(&self) -> bool {
         true
     }
+
+    /// Whether any path can answer a **body-carrying** frame through
+    /// [`repe_shared_into`](Self::repe_shared_into).
+    ///
+    /// The router asks before it takes the read lock. REPE puts a body on a
+    /// write *and* on a call with arguments, so a body alone cannot say which
+    /// one arrived — but a struct whose every write needs `&mut self` knows the
+    /// answer for all of them in advance, and `false` lets the router skip the
+    /// lock, the walk and the certain decline.
+    ///
+    /// This is a hint, and it cannot cost correctness. Everything the shared
+    /// borrow answers with a body, the exclusive path answers identically: a
+    /// `&self` method is callable through either, and every refusal
+    /// ([`BodyUnexpected`](StructError::BodyUnexpected) on a read-only endpoint,
+    /// [`InvalidPath`](StructError::InvalidPath) on an unknown one) is generated
+    /// from the same shape on both sides. `false` on an impl that could have
+    /// served one costs concurrency for that frame and nothing else.
+    ///
+    /// The default is `true`, the accurate answer for a hand-written
+    /// `repe_shared_into` this crate cannot see inside. A derived impl narrows
+    /// it to `false` when nothing it generates can answer a body: no `&self`
+    /// method taking arguments, no read-only endpoint whose refusal is servable
+    /// shared, and no `#[repe(nested)]` child that has either.
+    const REPE_SHARED_SERVES_BODIES: bool = true;
 }
 
 /// A **conditionally-present** child: a component that is not in every build, a
@@ -276,6 +300,11 @@ impl<T: RepeStruct> RepeStruct for Option<T> {
             None => false,
         }
     }
+
+    /// A present child answers for itself. An absent one refuses every write
+    /// and every sub-path, and refuses them identically on both borrows, so it
+    /// contributes nothing the exclusive path would not also say.
+    const REPE_SHARED_SERVES_BODIES: bool = T::REPE_SHARED_SERVES_BODIES;
 }
 
 /// Refuse a `null` written at an optional child's **own** path, present or
@@ -406,6 +435,19 @@ pub trait RepeMethods: MethodsDeclared {
     /// decline run a second time, which is the double invocation this const
     /// exists to rule out.
     const REPE_LISTING_NEEDS_EXCLUSIVE: bool = !Self::REPE_ACCESSOR_ENDPOINTS.is_empty();
+
+    /// Whether any endpoint in this table can answer a body-carrying frame
+    /// through [`repe_call_shared_into`](Self::repe_call_shared_into).
+    ///
+    /// The table half of
+    /// [`RepeStruct::REPE_SHARED_SERVES_BODIES`], which ORs this with what the
+    /// struct's own fields and children say. Three shapes here can answer one: a
+    /// `&self` method that takes arguments, a `&self` setter, and a read-only
+    /// accessor, whose refusal needs no exclusive borrow to give.
+    ///
+    /// The default is `true`, which is never wrong — only, for a table that
+    /// serves no body, slower than it needs to be.
+    const REPE_SHARED_SERVES_BODIES: bool = true;
 
     /// Invoke the method named by `segments[0]`.
     ///

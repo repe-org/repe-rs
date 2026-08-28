@@ -2170,17 +2170,28 @@ where
             // The shared attempt, which is the whole point of registering the
             // struct behind an `RwLock`. A mutex answers `None` from a defaulted
             // method with no work in it, so it compiles out.
-            match self.shared.with_read(|handler| {
-                shared_struct_segments(handler, segments, &mut body, &mut buf, req)
-            }) {
-                Some(Ok(Some(response))) => return response,
-                // The struct declined: this path needs `&mut self`. Nothing was
-                // written and `body` was left in place, so the exclusive attempt
-                // below starts from scratch.
-                Some(Ok(None)) => {}
-                Some(Err(err)) => return lock_error_response(req, path, err),
-                // This lock has no shared mode.
-                None => {}
+            //
+            // A body-carrying frame is skipped entirely when the struct says no
+            // path can answer one: REPE puts a body on a write and on a call
+            // with arguments alike, so the frame cannot tell them apart, but the
+            // type can. For a plain struct of leaf fields the const is `false`
+            // and this folds away, taking the read lock and a certain decline
+            // with it. Skipping never changes the answer — everything the shared
+            // borrow serves with a body, the exclusive path below serves
+            // identically.
+            if body.is_none() || T::REPE_SHARED_SERVES_BODIES {
+                match self.shared.with_read(|handler| {
+                    shared_struct_segments(handler, segments, &mut body, &mut buf, req)
+                }) {
+                    Some(Ok(Some(response))) => return response,
+                    // The struct declined: this path needs `&mut self`. Nothing
+                    // was written and `body` was left in place, so the exclusive
+                    // attempt below starts from scratch.
+                    Some(Ok(None)) => {}
+                    Some(Err(err)) => return lock_error_response(req, path, err),
+                    // This lock has no shared mode.
+                    None => {}
+                }
             }
 
             let mut guard = match self.shared.lock() {

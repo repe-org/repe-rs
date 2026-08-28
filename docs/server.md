@@ -389,6 +389,8 @@ Everything else — every field write, every `&mut self` method, a `&mut self` g
 
 `with_struct` puts the value behind a `Mutex`, which has no shared mode. There the shared path is compiled out entirely rather than acquiring the same lock twice, so a mutex-backed struct dispatches exactly as it did before.
 
+A frame carrying a body skips the shared attempt entirely when the struct cannot answer one. A body is what a write and a call-with-arguments have in common, so the frame alone cannot separate them, but the type can: `RepeStruct::REPE_SHARED_SERVES_BODIES` is `false` for a struct whose every write needs `&mut self`, and the router then goes straight to the exclusive lock rather than taking the read lock to be told no. The derive computes it — `true` for a `&self` method taking arguments, for any `#[repe(readonly)]` endpoint whose refusal needs no state, and for any `#[repe(nested)]` child with either, at any depth. It defaults to `true`, so a hand-written `repe_shared_into` keeps being asked, and it is only ever a hint: whatever the shared borrow would have answered with a body, the exclusive path answers identically.
+
 #### A listing decides at the top, or not at all
 
 A whole-object read is the one read that composes many others, so a decline discovered partway through would leave the entries before it already executed — and the exclusive retry then executes them again. A `&self` getter over a read counter would report the second call.

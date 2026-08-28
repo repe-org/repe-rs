@@ -1273,3 +1273,173 @@ fn parking_lot_rwlock_answers_the_same_as_a_mutex() {
         );
     }
 }
+
+/// `REPE_SHARED_SERVES_BODIES`: whether the router should attempt the shared
+/// borrow at all for a frame that carries a body.
+///
+/// REPE puts a body on a write and on a call with arguments alike, so the frame
+/// cannot tell the two apart — but the type can, and the router reads this
+/// before it takes the read lock. `false` is the whole point: a plain struct's
+/// every write needs `&mut self`, so the lock, the walk and the decline are
+/// work whose outcome is known before it starts.
+///
+/// Getting it wrong cannot change an answer, only concurrency: everything the
+/// shared borrow serves with a body, the exclusive path serves identically.
+/// That is what makes `true` the safe default for a hand-written impl, and it
+/// is why these are pinned here — a shape that silently flips to `true` costs
+/// throughput, and one that flips to `false` costs the concurrency this whole
+/// path exists for, and neither shows up as a failing dispatch test.
+mod shared_serves_bodies {
+    use super::*;
+
+    #[derive(Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+    struct Plain {
+        a: u64,
+    }
+
+    #[derive(Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+    struct ReadonlyField {
+        a: u64,
+        #[repe(readonly)]
+        ro: u64,
+    }
+
+    #[derive(Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+    #[repe(readonly)]
+    struct ReadonlyStruct {
+        a: u64,
+    }
+
+    #[derive(Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+    struct NestsPlain {
+        #[repe(nested)]
+        child: Plain,
+    }
+
+    #[derive(Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+    struct NestsReadonly {
+        #[repe(nested)]
+        child: ReadonlyField,
+    }
+
+    #[derive(Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+    struct OptionalPlain {
+        #[repe(nested)]
+        child: Option<Plain>,
+    }
+
+    #[derive(Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+    struct OptionalReadonly {
+        #[repe(nested)]
+        child: Option<ReadonlyField>,
+    }
+
+    #[derive(Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+    #[repe(methods)]
+    struct ExclusiveMethod {
+        a: u64,
+    }
+
+    #[repe::methods]
+    impl ExclusiveMethod {
+        fn bump(&mut self) -> u64 {
+            self.a += 1;
+            self.a
+        }
+    }
+
+    #[derive(Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+    #[repe(methods)]
+    struct SharedCallWithArgs {
+        a: u64,
+    }
+
+    #[repe::methods]
+    impl SharedCallWithArgs {
+        fn add(&self, x: u64) -> u64 {
+            self.a + x
+        }
+    }
+
+    #[derive(Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+    #[repe(methods)]
+    struct SharedCallNoArgs {
+        a: u64,
+    }
+
+    #[repe::methods]
+    impl SharedCallNoArgs {
+        fn peek(&self) -> u64 {
+            self.a
+        }
+    }
+
+    #[derive(Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+    #[repe(methods(probe(&self, x: u64) -> u64))]
+    struct StructListedCall {
+        a: u64,
+    }
+
+    impl StructListedCall {
+        fn probe(&self, x: u64) -> u64 {
+            self.a + x
+        }
+    }
+
+    fn serves<T: RepeStruct>() -> bool {
+        T::REPE_SHARED_SERVES_BODIES
+    }
+
+    #[test]
+    fn only_the_shapes_that_can_answer_a_body_ask_for_the_read_lock() {
+        // Nothing here can answer a body without `&mut self`, so the router
+        // skips the attempt. This is the shape the skip exists for.
+        assert!(
+            !serves::<Plain>(),
+            "a plain struct's every write is exclusive"
+        );
+        assert!(
+            !serves::<ExclusiveMethod>(),
+            "a `&mut self` method cannot be called through a shared borrow"
+        );
+        assert!(
+            !serves::<SharedCallNoArgs>(),
+            "a `&self` method taking no arguments is reached by a bodiless frame"
+        );
+
+        // A refusal needs no state, so there is no reason to take the write
+        // guard to give one.
+        assert!(
+            serves::<ReadonlyField>(),
+            "a readonly field refuses a write under the shared borrow"
+        );
+        assert!(
+            serves::<ReadonlyStruct>(),
+            "a readonly struct refuses a whole-object write under it too"
+        );
+
+        // A call, not a mutation: the reason the receiver decides.
+        assert!(
+            serves::<SharedCallWithArgs>(),
+            "a `&self` method taking arguments is served shared, body and all"
+        );
+        assert!(
+            serves::<StructListedCall>(),
+            "and so is one listed on the struct rather than in an impl block"
+        );
+
+        // The answer composes down the tree, through `Option` as well as
+        // through a plain child, or a parent would give up a child's shared
+        // service without knowing it.
+        assert!(!serves::<NestsPlain>());
+        assert!(
+            serves::<NestsReadonly>(),
+            "a child that can answer makes its parent able to"
+        );
+        assert!(!serves::<OptionalPlain>());
+        assert!(
+            serves::<OptionalReadonly>(),
+            "and `Option` forwards its child's answer rather than masking it"
+        );
+    }
+}

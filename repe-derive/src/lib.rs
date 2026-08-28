@@ -279,6 +279,17 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
         quote! { #(#decline_terms)||* }
     };
 
+    // Whether the router should bother with the shared attempt for a frame that
+    // carries a body. Empty means the constant `false`: every write here needs
+    // the exclusive borrow, so the read lock, the walk and the decline are all
+    // work whose outcome is known before it starts.
+    let body_terms = shared_body_terms(&field_specs, &struct_attrs, from_impl_block, &repe);
+    let shared_serves_bodies = if body_terms.is_empty() {
+        quote! { false }
+    } else {
+        quote! { #(#body_terms)||* }
+    };
+
     let mut bodies = Vec::new();
     for sink in [Sink::Value, Sink::Encode] {
         let listing = build_listing(
@@ -432,6 +443,10 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
         fn repe_listing_declines(&self) -> bool {
             #listing_declines
         }
+    });
+
+    bodies.push(quote! {
+        const REPE_SHARED_SERVES_BODIES: bool = #shared_serves_bodies;
     });
 
     bodies.push(quote! {
@@ -2073,6 +2088,75 @@ fn build_shared_field_arms(fields: &[FieldSpec], repe: &TokenStream2) -> Vec<Tok
 /// An empty result means the constant `false`: a struct of plain fields, or one
 /// whose nesting and accessors all read shared. The caller emits no guard at all
 /// for that, so the common case costs nothing.
+/// The terms of "some path on this struct answers a body-carrying frame under a
+/// shared borrow", OR'd into the `RepeStruct::REPE_SHARED_SERVES_BODIES` this
+/// struct publishes.
+///
+/// The const is a hint the router reads before it takes the read lock, so the
+/// only cost of a wrong answer is concurrency: everything the shared borrow
+/// answers with a body, the exclusive path answers identically. That makes `true`
+/// the safe direction, and this over-approximates deliberately rather than
+/// tracking every arm shape exactly.
+///
+/// Four things put a body-carrying answer on this struct:
+///
+/// * `#[repe(readonly)]` on the struct, whose whole-object refusal is servable
+///   shared — there is no reason to take the write guard to say no;
+/// * `#[repe(readonly)]` on a field, for the same reason one level down;
+/// * a struct-listed `&self` method that takes arguments, which is a call
+///   rather than a mutation and is exactly what the shared path exists for; and
+/// * a `#[repe(nested)]` child with any of the above, at any depth.
+///
+/// The impl block's own methods and accessors are a fifth, but the derive
+/// cannot see them; `#[repe::methods]` computes
+/// `RepeMethods::REPE_SHARED_SERVES_BODIES` and this ORs it in.
+///
+/// A `#[repe(nested_serde)]` field contributes no term unless it is read-only:
+/// it is walked through `serde`, and a write through it needs `&mut self`.
+///
+/// An empty result means the constant `false` — a struct of plain fields whose
+/// every write needs the exclusive borrow, which is the shape the skip is for.
+fn shared_body_terms(
+    fields: &[FieldSpec],
+    struct_attrs: &StructAttrs,
+    from_impl_block: bool,
+    repe: &TokenStream2,
+) -> Vec<TokenStream2> {
+    // A refusal that needs no state, or a call that needs no mutation: both are
+    // answers this struct can give without the write guard.
+    if struct_attrs.readonly
+        || struct_attrs
+            .methods
+            .iter()
+            .any(|m| matches!(m.receiver, ReceiverKind::Ref) && !m.args.is_empty())
+    {
+        return vec![quote! { true }];
+    }
+
+    let mut terms = Vec::new();
+    if from_impl_block {
+        terms.push(quote! {
+            <Self as #repe::structs::RepeMethods>::REPE_SHARED_SERVES_BODIES
+        });
+    }
+    for field in fields {
+        if field.attrs.skip {
+            continue;
+        }
+        if field.attrs.readonly {
+            return vec![quote! { true }];
+        }
+        if !field.attrs.nested {
+            continue;
+        }
+        let ty = &field.ty;
+        terms.push(quote! {
+            <#ty as #repe::RepeStruct>::REPE_SHARED_SERVES_BODIES
+        });
+    }
+    terms
+}
+
 fn listing_decline_terms(
     fields: &[FieldSpec],
     from_impl_block: bool,
@@ -2319,6 +2403,20 @@ fn methods_impl(
         .iter()
         .any(|spec| !matches!(spec.get.receiver, ReceiverKind::Ref));
 
+    // Which endpoints in this table answer a frame that carries a body without
+    // the exclusive borrow: a `&self` method taking arguments (a call, not a
+    // mutation), a `&self` setter, and a read-only accessor, whose refusal
+    // needs no state to give. Everything else declines, and the router can skip
+    // the attempt when nothing here is any of the three.
+    let shared_serves_bodies = published
+        .methods
+        .iter()
+        .any(|spec| matches!(spec.receiver, ReceiverKind::Ref) && !spec.args.is_empty())
+        || published.accessors.iter().any(|spec| match &spec.set {
+            Some(set) => matches!(set.receiver, ReceiverKind::Ref),
+            None => true,
+        });
+
     let mut bodies = Vec::new();
     for sink in [Sink::Value, Sink::Encode] {
         let arms = build_method_arms(&published.methods, repe, sink, Raise::Result)
@@ -2421,6 +2519,8 @@ fn methods_impl(
                 &[#(#accessor_endpoints),*];
 
             const REPE_LISTING_NEEDS_EXCLUSIVE: bool = #listing_needs_exclusive;
+
+            const REPE_SHARED_SERVES_BODIES: bool = #shared_serves_bodies;
 
             const REPE_TABLE_RECOVERED: bool = #recovered;
 
@@ -2943,4 +3043,172 @@ fn expand_plugin(args: PluginArgs, item_fn: syn::ItemFn) -> syn::Result<TokenStr
             unsafe { __REPE_PLUGIN_RUNTIME.call(request, request_size) }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    //! The rejections this macro makes at expansion time.
+    //!
+    //! Every one of these is a `syn::Error` the user reads as a compile error,
+    //! and its text is the whole remedy. Asserting on the message here rather
+    //! than on a captured rustc rendering keeps the check precise about the
+    //! sentence we wrote and indifferent to how the compiler frames it, which
+    //! changes between releases.
+
+    use super::*;
+    use syn::parse_quote;
+
+    fn field_error(field: syn::Field) -> String {
+        match parse_field(&field) {
+            Err(err) => err.to_string(),
+            Ok(spec) => panic!("`{}` was supposed to be rejected", spec.endpoint),
+        }
+    }
+
+    fn order(keys: &[&str]) -> ListingOrder {
+        ListingOrder {
+            keys: keys
+                .iter()
+                .map(|k| LitStr::new(k, Span::call_site()))
+                .collect(),
+            span: Span::call_site(),
+        }
+    }
+
+    fn declared(names: &[&str]) -> Vec<(&'static str, Span)> {
+        // Leaked so the borrow outlives the call; a test binary's lifetime.
+        names
+            .iter()
+            .map(|n| {
+                (
+                    &*Box::leak(n.to_string().into_boxed_str()),
+                    Span::call_site(),
+                )
+            })
+            .collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // Field attribute conflicts
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn typed_and_nested_are_rejected_together() {
+        let msg = field_error(parse_quote! {
+            #[repe(typed, nested)]
+            child: Child
+        });
+        assert!(
+            msg.contains("BEVE typed array"),
+            "the message should say why the two cannot combine, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn typed_and_nested_serde_are_rejected_together() {
+        let msg = field_error(parse_quote! {
+            #[repe(typed, nested_serde)]
+            child: Child
+        });
+        assert!(msg.contains("BEVE typed array"), "got: {msg}");
+    }
+
+    #[test]
+    fn nested_and_nested_serde_are_rejected_together() {
+        let msg = field_error(parse_quote! {
+            #[repe(nested, nested_serde)]
+            child: Child
+        });
+        assert!(
+            msg.contains("two ways to descend into one field"),
+            "the message should name the choice between them, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_field_attribute_is_rejected() {
+        let msg = field_error(parse_quote! {
+            #[repe(nonsense)]
+            a: u64
+        });
+        assert!(
+            msg.contains("unsupported `repe` field attribute"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn the_ordinary_combinations_are_accepted() {
+        for field in [
+            parse_quote! { #[repe(typed)] values: Vec<f64> },
+            parse_quote! { #[repe(nested)] child: Child },
+            parse_quote! { #[repe(nested_serde)] child: Child },
+            parse_quote! { #[repe(nested, readonly)] child: Child },
+            parse_quote! { #[repe(rename = "other")] a: u64 },
+            parse_quote! { #[repe(skip)] a: u64 },
+        ] {
+            let field: syn::Field = field;
+            assert!(parse_field(&field).is_ok());
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // `#[repe(listing_order(..))]`, the half checked at macro time
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_order_naming_every_endpoint_is_accepted() {
+        let d = declared(&["a", "b"]);
+        assert!(validate_listing_order(&order(&["b", "a"]), &d, false).is_ok());
+    }
+
+    #[test]
+    fn a_key_named_twice_is_rejected() {
+        let d = declared(&["a"]);
+        let msg = validate_listing_order(&order(&["a", "a"]), &d, false)
+            .expect_err("a repeated key is rejected")
+            .to_string();
+        assert!(msg.contains("named twice"), "got: {msg}");
+    }
+
+    #[test]
+    fn a_key_that_is_not_an_endpoint_is_rejected() {
+        let d = declared(&["a"]);
+        let msg = validate_listing_order(&order(&["a", "typo"]), &d, false)
+            .expect_err("an unknown key is rejected")
+            .to_string();
+        assert!(
+            msg.contains("`typo` is not an endpoint on this struct"),
+            "the message should name the offending key, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_endpoint_missing_from_the_order_is_rejected() {
+        let d = declared(&["a", "b"]);
+        let msg = validate_listing_order(&order(&["a"]), &d, false)
+            .expect_err("an omitted endpoint is rejected")
+            .to_string();
+        assert!(
+            msg.contains("`b` is missing from"),
+            "the message should name the omitted endpoint, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_impl_block_defers_the_unknown_key_check_to_the_const_assertion() {
+        // The derive cannot see the impl block's endpoints, so an unrecognized
+        // key here may still be one of them. `assert_listing_order` catches a
+        // genuine typo at compile time instead; `repe-core`'s
+        // `const_assertions.rs` pins that message.
+        let d = declared(&["a"]);
+        assert!(validate_listing_order(&order(&["a", "calc"]), &d, true).is_ok());
+
+        // The other direction is still checked, because a field the derive can
+        // see is one it knows the order must name.
+        let msg = validate_listing_order(&order(&["calc"]), &d, true)
+            .expect_err("a field omitted from the order is still rejected")
+            .to_string();
+        assert!(msg.contains("`a` is missing from"), "got: {msg}");
+    }
 }
