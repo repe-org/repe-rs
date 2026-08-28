@@ -2186,7 +2186,7 @@ where
             &mut *guard,
             relative,
             body,
-            &mut buf,
+            buf,
             req,
         ))
     }
@@ -2288,27 +2288,28 @@ fn dispatch_struct_segments<T>(
     handler: &mut T,
     relative: &str,
     body: Option<Value>,
-    buf: &mut Vec<u8>,
+    mut buf: Vec<u8>,
     req: &Message,
 ) -> Message
 where
     T: RepeStruct + ?Sized,
 {
-    let mut out = ResponseBody::new(buf);
+    let mut out = ResponseBody::new(&mut buf);
     let result = with_segments(relative, |segments| {
         handler.repe_handle_into(segments, body, &mut out)
     });
     let body_format = out.format();
-    finish_struct_response(req, std::mem::take(buf), body_format, result)
+    finish_struct_response(req, buf, body_format, result)
 }
 
 /// The shared-borrow counterpart: attempt the same dispatch through
 /// [`RepeStruct::repe_shared_into`], and report `None` if the struct declined
 /// because the path needs exclusive access.
 ///
-/// `body` and `buf` are both borrowed rather than moved, so a decline leaves the
-/// exclusive retry the request it was handed and the buffer already allocated
-/// for it. That is the contract [`RepeStruct::repe_shared_into`] documents on
+/// `body` and `buf` are both borrowed rather than moved — the one place the two
+/// dispatch helpers differ, and for the reason the shared path exists: a decline
+/// leaves the exclusive retry the request it was handed and the buffer already
+/// allocated for it. That is the contract [`RepeStruct::repe_shared_into`] documents on
 /// the other side; the `clear` is the belt for a hand-written impl that breaks
 /// the half of it about writing nothing, since the retry would otherwise ship
 /// those bytes ahead of its own.

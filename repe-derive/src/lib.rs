@@ -289,7 +289,7 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
             },
         );
         let field_arms = build_field_arms(&field_specs, &repe, sink);
-        let method_arms = build_method_arms(&struct_attrs.methods, &repe, sink);
+        let method_arms = build_method_arms(&struct_attrs.methods, &repe, sink, Raise::Result);
         let fallthrough = if from_impl_block {
             let call = sink.methods_method();
             let args = sink.with_out(quote! { self, segments, body });
@@ -394,7 +394,8 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
         }
     };
     let shared_field_arms = build_shared_field_arms(&field_specs, &repe);
-    let shared_method_arms = build_shared_method_arms(&struct_attrs.methods, &repe);
+    let shared_method_arms =
+        build_method_arms(&struct_attrs.methods, &repe, Sink::Encode, Raise::Shared);
     let shared_fallthrough = if from_impl_block {
         quote! {
             _ => <Self as #repe::structs::RepeMethods>::repe_call_shared_into(
@@ -1074,18 +1075,6 @@ enum ListingSink {
 }
 
 impl ListingSink {
-    /// Run one fallible entry, propagating a failure in this listing's shape.
-    fn attempt(self, expr: TokenStream2) -> TokenStream2 {
-        match self {
-            ListingSink::Value | ListingSink::Encode => quote! { #expr?; },
-            ListingSink::Shared => quote! {
-                if let Err(__repe_err) = #expr {
-                    return Some(Err(__repe_err));
-                }
-            },
-        }
-    }
-
     /// The `RepeStruct` method a `#[repe(nested)]` child is listed through.
     fn child_call(self, repe: &TokenStream2, ty: &Type, ident: &Ident) -> TokenStream2 {
         match self {
@@ -1186,9 +1175,12 @@ impl ListingSink {
                     map.insert(String::from(#key), __repe_value);
                 }
             },
-            ListingSink::Encode | ListingSink::Shared => {
-                self.attempt(quote! { __repe_obj.entry(#key, &#value) })
-            }
+            ListingSink::Encode => quote! { __repe_obj.entry(#key, &#value)?; },
+            ListingSink::Shared => quote! {
+                if let Err(__repe_err) = __repe_obj.entry(#key, &#value) {
+                    return Some(Err(__repe_err));
+                }
+            },
         }
     }
 
@@ -1356,6 +1348,9 @@ fn nested_dispatch(
 }
 
 fn build_field_arms(fields: &[FieldSpec], repe: &TokenStream2, sink: Sink) -> Vec<TokenStream2> {
+    let refuse = refuse_write(repe, Raise::Result);
+    let subpath = refuse_subpath(repe, Raise::Result);
+    let ack = sink.emit_null();
     let mut arms = Vec::new();
     for field in fields {
         if field.attrs.skip {
@@ -1364,9 +1359,6 @@ fn build_field_arms(fields: &[FieldSpec], repe: &TokenStream2, sink: Sink) -> Ve
         let key = LitStr::new(&field.endpoint, Span::call_site());
         let ident = &field.ident;
         let path = endpoint_path(&field.endpoint);
-        let refuse = refuse_write(repe, Raise::Result);
-        let subpath = refuse_subpath(repe, Raise::Result);
-        let ack = sink.emit_null();
 
         if field.attrs.nested {
             // Reading the child whole differs from writing it by one step in the
@@ -1382,74 +1374,61 @@ fn build_field_arms(fields: &[FieldSpec], repe: &TokenStream2, sink: Sink) -> Ve
                 Sink::Encode => whole,
             };
 
-            if field.attrs.readonly {
-                // `readonly` on a nested field refuses every write *through* it,
-                // subpaths included: the attribute says the field cannot be
-                // written, and a write below it mutates the field just as surely
-                // as a write at it.
-                let read_whole = lift(nested_dispatch(
-                    &field.ty,
-                    ident,
-                    key.clone(),
-                    quote! { &[], None },
-                    repe,
-                    sink,
-                ));
-                let read_descend = nested_dispatch(
-                    &field.ty,
-                    ident,
-                    key.clone(),
-                    quote! { tail, None },
-                    repe,
-                    sink,
-                );
-                arms.push(quote! {
-                    #key => {
-                        if body.is_some() {
-                            return #refuse;
-                        }
-                        if tail.is_empty() {
-                            return #read_whole;
-                        }
-                        return #read_descend;
+            // `readonly` on a nested field refuses every write *through* it,
+            // subpaths included: the attribute says the field cannot be written,
+            // and a write below it mutates the field just as surely as a write
+            // at it. Past this guard `body` is `None`, so the descent below is
+            // the same code either way.
+            let guard = field.attrs.readonly.then(|| {
+                quote! {
+                    if body.is_some() {
+                        return #refuse;
                     }
-                });
-            } else {
-                // The whole-child write descends, exactly as the whole-child
-                // read already did. Before this, a write with an empty tail
-                // replaced the child — `self.field = from_value(body)?` — and so
-                // was the one path on which a child's own `RepeStruct` impl was
-                // never consulted. That is precisely the path where a child
-                // backed by a resource has something to say: applying a partial
-                // object to live state is not the same operation as replacing a
-                // struct. A derived child's empty-segments arm is
-                // still `*self = from_value(..)`, so nothing that worked before
-                // changes; only a hand-written child gains a say.
-                let whole = lift(nested_dispatch(
-                    &field.ty,
-                    ident,
-                    key.clone(),
-                    quote! { &[], body },
-                    repe,
-                    sink,
-                ));
-                let descend = nested_dispatch(
-                    &field.ty,
-                    ident,
-                    key.clone(),
-                    quote! { tail, body },
-                    repe,
-                    sink,
-                );
-                arms.push(quote! {
-                    #key => {
+                }
+            });
+
+            // The whole-child write descends, exactly as the whole-child read
+            // already did. Before this, a write with an empty tail replaced the
+            // child — `self.field = from_value(body)?` — and so was the one path
+            // on which a child's own `RepeStruct` impl was never consulted. That
+            // is precisely the path where a child backed by a resource has
+            // something to say: applying a partial object to live state is not
+            // the same operation as replacing a struct. A derived child's
+            // empty-segments arm is still `*self = from_value(..)`, so nothing
+            // that worked before changes; only a hand-written child gains a say.
+            let descend = nested_dispatch(
+                &field.ty,
+                ident,
+                key.clone(),
+                quote! { tail, body },
+                repe,
+                sink,
+            );
+            let body = match sink {
+                // `tail` *is* the empty slice when it is empty, and `lift` is
+                // the identity here, so the two branches the `Value` sink needs
+                // would be the same call twice.
+                Sink::Encode => quote! { return #descend; },
+                // Only here do they differ: a whole-child read has to lift the
+                // child's `Option` into this struct's.
+                Sink::Value => {
+                    let whole = lift(nested_dispatch(
+                        &field.ty,
+                        ident,
+                        key.clone(),
+                        quote! { &[], body },
+                        repe,
+                        sink,
+                    ));
+                    quote! {
                         if tail.is_empty() {
                             return #whole;
                         }
                         return #descend;
                     }
-                });
-            }
+                }
+            };
+            arms.push(quote! { #key => { #guard #body } });
         } else if field.attrs.nested_serde {
             // Descend by walking a `serde_json::Value` of the field. The whole
             // point is that the field's type implements only `Serialize` +
@@ -1735,38 +1714,55 @@ fn decode_method_args(
     }
 }
 
-fn build_method_arms(methods: &[MethodSpec], repe: &TokenStream2, sink: Sink) -> Vec<TokenStream2> {
+fn build_method_arms(
+    methods: &[MethodSpec],
+    repe: &TokenStream2,
+    sink: Sink,
+    raise: Raise,
+) -> Vec<TokenStream2> {
     methods
         .iter()
-        .map(|method| build_method_arm(method, repe, sink))
+        .map(|method| build_method_arm(method, repe, sink, raise))
         .collect()
 }
 
-fn build_method_arm(method: &MethodSpec, repe: &TokenStream2, sink: Sink) -> TokenStream2 {
+fn build_method_arm(
+    method: &MethodSpec,
+    repe: &TokenStream2,
+    sink: Sink,
+    raise: Raise,
+) -> TokenStream2 {
     let key = LitStr::new(&method.endpoint, Span::call_site());
+    // A `&mut self` method cannot run under a shared borrow however the frame is
+    // shaped. Declining costs nothing: the exclusive path answers it exactly as
+    // it always has.
+    if matches!(raise, Raise::Shared) && !matches!(method.receiver, ReceiverKind::Ref) {
+        return quote! { #key => None, };
+    }
     let path = endpoint_path(&method.endpoint);
-    let subpath = refuse_subpath(repe, Raise::Result);
+    let subpath = refuse_subpath(repe, raise);
     let method_ident = &method.method_ident;
 
     let bindings: Vec<Ident> = (0..method.args.len())
         .map(|i| format_ident!("__repe_arg{}", i))
         .collect();
 
-    let decode_args = decode_method_args(method, &bindings, repe, Raise::Result);
+    let decode_args = decode_method_args(method, &bindings, repe, raise);
 
-    let ok_is_unit = method.ret.ok_is_unit();
-    let emit_ok = if ok_is_unit {
+    let emit_ok = if method.ret.ok_is_unit() {
         sink.emit_null()
     } else {
         sink.emit_value(repe, &path, quote! { __repe_ok })
     };
-    let call_and_emit = call_and_emit(
-        quote! { Self::#method_ident(self #(, #bindings)*) },
-        &method.ret,
-        emit_ok,
-        repe,
-        &path,
-    );
+    // Spanned at the method name, because this is the one call in the generated
+    // code whose receiver comes from a *declaration* rather than from a
+    // signature: a `#[repe(methods(..))]` entry that says `&self` for a
+    // `&mut self` method fails here, and the error has to point at that entry
+    // rather than at `#[derive(RepeStruct)]`.
+    let invocation = quote_spanned! { method_ident.span()=>
+        Self::#method_ident(self #(, #bindings)*)
+    };
+    let call = raise.ok(call_and_emit(invocation, &method.ret, emit_ok, repe, &path));
 
     quote! {
         #key => {
@@ -1774,7 +1770,7 @@ fn build_method_arm(method: &MethodSpec, repe: &TokenStream2, sink: Sink) -> Tok
                 return #subpath;
             }
             #decode_args
-            #call_and_emit
+            #call
         }
     }
 }
@@ -1840,36 +1836,49 @@ fn call_and_emit(
 /// The only difference is where the value comes from — a getter call instead of
 /// a field read, a setter call instead of an assignment — which is the whole
 /// point of the attribute.
-fn build_accessor_arm(accessor: &AccessorSpec, repe: &TokenStream2, sink: Sink) -> TokenStream2 {
+fn build_accessor_arm(
+    accessor: &AccessorSpec,
+    repe: &TokenStream2,
+    sink: Sink,
+    raise: Raise,
+) -> TokenStream2 {
     let key = LitStr::new(&accessor.endpoint, Span::call_site());
     let path = endpoint_path(&accessor.endpoint);
-    let subpath = refuse_subpath(repe, Raise::Result);
+    let subpath = refuse_subpath(repe, raise);
 
-    let getter = &accessor.get.method_ident;
-    let emit = if accessor.typed {
-        sink.emit_typed_slice(repe, &path, quote! { __repe_ok })
-    } else {
-        sink.emit_value(repe, &path, quote! { __repe_ok })
-    };
-    let read = call_and_emit(
-        quote! { Self::#getter(self) },
-        &accessor.get.ret,
-        emit,
-        repe,
-        &path,
-    );
+    // No `ok_is_unit` branch: a getter that returns nothing is rejected at
+    // `parse_impl_method`, since the listing would have no value to show for the
+    // endpoint. A `&mut self` getter cannot run under a shared borrow.
+    let read =
+        if matches!(raise, Raise::Shared) && !matches!(accessor.get.receiver, ReceiverKind::Ref) {
+            quote! { None }
+        } else {
+            let getter = &accessor.get.method_ident;
+            let emit = if accessor.typed {
+                sink.emit_typed_slice(repe, &path, quote! { __repe_ok })
+            } else {
+                sink.emit_value(repe, &path, quote! { __repe_ok })
+            };
+            raise.ok(call_and_emit(
+                quote! { Self::#getter(self) },
+                &accessor.get.ret,
+                emit,
+                repe,
+                &path,
+            ))
+        };
 
     // A getter with no setter *is* a read-only endpoint, so the refusal is the
     // same one `#[repe(readonly)]` produces on a field. Emitting only the
     // rejection — never a write followed by dead code — keeps generated code
-    // clean under `#![deny(warnings)]`, as the field arms do.
-    let write = match &accessor.set {
-        None => quote! {
-            Some(_) => Err(#repe::StructError::BodyUnexpected {
-                path: #repe::structs::path_from_segments(segments),
-            }),
-        },
-        Some(set) => {
+    // clean under `#![deny(warnings)]`, as the field arms do. A setter mutates
+    // by construction, so the shared borrow declines it; the refusal above
+    // mutates nothing and is served either way.
+    let refuse = refuse_write(repe, raise);
+    let write = match (&accessor.set, raise) {
+        (None, _) => quote! { Some(_) => #refuse, },
+        (Some(_), Raise::Shared) => quote! { Some(_) => None, },
+        (Some(set), Raise::Result) => {
             let setter = &set.method_ident;
             let ty = &set.args[0].1;
             let call = call_and_emit(
@@ -1911,17 +1920,20 @@ fn build_accessor_arm(accessor: &AccessorSpec, repe: &TokenStream2, sink: Sink) 
 //
 // `repe_shared_into` and `repe_call_shared_into` serve a request through
 // `&self`, so a read does not queue behind a long-running call on the same
-// object. They are built separately from the two `&mut self` bodies rather than
-// as a third `Sink` pass, because the arm *shape* is genuinely different: an arm
-// that cannot be served under a shared borrow declines instead of answering, and
-// a decline is not a value any sink can encode.
+// object. A decline is not a value any sink can encode, so this is not a third
+// `Sink`; it is a second `Raise`, and the arms themselves are the same
+// generators the exclusive path uses — `build_method_arm`, `build_accessor_arm`
+// — called with `Raise::Shared`.
 //
-// The encoding is not duplicated. Every value below goes through the same
-// `Sink::Encode` emitter the exclusive path uses, wrapped in `Some(..)`, and the
-// argument decoding through the same `decode_method_args`, so the two cannot
-// disagree about how a value is serialized or how a body is read — only about
-// whether this path serves it at all. `tests/shared_reads.rs` pins the rest by
-// driving one struct through both and comparing frames.
+// That is why the two cannot disagree about how a value is serialized or how a
+// body is read: it is one generator, not two kept in step. They differ only in
+// whether this borrow serves a path at all, which is decided from the receiver
+// at the top of each arm. `tests/shared_reads.rs` pins the rest by driving one
+// struct through both and comparing frames.
+//
+// The field and listing arms are still built separately, because there the
+// shapes genuinely diverge: a nested child is asked to decline in turn, and a
+// listing rewinds.
 //
 // **What decides.** The receiver, not the frame. REPE separates read from write
 // at the frame level, and taking that as the borrow rule meant a `&self` method
@@ -1950,104 +1962,6 @@ fn build_accessor_arm(accessor: &AccessorSpec, repe: &TokenStream2, sink: Sink) 
 //
 // Reading one of those endpoints on its own is unaffected: that arm decides from
 // the receiver, before it calls anything.
-
-/// One shared arm per published method: served when the receiver is `&self`,
-/// arguments and all.
-fn build_shared_method_arms(methods: &[MethodSpec], repe: &TokenStream2) -> Vec<TokenStream2> {
-    methods
-        .iter()
-        .map(|method| build_shared_method_arm(method, repe))
-        .collect()
-}
-
-fn build_shared_method_arm(method: &MethodSpec, repe: &TokenStream2) -> TokenStream2 {
-    let key = LitStr::new(&method.endpoint, Span::call_site());
-    // A `&mut self` method cannot run under this borrow however the frame is
-    // shaped. Declining costs nothing: the exclusive path answers it exactly as
-    // it always has.
-    if !matches!(method.receiver, ReceiverKind::Ref) {
-        return quote! { #key => None, };
-    }
-    let path = endpoint_path(&method.endpoint);
-    let method_ident = &method.method_ident;
-    let bindings: Vec<Ident> = (0..method.args.len())
-        .map(|i| format_ident!("__repe_arg{}", i))
-        .collect();
-    let decode_args = decode_method_args(method, &bindings, repe, Raise::Shared);
-    let emit_ok = if method.ret.ok_is_unit() {
-        Sink::Encode.emit_null()
-    } else {
-        Sink::Encode.emit_value(repe, &path, quote! { __repe_ok })
-    };
-    // Spanned at the method name, because this is the one call in the generated
-    // code whose receiver comes from a *declaration* rather than from a
-    // signature: a `#[repe(methods(..))]` entry that says `&self` for a
-    // `&mut self` method fails here, and the error has to point at that entry
-    // rather than at `#[derive(RepeStruct)]`.
-    let invocation = quote_spanned! { method_ident.span()=>
-        Self::#method_ident(self #(, #bindings)*)
-    };
-    let call = call_and_emit(invocation, &method.ret, emit_ok, repe, &path);
-    let subpath = refuse_subpath(repe, Raise::Shared);
-    quote! {
-        #key => {
-            if !tail.is_empty() {
-                return #subpath;
-            }
-            #decode_args
-            Some(#call)
-        }
-    }
-}
-
-/// The shared arm for a field-shaped endpoint: the getter, when it takes
-/// `&self`. A setter mutates by construction, so the write half is never served
-/// here — except the refusal a read-only accessor gives it, which mutates
-/// nothing.
-fn build_shared_accessor_arm(accessor: &AccessorSpec, repe: &TokenStream2) -> TokenStream2 {
-    let key = LitStr::new(&accessor.endpoint, Span::call_site());
-    let path = endpoint_path(&accessor.endpoint);
-    let subpath = refuse_subpath(repe, Raise::Shared);
-
-    let read = if matches!(accessor.get.receiver, ReceiverKind::Ref) {
-        let getter = &accessor.get.method_ident;
-        // No `ok_is_unit` branch, matching `build_accessor_arm`: a getter that
-        // returns nothing is rejected at `parse_impl_method`, since the listing
-        // would have no value to show for the endpoint.
-        let emit_ok = if accessor.typed {
-            Sink::Encode.emit_typed_slice(repe, &path, quote! { __repe_ok })
-        } else {
-            Sink::Encode.emit_value(repe, &path, quote! { __repe_ok })
-        };
-        let call = call_and_emit(
-            quote! { Self::#getter(self) },
-            &accessor.get.ret,
-            emit_ok,
-            repe,
-            &path,
-        );
-        quote! { Some(#call) }
-    } else {
-        quote! { None }
-    };
-
-    let write = match &accessor.set {
-        None => refuse_write(repe, Raise::Shared),
-        Some(_) => quote! { None },
-    };
-
-    quote! {
-        #key => {
-            if !tail.is_empty() {
-                return #subpath;
-            }
-            if body.is_some() {
-                return #write;
-            }
-            #read
-        }
-    }
-}
 
 /// One shared arm per field: a leaf serializes itself, a nested field asks its
 /// child, which may decline in turn, and a write declines unless the field is
@@ -2399,13 +2313,13 @@ fn methods_impl(
 
     let mut bodies = Vec::new();
     for sink in [Sink::Value, Sink::Encode] {
-        let arms = build_method_arms(&published.methods, repe, sink)
+        let arms = build_method_arms(&published.methods, repe, sink, Raise::Result)
             .into_iter()
             .chain(
                 published
                     .accessors
                     .iter()
-                    .map(|accessor| build_accessor_arm(accessor, repe, sink)),
+                    .map(|accessor| build_accessor_arm(accessor, repe, sink, Raise::Result)),
             )
             .collect::<Vec<_>>();
         let (signature, ret, unused) = match sink {
@@ -2449,13 +2363,13 @@ fn methods_impl(
         });
     }
 
-    let shared_arms = build_shared_method_arms(&published.methods, repe)
+    let shared_arms = build_method_arms(&published.methods, repe, Sink::Encode, Raise::Shared)
         .into_iter()
         .chain(
             published
                 .accessors
                 .iter()
-                .map(|accessor| build_shared_accessor_arm(accessor, repe)),
+                .map(|accessor| build_accessor_arm(accessor, repe, Sink::Encode, Raise::Shared)),
         )
         .collect::<Vec<_>>();
     let shared_invalid_root = quote! {

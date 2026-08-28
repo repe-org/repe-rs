@@ -240,13 +240,7 @@ impl<T: RepeStruct> RepeStruct for Option<T> {
             Some(inner) => inner.repe_shared_into(segments, body, out),
             // Absent is a constant: no state to borrow exclusively, so every
             // answer above is servable here and none of them touches `body`.
-            None => Some(match absent_child(segments, body.is_some()) {
-                Ok(()) => {
-                    out.write_null();
-                    Ok(())
-                }
-                Err(err) => Err(err),
-            }),
+            None => Some(absent_child(segments, body.is_some()).map(|()| out.write_null())),
         }
     }
 
@@ -786,7 +780,7 @@ pub const fn assert_no_endpoint_collision(
             );
         }
 
-        if const_contains_endpoint(methods, accessors[i]) {
+        if listed_signature(methods, accessors[i]).is_some() {
             panic!(
                 "a `#[repe::methods]` method and a `#[repe(get = \"...\")]` accessor in the \
                  same table share an endpoint name: one of them is unreachable, and the \
@@ -829,7 +823,7 @@ pub const fn assert_listing_order(
     while i < order.len() {
         let known = const_contains(declared, order[i])
             || const_contains(accessors, order[i])
-            || const_contains_endpoint(methods, order[i]);
+            || listed_signature(methods, order[i]).is_some();
         if !known && !recovering {
             panic!(
                 "`#[repe(listing_order(..))]` names a key that is not an endpoint on this \
@@ -875,10 +869,7 @@ pub const fn assert_listing_order(
 /// `#[repe::methods]` block, so it does not know which of the two tables an
 /// ordered key came from, but the tables themselves are constants and the
 /// question folds away before run time.
-pub const fn listed_signature(
-    methods: &[(&'static str, &'static str)],
-    name: &str,
-) -> Option<&'static str> {
+pub const fn listed_signature<'a>(methods: &[(&'a str, &'a str)], name: &str) -> Option<&'a str> {
     let mut i = 0;
     while i < methods.len() {
         if const_str_eq(methods[i].0, name) {
@@ -887,18 +878,6 @@ pub const fn listed_signature(
         i += 1;
     }
     None
-}
-
-/// [`const_contains`] over the endpoint half of an `(endpoint, signature)` table.
-const fn const_contains_endpoint(methods: &[(&str, &str)], name: &str) -> bool {
-    let mut i = 0;
-    while i < methods.len() {
-        if const_str_eq(methods[i].0, name) {
-            return true;
-        }
-        i += 1;
-    }
-    false
 }
 
 /// `slice.contains(&name)` usable in a `const` context.
