@@ -200,6 +200,14 @@ pub trait RepeStruct: Send + Sync {
 ///   when absent, since a `null` needs no exclusive borrow, and with the inner
 ///   value's own answer when present.
 ///
+/// **Presence is the host's, not the client's.** A `null` written at the child's
+/// own path is refused with [`StructError::BodyUnexpected`] whether the child is
+/// there or not, so the one value this path can read back is the one value it
+/// will not take. Removing a child would otherwise be a door that only opens one
+/// way, since creating one is the write an absent child already refuses. A
+/// whole-object write at the *parent* replaces the field, `null` included; that
+/// is a replace of the parent rather than a write to this path.
+///
 /// This matches what Glaze publishes for an unmapped optional member, so a
 /// port's wire shape does not change with the language.
 impl<T: RepeStruct> RepeStruct for Option<T> {
@@ -208,6 +216,7 @@ impl<T: RepeStruct> RepeStruct for Option<T> {
         segments: &[&str],
         body: Option<Value>,
     ) -> StructResult<Option<Value>> {
+        refuse_presence_write(segments, body.as_ref())?;
         match self {
             Some(inner) => inner.repe_handle(segments, body),
             None => absent_child(segments, body.is_some()).map(|()| None),
@@ -220,6 +229,7 @@ impl<T: RepeStruct> RepeStruct for Option<T> {
         body: Option<Value>,
         out: &mut ResponseBody<'_>,
     ) -> StructResult<()> {
+        refuse_presence_write(segments, body.as_ref())?;
         match self {
             Some(inner) => inner.repe_handle_into(segments, body, out),
             None => {
@@ -236,6 +246,12 @@ impl<T: RepeStruct> RepeStruct for Option<T> {
         body: &mut Option<Value>,
         out: &mut ResponseBody<'_>,
     ) -> Option<StructResult<()>> {
+        // Refusing touches nothing, so it needs no exclusive borrow — and it has
+        // to be decided here rather than left to the retry, or a present child
+        // would forward the `null` to its inner value under both guards.
+        if let Err(err) = refuse_presence_write(segments, body.as_ref()) {
+            return Some(Err(err));
+        }
         match self {
             Some(inner) => inner.repe_shared_into(segments, body, out),
             // Absent is a constant: no state to borrow exclusively, so every
@@ -250,6 +266,31 @@ impl<T: RepeStruct> RepeStruct for Option<T> {
             None => false,
         }
     }
+}
+
+/// Refuse a `null` written at an optional child's **own** path, present or
+/// absent.
+///
+/// `null` is what that path *reads* when the child is absent, so a client will
+/// try writing it back, and without this it lands on whichever branch happens to
+/// be live: a present child forwards it to its inner value and answers with that
+/// type's serde complaint, an absent one answers `InvalidPath`. Neither says
+/// what is actually true, which is that presence is not settable here.
+///
+/// It is refused rather than honoured because honouring it would open a one-way
+/// door: `null` could remove a child, and nothing could put it back — creating
+/// one is the write an absent child already refuses, for the reason that a
+/// client configuring something that is not there must not be told it worked.
+/// Presence belongs to the host on both sides of that. A whole-object write at
+/// the *parent* still replaces the field, `null` included; that is a replace of
+/// the parent, not a write to this path.
+fn refuse_presence_write(segments: &[&str], body: Option<&Value>) -> StructResult<()> {
+    if segments.is_empty() && matches!(body, Some(Value::Null)) {
+        return Err(StructError::BodyUnexpected {
+            path: path_from_segments(segments),
+        });
+    }
+    Ok(())
 }
 
 /// The absent half of [`RepeStruct for Option<T>`](RepeStruct#impl-RepeStruct-for-Option<T>):
@@ -311,6 +352,17 @@ pub trait RepeMethods: MethodsDeclared {
     /// listing asks the same question of `repe_call_shared_into`, where a `None`
     /// is not a failure — it declines the whole listing to the exclusive path.
     const REPE_ACCESSOR_ENDPOINTS: &'static [&'static str] = &[];
+
+    /// `true` only on the placeholder table `#[repe::methods]` emits when the
+    /// block itself failed to parse.
+    ///
+    /// That table publishes nothing, so every compile-time check against it
+    /// would fire and bury the real error under a second, misleading one. This
+    /// says "these tables are not the truth" so those checks can stand down —
+    /// which emptiness alone cannot say, because a block that compiles and
+    /// publishes nothing is empty too, and its checks must still run.
+    #[doc(hidden)]
+    const REPE_TABLE_RECOVERED: bool = false;
 
     /// Whether the whole-struct listing must be served exclusively because some
     /// entry in it can only be read through `&mut self`.
@@ -809,16 +861,16 @@ pub const fn assert_listing_order(
     declared: &[&str],
     methods: &[(&str, &str)],
     accessors: &[&str],
+    recovering: bool,
 ) {
-    // Both tables empty is the shape `#[repe::methods]` emits when the block
-    // itself failed to compile: it publishes nothing so that a real error in the
-    // block is not buried under a second, misleading one about the marker. Every
-    // key here would then look unknown, and this assertion would be exactly the
-    // extra error that recovery exists to prevent. The two completeness loops
-    // below are already vacuous in that shape, so skipping this one loses
-    // nothing a compiling block would have caught.
-    let recovering = methods.is_empty() && accessors.is_empty();
-
+    // `recovering` is [`RepeMethods::REPE_TABLE_RECOVERED`]: the block failed to
+    // parse, so the tables describe nothing and every key here would look
+    // unknown. This assertion would then be exactly the extra error that
+    // recovery exists to prevent. It must come from the marker rather than from
+    // the tables being empty — a block that compiles and publishes nothing is
+    // also empty, and an unknown key in *that* struct's order has to be caught
+    // here, because the derive skips its own check whenever an impl block is in
+    // play.
     let mut i = 0;
     while i < order.len() {
         let known = const_contains(declared, order[i])

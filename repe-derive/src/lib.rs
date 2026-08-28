@@ -249,6 +249,7 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
                     &[#(#declared),*],
                     <#struct_ident as #repe::structs::RepeMethods>::REPE_METHOD_SIGNATURES,
                     <#struct_ident as #repe::structs::RepeMethods>::REPE_ACCESSOR_ENDPOINTS,
+                    <#struct_ident as #repe::structs::RepeMethods>::REPE_TABLE_RECOVERED,
                 );
             }
         });
@@ -2110,14 +2111,17 @@ fn expand_methods(mut item_impl: ItemImpl) -> TokenStream2 {
     }
 
     match collect_methods(&item_impl, stripped) {
-        Ok(published) => methods_impl(&item_impl, &published, &repe),
+        Ok(published) => methods_impl(&item_impl, &published, &repe, false),
         Err(err) => {
-            // Emit the diagnostic *and* a table with nothing in it. Failing with
-            // the error alone would drop the `RepeMethods` impl and add a second,
-            // misleading "no `#[repe::methods]` impl block" error on top of the
-            // real one.
+            // Emit the diagnostic *and* a table with nothing in it, marked as
+            // the recovery shape. Failing with the error alone would drop the
+            // `RepeMethods` impl and add a second, misleading "no
+            // `#[repe::methods]` impl block" error on top of the real one; the
+            // marker is what lets the compile-time checks against these tables
+            // stand down without also standing down for a block that compiles
+            // and happens to publish nothing.
             let error = err.to_compile_error();
-            let empty = methods_impl(&item_impl, &PublishedItems::default(), &repe);
+            let empty = methods_impl(&item_impl, &PublishedItems::default(), &repe, true);
             quote! {
                 #error
                 #empty
@@ -2286,6 +2290,7 @@ fn methods_impl(
     item_impl: &ItemImpl,
     published: &PublishedItems,
     repe: &TokenStream2,
+    recovered: bool,
 ) -> TokenStream2 {
     let self_ty = &item_impl.self_ty;
     let (impl_generics, _ty_generics, where_clause) = item_impl.generics.split_for_impl();
@@ -2413,6 +2418,8 @@ fn methods_impl(
                 &[#(#accessor_endpoints),*];
 
             const REPE_LISTING_NEEDS_EXCLUSIVE: bool = #listing_needs_exclusive;
+
+            const REPE_TABLE_RECOVERED: bool = #recovered;
 
             #(#bodies)*
         }

@@ -548,3 +548,71 @@ fn an_option_child_answers_the_same_under_both_locks() {
         );
     }
 }
+
+#[test]
+fn presence_is_not_settable_through_the_child_s_own_path() {
+    // `null` is what an absent child *reads*, so a client will try writing it
+    // back. It is refused either way: honouring it would let a client remove a
+    // child and never put it back, since creating one is the write an absent
+    // child already refuses.
+    for (kind, router) in routers(with_aux) {
+        assert_eq!(
+            body(&router, &read("/service/aux")),
+            json!({ "ticks": 12, "source": "alpha" }),
+            "under a {kind} the child is present to begin with"
+        );
+        assert_eq!(
+            answer(&router, &write("/service/aux", &Value::Null)).error_code(),
+            Some(ErrorCode::InvalidBody),
+            "under a {kind} a `null` write does not clear a present child"
+        );
+        assert_eq!(
+            body(&router, &read("/service/aux")),
+            json!({ "ticks": 12, "source": "alpha" }),
+            "under a {kind} it is still there"
+        );
+    }
+
+    for (kind, router) in routers(service) {
+        assert_eq!(
+            body(&router, &read("/service/aux")),
+            Value::Null,
+            "under a {kind} an absent child reads as null"
+        );
+        assert_eq!(
+            answer(&router, &write("/service/aux", &Value::Null)).error_code(),
+            Some(ErrorCode::InvalidBody),
+            "under a {kind} writing that value back is refused rather than a silent no-op"
+        );
+    }
+
+    // The refusal is served without the exclusive guard, like every other one.
+    let state = Arc::new(RwLock::new(with_aux()));
+    let router = Router::new().with_struct_shared::<Service, _>("/service", Arc::clone(&state));
+    let held = state.read().expect("the lock is not poisoned");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(router.call(&write("/service/aux", &Value::Null)));
+    });
+    let frame = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("refusing a presence write must not wait for the exclusive guard")
+        .expect("a non-notify request is answered");
+    let message = Message::from_slice(&frame).expect("the response is a REPE frame");
+    assert_eq!(message.error_code(), Some(ErrorCode::InvalidBody));
+    drop(held);
+
+    // And the whole-object write at the parent is a different operation: it
+    // replaces the field, `null` included. `Service` is `#[repe(readonly)]`, so
+    // that path is refused here for its own reason; a nested child under a
+    // writable parent still replaces.
+    assert_eq!(
+        answer(
+            &Router::new()
+                .with_struct_shared::<Service, _>("/service", Arc::new(RwLock::new(with_aux()))),
+            &write("/service", &json!({ "aux": null })),
+        )
+        .error_code(),
+        Some(ErrorCode::InvalidBody),
+    );
+}

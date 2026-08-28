@@ -87,6 +87,32 @@ impl Appended {
     fn reset(&mut self) {}
 }
 
+/// A `#[repe::methods]` block that compiles and publishes **nothing**.
+///
+/// Both generated tables are empty, which is also the shape the attribute emits
+/// when the block failed to parse. The const assertion stands down for that
+/// recovery shape so a real error is not buried under a second one, and it has
+/// to tell the two apart by the marker rather than by emptiness: the derive
+/// skips its own unknown-key check whenever an impl block is in play, so if the
+/// assertion also stood down here, `#[repe(listing_order("a", "typo"))]` would
+/// compile and then fail *every* whole-object read with `InvalidPath` while each
+/// endpoint still answered on its own path.
+#[derive(Clone, Default, Serialize, Deserialize, RepeStruct)]
+#[repe(methods)]
+#[repe(listing_order("beta", "alpha"))]
+struct Quiet {
+    alpha: u32,
+    beta: u32,
+}
+
+#[repe::methods]
+impl Quiet {
+    #[repe(skip)]
+    fn hidden(&self) -> u32 {
+        self.alpha
+    }
+}
+
 /// A struct with no `#[repe::methods]` block: everything the order names is
 /// visible to the derive, so the whole check happens at macro time.
 #[derive(Clone, Default, Serialize, Deserialize, RepeStruct)]
@@ -254,4 +280,24 @@ fn reordering_the_listing_changes_nothing_else() {
         .expect("a non-notify request is answered");
     let message = Message::from_slice(&frame).expect("the response is a REPE frame");
     assert_eq!(message.json_body::<f64>().unwrap(), 25.0);
+}
+
+#[test]
+fn an_order_is_still_checked_against_a_block_that_publishes_nothing() {
+    // The runtime half of the comment on `Quiet`. The compile-time half is that
+    // this file compiles at all: naming a key that is not an endpoint here is an
+    // `E0080` at the attribute, and it would not be if the assertion mistook an
+    // empty table for a failed one.
+    let router =
+        Router::new().with_struct_shared::<Quiet, _>("/q", Arc::new(RwLock::new(Quiet::default())));
+    assert_eq!(
+        listing_keys(&router, "/q"),
+        ["beta", "alpha"],
+        "a block that publishes nothing still gets its order emitted"
+    );
+    assert_eq!(
+        Quiet::default().hidden(),
+        0,
+        "`#[repe(skip)]` takes the method off the wire, not off the type"
+    );
 }
