@@ -12,20 +12,13 @@ pub fn parse(ptr: &str) -> Vec<String> {
         .collect()
 }
 
-/// Evaluate a JSON Pointer against a serde_json::Value and return a reference.
+/// Evaluate a JSON Pointer against a [`Value`] and return a reference.
+///
+/// The walk itself is [`repe_core::structs::serde_pointer`], which the struct
+/// router reaches directly because it already holds split segments. This is the
+/// string-pointer front end for a caller that does not.
 pub fn evaluate<'a>(v: &'a Value, ptr: &str) -> Option<&'a Value> {
-    let mut cur = v;
-    for tok in parse(ptr) {
-        match cur {
-            Value::Object(map) => {
-                cur = map.get(&tok)?;
-            }
-            Value::Array(arr) => {
-                let idx: usize = tok.parse().ok()?;
-                cur = arr.get(idx)?;
-            }
-            _ => return None,
-        }
-    }
-    Some(cur)
+    let tokens = parse(ptr);
+    let segments: Vec<&str> = tokens.iter().map(String::as_str).collect();
+    crate::structs::serde_pointer(v, &segments)
 }

@@ -54,7 +54,9 @@ pub(crate) fn route<'a>(router: &Router, header: &Header, query: &'a [u8]) -> Ro
                 };
             }
         },
-        QueryFormat::RawBinary => {
+        // Raw binary, and any query format this build does not know: neither is
+        // a path this router can look up.
+        _ => {
             return RouteOutcome::Reject {
                 notify,
                 code: ErrorCode::InvalidQuery,

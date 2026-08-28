@@ -2,7 +2,50 @@
 
 ## [Unreleased]
 
+Next release is a **major**: the shared-borrow trait methods change shape, and a whole-child write now descends.
+
+### Added
+- **New crate: `repe-core`.** The `RepeStruct` surface on its own — the trait, `RepeMethods`, `StructError`, `ResponseBody`, and the protocol constants those name. A crate that only *declares* a served type can now derive against it without pulling in the server, the client, or the transport, which a crate with a deliberately light dependency list could not do before. `repe` re-exports all of it at the paths it has always had (`repe::structs::*`, `repe::constants::*`), and `#[derive(RepeStruct)]` resolves against whichever of the two crates is in scope. Nothing moved for a caller of `repe`.
+
+- **Struct-level `#[repe(no_replace)]`.** Refuses a write of the whole object — and, because it emits only the refusal, never generates `serde_json::from_value::<Self>`. A derived struct is therefore no longer required to be `DeserializeOwned`, which a struct holding an open socket or a file handle never could be. Replaces a hand-written `Deserialize` that always errors.
+
+  Spelled apart from `#[repe(readonly)]` on purpose. The two are different statements: `readonly` on a field says *this subtree is not writable*, recursively, while this says *this type cannot be rebuilt from a body* and leaves every field writable. One word for both reads as correct and means the wrong thing one level up, and it would spend the spelling the recursive meaning should have if a struct ever wants one. `#[repe(readonly)]` on a struct is a compile error naming both.
+
+- **`#[repe(listing_order("a", "b", ..))]`.** The whole-object listing's key order, named in full. Without it a `#[repe(get/set)]` endpoint is always last, so a `glz::object` with a `custom<setter, getter>` in the middle had no counterpart here. Naming the sequence in full makes a typo or an omission a compile error: at macro time for fields and listed methods, and by a `const` assertion for the impl block's endpoints, which the derive cannot see. Reorders emission only.
+
+  It governs the two listings the router encodes through, which is every frame a client sees. It cannot govern `RepeStruct::repe_handle`, whose `serde_json::Map` sorts its keys unless the dependency graph enables `serde_json/preserve_order` — that has always been true of declaration order too.
+
+- **`#[repe(nested_serde)]`.** Descend into a field that implements only `Serialize` + `DeserializeOwned`, by walking a `serde_json::Value` of it. For a type there is no way to annotate — a third-party one, or one whose crate must not take this dependency. Prefer `#[repe(nested)]` (with `repe-core` where the edge is the problem): it descends without materializing anything. The cost here is paid only on a sub-path.
+
+- **`RepeStruct` for `Option<T>`.** A conditionally-present child. `Option` is foreign and the trait is not a host's, so this could only live here; the alternative was a newtype per crate. Present forwards to the inner value; absent reads as `null` at its own path and answers `MethodNotFound` to a write or any sub-path, because a silent no-op against a live resource is worse than an error. A `null` written at the child's own path is refused whether it is there or not: presence is the host's, not the client's, and honouring it would let a client remove a child it could never put back. Matches what Glaze publishes for an unmapped optional member.
+
 ### Changed
+- **BREAKING: the shared borrow serves a `&self` method that takes arguments.** The read/write distinction was made per *frame*, so a call carrying a body took the exclusive guard however it was declared — and one long-running `&self` call stalled every read of the object for as long as it ran. That is a regression against the C++ registry this replaces, which has no mutex at all, and it silently defeated `with_struct_rw` for exactly the endpoints that need it. The receiver is known where the arms are generated, so the receiver now decides.
+
+  `RepeStruct::repe_read_into` becomes `repe_shared_into(&self, segments, body: &mut Option<Value>, out)`, and `RepeMethods::repe_call_read_into` becomes `repe_call_shared_into` alongside it. Both still default to declining, so a hand-written impl that overrides neither is unaffected. The body is borrowed rather than moved so a decline leaves the exclusive retry the request it was handed, with no clone: take it only once the borrow has committed to answering.
+
+  The router skips the shared attempt outright for a body-carrying frame the struct cannot answer. REPE puts a body on a write and on a call with arguments alike, so the frame cannot tell them apart, but the type can: `RepeStruct::REPE_SHARED_SERVES_BODIES` (and `RepeMethods::REPE_SHARED_SERVES_BODIES` for one method table) is `false` when nothing generated can serve one, and a plain struct's writes then skip the read lock, the walk and the certain decline. Both default to `true`, so a hand-written impl is unaffected. It is a hint and cannot cost correctness: everything the shared borrow answers with a body, the exclusive path answers identically.
+
+  The JSON Pointer is split once for both attempts rather than once per attempt. A declining shared attempt used to hand the exclusive retry the same string to re-split, which for an escaped pointer meant running `json_pointer::parse` twice — four extra allocations per write, pinned now by `struct_write_under_a_shared_lock_splits_the_pointer_once`.
+
+- **BREAKING: a whole-child write descends into the child.** `#[repe(nested)]` used to assign over the field — `self.child = from_value(body)?` — which was the one path where a child's own `RepeStruct` impl was never consulted, and exactly the path where a child that owns live state has something to say. It is now `Child::repe_handle_into(&[], Some(body))`, matching the read. A derived child's empty-segments arm is still `*self = from_value(..)`, so nothing that worked before changes; only a hand-written child gains a say.
+
+  One consequence beyond the intent: a `#[repe(nested)]` child is no longer touched by `serde` from its parent at all — not on a write, not in the listing — so it needs neither `Serialize` nor `DeserializeOwned` for the parent's sake, only `RepeStruct`.
+
+- **BREAKING: `#[repe(readonly)]` on a nested field refuses sub-path writes too.** It previously guarded only the whole-child write. The attribute says the field cannot be written, and a write below it mutates the field just as surely.
+
+- **`ErrorCode`, `BodyFormat`, and `QueryFormat` now live in `repe-core`.** Re-exported unchanged; no caller-visible move. They are `#[non_exhaustive]`, which does nothing within a crate and everything across one, so `repe`'s own matches on them gained explicit unknown-variant arms. Eight report what the neighbouring unrecognized-code arm already reported; the ninth, `message::finish_response`, has no such neighbour and falls back to JSON, labelled as JSON.
+
+- **`repe-derive` is now `0.5.0`.** Its generated code names items that only exist alongside this release — `repe_shared_into`, `assert_listing_order`, `serde_pointer` — so the two move together, as they did at 9.0.0.
+
+- **New in `repe::structs`:** `serde_pointer` and `serde_pointer_set`, the pointer pair backing `#[repe(nested_serde)]` and useful on its own. `json_pointer::evaluate` is now a thin front end over `serde_pointer` rather than a second copy of the same walk. `assert_listing_order` and `listed_signature` are also new but `#[doc(hidden)]`: generated code names them, nothing else should, and `assert_no_endpoint_collision` is hidden with them for the same reason.
+
+- **BREAKING: `StructError` is `#[non_exhaustive]`,** joining `ErrorCode`, `BodyFormat`, and `QueryFormat`. A match on it from outside the crate needs a wildcard arm; `code()` maps any variant onto its protocol code without one.
+
+- **BREAKING: `structs::join_path` is removed.** It had no callers in this crate or its generated code, and 1.0.0 of `repe-core` is the wrong place to freeze a dead helper. `path_from_segments` is the one that is used.
+
+- **`RepeStruct` carries an `on_unimplemented` note.** The likeliest way to hit it is `#[repe(nested)]` on a type that only implements serde, so the message names `#[repe(nested_serde)]` and the `repe-core` derive as the two answers.
+
 - **Depend on `uniudp = "1.2.2"`** (raised from `1.2.1`) behind `fleet-udp`. 1.2.2 drops `mio`, `rand`, `subtle`, and `hmac`, taking 8 packages out of the lockfile: it moves to a plain `std::net::UdpSocket` and seeds from `getrandom` directly. The UDP wire format is unchanged and the MSRV floor is still 1.96 (below repe's 1.96.1), so this is a lockfile-and-floor move with no repe API change — repe drives only uniudp's sender.
 
   The `Cargo.toml` note explaining why `uniudp` is target-gated is corrected with it. The gate is still needed, but no longer because of mio: `getrandom` refuses `wasm32-unknown-unknown` unless the consumer enables its `wasm_js` backend. `--all-features --lib` still builds for wasm32.

@@ -438,7 +438,9 @@ impl Registry {
             Ok(BodyFormat::RawBinary) => Ok(Some(Value::Array(
                 req.body.iter().map(|byte| Value::from(*byte)).collect(),
             ))),
-            Err(_) => Err(RegistryError::UnsupportedBodyFormat {
+            // A code this build does not recognize, or a `BodyFormat` variant it
+            // does not know — the spec can add one, and neither is decodable here.
+            Ok(_) | Err(_) => Err(RegistryError::UnsupportedBodyFormat {
                 format: req.header.body_format,
             }),
         }

@@ -17,7 +17,6 @@ pub mod async_io;
 pub mod async_server;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod client;
-pub mod constants;
 pub mod error;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod fleet;
@@ -41,7 +40,6 @@ pub mod server;
 mod server_request;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod stream;
-pub mod structs;
 #[cfg(all(feature = "fleet-udp", not(target_arch = "wasm32")))]
 pub mod udp_client;
 #[cfg(all(feature = "fleet-udp", not(target_arch = "wasm32")))]
@@ -56,6 +54,18 @@ pub mod websocket_client;
 pub mod websocket_limits;
 #[cfg(all(feature = "websocket", not(target_arch = "wasm32")))]
 pub mod websocket_server;
+
+/// The `RepeStruct` surface, re-exported from [`repe_core`] at the paths it has
+/// always had.
+///
+/// The trait lives in its own crate so a type can be *declared* served without
+/// its crate depending on the server, the client, or the transport — a
+/// pure-logic crate with a no-I/O charter is the case that forced it. Nothing
+/// here moved as far as a caller is concerned: `repe::structs::RepeStruct` and
+/// `repe::constants::ErrorCode` name what they always did, and
+/// `#[derive(RepeStruct)]` resolves against whichever of the two crates is in
+/// scope.
+pub use repe_core::{constants, structs};
 
 #[doc(hidden)]
 pub mod derive {

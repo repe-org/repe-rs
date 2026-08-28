@@ -25,13 +25,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Tests
-        run: cargo test --all-features
+        run: cargo test --workspace --all-features
 
       - name: Docs
-        run: cargo doc --no-deps
+        run: cargo doc --workspace --no-deps
 
   # `wasm_client` is gated on `all(feature = "websocket-wasm", target_arch =
   # "wasm32")`, so the `check` job above never compiles it: `--all-features` on
@@ -164,7 +164,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Tests
-        run: cargo test --all-features
+        run: cargo test --workspace --all-features

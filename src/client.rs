@@ -734,7 +734,11 @@ impl Client {
                 );
                 Err(RepeError::Json(serde_json::Error::io(io_err)))
             }
-            Err(_) => Err(RepeError::UnknownEnumValue(resp.header.body_format as u64)),
+            // A code this build does not recognize, or a `BodyFormat` variant
+            // it does not know: `BodyFormat` is `#[non_exhaustive]`, so the spec
+            // can add one, and an unknown name decodes no better than an unknown
+            // number.
+            Ok(_) | Err(_) => Err(RepeError::UnknownEnumValue(resp.header.body_format as u64)),
         }
     }
 }

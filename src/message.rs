@@ -1343,6 +1343,12 @@ fn finish_response(
             builder.body_bytes(v).body_format(BodyFormat::RawBinary)
         }
         BodyFormat::Beve => builder.body_beve(&result)?,
+        // A `BodyFormat` this build does not know how to encode. `finish_response`
+        // is handed one by a caller that already chose it, so refusing is not an
+        // option here — but labelling JSON bytes with a code we did not encode
+        // them in is worse than falling back honestly. `body_json` sets the
+        // format to match what it wrote.
+        _ => builder.body_json(&result)?,
     };
     Ok(builder.build())
 }

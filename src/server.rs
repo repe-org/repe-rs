@@ -261,7 +261,7 @@ impl<H: HandlerErased> HandlerErased for OffReaderHandler<H> {
 }
 
 /// Lets an already-erased handler be wrapped again — by
-/// [`OffReaderHandler`], for [`Router::register_fallback_blocking`], which
+/// `OffReaderHandler`, for [`Router::register_fallback_blocking`], which
 /// receives an `Arc<dyn HandlerErased>` rather than a concrete type.
 ///
 /// Every method forwards, `execution` included, so the wrapper decides.
@@ -2128,26 +2128,12 @@ where
             ));
         };
 
-        // A read — a frame with no body, by REPE's own read/write distinction —
-        // may be servable through a shared borrow, which is the whole point of
-        // registering the struct behind an `RwLock`. A mutex answers `None`
-        // from a defaulted method with no work in it, so it compiles out.
-        if req.body.is_empty() {
-            match self
-                .shared
-                .with_read(|handler| read_struct_segments(handler, relative, req))
-            {
-                Some(Ok(Some(response))) => return Ok(response),
-                // The struct declined: this path needs `&mut self`. Nothing was
-                // written, so the exclusive attempt below starts from scratch.
-                Some(Ok(None)) => {}
-                Some(Err(err)) => return Ok(lock_error_response(req, path, err)),
-                // This lock has no shared mode.
-                None => {}
-            }
-        }
-
-        let body = if req.body.is_empty() {
+        // Decoded before either attempt, because the shared one is offered the
+        // body too: a `&self` method taking arguments is a call, not a
+        // mutation, and gating the shared path on an empty frame put every such
+        // call behind the write guard. The struct decides from the receiver it
+        // was generated from; this side only has to make the body available.
+        let mut body = if req.body.is_empty() {
             None
         } else {
             match BodyFormat::try_from(req.header.body_format) {
@@ -2155,7 +2141,9 @@ where
                     Some(serde_json::from_slice::<Value>(&req.body).map_err(RepeError::from)?)
                 }
                 Ok(BodyFormat::Beve) => Some(beve_from_slice(&req.body)?),
-                Ok(BodyFormat::RawBinary) | Err(_) => {
+                // Raw binary, an unrecognized code, and a `BodyFormat` this
+                // build does not know: none of them is a JSON tree.
+                Ok(_) | Err(_) => {
                     return Ok(create_error_response_like(
                         req,
                         ErrorCode::InvalidBody,
@@ -2168,12 +2156,52 @@ where
             }
         };
 
-        let mut guard = match self.shared.lock() {
-            Ok(g) => g,
-            Err(err) => return Ok(lock_error_response(req, path, err)),
-        };
+        // One buffer for both attempts: a declining shared attempt leaves it
+        // empty, so the exclusive retry inherits the allocation rather than
+        // making a second one.
+        let mut buf = response_buffer(req);
 
-        Ok(dispatch_struct_segments(&mut *guard, relative, body, req))
+        // One split for both attempts, for the same reason. A declining shared
+        // attempt would otherwise hand the exclusive retry the same string to
+        // re-split, and for an escaped pointer that is `json_pointer::parse`
+        // run twice — the `Vec<String>` and its `str::replace` per token, paid
+        // again to reach the identical segments.
+        let response = with_segments(relative, |segments| {
+            // The shared attempt, which is the whole point of registering the
+            // struct behind an `RwLock`. A mutex answers `None` from a defaulted
+            // method with no work in it, so it compiles out.
+            //
+            // A body-carrying frame is skipped entirely when the struct says no
+            // path can answer one: REPE puts a body on a write and on a call
+            // with arguments alike, so the frame cannot tell them apart, but the
+            // type can. For a plain struct of leaf fields the const is `false`
+            // and this folds away, taking the read lock and a certain decline
+            // with it. Skipping never changes the answer — everything the shared
+            // borrow serves with a body, the exclusive path below serves
+            // identically.
+            if body.is_none() || T::REPE_SHARED_SERVES_BODIES {
+                match self.shared.with_read(|handler| {
+                    shared_struct_segments(handler, segments, &mut body, &mut buf, req)
+                }) {
+                    Some(Ok(Some(response))) => return response,
+                    // The struct declined: this path needs `&mut self`. Nothing
+                    // was written and `body` was left in place, so the exclusive
+                    // attempt below starts from scratch.
+                    Some(Ok(None)) => {}
+                    Some(Err(err)) => return lock_error_response(req, path, err),
+                    // This lock has no shared mode.
+                    None => {}
+                }
+            }
+
+            let mut guard = match self.shared.lock() {
+                Ok(g) => g,
+                Err(err) => return lock_error_response(req, path, err),
+            };
+
+            dispatch_struct_segments(&mut *guard, segments, body, buf, req)
+        });
+        Ok(response)
     }
 }
 
@@ -2271,36 +2299,53 @@ fn response_buffer(req: &Message) -> Vec<u8> {
 /// allocating a frame, making a leaf read one allocation end to end.
 fn dispatch_struct_segments<T>(
     handler: &mut T,
-    relative: &str,
+    segments: &[&str],
     body: Option<Value>,
+    mut buf: Vec<u8>,
     req: &Message,
 ) -> Message
 where
     T: RepeStruct + ?Sized,
 {
-    let mut buf = response_buffer(req);
     let mut out = ResponseBody::new(&mut buf);
-    let result = with_segments(relative, |segments| {
-        handler.repe_handle_into(segments, body, &mut out)
-    });
+    let result = handler.repe_handle_into(segments, body, &mut out);
     let body_format = out.format();
     finish_struct_response(req, buf, body_format, result)
 }
 
-/// The shared-borrow counterpart: attempt the same read through
-/// [`RepeStruct::repe_read_into`], and report `None` if the struct declined
+/// The shared-borrow counterpart: attempt the same dispatch through
+/// [`RepeStruct::repe_shared_into`], and report `None` if the struct declined
 /// because the path needs exclusive access.
-fn read_struct_segments<T>(handler: &T, relative: &str, req: &Message) -> Option<Message>
+///
+/// `body` and `buf` are both borrowed rather than moved — the one place the two
+/// dispatch helpers differ, and for the reason the shared path exists: a decline
+/// leaves the exclusive retry the request it was handed and the buffer already
+/// allocated for it. That is the contract [`RepeStruct::repe_shared_into`] documents on
+/// the other side; the `clear` is the belt for a hand-written impl that breaks
+/// the half of it about writing nothing, since the retry would otherwise ship
+/// those bytes ahead of its own.
+fn shared_struct_segments<T>(
+    handler: &T,
+    segments: &[&str],
+    body: &mut Option<Value>,
+    buf: &mut Vec<u8>,
+    req: &Message,
+) -> Option<Message>
 where
     T: RepeStruct + ?Sized,
 {
-    let mut buf = response_buffer(req);
-    let mut out = ResponseBody::new(&mut buf);
-    let result = with_segments(relative, |segments| {
-        handler.repe_read_into(segments, &mut out)
-    })?;
+    let mut out = ResponseBody::new(buf);
+    let Some(result) = handler.repe_shared_into(segments, body, &mut out) else {
+        buf.clear();
+        return None;
+    };
     let body_format = out.format();
-    Some(finish_struct_response(req, buf, body_format, result))
+    Some(finish_struct_response(
+        req,
+        std::mem::take(buf),
+        body_format,
+        result,
+    ))
 }
 
 /// Turn what a dispatch left in `buf` into the response frame, shared by the

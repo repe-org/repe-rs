@@ -173,6 +173,8 @@ A method's arguments are deserialized from the request body:
 | 1 | *is* the argument |
 | 2+ | an array of N values, positionally, **or** an object keyed by parameter name |
 
+In the object form a missing key decodes as `null`, so a parameter typed `Option<T>` may be omitted and arrives as `None`. Omitting a parameter that is not optional is an `InvalidBody` error naming it — `deserialization error for /blend(right)` — rather than a silent default.
+
 ```rust
 #[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
 #[repe(methods)]
@@ -201,35 +203,35 @@ Resolving either would need type information a macro does not have.
 
 ### Field-shaped endpoints
 
-Some values look like fields to a client and are not fields at all: a register in different units, a value derived from two others, a setting the hardware holds rather than the struct. `#[repe(get = "...")]` and `#[repe(set = "...")]` publish one endpoint served by a getter/setter pair:
+Some values look like fields to a client and are not fields at all: a stored value in different units, a value derived from two others, a setting the backing resource holds rather than the struct. `#[repe(get = "...")]` and `#[repe(set = "...")]` publish one endpoint served by a getter/setter pair:
 
 ```rust
 #[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
 #[repe(methods)]
-struct Synthesizer {
-    phase_step: u32,
-    sample_rate_mhz: f64,
+struct Budget {
+    used_bytes: u64,
+    total_bytes: u64,
 }
 
 #[repe::methods]
-impl Synthesizer {
-    #[repe(get = "mix_freq_mhz")]
-    fn mix_freq_mhz(&self) -> f64 {
-        self.phase_step as f64 * self.sample_rate_mhz / 4096.0
+impl Budget {
+    #[repe(get = "used_percent")]
+    fn used_percent(&self) -> f64 {
+        self.used_bytes as f64 * 100.0 / self.total_bytes as f64
     }
 
-    #[repe(set = "mix_freq_mhz")]
-    fn set_mix_freq_mhz(&mut self, mhz: f64) {
-        self.phase_step = (mhz * 4096.0 / self.sample_rate_mhz).round() as u32;
+    #[repe(set = "used_percent")]
+    fn set_used_percent(&mut self, percent: f64) {
+        self.used_bytes = (percent * self.total_bytes as f64 / 100.0).round() as u64;
     }
 
     /// No setter: read-only, with nothing extra to say.
-    #[repe(get = "firmware")]
-    fn firmware(&self) -> &'static str { "1.4.2" }
+    #[repe(get = "version")]
+    fn version(&self) -> &'static str { "1.4.2" }
 }
 ```
 
-`/mix_freq_mhz` now behaves exactly like a field: a bodiless request reads it, a request with a body writes it, a write is acknowledged with `null`, and the whole-object read lists its **value** rather than a signature string. Publishing the same thing as methods would mean `/get_mix_freq_mhz` and `/set_mix_freq_mhz`, which is a different path and a different shape.
+`/used_percent` now behaves exactly like a field: a bodiless request reads it, a request with a body writes it, a write is acknowledged with `null`, and the whole-object read lists its **value** rather than a signature string. Publishing the same thing as methods would mean `/get_used_percent` and `/set_used_percent`, which is a different path and a different shape.
 
 The two halves need not sit next to each other, and the rules are the ones the shape implies:
 
@@ -274,11 +276,79 @@ Declare the receiver accurately. A method listed as `&self` is served through th
 |---|---|
 | `#[repe(rename = "...")]` | publish under a different path segment |
 | `#[repe(skip)]` | keep the field off the wire entirely |
-| `#[repe(readonly)]` | reads succeed, writes return `InvalidBody` |
+| `#[repe(readonly)]` | reads succeed, every write *through* the field returns `InvalidBody` |
 | `#[repe(nested)]` | descend into a field that is itself a `RepeStruct` |
+| `#[repe(nested_serde)]` | descend into a field that implements only `Serialize` + `DeserializeOwned` |
 | `#[repe(typed)]` | encode a numeric slice as a BEVE typed array |
 
 For a field-shaped endpoint with no field behind it, see [Field-shaped endpoints](#field-shaped-endpoints).
+
+### Struct attributes
+
+| Attribute | Effect |
+|---|---|
+| `#[repe(methods)]` | the method table comes from a `#[repe::methods]` impl block |
+| `#[repe(methods(..))]` | the method table is the list given here |
+| `#[repe(no_replace)]` | a write of the **whole object** is refused, and `Self: DeserializeOwned` is not required |
+| `#[repe(listing_order(..))]` | the key order of the whole-object listing, named in full |
+
+`#[repe(no_replace)]` refuses a write of the whole object and nothing more. It is spelled apart from `#[repe(readonly)]` because the two are different statements: `readonly` on a field says *this subtree is not writable*, recursively, while `no_replace` says *this type cannot be rebuilt from a body* and leaves every field writable. Writing `#[repe(readonly)]` on a struct is a compile error naming both, rather than silently meaning one of them. It also matters for more than the refusal. Without it the empty-segments arm emits `*self = serde_json::from_value(body)?`, so **every** derived struct has to be constructible from JSON — including one that holds an open socket, a file handle, or anything else no JSON describes. The attribute emits only the refusal, never the assignment followed by dead code, so `from_value::<Self>` is not generated and the bound is not required. Fields and children are unaffected: they still read and write as they always did.
+
+`#[repe(listing_order(..))]` names every key of the whole-object listing, in the order to emit them. Without it the listing appends fields in declaration order, then struct-listed methods, then the impl block's signatures, then its field-shaped accessors — so a `#[repe(get/set)]` endpoint is always last, wherever its logical place reads. That is wire-visible, and it is the one key order a `glz::object` with a `custom<setter, getter>` in the middle cannot be reproduced in.
+
+```rust
+# use serde::{Deserialize, Serialize};
+#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+#[repe(methods)]
+#[repe(listing_order("name", "count", "percent", "total", "identify"))]
+struct Report {
+    name: String,
+    count: u32,
+    total: f64,
+    #[repe(skip)]
+    ratio: f64,
+}
+
+#[repe::methods]
+impl Report {
+    #[repe(get = "percent")]
+    fn percent(&self) -> f64 { self.ratio * 100.0 }
+    #[repe(set = "percent")]
+    fn set_percent(&mut self, percent: f64) { self.ratio = percent / 100.0; }
+    fn identify(&self) -> String { self.name.clone() }
+}
+```
+
+Naming the sequence in full is what makes a typo or an omission a compile error. Half the check is at macro time, against the fields and the struct-level method list, with the offending key in the message; the other half is a `const` assertion against the impl block's two generated tables, which the derive cannot see. It reorders emission only — same keys, same values, no run-time cost, and nothing at all for a struct that does not use it.
+
+The order governs every frame that reaches a client, because the router encodes through `repe_handle_into`. It does *not* govern `RepeStruct::repe_handle`, the `serde_json::Value` form: a `serde_json::Map` is a `BTreeMap` unless something in the dependency graph enables `serde_json/preserve_order`, so that form sorts its keys and carries no order at all. The same is true of declaration order, and has been since before this attribute existed.
+
+### Descending into a child
+
+`#[repe(nested)]` asks the field's own `RepeStruct` impl. Every path through the field goes there, including a write of the **whole child**: `/device/metrics` with body `{"temperature": 22.0}` is handed to `Metrics::repe_handle_into(&[], Some(body))` rather than assigned over the field.
+
+That matters for a child that owns something. A derived child's empty-segments arm is `*self = from_value(..)`, so a derived child is still replaced and nothing that worked before changes; a hand-written one can *apply* the fields it was given, which is what a live settings object means by a write. `#[repe(readonly)]` on the field refuses every write through it, whole-child and sub-path alike.
+
+`#[repe(nested_serde)]` is for a field whose type implements only the two serde traits. It descends by walking a `serde_json::Value` of the field, so sub-paths work without the field's type implementing `RepeStruct` — and so without the crate that *declares* that type depending on this one. Reach for it when that dependency edge is not available: a third-party type, or a pure-logic crate you would rather not hand an RPC layer. Where the type can implement the trait, [`repe-core`](#repe-core-declaring-a-served-type-without-the-server) is the better answer, because `#[repe(nested)]` descends without materializing anything.
+
+The cost is explicit and paid only on a sub-path: a read serializes the field and walks the result, a write serializes it, edits it, and deserializes it back. A whole-field read or write pays neither, and neither does a listing. Two consequences follow from that round trip, and both are the attribute's real limits:
+
+- **The field's type must round-trip losslessly through serde.** A sub-path write rebuilds the *whole* field from its serialized form, so anything serde drops on the way out is reset to its `Default` on the way back in — a `#[serde(skip)]` field is silently zeroed by a write to an unrelated sibling key. If the type does not round-trip, use `#[repe(nested)]` or mark the field `#[repe(readonly)]`.
+- **Sub-paths are the *serialized* names, not the Rust ones.** `#[serde(rename)]` renames a sub-path, `#[serde(flatten)]` lifts one, `#[serde(skip)]` removes it, and `#[serde(skip_serializing_if)]` removes it *conditionally* — a `None` field behind `skip_serializing_if` is `MethodNotFound` for both read and write until something else sets it.
+
+A child that may not be there at all is an `Option<T>`. `RepeStruct` is implemented for it here, because a host cannot implement it itself — `Option` is foreign and the trait is not theirs. Present forwards everything to the inner value; absent reads as `null` at the child's own path and answers `MethodNotFound` to a write or any sub-path, because a silent no-op against a live resource is worse than an error. Presence itself is not settable through that path: a `null` write is refused whether the child is there or not, because removing one would otherwise be a door that only opens one way. A whole-object write at the parent still replaces the field.
+
+```rust
+# use serde::{Deserialize, Serialize};
+# #[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+# struct Metrics { temperature: f64 }
+#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+struct Device {
+    id: String,
+    #[repe(nested)]
+    metrics: Option<Metrics>,
+}
+```
 
 `#[repe(typed)]` routes a numeric array or `Vec` field to the bulk encoder behind [`MessageBuilder::body_typed_slice`](numeric-bodies.md) — one `copy_nonoverlapping` rather than a per-element serde walk, and byte-identical to what Glaze emits for the same array. That response carries `BodyFormat::Beve`; decode it with `Message::decode_typed_slice`. Writes to the field are unaffected and still take JSON. Inside the whole-object read the frame is already committed to JSON, so the field appears there as an ordinary JSON array; the typed encoding is what you get by reading the field on its own, which is the case it exists for.
 
@@ -295,7 +365,7 @@ Two consequences worth knowing:
 
 ### Reads share the guard
 
-A read does not need exclusive access, and behind an `RwLock` it no longer takes it. REPE separates a read from a write at the frame level — a request with no body is a read — so the router can decide before it locks anything:
+A read does not need exclusive access, and behind an `RwLock` it no longer takes it:
 
 ```rust
 use repe::server::Router;
@@ -309,14 +379,19 @@ let (router, instrument) = Router::new().with_struct_rw("/instrument", Instrumen
 
 Under that registration a `/instrument/gain` read runs concurrently with any other read, including one already inside a slow `&self` method. What is served this way is everything the derive can reach without `&mut self`:
 
-- every field read, at any depth through `#[repe(nested)]`;
-- a `#[repe::methods]` method taking `&self` and no arguments;
+- every field read, at any depth through `#[repe(nested)]` or `#[repe(nested_serde)]`;
+- **every `#[repe::methods]` method taking `&self`, arguments included**;
 - the getter half of a field-shaped endpoint, when that getter takes `&self`;
+- a refusal that needs no state at all — a write to a `#[repe(readonly)]` endpoint;
 - the whole-object listing, when nothing anywhere beneath it has to be *invoked* through `&mut self` — see below.
 
-Everything else — every write, every `&mut self` method, a `&mut self` getter — **declines**: the shared attempt returns without writing anything, and the router retakes the lock exclusively and dispatches exactly as it always did. Declining is invisible from the outside; the answer is the same frame either way.
+**The receiver decides, not the frame.** REPE separates a read from a write at the frame level, and taking that as the borrow rule looks right until a `&self` method takes arguments: the frame then carries a body, so it was dispatched exclusively and stalled every read of the object for as long as it ran. A long-running `&self` call turned a sub-millisecond `/version` read into one that waited for the whole call — a regression against the C++ registry this replaces, which has no mutex at all. The receiver is known where the dispatch arms are generated, so it is the receiver that answers.
+
+Everything else — every field write, every `&mut self` method, a `&mut self` getter, a setter — **declines**: the shared attempt returns without writing anything and without consuming the request body, and the router retakes the lock exclusively and dispatches exactly as it always did. Declining is invisible from the outside; the answer is the same frame either way.
 
 `with_struct` puts the value behind a `Mutex`, which has no shared mode. There the shared path is compiled out entirely rather than acquiring the same lock twice, so a mutex-backed struct dispatches exactly as it did before.
+
+A frame carrying a body skips the shared attempt entirely when the struct cannot answer one. A body is what a write and a call-with-arguments have in common, so the frame alone cannot separate them, but the type can: `RepeStruct::REPE_SHARED_SERVES_BODIES` is `false` for a struct whose every write needs `&mut self`, and the router then goes straight to the exclusive lock rather than taking the read lock to be told no. The derive computes it — `true` for a `&self` method taking arguments, for any `#[repe(readonly)]` endpoint whose refusal needs no state, and for any `#[repe(nested)]` child with either, at any depth. It defaults to `true`, so a hand-written `repe_shared_into` keeps being asked, and it is only ever a hint: whatever the shared borrow would have answered with a body, the exclusive path answers identically.
 
 #### A listing decides at the top, or not at all
 
@@ -329,16 +404,46 @@ So the listing settles the question before it writes or calls anything, and it s
 
 The subtree half is not optional. A child is listed before the parent's own accessors are read, so a parent that only checked its own getters would list a child, invoke that child's getters, and *then* discover a later sibling declining — leaving the retry to invoke them a second time. Rewinding the response buffer undoes the bytes; it cannot undo a call.
 
-So a struct whose getters all take `&self`, and whose children are the same — the ordinary case, and the only one for a register read — keeps its shared whole-object listing, with each accessor's current value in it. One `&mut self` getter anywhere beneath gives it up. Reading an individual endpoint is unaffected either way; that decision comes from the receiver, before anything is called.
+So a struct whose getters all take `&self`, and whose children are the same — the ordinary case — keeps its shared whole-object listing, with each accessor's current value in it. One `&mut self` getter anywhere beneath gives it up. Reading an individual endpoint is unaffected either way; that decision comes from the receiver, before anything is called.
 
-Two overridables carry it, both defaulting to the conservative answer. `RepeMethods::REPE_LISTING_NEEDS_EXCLUSIVE` is the per-table half — any accessor at all, unless `#[repe::methods]` computed otherwise from the receivers it has seen. `RepeStruct::repe_listing_declines` is the subtree half, which a parent asks of each child; it defaults to `true`, the accurate answer for the default `repe_read_into`, which declines everything. A hand-written impl that serves listings shared should override it, or every derived struct nesting it gives up its own listing. Overriding either is a promise: break it and the response is still correct — the listing rewinds and retries exclusively — but whatever the shared attempt had already invoked runs twice.
+Two overridables carry it, both defaulting to the conservative answer. `RepeMethods::REPE_LISTING_NEEDS_EXCLUSIVE` is the per-table half — any accessor at all, unless `#[repe::methods]` computed otherwise from the receivers it has seen. `RepeStruct::repe_listing_declines` is the subtree half, which a parent asks of each child; it defaults to `true`, the accurate answer for the default `repe_shared_into`, which declines everything. A hand-written impl that serves listings shared should override it, or every derived struct nesting it gives up its own listing. Overriding either is a promise: break it and the response is still correct — the listing rewinds and retries exclusively — but whatever the shared attempt had already invoked runs twice.
 
 #### Two things that change for callers
 
 - **Two `&self` methods on one object now run at the same time.** The exclusive guard used to give them mutual exclusion for free. A `&self` method that reads several interior-mutable cells expecting a consistent snapshot needs its own synchronization now. Writers still exclude readers.
 - **A panic under a shared guard no longer poisons the lock.** `std::sync::RwLock` poisons only on a panic while the *write* guard is held, so a panicking `&self` handler no longer retires the object for the life of the process the way it did under a `Mutex`. A panicking `&mut self` handler still does.
 
-A hand-written `RepeStruct` impl gets the exclusive behavior by default. To opt one in, override `repe_read_into`, which carries two obligations: answer a path identically to `repe_handle_into` or decline it, and write nothing into the response body when declining. `ObjectBody::entry_try_with` is there for the second one when the decline surfaces partway through an object — it rewinds the whole object, so propagating its `None` is all the caller has to do.
+A hand-written `RepeStruct` impl gets the exclusive behavior by default. To opt one in, override `repe_shared_into`, which carries three obligations:
+
+- **answer a path identically** to `repe_handle_into`, or decline it;
+- **write nothing into the response body when declining.** `ObjectBody::entry_try_with` is there for this when the decline surfaces partway through an object — it rewinds the whole object, so propagating its `None` is all the caller has to do;
+- **leave the body alone when declining.** It arrives as `&mut Option<Value>` rather than by value precisely so the exclusive retry can re-dispatch the same request without a clone. Call `take` on it only once this borrow has committed to answering — an `Err` counts as an answer — and never on a path that goes on to return `None`.
+
+### `repe-core`: declaring a served type without the server
+
+A served type's endpoints are declared where the *type* is declared, and that is not always the crate that runs the RPC. A pure-logic crate — no I/O, no `unsafe`, buildable on any host, and often kept that way deliberately — should not have to acquire a server, a client, and a transport just to publish a couple of paths.
+
+`repe-core` carries the `RepeStruct` surface on its own: the trait, `RepeMethods`, `StructError`, `ResponseBody`, and the protocol constants those name. Depend on it from the crate that declares the type, and on `repe` from the crate that serves it.
+
+```toml
+# the pure crate
+[dependencies]
+repe-core = "1"
+```
+
+```rust,ignore
+use repe_core::RepeStruct;
+
+#[derive(Serialize, Deserialize, RepeStruct)]
+pub struct Build {
+    pub version: String,
+    pub revision: u64,
+}
+```
+
+`repe` re-exports every one of those at the paths they have always had — `repe::structs::*`, `repe::constants::*` — so a type derived against `repe-core` mounts on a `repe::Router` with nothing in between, and `#[derive(RepeStruct)]` resolves its generated paths against whichever of the two crates is in scope. The one spelling that follows the crate name is the attribute macro: `#[repe_core::methods]` where only the core is a dependency, `#[repe::methods]` where `repe` is. It is one macro either way.
+
+Where you cannot add even that dependency — a type from a crate you do not own — `#[repe(nested_serde)]` descends into it without one.
 
 ## Async Server
 

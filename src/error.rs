@@ -1,5 +1,4 @@
 use crate::constants::ErrorCode;
-use std::fmt::{Display, Formatter};
 
 /// A REPE protocol, transport, or codec failure.
 ///
@@ -94,25 +93,6 @@ impl RepeError {
     }
 }
 
-impl Display for ErrorCode {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            ErrorCode::Ok => "OK",
-            ErrorCode::VersionMismatch => "Version mismatch",
-            ErrorCode::InvalidHeader => "Invalid header",
-            ErrorCode::InvalidQuery => "Invalid query",
-            ErrorCode::InvalidBody => "Invalid body",
-            ErrorCode::ParseError => "Parse error",
-            ErrorCode::MethodNotFound => "Method not found",
-            ErrorCode::Timeout => "Timeout",
-            ErrorCode::ResourceExhausted => "Resource exhausted",
-            ErrorCode::InternalError => "Internal error",
-            ErrorCode::ApplicationErrorBase => "Application error",
-        };
-        f.write_str(s)
-    }
-}
-
 /// Returned by a client's `subscribe_notifies` when a live subscription
 /// already exists.
 ///
@@ -131,8 +111,8 @@ impl Display for ErrorCode {
 pub struct AlreadySubscribed;
 
 #[cfg(any(feature = "websocket", feature = "websocket-wasm"))]
-impl Display for AlreadySubscribed {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+impl std::fmt::Display for AlreadySubscribed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("a notify subscription is already active on this client")
     }
 }
