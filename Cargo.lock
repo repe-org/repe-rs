@@ -1007,6 +1007,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "zstandard",
  "zstd",
 ]
 
@@ -1608,6 +1609,12 @@ name = "zeroize"
 version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
+
+[[package]]
+name = "zstandard"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3833f829edb8a31977ff8c96387a48dcbceb342e716a1751d3920102cca9612d"
 
 [[package]]
 name = "zstd"

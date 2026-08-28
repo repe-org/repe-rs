@@ -76,14 +76,15 @@ plugin-host = ["plugin", "dep:libloading", "dep:libc"]
 # bind there.
 rest = ["dep:hyper", "dep:hyper-util", "dep:http-body-util"]
 # Streaming transfer of a serialized, optionally zstd-compressed in-memory value
-# over ordinary REPE request/response (the SVS wire contract). Pulls in `zstd`
-# for the compressed path; the engine itself is plain `std` threads + channels.
+# over ordinary REPE request/response (the SVS wire contract). Pulls in
+# `zstandard` for the compressed path; the engine itself is plain `std` threads
+# + channels.
 #
 # Resolves to nothing on wasm32: the module is `not(wasm32)` in lib.rs and the
-# `zstd` dep is target-gated to match, so enabling this feature there compiles
-# away instead of failing. That is what lets a workspace hoist it into a shared
-# feature union alongside a wasm32 member, which cannot subtract it.
-value-stream = ["dep:zstd"]
+# `zstandard` dep is target-gated to match, so enabling this feature there
+# compiles away instead of failing. That is what lets a workspace hoist it into a
+# shared feature union alongside a wasm32 member, which cannot subtract it.
+value-stream = ["dep:zstandard"]
 
 [[bin]]
 name = "repe"
@@ -184,18 +185,22 @@ tokio-util = { version = "0.7", optional = true, default-features = false, featu
 # errors on wasm32-unknown-unknown unless the consumer enables its `wasm_js`
 # backend feature.
 uniudp = { version = "1.2.2", optional = true }
-# Streaming zstd codec for the `value-stream` feature (SVS `compression = 1`).
-# Optional so the core crate stays free of the libzstd C dependency.
+# Streaming Zstandard codec for the `value-stream` feature (SVS `compression = 1`).
+# Optional so the core crate carries no compressor unless the feature is on.
 #
-# Target-gated because `zstd-sys` is the libzstd C library and its build script
-# cannot target wasm32-unknown-unknown (clang: "No available targets are
-# compatible with triple wasm32-unknown-unknown", compiling
-# `huf_decompress_amd64.S`). `value_stream` is already `not(wasm32)` in lib.rs,
-# so nothing on wasm32 could call it regardless; leaving the dep untargeted
-# only meant Cargo built a C library for a target whose consumer did not exist.
-# That made `value-stream` unusable in a *workspace* feature union, since Cargo
-# features are additive and an inheriting wasm32 crate cannot subtract one.
-zstd = { version = "0.13", optional = true }
+# `zstandard` is a pure-Rust implementation of the format: no `cc`, no build
+# script, no C toolchain, so it builds for every target Cargo does. It replaces
+# the `zstd` C bindings, whose `zstd-sys` build script could not target
+# wasm32-unknown-unknown at all (clang: "No available targets are compatible with
+# triple wasm32-unknown-unknown", compiling `huf_decompress_amd64.S`).
+#
+# Still target-gated, now only to match the `not(wasm32)` gate `value_stream`
+# carries in lib.rs: that module is std threads + blocking channels, so on wasm32
+# there is no consumer for the dep and no reason to build one. Keeping the two
+# gates aligned is what lets `value-stream` sit in a *workspace* feature union
+# alongside a wasm32 member, since Cargo features are additive and an inheriting
+# crate cannot subtract one.
+zstandard = { version = "0.1", optional = true }
 
 # The `plugin-host` feature's dynamic loader. Target-gated because there is no
 # dynamic loader on wasm32-unknown-unknown, matching the `not(wasm32)` gate the
@@ -247,8 +252,11 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 # types of the typed-numeric body path (the runtime dep on half comes via beve).
 half = "2.4"
 # Only for the `value-stream` integration tests: independently decompress a
-# pulled `.beve.zst` file to assert its contents. Matches the optional runtime
-# dep version.
+# pulled `.beve.zst` file to assert its contents. Deliberately the reference C
+# implementation rather than the `zstandard` crate the runtime path uses, so the
+# assertion is cross-implementation interop rather than self-consistency. A
+# dev-dependency does not propagate, so this costs downstream (and wasm32)
+# consumers nothing.
 zstd = "0.13"
 
 [[bench]]

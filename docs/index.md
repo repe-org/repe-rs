@@ -71,7 +71,7 @@ Replace `body_json` with `body_beve` to encode the body with BEVE; everything el
 | `websocket` | Native `WebSocketClient`, `WebSocketServer`, and `proxy_connection`. |
 | `websocket-wasm` | Browser `WasmClient` on `wasm32-unknown-unknown`. |
 | `fleet-udp` | UDP fanout via `UniUdpFleet`. |
-| `value-stream` | Streaming value transfer (SVS), with an optional zstd codec. |
+| `value-stream` | Streaming value transfer (SVS), with an optional Zstandard codec (pure Rust, no C toolchain). |
 | `parking-lot` | `Lockable` impls for `parking_lot::Mutex` / `RwLock`. |
 | `cli` | Builds the `repe` command-line client (pulls in `clap` and `websocket`). |
 

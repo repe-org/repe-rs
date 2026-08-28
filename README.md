@@ -127,7 +127,7 @@ A `with_typed_slice_ref` route is a drop-in superset of `with_typed_slice`: it s
 | `websocket` | Native `WebSocketClient`, `WebSocketServer`, and `proxy_connection`. |
 | `websocket-wasm` | Browser `WasmClient` on `wasm32-unknown-unknown`. |
 | `fleet-udp` | UDP fanout via `UniUdpFleet`. |
-| `value-stream` | Streaming value transfer (SVS), with an optional zstd codec. |
+| `value-stream` | Streaming value transfer (SVS), with an optional Zstandard codec (pure Rust, no C toolchain). |
 | `parking-lot` | `Lockable` impls for `parking_lot::Mutex` / `RwLock`. |
 | `cli` | Builds the `repe` command-line client (pulls in `clap` and `websocket`). |
 

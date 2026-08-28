@@ -136,7 +136,9 @@ pub struct StreamOpts {
     pub chunk_bytes: usize,
     /// Codec applied over the serialized bytes.
     pub compression: Compression,
-    /// zstd compression level when `compression` is [`Compression::Zstd`].
+    /// Zstandard compression level when `compression` is [`Compression::Zstd`].
+    /// Accepts the full upstream range, `-131072..=22`; a value outside it fails
+    /// the stream rather than being clamped.
     pub zstd_level: i32,
     /// Bounded depth of the per-stream producer channel. This is where memory is
     /// bounded and backpressure lives: the serializer parks once this many chunks
@@ -277,7 +279,11 @@ fn produce(body: BodyWriter, tx: SyncSender<Msg>, opts: StreamOpts) {
         match opts.compression {
             Compression::None => body(&mut sink)?,
             Compression::Zstd => {
-                let mut enc = zstd::stream::write::Encoder::new(&mut sink, opts.zstd_level)?;
+                let mut enc = zstandard::io::Writer::with_options(
+                    &mut sink,
+                    zstandard::EncoderOptions::default()
+                        .with_compression_level(opts.zstd_level.try_into()?),
+                )?;
                 body(&mut enc)?;
                 enc.finish()?;
             }
@@ -804,7 +810,7 @@ pub fn pull_stream<T: DeserializeOwned>(
         }
         StreamOutput::BeveFile(path) => {
             write_file(client, open.stream_id, path, |reader, file| {
-                let mut dec = zstd::stream::read::Decoder::new(reader).map_err(RepeError::Io)?;
+                let mut dec = zstandard::io::Reader::new(reader);
                 io::copy(&mut dec, file)?;
                 Ok(())
             })?;
@@ -815,8 +821,7 @@ pub fn pull_stream<T: DeserializeOwned>(
             let value = match open.compression {
                 Compression::None => beve::from_reader_streaming::<_, T>(reader)?,
                 Compression::Zstd => {
-                    let dec = zstd::stream::read::Decoder::new(reader).map_err(RepeError::Io)?;
-                    beve::from_reader_streaming::<_, T>(dec)?
+                    beve::from_reader_streaming::<_, T>(zstandard::io::Reader::new(reader))?
                 }
             };
             // The value decoded fully; release any remainder of the stream the
@@ -832,8 +837,7 @@ pub fn pull_stream<T: DeserializeOwned>(
                         io::copy(reader, file)?;
                     }
                     Compression::Zstd => {
-                        let mut dec =
-                            zstd::stream::read::Decoder::new(reader).map_err(RepeError::Io)?;
+                        let mut dec = zstandard::io::Reader::new(reader);
                         io::copy(&mut dec, file)?;
                     }
                 }
@@ -900,10 +904,7 @@ where
             let mut reader = reader;
             consume(&mut reader)
         }
-        Compression::Zstd => match zstd::stream::read::Decoder::new(reader) {
-            Ok(mut dec) => consume(&mut dec),
-            Err(e) => Err(RepeError::Io(e)),
-        },
+        Compression::Zstd => consume(&mut zstandard::io::Reader::new(reader)),
     };
     let _ = cancel_stream(client, open.stream_id, "consume complete");
     result
@@ -1009,10 +1010,10 @@ pub fn pull_typed_slice<T: beve::BeveTypedSlice>(
         Compression::None => {
             beve::read_typed_slice_from_reader::<T, _>(reader).map_err(RepeError::from)
         }
-        Compression::Zstd => match zstd::stream::read::Decoder::new(reader) {
-            Ok(dec) => beve::read_typed_slice_from_reader::<T, _>(dec).map_err(RepeError::from),
-            Err(e) => Err(RepeError::Io(e)),
-        },
+        Compression::Zstd => {
+            beve::read_typed_slice_from_reader::<T, _>(zstandard::io::Reader::new(reader))
+                .map_err(RepeError::from)
+        }
     };
     // Release the stream whether or not the decode used every chunk (and on error).
     let _ = cancel_stream(client, open.stream_id, "bulk typed slice complete");
@@ -1041,10 +1042,10 @@ pub fn pull_complex_slice<T: beve::BeveTypedSlice>(
         Compression::None => {
             beve::read_complex_slice_from_reader::<T, _>(reader).map_err(RepeError::from)
         }
-        Compression::Zstd => match zstd::stream::read::Decoder::new(reader) {
-            Ok(dec) => beve::read_complex_slice_from_reader::<T, _>(dec).map_err(RepeError::from),
-            Err(e) => Err(RepeError::Io(e)),
-        },
+        Compression::Zstd => {
+            beve::read_complex_slice_from_reader::<T, _>(zstandard::io::Reader::new(reader))
+                .map_err(RepeError::from)
+        }
     };
     let _ = cancel_stream(client, open.stream_id, "bulk complex slice complete");
     result
@@ -1576,9 +1577,7 @@ where
     let consume_task = tokio::task::spawn_blocking(move || -> Result<V, RepeError> {
         let reader: Box<dyn Read> = match compression {
             Compression::None => Box::new(ChannelReader::new(rx)),
-            Compression::Zstd => Box::new(
-                zstd::stream::read::Decoder::new(ChannelReader::new(rx)).map_err(RepeError::Io)?,
-            ),
+            Compression::Zstd => Box::new(zstandard::io::Reader::new(ChannelReader::new(rx))),
         };
         consume(reader)
     });
