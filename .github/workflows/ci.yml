@@ -30,6 +30,42 @@ jobs:
       - name: Tests
         run: cargo test --workspace --all-features
 
+      # `--all-features` turns `repe-core`'s `typed` on, and feature unification
+      # would turn it on regardless because `repe` enables it. So the one
+      # configuration that crate exists to serve — `repe-core` alone, default
+      # features, no BEVE encoder linked — is compiled by nothing else in this
+      # file, and would break silently.
+      - name: Clippy (repe-core, no `typed`)
+        run: cargo clippy -p repe-core --all-targets -- -D warnings
+
+      - name: Tests (repe-core, no `typed`)
+        run: cargo test -p repe-core
+
+      # The point of the feature, asserted directly rather than inferred from
+      # the above compiling: `beve` and the six packages behind it stay out of a
+      # default `repe-core` graph. Deliberately no package *count* here — that
+      # depends on the lockfile and on when the graph was resolved, and it has
+      # already been wrong once. The assertion greps for `beve` itself, which
+      # cannot rot the same way.
+      - name: repe-core's default graph carries no BEVE encoder
+        run: |
+          tree=$(cargo tree -p repe-core --edges normal --prefix none)
+          if grep -q '^beve ' <<<"$tree"; then
+            echo "::error::beve reached repe-core's default feature set" >&2
+            printf '%s\n' "$tree" >&2
+            exit 1
+          fi
+
+      # `#[derive(RepeStruct)]` resolves `serde_json` through
+      # `repe_core::__private`, so a deriving crate declares only what its own
+      # source names. Nothing else here can check that: every crate in this
+      # workspace has `serde_json` in scope already, so a regression to an
+      # absolute `::serde_json` path compiles green everywhere and fails only in
+      # a real consumer. The fixture is a standalone crate whose entire point is
+      # its `[dependencies]` table.
+      - name: A consumer crate needs no `serde_json` of its own
+        run: cargo build --manifest-path derive-tests/minimal-consumer/Cargo.toml
+
       - name: Docs
         run: cargo doc --workspace --no-deps
 

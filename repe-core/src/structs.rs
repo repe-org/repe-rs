@@ -547,6 +547,37 @@ pub fn prepend_path(mut err: StructError, prefix: &str) -> StructError {
     err
 }
 
+/// The bound on [`ResponseBody::write_typed_slice`] without the `typed`
+/// feature. Deliberately unimplementable — it is sealed, so no type satisfies
+/// it *and none can be made to* — which makes the method uncallable and a
+/// `#[repe(typed)]` field an error against a named feature rather than against
+/// a method that does not exist.
+///
+/// It exists **only** in that configuration. With the feature on, the method
+/// takes `beve::BeveTypedSlice + Serialize` directly and this trait is not
+/// there at all — a diagnostic device has no business being public API of the
+/// build everyone ships, and, since every type BEVE accepts would satisfy it
+/// through a blanket impl, nothing would ever name it there anyway.
+/// Seals [`TypedSliceElement`] so that "no type implements it" is a fact this
+/// crate enforces rather than one it merely asserts. Without this a downstream
+/// crate could write `impl TypedSliceElement for T {}` — the trait is public and
+/// has no members, so nothing stops it — and reach a `write_typed_slice` whose
+/// body is an `unreachable!`.
+#[cfg(not(feature = "typed"))]
+mod sealed {
+    pub trait Sealed {}
+}
+
+#[cfg(not(feature = "typed"))]
+#[diagnostic::on_unimplemented(
+    message = "`#[repe(typed)]` needs the `typed` feature of `repe-core`",
+    label = "no BEVE typed-array encoding is compiled in",
+    note = "enable it with `repe-core = {{ version = \"2\", features = [\"typed\"] }}`, or drop \
+            `#[repe(typed)]` from the field to serve it as a JSON array",
+    note = "crates that depend on `repe` rather than `repe-core` already have it on"
+)]
+pub trait TypedSliceElement: sealed::Sealed {}
+
 /// Response body under construction for a [`RepeStruct`] read.
 ///
 /// Handed to [`RepeStruct::repe_handle_into`] so a read serializes the live field
@@ -579,6 +610,15 @@ pub struct ResponseBody<'a> {
     /// segments and so always takes its own object branch.) The flag also covers
     /// hand-written `repe_handle_into` impls, which can call anything from
     /// anywhere; a JSON-array fallback beats corrupting the frame.
+    ///
+    /// [`write_typed_slice`](Self::write_typed_slice) is the only reader, and
+    /// without the `typed` feature there is no typed encoding to divert — the
+    /// flag is still set where an object is entered, so that turning the
+    /// feature on needs no other change.
+    ///
+    /// `expect` rather than `allow`: if this ever gains a second reader that is
+    /// not feature-gated, the attribute becomes wrong and says so.
+    #[cfg_attr(not(feature = "typed"), expect(dead_code))]
     nested: bool,
 }
 
@@ -652,6 +692,12 @@ impl<'a> ResponseBody<'a> {
     /// already committed to JSON, so the slice is written as a JSON array
     /// instead. A field only reaches the typed encoding when it is read on its
     /// own.
+    ///
+    /// Requires the `typed` feature, which is what carries `beve`. It is on
+    /// through `repe` and off for a direct `repe-core` dependency, where this
+    /// signature is replaced by one whose bound no type satisfies, so that
+    /// calling it is a compile error naming the feature.
+    #[cfg(feature = "typed")]
     pub fn write_typed_slice<T>(&mut self, path: &str, slice: &[T]) -> StructResult<()>
     where
         T: beve::BeveTypedSlice + Serialize,
@@ -667,6 +713,31 @@ impl<'a> ResponseBody<'a> {
         debug_assert_eq!(self.buf.len() - start, encoded_len);
         self.format = BodyFormat::Beve;
         Ok(())
+    }
+
+    /// The `typed`-less stand-in for [`write_typed_slice`], kept so a
+    /// `#[repe(typed)]` field reports a missing *feature* rather than a missing
+    /// *method*.
+    ///
+    /// No type implements [`TypedSliceElement`] without the feature, so this is
+    /// uncallable and the diagnostic on that trait is what a caller actually
+    /// reads.
+    ///
+    /// **The `E0277` this produces is the deliverable, not a side effect.**
+    /// `#[cfg]`-ing this method away instead is the obvious simplification and
+    /// silently degrades it to `E0599`, "no method named `write_typed_slice`",
+    /// pointing at a derive rather than at a feature — and nothing in CI would
+    /// notice. Falling back to the JSON array here would be worse still: it
+    /// compiles and changes the wire.
+    ///
+    /// [`write_typed_slice`]: ResponseBody::write_typed_slice
+    #[cfg(not(feature = "typed"))]
+    pub fn write_typed_slice<T>(&mut self, path: &str, slice: &[T]) -> StructResult<()>
+    where
+        T: TypedSliceElement,
+    {
+        let _ = (path, slice);
+        unreachable!("`TypedSliceElement` is sealed and implemented by nothing")
     }
 
     /// Begin a JSON object body, written key by key.

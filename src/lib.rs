@@ -72,6 +72,33 @@ pub mod derive {
     pub use repe_derive::{RepeStruct, methods};
 }
 
+/// Items named by `#[derive(RepeStruct)]`'s generated code. Not public API:
+/// nothing outside the derive should name anything here, and its contents may
+/// change in any release.
+///
+/// It exists so generated code reaches `serde_json` through the crate that
+/// *defines* the trait rather than through the deriving crate's own dependency
+/// list. That buys two things. A deriving crate no longer has to declare
+/// `serde_json` for paths nothing in its source mentions — which matters most
+/// to exactly the light-dependency crate `repe-core` was split out for. And
+/// `RepeStruct`'s signatures name `serde_json::Value`, so the emitted impl must
+/// use the *same* `serde_json` the trait was declared with; resolving through
+/// here makes that structural instead of a coincidence of everyone being on
+/// `serde_json` 1.x, and it keeps working for a crate that renames the
+/// dependency (`json = { package = "serde_json" }`), which the old absolute
+/// `::serde_json` path did not.
+#[doc(hidden)]
+pub mod __private {
+    // Forwarded from `repe-core` rather than re-exported from this crate's own
+    // `serde_json`. `RepeStruct`'s signatures name `repe_core`'s
+    // `serde_json::Value`, so generated code has to name that one — and `repe`
+    // re-exporting its own would be the same crate only because both manifests
+    // say `"1"` and Cargo unifies them. That is a coincidence, narrower than the
+    // one this module removed but the same kind. This makes it structural: there
+    // is only ever one `serde_json` in play, and it is the trait's.
+    pub use repe_core::__private::serde_json;
+}
+
 /// Derive macro to generate [`structs::RepeStruct`] implementations.
 pub use repe_derive::RepeStruct;
 

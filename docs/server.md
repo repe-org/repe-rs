@@ -428,7 +428,10 @@ A served type's endpoints are declared where the *type* is declared, and that is
 ```toml
 # the pure crate
 [dependencies]
-repe-core = "1"
+repe-core = "2"
+# Only what the source below actually names. The derive reaches `serde_json`
+# through `repe-core`, so it is not a dependency of yours.
+serde = { version = "1", features = ["derive"] }
 ```
 
 ```rust,ignore
@@ -442,6 +445,16 @@ pub struct Build {
 ```
 
 `repe` re-exports every one of those at the paths they have always had — `repe::structs::*`, `repe::constants::*` — so a type derived against `repe-core` mounts on a `repe::Router` with nothing in between, and `#[derive(RepeStruct)]` resolves its generated paths against whichever of the two crates is in scope. The one spelling that follows the crate name is the attribute macro: `#[repe_core::methods]` where only the core is a dependency, `#[repe::methods]` where `repe` is. It is one macro either way.
+
+`#[repe(typed)]` is the one attribute that costs something here. The BEVE typed-numeric encoding lives behind `repe-core`'s `typed` feature, off by default, because `beve` and the six packages behind it are the whole weight of the crate — and a crate light enough to want this split usually has no typed field at all. Add the feature where you do:
+
+```toml
+repe-core = { version = "2", features = ["typed"] }
+```
+
+A struct with no `#[repe(typed)]` field compiles identically either way, and one that has such a field fails to compile with the feature named rather than quietly serving a JSON array. Through `repe` the feature is always on, so none of this reaches a crate that depends on `repe`.
+
+One consequence to know about: Cargo features are additive across a whole graph, so in a workspace that also contains `repe`, a pure crate that uses `#[repe(typed)]` and *forgets* the feature still compiles — `repe` turned it on for everyone. It fails only when that crate is built on its own, which is where it will be built by whoever consumes it. Build the pure crate standalone in CI if its light dependency list is load-bearing; this repo does exactly that for `repe-core`.
 
 Where you cannot add even that dependency — a type from a crate you do not own — `#[repe(nested_serde)]` descends into it without one.
 

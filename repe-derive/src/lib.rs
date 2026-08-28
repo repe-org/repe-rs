@@ -103,7 +103,7 @@ impl Sink {
         match self {
             Sink::Value => quote! {
                 {
-                    let value = ::serde_json::to_value(&#expr)
+                    let value = #repe::__private::serde_json::to_value(&#expr)
                         .map_err(|source| #repe::StructError::Serialize {
                             path: String::from(#path),
                             source,
@@ -334,7 +334,7 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
             let root_write_ack = sink.emit_null();
             quote! {
                 if let Some(value) = body {
-                    *self = ::serde_json::from_value(value).map_err(|source| #repe::StructError::Deserialize {
+                    *self = #repe::__private::serde_json::from_value(value).map_err(|source| #repe::StructError::Deserialize {
                         path: String::from(""),
                         source,
                     })?;
@@ -348,17 +348,17 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
                     fn repe_handle(
                         &mut self,
                         segments: &[&str],
-                        body: Option<::serde_json::Value>,
+                        body: Option<#repe::__private::serde_json::Value>,
                     )
                 },
-                quote! { #repe::structs::StructResult<Option<::serde_json::Value>> },
+                quote! { #repe::structs::StructResult<Option<#repe::__private::serde_json::Value>> },
             ),
             Sink::Encode => (
                 quote! {
                     fn repe_handle_into(
                         &mut self,
                         segments: &[&str],
-                        body: Option<::serde_json::Value>,
+                        body: Option<#repe::__private::serde_json::Value>,
                         out: &mut #repe::structs::ResponseBody<'_>,
                     )
                 },
@@ -453,7 +453,7 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
         fn repe_shared_into(
             &self,
             segments: &[&str],
-            body: &mut Option<::serde_json::Value>,
+            body: &mut Option<#repe::__private::serde_json::Value>,
             out: &mut #repe::structs::ResponseBody<'_>,
         ) -> Option<#repe::structs::StructResult<()>> {
             if segments.is_empty() {
@@ -1175,12 +1175,17 @@ impl ListingSink {
     /// safety net for a hand-written table whose `REPE_LISTING_NEEDS_EXCLUSIVE`
     /// disagrees with its `repe_call_shared_into`, not a path a derived listing
     /// takes.
-    fn entry_with(self, key: TokenStream2, produce: TokenStream2) -> TokenStream2 {
+    fn entry_with(
+        self,
+        repe: &TokenStream2,
+        key: TokenStream2,
+        produce: TokenStream2,
+    ) -> TokenStream2 {
         match self {
             ListingSink::Value => quote! {
                 map.insert(
                     String::from(#key),
-                    (#produce)?.unwrap_or(::serde_json::Value::Null),
+                    (#produce)?.unwrap_or(#repe::__private::serde_json::Value::Null),
                 );
             },
             ListingSink::Encode => quote! {
@@ -1207,7 +1212,7 @@ impl ListingSink {
         match self {
             ListingSink::Value => quote! {
                 {
-                    let __repe_value = ::serde_json::to_value(&#value)
+                    let __repe_value = #repe::__private::serde_json::to_value(&#value)
                         .map_err(|source| #repe::StructError::Serialize {
                             path: String::from(#path),
                             source,
@@ -1225,16 +1230,16 @@ impl ListingSink {
     }
 
     /// Open the body, run `entries`, and close it.
-    fn wrap(self, entries: &[TokenStream2]) -> TokenStream2 {
+    fn wrap(self, repe: &TokenStream2, entries: &[TokenStream2]) -> TokenStream2 {
         match self {
             // The `Map` is a `BTreeMap` unless something in the dependency
             // graph turns on `serde_json/preserve_order`, so this listing's key
             // order is serde_json's and not the derive's — see `build_listing`.
             ListingSink::Value => quote! {
                 {
-                    let mut map = ::serde_json::Map::new();
+                    let mut map = #repe::__private::serde_json::Map::new();
                     #(#entries)*
-                    Ok(Some(::serde_json::Value::Object(map)))
+                    Ok(Some(#repe::__private::serde_json::Value::Object(map)))
                 }
             },
             ListingSink::Encode => quote! {
@@ -1288,6 +1293,7 @@ fn build_listing(
                     // JSON no matter what the child would emit on its own.
                     let call = sink.child_call(repe, &field.ty, ident);
                     sink.entry_with(
+                        repe,
                         quote! { #key },
                         sink.prepend(repe, call, quote! { #key }),
                     )
@@ -1311,7 +1317,7 @@ fn build_listing(
             ListingEntry::ImplNamed(name) => {
                 let resolved = impl_named_signature(name, repe);
                 let accessor =
-                    sink.entry_with(quote! { #name }, sink.accessor_call(repe, quote! { #name }));
+                    sink.entry_with(repe, quote! { #name }, sink.accessor_call(repe, quote! { #name }));
                 let path = endpoint_path(&name.value());
                 let signature = sink.entry(
                     repe,
@@ -1352,7 +1358,7 @@ fn build_listing(
             // error.
             ListingEntry::ImplAccessors => {
                 let accessor =
-                    sink.entry_with(quote! { name }, sink.accessor_call(repe, quote! { name }));
+                    sink.entry_with(repe, quote! { name }, sink.accessor_call(repe, quote! { name }));
                 quote! {
                     for &name in <Self as #repe::structs::RepeMethods>::REPE_ACCESSOR_ENDPOINTS {
                         #accessor
@@ -1362,7 +1368,7 @@ fn build_listing(
         });
     }
 
-    sink.wrap(&emitted)
+    sink.wrap(repe, &emitted)
 }
 
 // ---------------------------------------------------------------------------
@@ -1408,7 +1414,7 @@ fn build_field_arms(fields: &[FieldSpec], repe: &TokenStream2, sink: Sink) -> Ve
                 Sink::Value => quote! {
                     {
                         let nested = #whole?;
-                        Ok(Some(nested.unwrap_or(::serde_json::Value::Null)))
+                        Ok(Some(nested.unwrap_or(#repe::__private::serde_json::Value::Null)))
                     }
                 },
                 Sink::Encode => whole,
@@ -1484,7 +1490,7 @@ fn build_field_arms(fields: &[FieldSpec], repe: &TokenStream2, sink: Sink) -> Ve
                 quote! {
                     Some(value) => {
                         if tail.is_empty() {
-                            self.#ident = ::serde_json::from_value(value)
+                            self.#ident = #repe::__private::serde_json::from_value(value)
                                 .map_err(|source| #repe::StructError::Deserialize {
                                     path: String::from(#path),
                                     source,
@@ -1495,7 +1501,7 @@ fn build_field_arms(fields: &[FieldSpec], repe: &TokenStream2, sink: Sink) -> Ve
                             // reason the field's type has to survive one: the
                             // whole child is materialized, edited, and decoded
                             // back.
-                            let mut __repe_value = ::serde_json::to_value(&self.#ident)
+                            let mut __repe_value = #repe::__private::serde_json::to_value(&self.#ident)
                                 .map_err(|source| #repe::StructError::Serialize {
                                     path: String::from(#path),
                                     source,
@@ -1505,7 +1511,7 @@ fn build_field_arms(fields: &[FieldSpec], repe: &TokenStream2, sink: Sink) -> Ve
                             {
                                 return #unresolved;
                             }
-                            self.#ident = ::serde_json::from_value(__repe_value)
+                            self.#ident = #repe::__private::serde_json::from_value(__repe_value)
                                 .map_err(|source| #repe::StructError::Deserialize {
                                     path: String::from(#path),
                                     source,
@@ -1534,7 +1540,7 @@ fn build_field_arms(fields: &[FieldSpec], repe: &TokenStream2, sink: Sink) -> Ve
             } else {
                 quote! {
                     Some(value) => {
-                        self.#ident = ::serde_json::from_value(value)
+                        self.#ident = #repe::__private::serde_json::from_value(value)
                             .map_err(|source| #repe::StructError::Deserialize {
                                 path: String::from(#path),
                                 source,
@@ -1662,7 +1668,7 @@ fn nested_serde_read(
         if tail.is_empty() {
             #whole
         } else {
-            match ::serde_json::to_value(&self.#ident) {
+            match #repe::__private::serde_json::to_value(&self.#ident) {
                 Ok(__repe_value) => match #repe::structs::serde_pointer(&__repe_value, tail) {
                     Some(__repe_found) => #found,
                     None => #unresolved,
@@ -1722,7 +1728,7 @@ fn decode_method_args(
         });
         return quote! {
             #take_body
-            let #binding: #ty = match ::serde_json::from_value(value) {
+            let #binding: #ty = match #repe::__private::serde_json::from_value(value) {
                 Ok(__repe_value) => __repe_value,
                 Err(source) => { #undecodable }
             };
@@ -1930,7 +1936,7 @@ fn build_accessor_arm(
             );
             quote! {
                 Some(value) => {
-                    let __repe_arg: #ty = ::serde_json::from_value(value)
+                    let __repe_arg: #ty = #repe::__private::serde_json::from_value(value)
                         .map_err(|source| #repe::StructError::Deserialize {
                             path: String::from(#path),
                             source,
@@ -2455,10 +2461,10 @@ fn methods_impl(
                     fn repe_call(
                         &mut self,
                         segments: &[&str],
-                        body: Option<::serde_json::Value>,
+                        body: Option<#repe::__private::serde_json::Value>,
                     )
                 },
-                quote! { #repe::structs::StructResult<Option<::serde_json::Value>> },
+                quote! { #repe::structs::StructResult<Option<#repe::__private::serde_json::Value>> },
                 quote! { let _ = &body; },
             ),
             Sink::Encode => (
@@ -2466,7 +2472,7 @@ fn methods_impl(
                     fn repe_call_into(
                         &mut self,
                         segments: &[&str],
-                        body: Option<::serde_json::Value>,
+                        body: Option<#repe::__private::serde_json::Value>,
                         out: &mut #repe::structs::ResponseBody<'_>,
                     )
                 },
@@ -2511,7 +2517,7 @@ fn methods_impl(
         fn repe_call_shared_into(
             &self,
             segments: &[&str],
-            body: &mut Option<::serde_json::Value>,
+            body: &mut Option<#repe::__private::serde_json::Value>,
             out: &mut #repe::structs::ResponseBody<'_>,
         ) -> Option<#repe::structs::StructResult<()>> {
             let Some((head, tail)) = segments.split_first() else {

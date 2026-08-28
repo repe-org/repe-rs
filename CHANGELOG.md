@@ -1,5 +1,30 @@
 # Changelog
 
+## [11.0.0] - 2026-08-28
+
+A **major** release for one reason: `repe` re-exports `repe-core`, so that crate's major is this crate's major. No `repe` API changed and no source change is needed.
+
+### Changed
+- **Generated code reaches `serde_json` through `repe`, not through your crate.** `#[derive(RepeStruct)]` emitted absolute `::serde_json::...` paths at 22 sites, so a deriving crate had to declare `serde_json` itself for paths nothing in its source mentions. It now emits `#repe::__private::serde_json`, resolved by the same `proc-macro-crate` lookup that already finds `repe` vs `repe-core` — and handles either being renamed.
+
+  Three things follow. A consumer's manifest shrinks to what its source actually names, which matters most to the light-dependency crate `repe-core` exists for. A crate that *renames* the dependency (`json = { package = "serde_json" }`) now compiles; before, it failed with `cannot find serde_json in the crate root` and a suggestion to import `std::iter::Map`. And `RepeStruct`'s signatures name `serde_json::Value`, so the emitted impl must use the same `serde_json` the trait was declared with — that was previously a coincidence of everyone being on 1.x, and is now structural.
+
+  Purely additive for a crate that already declares `serde_json`: the dependency simply goes unused. **`repe-derive` is `0.6.0`**, and the minor is load-bearing — `repe = "10"` requires `repe-derive = "^0.5.0"`, which must not resolve to a derive emitting a `__private` module that `repe` 10 does not have.
+
+  `derive-tests/minimal-consumer` is the regression guard, and is a standalone crate because that is the only way to hold the claim: every crate in this workspace has `serde_json` in scope, so a regression compiles green in the whole test suite and fails only in a real consumer.
+
+- **`repe-core` 2.0.0: the BEVE encoder moves behind a `typed` feature, off by default.** `repe-core` exists so a crate with a deliberately light dependency list can declare a served type without the server, the client, or the transport — and then handed back `beve` plus `bytemuck`, `half`, `cfg-if`, `simdutf8`, `zerocopy` and `zerocopy-derive` — seven packages, six of which link into the artifact — for an encoding most such crates never reach. `beve` was named in one place: `ResponseBody::write_typed_slice`, which the derive emits only for a `#[repe(typed)]` field.
+
+  The feature carries that method and nothing else, so a struct with no `#[repe(typed)]` field compiles identically either way. A struct that has one gets a compile error naming the feature — `ResponseBody::write_typed_slice`'s bound is `structs::TypedSliceElement`, which has no implementors without it — rather than a method that fails to resolve, and never a silent fallback to a JSON array, which would change the wire without saying so.
+
+  **No source change for a caller of `repe`,** which enables `typed` unconditionally: it depends on `beve` directly for the builder-side half of the same encoding, so there the feature is free. `#[repe(typed)]` keeps working with no opt-in.
+
+  **`repe` is nonetheless a major**, because `src/lib.rs` has `pub use repe_core::{constants, structs}` — `repe-core` is a *public* dependency, so its major is `repe`'s whether or not `repe`'s own surface moves. Shipping this as a minor would break a crate holding `repe-core = "1"` and `repe = "10"` on `cargo update` alone, with two incompatible `RepeStruct` traits in one graph and an error pointing at neither — and that pairing is precisely the split's headline use case. Bump both, or neither.
+
+  The source-level break is narrower: a crate depending on `repe-core` *directly* and using `#[repe(typed)]` adds `features = ["typed"]`. That is the whole of it.
+
+  Feature unification means a workspace where anything already depends on `repe` gets `beve` regardless. The win is for a crate resolved on its own: published independently, built alone on a host with no business compiling an RPC stack, or vendored into a build that audits every package it links.
+
 ## [10.1.0] - 2026-08-28
 
 ### Changed

@@ -6,7 +6,10 @@ Depend on this instead of `repe` when the crate that *declares* a served type is
 
 ```toml
 [dependencies]
-repe-core = "1"
+repe-core = "2"
+# Only what the source below actually names. The derive reaches `serde_json`
+# through `repe-core`, so it is not a dependency of yours.
+serde = { version = "1", features = ["derive"] }
 ```
 
 ```rust
@@ -20,5 +23,17 @@ pub struct Build {
 ```
 
 Everything in this crate is re-exported by `repe` at the same paths (`repe::structs::*`, `repe::constants::*`), so a type derived against `repe-core` mounts on a `repe::Router` with nothing in between.
+
+## Features
+
+`typed`, off by default, adds `ResponseBody::write_typed_slice` — the BEVE typed-numeric array encoding a `#[repe(typed)]` field is read as — and with it `beve` and the six packages behind it: `bytemuck`, `half`, `cfg-if`, `simdutf8`, `zerocopy` and `zerocopy-derive`.
+
+It is off because that encoder is the whole weight of this crate. Without it the dependency list is `serde`, `serde_json` and `thiserror`, which is the point of depending here rather than on `repe`. A struct with no `#[repe(typed)]` field compiles identically either way; one that has such a field gets a compile error naming the feature, never a silent fallback to a JSON array.
+
+```toml
+repe-core = { version = "2", features = ["typed"] }
+```
+
+`repe` enables it, so a crate depending on `repe` needs no opt-in.
 
 See the [`repe` documentation](https://repe-org.github.io/repe-rs/) for the server, the client, and the protocol.
