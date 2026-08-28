@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [10.1.0] - 2026-08-28
 
 ### Changed
 - **`value-stream` compresses with [`zstandard`](https://crates.io/crates/zstandard) instead of `zstd`.** A pure-Rust implementation of the same format: no `cc`, no build script, no C toolchain to arrange for a cross-compile. The wire is unchanged, and the integration tests still decode produced frames with the reference C `zstd` (kept as a dev-dependency) to hold that. `StreamOpts::zstd_level` keeps its name, meaning, and default.
