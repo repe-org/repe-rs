@@ -1,5 +1,16 @@
 # Changelog
 
+## [12.0.0] - 2026-08-29
+
+A **major** release for one reason: the `beve` pin moves to 10. No `repe` API changed and no source change is needed.
+
+### Changed
+- **`beve` moves to 10.** Nothing in that release reaches repe. It is a major for the `mat` feature alone: hdf5-pure leaves beve's public API, so the MATLAB option enums (`Compression`, `NullPolicy`, `LibVer`, ...) become beve's own types rather than re-exports, `StringClass` / `EmptyMarkerEncoding` and the `From<hdf5_pure::Error> for beve::Error` impls are gone, and a stored `MatV73Options` deserializes with `#[serde(default)]`. repe does not enable `mat` and names none of it; every primitive repe uses — the aligned typed-slice pair, the streaming complex writers, the bulk `read_typed_slice` / `read_complex_slice` decoders, `beve::Error` — is unchanged, and the bytes on the wire are unchanged.
+
+  **It is nonetheless a repe major, as every beve major is.** beve types are in repe's public API — `RepeError::Beve(beve::Error)`, the re-exported `beve::{BeveTypedSlice, Complex}`, and the `T: beve::BeveTypedSlice` bounds on the typed and complex surfaces — so a downstream crate that also depends on `beve` directly must move to `beve 10` in step. Shipping this as a minor would hand such a graph two `beve::Error` types on `cargo update` alone. MSRV is unchanged at 1.96.1.
+
+- **`repe-core` 3.0.0**, for the same reason at one remove: its `typed` feature puts `beve::BeveTypedSlice` in the bound on `ResponseBody::write_typed_slice`, and `repe` re-exports the crate, so its major is `repe`'s. Bump both, or neither. `repe-derive` stays at `0.6.0` — the paths it generates do not name `beve`.
+
 ## [11.0.0] - 2026-08-28
 
 A **major** release for one reason: `repe` re-exports `repe-core`, so that crate's major is this crate's major. No `repe` API changed and no source change is needed.
