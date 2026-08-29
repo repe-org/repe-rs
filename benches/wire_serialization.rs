@@ -11,8 +11,22 @@
 //!   `to_vec`.
 //! * `into_wire_bytes` (fast path): the body is pre-allocated with
 //!   `Vec::with_capacity(body_len + HEADER_SIZE + query.len())`. The method
-//!   reuses the body buffer and performs one in-place memcpy. Should improve
-//!   noticeably as the body grows.
+//!   reuses the body buffer and shifts the body back over the prefix in place,
+//!   saving an allocation and a second buffer's worth of traffic.
+//!
+//! The fast path's win is not monotone in body size, and the sweep is sized to
+//! show that. It wins by ~30% through 64 KiB and still wins at 256 KiB, loses
+//! by up to ~19% between roughly 512 KiB and 8 MiB, then wins again by 16 MiB.
+//! The penalty in that band is the overlapping backward `copy_within`, which
+//! runs at ~50 GiB/s against ~58 GiB/s for a forward copy into fresh memory;
+//! the win outside it is the allocation and page faults the in-place path
+//! never pays, which grow until they dominate again. Aligning the shift to 64
+//! bytes recovers only about a third of the gap, so the prefix length is not
+//! worth padding. Deliberately left unthresholded: the band's edges are set by
+//! cache size, allocator, and page-fault cost, so a size cutoff here would be
+//! tuned to one machine. A multi-MiB body that cares should be framed with
+//! `write_message_streaming` or `write_message_typed_slice`, which never
+//! materialize a wire buffer at all.
 //!
 //! Body sizes span the small RPC response (64 B) through the multi-MiB
 //! streaming chunk (`repe::stream` documents 64 MiB windows; bench up to a
@@ -43,10 +57,9 @@
 //! reflected a bulk-byte body (O(1) encode, copy-bound), which is not the shape
 //! the server actually produces.
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use benchit::{Bench, GroupResult, Throughput};
 use repe::{BodyFormat, HEADER_SIZE, Header, Message, QueryFormat};
 use serde::{Deserialize, Serialize};
-use std::hint::black_box;
 
 const QUERY: &str = "/collect/file_chunk";
 const BODY_SIZES: &[usize] = &[64, 4 * 1024, 64 * 1024, 4 * 1024 * 1024];
@@ -73,46 +86,35 @@ fn build_message_with_reserve(body_len: usize) -> Message {
         .build()
 }
 
-fn bench_wire_serialization(c: &mut Criterion) {
-    let mut group = c.benchmark_group("wire_serialization");
+fn bench_wire_serialization(bench: &mut Bench) {
+    // One group per body size, so the three framings are interleaved against
+    // each other at a fixed size and the reported ratio answers the question
+    // the module doc poses: parity for the slow path, a widening win for the
+    // fast one. A single group spanning every size would ratio a 4 MiB case
+    // against a 64 B one.
     for &size in BODY_SIZES {
+        let mut group = bench.group(format!("wire_serialization/{size}"));
         group.throughput(Throughput::Bytes((HEADER_SIZE + QUERY.len() + size) as u64));
 
-        group.bench_with_input(BenchmarkId::new("to_vec", size), &size, |b, &size| {
-            // Build outside the timing loop; the cost being measured is the
-            // serialization step, not the build.
-            b.iter_batched(
-                || build_message_no_reserve(size),
-                |msg| black_box(msg.to_vec()),
-                criterion::BatchSize::SmallInput,
-            );
+        // Build outside the timing loop; the cost being measured is the
+        // serialization step, not the build.
+        group.bench("to_vec", move |b| {
+            b.iter_with(|| build_message_no_reserve(size), |msg| msg.to_vec())
         });
-
-        group.bench_with_input(
-            BenchmarkId::new("into_wire_bytes_slow", size),
-            &size,
-            |b, &size| {
-                b.iter_batched(
-                    || build_message_no_reserve(size),
-                    |msg| black_box(msg.into_wire_bytes()),
-                    criterion::BatchSize::SmallInput,
-                );
-            },
-        );
-
-        group.bench_with_input(
-            BenchmarkId::new("into_wire_bytes_fast", size),
-            &size,
-            |b, &size| {
-                b.iter_batched(
-                    || build_message_with_reserve(size),
-                    |msg| black_box(msg.into_wire_bytes()),
-                    criterion::BatchSize::SmallInput,
-                );
-            },
-        );
+        group.bench("into_wire_bytes_slow", move |b| {
+            b.iter_with(
+                || build_message_no_reserve(size),
+                |msg| msg.into_wire_bytes(),
+            )
+        });
+        group.bench("into_wire_bytes_fast", move |b| {
+            b.iter_with(
+                || build_message_with_reserve(size),
+                |msg| msg.into_wire_bytes(),
+            )
+        });
+        group.finish();
     }
-    group.finish();
 }
 
 /// A handler-shaped response body: a small head plus a sized payload, encoded
@@ -162,7 +164,7 @@ fn frame_direct(value: &Payload) -> Vec<u8> {
     buf
 }
 
-fn bench_outbound_frame_beve(c: &mut Criterion) {
+fn bench_outbound_frame_beve(bench: &mut Bench) {
     // Guard: both framings must round-trip to the same value, so the benchmark
     // compares equivalent work rather than a shortcut.
     let probe = Payload {
@@ -174,22 +176,21 @@ fn bench_outbound_frame_beve(c: &mut Criterion) {
     assert_eq!(via.beve_body::<Payload>().unwrap(), probe);
     assert_eq!(direct.beve_body::<Payload>().unwrap(), probe);
 
-    let mut group = c.benchmark_group("outbound_frame_beve");
     for &size in BODY_SIZES {
         let payload = Payload {
             id: 1,
             data: vec![0xAB; size],
         };
-        group.throughput(Throughput::Bytes((HEADER_SIZE + QUERY.len() + size) as u64));
+        let payload = &payload;
 
-        group.bench_with_input(BenchmarkId::new("via_message", size), &payload, |b, p| {
-            b.iter(|| black_box(frame_via_message(p)));
+        let mut group = bench.group(format!("outbound_frame_beve/{size}"));
+        group.throughput(Throughput::Bytes((HEADER_SIZE + QUERY.len() + size) as u64));
+        group.bench("via_message", move |b| {
+            b.iter(|| frame_via_message(payload))
         });
-        group.bench_with_input(BenchmarkId::new("direct_frame", size), &payload, |b, p| {
-            b.iter(|| black_box(frame_direct(p)));
-        });
+        group.bench("direct_frame", move |b| b.iter(|| frame_direct(payload)));
+        group.finish();
     }
-    group.finish();
 }
 
 /// Framing a whole-body numeric `Vec<f64>`: the serde streaming path
@@ -197,7 +198,7 @@ fn bench_outbound_frame_beve(c: &mut Criterion) {
 /// the typed-slice fast path (`write_message_typed_slice`: O(1) `typed_slice_size`
 /// plus one bulk `to_writer_typed_slice`). Both emit identical wire bytes, so the
 /// difference is exactly the two per-element traversals the bulk path skips.
-fn bench_typed_numeric_framing(c: &mut Criterion) {
+fn bench_typed_numeric_framing(bench: &mut Bench) {
     const ELEM_COUNTS: &[usize] = &[64, 4096, 64 * 1024, 1024 * 1024];
 
     fn frame_serde(sink: &mut Vec<u8>, data: &[f64]) {
@@ -229,35 +230,76 @@ fn bench_typed_numeric_framing(c: &mut Criterion) {
         "serde and typed-slice framings must agree byte-for-byte"
     );
 
-    let mut group = c.benchmark_group("typed_numeric_framing_f64");
     for &n in ELEM_COUNTS {
         let data: Vec<f64> = (0..n).map(|i| i as f64 * 0.5).collect();
-        group.throughput(Throughput::Bytes(
-            (HEADER_SIZE + QUERY.len() + n * 8) as u64,
-        ));
+        let data = &data;
+        // Distinct sinks rather than one shared buffer: both cases are live at
+        // once, so a single `&mut` would be borrowed twice.
         let mut serde_sink = Vec::new();
         let mut typed_sink = Vec::new();
 
-        group.bench_with_input(BenchmarkId::new("serde_stream", n), &data, |bn, d| {
+        let mut group = bench.group(format!("typed_numeric_framing_f64/{n}"));
+        group.throughput(Throughput::Bytes(
+            (HEADER_SIZE + QUERY.len() + n * 8) as u64,
+        ));
+        group.bench("serde_stream", |bn| {
             bn.iter(|| {
-                frame_serde(&mut serde_sink, d);
-                black_box(&serde_sink);
-            });
+                frame_serde(&mut serde_sink, data);
+                serde_sink.len()
+            })
         });
-        group.bench_with_input(BenchmarkId::new("typed_slice", n), &data, |bn, d| {
+        group.bench("typed_slice", |bn| {
             bn.iter(|| {
-                frame_typed(&mut typed_sink, d);
-                black_box(&typed_sink);
-            });
+                frame_typed(&mut typed_sink, data);
+                typed_sink.len()
+            })
         });
+        // The one ratio here worth gating. It is algorithmic -- O(1)
+        // `typed_slice_size` plus one bulk write, against two O(n) element
+        // walks -- so it does not shrink on a slow or contended runner the way
+        // a constant-factor margin would, and it widens with `n` rather than
+        // narrowing. Measured at 0.031..0.038, so 0.2 is roughly 6x of slack:
+        // it fires when the bulk path stops being taken at all, and not on
+        // ordinary drift. The other groups' ratios are constant factors and
+        // are deliberately left ungated.
+        gate(
+            &group.finish(),
+            "typed_slice",
+            0.2,
+            "the bulk typed-slice path may have fallen back to per-element serde",
+        );
     }
-    group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_wire_serialization,
-    bench_outbound_frame_beve,
-    bench_typed_numeric_framing
-);
-criterion_main!(benches);
+/// Fail the run if a within-run ratio invariant no longer holds.
+///
+/// Deliberately within-run rather than against a saved baseline: the ratio is
+/// measured from interleaved rounds in this same process, so it carries no
+/// stored state and does not care how loaded or how fast the machine is.
+///
+/// Skips rather than fails when the run did not actually measure the
+/// comparison. An absent case means the group was filtered out; a `None` ratio
+/// means this case *became* the reference because everything registered ahead
+/// of it was filtered away, which is exactly what `cargo bench -- typed_slice`
+/// does. Both are ordinary filtered runs, and failing on either would make
+/// every narrow filter look like the regression this exists to catch.
+fn gate(result: &GroupResult, case: &str, max_ratio: f64, suspect: &str) {
+    let Some(measured) = result.cases.iter().find(|c| c.name == case) else {
+        return;
+    };
+    let Some(ratio) = &measured.ratio else { return };
+    assert!(
+        ratio.point < max_ratio,
+        "{}/{}: ratio {:.4} against the group reference exceeds the {max_ratio} gate; {suspect}",
+        result.name,
+        case,
+        ratio.point,
+    );
+}
+
+fn main() {
+    let mut bench = Bench::from_args();
+    bench_wire_serialization(&mut bench);
+    bench_outbound_frame_beve(&mut bench);
+    bench_typed_numeric_framing(&mut bench);
+}

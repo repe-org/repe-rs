@@ -14,7 +14,7 @@
 //! (`with_json`, the Value round-trip path) and a typed handler (`with_typed`,
 //! which deserializes straight into a struct and skips the Value round-trip).
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use benchit::Bench;
 use repe::server::Router;
 use repe::{
     CallContext, HEADER_SIZE, Message, MessageView, QueryFormat, read_message, read_message_into,
@@ -78,65 +78,72 @@ fn run_cycle_view(router: &Router, wire: &[u8], path: &str, buf: &mut Vec<u8>, o
     .expect("write");
 }
 
-fn bench_server_lifecycle(c: &mut Criterion) {
+fn main() {
+    let mut bench = Bench::from_args();
+
     let json_router = Router::new().with_json("/echo", |v: serde_json::Value| Ok(v));
     let typed_router = Router::new()
         .with_typed::<SumIn, SumOut, _>("/sum", |i: SumIn| Ok(SumOut { sum: i.a + i.b }));
 
     let json_wire = frame("/echo", &json!({"x": 1, "y": "hello"}));
     let typed_wire = frame("/sum", &json!({"a": 2, "b": 3}));
-    let mut out = Vec::with_capacity(256);
 
-    let mut group = c.benchmark_group("server_lifecycle");
-    group.bench_function("json_echo", |b| {
+    // Every case in a group is live at once, so a single shared response buffer
+    // would be two simultaneous `&mut` borrows. One buffer per case instead:
+    // each is still reused across that case's own iterations, which is the
+    // property the benchmark is measuring.
+    let mut json_out = Vec::with_capacity(256);
+    let mut typed_out = Vec::with_capacity(256);
+
+    let mut group = bench.group("server_lifecycle");
+    group.bench("json_echo", |b| {
         b.iter(|| {
             run_cycle(
                 black_box(&json_router),
                 black_box(&json_wire),
                 "/echo",
-                &mut out,
+                &mut json_out,
             )
         })
     });
-    group.bench_function("typed_sum", |b| {
+    group.bench("typed_sum", |b| {
         b.iter(|| {
             run_cycle(
                 black_box(&typed_router),
                 black_box(&typed_wire),
                 "/sum",
-                &mut out,
+                &mut typed_out,
             )
         })
     });
     group.finish();
 
     // Borrowing path: same work, reusable read buffer + MessageView dispatch.
-    let mut buf = Vec::with_capacity(256);
-    let mut view_group = c.benchmark_group("server_lifecycle_view");
-    view_group.bench_function("json_echo", |b| {
+    let mut json_buf = Vec::with_capacity(256);
+    let mut typed_buf = Vec::with_capacity(256);
+
+    let mut view_group = bench.group("server_lifecycle_view");
+    view_group.bench("json_echo", |b| {
         b.iter(|| {
             run_cycle_view(
                 black_box(&json_router),
                 black_box(&json_wire),
                 "/echo",
-                &mut buf,
-                &mut out,
+                &mut json_buf,
+                &mut json_out,
             )
         })
     });
-    view_group.bench_function("typed_sum", |b| {
+    view_group.bench("typed_sum", |b| {
         b.iter(|| {
             run_cycle_view(
                 black_box(&typed_router),
                 black_box(&typed_wire),
                 "/sum",
-                &mut buf,
-                &mut out,
+                &mut typed_buf,
+                &mut typed_out,
             )
         })
     });
     view_group.finish();
 }
-
-criterion_group!(benches, bench_server_lifecycle);
-criterion_main!(benches);
