@@ -13,7 +13,7 @@
 //! `Arc` built at registration time. The `middleware` variants of these
 //! benches surface that hoisting directly.
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use benchit::Bench;
 use repe::registry::{Registry, RegistryCallable};
 use repe::server::{Middleware, Next, Router};
 use repe::{BodyFormat, Message, QueryFormat};
@@ -119,7 +119,7 @@ fn build_request(path: &str) -> Message {
         .build()
 }
 
-fn bench_router_get(c: &mut Criterion) {
+fn bench_router_get(bench: &mut Bench) {
     let plain = build_plain_router(false);
     let plain_mw = build_plain_router(true);
     let registry = build_registry_router(false);
@@ -127,29 +127,27 @@ fn bench_router_get(c: &mut Criterion) {
     let struct_router = build_struct_router(false);
     let struct_router_mw = build_struct_router(true);
 
-    let mut group = c.benchmark_group("router_get");
-    group.bench_function("plain", |b| {
-        b.iter(|| black_box(plain.get(black_box("/sum"))))
+    let mut group = bench.group("router_get");
+    group.bench("plain", |b| b.iter(|| plain.get(black_box("/sum"))));
+    group.bench("plain_with_middleware", |b| {
+        b.iter(|| plain_mw.get(black_box("/sum")))
     });
-    group.bench_function("plain_with_middleware", |b| {
-        b.iter(|| black_box(plain_mw.get(black_box("/sum"))))
+    group.bench("registry", |b| {
+        b.iter(|| registry.get(black_box("/api/echo")))
     });
-    group.bench_function("registry", |b| {
-        b.iter(|| black_box(registry.get(black_box("/api/echo"))))
+    group.bench("registry_with_middleware", |b| {
+        b.iter(|| registry_mw.get(black_box("/api/echo")))
     });
-    group.bench_function("registry_with_middleware", |b| {
-        b.iter(|| black_box(registry_mw.get(black_box("/api/echo"))))
+    group.bench("struct", |b| {
+        b.iter(|| struct_router.get(black_box("/svc/get_number")))
     });
-    group.bench_function("struct", |b| {
-        b.iter(|| black_box(struct_router.get(black_box("/svc/get_number"))))
-    });
-    group.bench_function("struct_with_middleware", |b| {
-        b.iter(|| black_box(struct_router_mw.get(black_box("/svc/get_number"))))
+    group.bench("struct_with_middleware", |b| {
+        b.iter(|| struct_router_mw.get(black_box("/svc/get_number")))
     });
     group.finish();
 }
 
-fn bench_full_dispatch(c: &mut Criterion) {
+fn bench_full_dispatch(bench: &mut Bench) {
     let plain = build_plain_router(false);
     let plain_mw = build_plain_router(true);
     let registry = build_registry_router(false);
@@ -161,71 +159,70 @@ fn bench_full_dispatch(c: &mut Criterion) {
     let registry_req = build_request("/api/echo");
     let struct_req = build_request("/svc/get_number");
 
-    let mut group = c.benchmark_group("router_dispatch");
-    group.bench_function("plain", |b| {
+    let mut group = bench.group("router_dispatch");
+    group.bench("plain", |b| {
         b.iter(|| {
             let h = plain.get(black_box("/sum")).unwrap();
-            black_box(h.handle(&plain_req).unwrap());
+            h.handle(&plain_req).unwrap()
         })
     });
-    group.bench_function("plain_with_middleware", |b| {
+    group.bench("plain_with_middleware", |b| {
         b.iter(|| {
             let h = plain_mw.get(black_box("/sum")).unwrap();
-            black_box(h.handle(&plain_req).unwrap());
+            h.handle(&plain_req).unwrap()
         })
     });
-    group.bench_function("registry", |b| {
+    group.bench("registry", |b| {
         b.iter(|| {
             let h = registry.get(black_box("/api/echo")).unwrap();
-            black_box(h.handle(&registry_req).unwrap());
+            h.handle(&registry_req).unwrap()
         })
     });
-    group.bench_function("registry_with_middleware", |b| {
+    group.bench("registry_with_middleware", |b| {
         b.iter(|| {
             let h = registry_mw.get(black_box("/api/echo")).unwrap();
-            black_box(h.handle(&registry_req).unwrap());
+            h.handle(&registry_req).unwrap()
         })
     });
-    group.bench_function("struct", |b| {
+    group.bench("struct", |b| {
         b.iter(|| {
             let h = struct_router.get(black_box("/svc/get_number")).unwrap();
-            black_box(h.handle(&struct_req).unwrap());
+            h.handle(&struct_req).unwrap()
         })
     });
-    group.bench_function("struct_with_middleware", |b| {
+    group.bench("struct_with_middleware", |b| {
         b.iter(|| {
             let h = struct_router_mw.get(black_box("/svc/get_number")).unwrap();
-            black_box(h.handle(&struct_req).unwrap());
+            h.handle(&struct_req).unwrap()
         })
     });
     group.finish();
 }
 
-fn bench_registry_value(c: &mut Criterion) {
+fn bench_registry_value(bench: &mut Bench) {
     let router = build_registry_value_router();
     let read_req = build_read_request("/api/a/b/c");
     let write_req = build_request("/api/a/b/c"); // non-empty body => WRITE (set_pointer)
 
-    let mut group = c.benchmark_group("registry_value");
-    group.bench_function("read_depth3", |b| {
+    let mut group = bench.group("registry_value");
+    group.bench("read_depth3", |b| {
         b.iter(|| {
             let h = router.get(black_box("/api/a/b/c")).unwrap();
-            black_box(h.handle(&read_req).unwrap());
+            h.handle(&read_req).unwrap()
         })
     });
-    group.bench_function("write_depth3", |b| {
+    group.bench("write_depth3", |b| {
         b.iter(|| {
             let h = router.get(black_box("/api/a/b/c")).unwrap();
-            black_box(h.handle(&write_req).unwrap());
+            h.handle(&write_req).unwrap()
         })
     });
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_router_get,
-    bench_full_dispatch,
-    bench_registry_value
-);
-criterion_main!(benches);
+fn main() {
+    let mut bench = Bench::from_args();
+    bench_router_get(&mut bench);
+    bench_full_dispatch(&mut bench);
+    bench_registry_value(&mut bench);
+}
