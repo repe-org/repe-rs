@@ -6,7 +6,7 @@ Depend on this instead of `repe` when the crate that *declares* a served type is
 
 ```toml
 [dependencies]
-repe-core = "2"
+repe-core = "3"
 # Only what the source below actually names. The derive reaches `serde_json`
 # through `repe-core`, so it is not a dependency of yours.
 serde = { version = "1", features = ["derive"] }

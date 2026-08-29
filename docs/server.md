@@ -428,7 +428,7 @@ A served type's endpoints are declared where the *type* is declared, and that is
 ```toml
 # the pure crate
 [dependencies]
-repe-core = "2"
+repe-core = "3"
 # Only what the source below actually names. The derive reaches `serde_json`
 # through `repe-core`, so it is not a dependency of yours.
 serde = { version = "1", features = ["derive"] }
