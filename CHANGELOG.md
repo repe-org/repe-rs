@@ -11,6 +11,8 @@ A **major** release for one reason: the `beve` pin moves to 10. No `repe` API ch
 
 - **`repe-core` 3.0.0**, for the same reason at one remove: its `typed` feature puts `beve::BeveTypedSlice` in the bound on `ResponseBody::write_typed_slice`, and `repe` re-exports the crate, so its major is `repe`'s. Bump both, or neither. `repe-derive` stays at `0.6.0` — the paths it generates do not name `beve`.
 
+- **The benchmarks move from criterion to [benchit](https://crates.io/crates/benchit).** A dev-dependency swap — all three bench targets already ran under `harness = false`, so no consumer graph changes and the lockfile drops 21 packages. `wire_serialization` now groups per body size, so each ratio compares framings at a fixed size rather than across sizes.
+
 ## [11.0.0] - 2026-08-28
 
 A **major** release for one reason: `repe` re-exports `repe-core`, so that crate's major is this crate's major. No `repe` API changed and no source change is needed.
