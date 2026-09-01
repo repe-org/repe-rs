@@ -298,3 +298,20 @@ harness = false
 # `tests/allocations.rs`, which pins the allocation count of the same cycle.
 name = "server_lifecycle"
 harness = false
+
+# Profiles are read only from the workspace root, so these settings cover
+# `repe-core` and `repe-derive` too; the excluded `bench/grpc-shootout` and the
+# `wasm-tests` crates are their own workspace roots and keep Cargo's defaults.
+[profile.dev]
+# Line tables are what a backtrace and a panic location need. Full debuginfo
+# additionally describes every type and local for a debugger, and it is the bulk
+# of the bytes rustc writes and the linker then chews through — paid on every
+# rebuild, whether or not anyone attaches a debugger. Set `debug = true` locally
+# for a session that actually needs variable inspection.
+debug = "line-tables-only"
+# Off deliberately. Incremental trades a slower first build and a large
+# `target/incremental` for cheaper edit-rebuild cycles, and it partitions
+# codegen units in a way that costs runtime speed in the same `dev` profile the
+# test suite runs under. CI already builds non-incrementally (Swatinem/rust-cache
+# sets `CARGO_INCREMENTAL=0`), so this is what makes local builds match it.
+incremental = false
