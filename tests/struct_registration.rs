@@ -147,16 +147,28 @@ fn request_empty(path: &str) -> Message {
         .build()
 }
 
-fn request_json(path: &str, body: &Value) -> Message {
+/// A request whose body is the given JSON text, sent verbatim.
+///
+/// These tests are about the wire contract, so the body is written as the text
+/// a client would send rather than built from a declared type. A declared type
+/// would put a shape between the test and what it is testing, and the malformed
+/// cases could not be expressed at all.
+fn request_json(path: &str, body: &str) -> Message {
     Message::builder()
         .query_str(path)
         .query_format(QueryFormat::JsonPointer)
-        .body_json(body)
+        .body_bytes(body.as_bytes().to_vec())
+        .body_format(BodyFormat::Json)
         .build()
 }
 
-fn parse_body(resp: &Message) -> Value {
-    serde_json::from_slice(&resp.body).expect("response body should be JSON")
+/// The response body as JSON text.
+///
+/// Compared as text throughout, which is what a response *is*: with no document
+/// model there is nothing between the bytes and the assertion, and the key
+/// order a listing emits becomes assertable rather than normalized away.
+fn body_text(resp: &Message) -> &str {
+    std::str::from_utf8(&resp.body).expect("response body should be UTF-8 JSON")
 }
 
 fn request_raw(path: &str, bytes: &[u8]) -> Message {
@@ -185,9 +197,9 @@ fn structs_of_functions() {
     // writing integer resets to requested value
     let handler = router.get("/i").unwrap();
     let resp = handler
-        .handle(&request_json("/i", &json!(42)))
+        .handle(&request_json("/i", r##"42"##))
         .expect("write integer");
-    assert_eq!(parse_body(&resp), Value::Null);
+    assert_eq!(body_text(&resp), "null");
     assert_eq!(shared.lock().unwrap().i, 42);
 
     // zero-argument functions
@@ -208,7 +220,7 @@ fn structs_of_functions() {
     let get_number = router
         .get("/get_number")
         .unwrap()
-        .handle(&request_json("/get_number", &json!("ignored")))
+        .handle(&request_json("/get_number", r##""ignored""##))
         .unwrap();
     assert_eq!(parse_body(&get_number), Value::from(42));
 
@@ -218,13 +230,13 @@ fn structs_of_functions() {
         .unwrap()
         .handle(&request_empty("/void_func"))
         .unwrap();
-    assert_eq!(parse_body(&void_resp), Value::Null);
+    assert_eq!(body_text(&void_resp), "null");
 
     // max with parameters
     let max_resp = router
         .get("/max")
         .unwrap()
-        .handle(&request_json("/max", &json!([1.1, 3.3, 2.25])))
+        .handle(&request_json("/max", r##"[1.1, 3.3, 2.25]"##))
         .unwrap();
     assert_eq!(parse_body(&max_resp), Value::from(3.3));
 
@@ -251,7 +263,7 @@ fn nested_structs_of_functions() {
         .unwrap()
         .handle(&request_empty("/my_functions/void_func"))
         .unwrap();
-    assert_eq!(parse_body(&resp), Value::Null);
+    assert_eq!(body_text(&resp), "null");
 
     let hello = router
         .get("/my_functions/hello")
@@ -270,7 +282,7 @@ fn nested_structs_of_functions() {
     let append = router
         .get("/append_awesome")
         .unwrap()
-        .handle(&request_json("/append_awesome", &json!("you are")))
+        .handle(&request_json("/append_awesome", r##""you are""##))
         .unwrap();
     assert_eq!(
         parse_body(&append),
@@ -280,9 +292,9 @@ fn nested_structs_of_functions() {
     let write_string = router
         .get("/my_string")
         .unwrap()
-        .handle(&request_json("/my_string", &json!("Howdy!")))
+        .handle(&request_json("/my_string", r##""Howdy!""##))
         .unwrap();
-    assert_eq!(parse_body(&write_string), Value::Null);
+    assert_eq!(body_text(&write_string), "null");
 
     let read_string = router
         .get("/my_string")
@@ -302,7 +314,7 @@ fn nested_structs_of_functions() {
     let max_resp = router
         .get("/my_functions/max")
         .unwrap()
-        .handle(&request_json("/my_functions/max", &json!([1.1, 3.3, 2.25])))
+        .handle(&request_json("/my_functions/max", r##"[1.1, 3.3, 2.25]"##))
         .unwrap();
     assert_eq!(parse_body(&max_resp), Value::from(3.3));
 
@@ -333,9 +345,9 @@ fn example_functions() {
     let write_name = router
         .get("/name")
         .unwrap()
-        .handle(&request_json("/name", &json!("Susan")))
+        .handle(&request_json("/name", r##""Susan""##))
         .unwrap();
-    assert_eq!(parse_body(&write_name), Value::Null);
+    assert_eq!(body_text(&write_name), "null");
 
     let read_name = router
         .get("/get_name")
@@ -347,7 +359,7 @@ fn example_functions() {
     let read_with_body = router
         .get("/get_name")
         .unwrap()
-        .handle(&request_json("/get_name", &json!("Bob")))
+        .handle(&request_json("/get_name", r##""Bob""##))
         .unwrap();
     assert_eq!(parse_body(&read_with_body), Value::String("Susan".into()));
 
@@ -356,17 +368,17 @@ fn example_functions() {
     let set_name = router
         .get("/set_name")
         .unwrap()
-        .handle(&request_json("/set_name", &json!("Bob")))
+        .handle(&request_json("/set_name", r##""Bob""##))
         .unwrap();
-    assert_eq!(parse_body(&set_name), Value::Null);
+    assert_eq!(body_text(&set_name), "null");
     assert_eq!(shared.lock().unwrap().name, "Bob");
 
     let custom_name = router
         .get("/custom_name")
         .unwrap()
-        .handle(&request_json("/custom_name", &json!("Alice")))
+        .handle(&request_json("/custom_name", r##""Alice""##))
         .unwrap();
-    assert_eq!(parse_body(&custom_name), Value::Null);
+    assert_eq!(body_text(&custom_name), "null");
     assert_eq!(shared.lock().unwrap().name, "Alice");
 }
 
@@ -390,9 +402,9 @@ fn struct_shared_accepts_rwlock() {
     let set_name = router
         .get("/set_name")
         .unwrap()
-        .handle(&request_json("/set_name", &json!("Updated")))
+        .handle(&request_json("/set_name", r##""Updated""##))
         .unwrap();
-    assert_eq!(parse_body(&set_name), Value::Null);
+    assert_eq!(body_text(&set_name), "null");
 
     assert_eq!(shared.read().unwrap().name.as_str(), "Updated");
 }
@@ -417,9 +429,9 @@ fn struct_shared_accepts_tokio_mutex() {
     let set_name = router
         .get("/set_name")
         .unwrap()
-        .handle(&request_json("/set_name", &json!("Updated")))
+        .handle(&request_json("/set_name", r##""Updated""##))
         .unwrap();
-    assert_eq!(parse_body(&set_name), Value::Null);
+    assert_eq!(body_text(&set_name), "null");
 
     assert_eq!(shared.blocking_lock().name.as_str(), "Updated");
 }
@@ -444,9 +456,9 @@ fn struct_shared_accepts_tokio_rwlock() {
     let set_name = router
         .get("/set_name")
         .unwrap()
-        .handle(&request_json("/set_name", &json!("Updated")))
+        .handle(&request_json("/set_name", r##""Updated""##))
         .unwrap();
-    assert_eq!(parse_body(&set_name), Value::Null);
+    assert_eq!(body_text(&set_name), "null");
 
     let guard = shared.blocking_read();
     assert_eq!(guard.name.as_str(), "Updated");
@@ -473,9 +485,9 @@ fn struct_shared_accepts_parking_lot_rwlock() {
     let set_name = router
         .get("/set_name")
         .unwrap()
-        .handle(&request_json("/set_name", &json!("Updated")))
+        .handle(&request_json("/set_name", r##""Updated""##))
         .unwrap();
-    assert_eq!(parse_body(&set_name), Value::Null);
+    assert_eq!(body_text(&set_name), "null");
 
     let guard = shared.read();
     assert_eq!(guard.name.as_str(), "Updated");
@@ -504,16 +516,16 @@ fn struct_attributes_control_behavior() {
     let write_value = router
         .get("/renamed_value")
         .unwrap()
-        .handle(&request_json("/renamed_value", &json!(11)))
+        .handle(&request_json("/renamed_value", r##"11"##))
         .unwrap();
-    assert_eq!(parse_body(&write_value), Value::Null);
+    assert_eq!(body_text(&write_value), "null");
     assert_eq!(shared.lock().unwrap().value, 11);
 
     // readonly field rejects writes but stays readable
     let readonly_err = router
         .get("/name")
         .unwrap()
-        .handle(&request_json("/name", &json!("beta")))
+        .handle(&request_json("/name", r##""beta""##))
         .unwrap();
     assert!(readonly_err.is_error());
     assert_eq!(readonly_err.header.ec, ErrorCode::InvalidBody as u32);
@@ -571,10 +583,10 @@ fn root_write_replaces_struct() {
     let replace = Message::builder()
         .query_str("")
         .query_format(QueryFormat::JsonPointer)
-        .body_json(&json!({"foo": 5, "bar": "five"}))
+        .body_json(r##"{"foo": 5, "bar": "five"}"##)
         .build();
     let resp = router.get("").unwrap().handle(&replace).unwrap();
-    assert_eq!(parse_body(&resp), Value::Null);
+    assert_eq!(body_text(&resp), "null");
 
     let data = shared.lock().unwrap();
     assert_eq!(data.foo, 5);
@@ -596,9 +608,9 @@ fn struct_with_root_prefix_routes() {
     let write = router
         .get("/sub/i")
         .unwrap()
-        .handle(&request_json("/sub/i", &json!(9)))
+        .handle(&request_json("/sub/i", r##"9"##))
         .unwrap();
-    assert_eq!(parse_body(&write), Value::Null);
+    assert_eq!(body_text(&write), "null");
     assert_eq!(shared.lock().unwrap().i, 9);
 
     let invalid = router

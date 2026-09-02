@@ -117,11 +117,18 @@ fn request_empty(path: &str) -> Message {
         .build()
 }
 
-fn request_json(path: &str, body: &Value) -> Message {
+/// A request whose body is the given JSON text, sent verbatim.
+///
+/// These tests are about the wire contract, so the body is written as the text
+/// a client would send rather than built from a declared type. A declared type
+/// would put a shape between the test and what it is testing, and the malformed
+/// cases could not be expressed at all.
+fn request_json(path: &str, body: &str) -> Message {
     Message::builder()
         .query_str(path)
         .query_format(QueryFormat::JsonPointer)
-        .body_json(body)
+        .body_bytes(body.as_bytes().to_vec())
+        .body_format(BodyFormat::Json)
         .build()
 }
 
@@ -133,15 +140,20 @@ fn call(router: &Router, path: &str, request: &Message) -> Message {
         .expect("dispatch")
 }
 
-fn parse_body(resp: &Message) -> Value {
-    serde_json::from_slice(&resp.body).expect("response body should be JSON")
+/// The response body as JSON text.
+///
+/// Compared as text throughout, which is what a response *is*: with no document
+/// model there is nothing between the bytes and the assertion, and the key
+/// order a listing emits becomes assertable rather than normalized away.
+fn body_text(resp: &Message) -> &str {
+    std::str::from_utf8(&resp.body).expect("response body should be UTF-8 JSON")
 }
 
 #[test]
 fn a_bodiless_request_reads_through_the_getter() {
     let router = Router::new().with_struct("", budget()).0;
     let resp = call(&router, "/used_percent", &request_empty("/used_percent"));
-    assert_eq!(parse_body(&resp), json!(12.5));
+    assert_eq!(body_text(&resp), "12.5");
 }
 
 #[test]
@@ -151,11 +163,11 @@ fn a_request_with_a_body_writes_through_the_setter() {
     let resp = call(
         &router,
         "/used_percent",
-        &request_json("/used_percent", &json!(25.0)),
+        &request_json("/used_percent", r##"25.0"##),
     );
     assert_eq!(
-        parse_body(&resp),
-        Value::Null,
+        body_text(&resp),
+        "null",
         "a field write is acknowledged with null"
     );
     assert_eq!(
@@ -170,11 +182,11 @@ fn a_getter_without_a_setter_is_read_only() {
     let router = Router::new().with_struct("", budget()).0;
 
     let resp = call(&router, "/version", &request_empty("/version"));
-    assert_eq!(parse_body(&resp), json!("1.4.2"));
+    assert_eq!(body_text(&resp), r#""1.4.2""#);
 
     // The same refusal a `#[repe(readonly)]` field gives: no setter is declared,
     // so there is nothing extra to say.
-    let resp = call(&router, "/version", &request_json("/version", &json!("2")));
+    let resp = call(&router, "/version", &request_json("/version", r##""2""##));
     assert_eq!(resp.header.ec, ErrorCode::InvalidBody as u32);
 }
 
@@ -184,7 +196,7 @@ fn the_typed_numeric_path_composes_with_an_accessor() {
     let resp = call(&router, "/weights", &request_empty("/weights"));
     assert_eq!(resp.header.body_format, BodyFormat::Beve as u16);
     assert_eq!(
-        beve::from_slice::<Vec<f64>>(&resp.body).unwrap(),
+        structio::from_beve::<Vec<f64>>(&resp.body).unwrap(),
         vec![1.0, 0.5, 0.25, 0.125]
     );
 }
@@ -194,9 +206,9 @@ fn either_half_may_fail() {
     let (router, handle) = Router::new().with_struct("", budget());
 
     let resp = call(&router, "/offset", &request_empty("/offset"));
-    assert_eq!(parse_body(&resp), json!(2));
+    assert_eq!(body_text(&resp), "2");
 
-    let resp = call(&router, "/offset", &request_json("/offset", &json!(64)));
+    let resp = call(&router, "/offset", &request_json("/offset", r##"64"##));
     assert_eq!(resp.header.ec, ErrorCode::ParseError as u32);
     assert!(String::from_utf8_lossy(&resp.body).contains("offset must be within"));
     assert_eq!(
@@ -216,7 +228,7 @@ fn a_setter_argument_of_the_wrong_type_is_a_body_error() {
     let resp = call(
         &router,
         "/used_percent",
-        &request_json("/used_percent", &json!("fast")),
+        &request_json("/used_percent", r##""fast""##),
     );
     assert_eq!(resp.header.ec, ErrorCode::InvalidBody as u32);
 }
@@ -235,23 +247,26 @@ fn an_accessor_endpoint_has_no_subpath() {
 #[test]
 fn the_whole_struct_listing_shows_accessor_values_and_method_signatures() {
     let router = Router::new().with_struct("", budget()).0;
-    let listing = parse_body(&call(&router, "", &request_empty("")));
+    let listing = call(&router, "", &request_empty(""));
+    let listing = body_text(&listing);
 
     // Fields, as always.
-    assert_eq!(listing["used"], json!(512));
+    assert!(listing.contains(r#""used":512"#), "{listing}");
 
     // Field-shaped endpoints list like fields: by value, not by signature.
-    assert_eq!(listing["used_percent"], json!(12.5));
-    assert_eq!(listing["version"], json!("1.4.2"));
-    assert_eq!(listing["offset"], json!(2));
-    assert_eq!(
-        listing["weights"],
-        json!([1.0, 0.5, 0.25, 0.125]),
-        "the enclosing object is JSON, so a typed accessor lists as a JSON array"
+    assert!(listing.contains(r#""used_percent":12.5"#), "{listing}");
+    assert!(listing.contains(r#""version":"1.4.2""#), "{listing}");
+    assert!(listing.contains(r#""offset":2"#), "{listing}");
+    assert!(
+        listing.contains(r#""weights":[1,0.5,0.25,0.125]"#),
+        "the enclosing object is JSON, so a typed accessor lists as a JSON array: {listing}"
     );
 
     // An ordinary method still publishes its signature.
-    assert_eq!(listing["reset"], json!("fn(&mut self) -> ()"));
+    assert!(
+        listing.contains(r#""reset":"fn(&mut self) -> ()""#),
+        "{listing}"
+    );
 }
 
 #[test]
@@ -259,11 +274,11 @@ fn the_two_halves_of_a_pair_need_not_be_adjacent() {
     // `set_offset` is declared above `reads` and `offset` below it, so the pairing
     // is by endpoint name rather than by position in the block.
     let (router, handle) = Router::new().with_struct("", budget());
-    call(&router, "/offset", &request_json("/offset", &json!(6)));
+    call(&router, "/offset", &request_json("/offset", r##"6"##));
     assert_eq!(handle.lock().unwrap().tier, 3);
     assert_eq!(
-        parse_body(&call(&router, "/offset", &request_empty("/offset"))),
-        json!(6)
+        body_text(&call(&router, "/offset", &request_empty("/offset"))),
+        "6"
     );
 }
 
@@ -271,12 +286,12 @@ fn the_two_halves_of_a_pair_need_not_be_adjacent() {
 fn a_getter_may_take_a_mut_receiver() {
     let (router, handle) = Router::new().with_struct("", budget());
     assert_eq!(
-        parse_body(&call(&router, "/reads", &request_empty("/reads"))),
-        json!(1)
+        body_text(&call(&router, "/reads", &request_empty("/reads"))),
+        "1"
     );
     assert_eq!(
-        parse_body(&call(&router, "/reads", &request_empty("/reads"))),
-        json!(2)
+        body_text(&call(&router, "/reads", &request_empty("/reads"))),
+        "2"
     );
     assert_eq!(handle.lock().unwrap().read_count, 2);
 }
@@ -325,31 +340,32 @@ mod nested {
         let (router, handle) = Router::new().with_struct("", plan());
 
         assert_eq!(
-            parse_body(&call(
+            body_text(&call(
                 &router,
                 "/budget/used_percent",
                 &request_empty("/budget/used_percent")
             )),
-            json!(12.5)
+            "12.5"
         );
 
         call(
             &router,
             "/budget/used_percent",
-            &request_json("/budget/used_percent", &json!(25.0)),
+            &request_json("/budget/used_percent", r##"25.0"##),
         );
         assert_eq!(handle.lock().unwrap().budget.used, 1024);
 
         // The child's own listing carries the accessor values.
-        let child = parse_body(&call(&router, "/budget", &request_empty("/budget")));
-        assert_eq!(child["used_percent"], json!(25.0));
-        assert_eq!(child["version"], json!("1.4.2"));
+        let child = call(&router, "/budget", &request_empty("/budget"));
+        let child = body_text(&child);
+        assert!(child.contains(r#""used_percent":25"#), "{child}");
+        assert!(child.contains(r#""version":"1.4.2""#), "{child}");
 
         // And an error from inside the child names the full path.
         let resp = call(
             &router,
             "/budget/version",
-            &request_json("/budget/version", &json!("2.0")),
+            &request_json("/budget/version", r##""2.0""##),
         );
         assert_eq!(resp.header.ec, ErrorCode::InvalidBody as u32);
         assert!(
@@ -359,71 +375,97 @@ mod nested {
     }
 }
 
-/// The two generated dispatch paths are built from one set of specs and must
-/// agree on every accessor arm, exactly as they must on every field arm.
+/// Every accessor arm the derive generates, checked against the bytes it writes.
+///
+/// This was an agreement test between `repe_handle` (which built a `Value`) and
+/// `repe_handle_into` (which wrote bytes). There is one path now, so what is
+/// left to pin is the arms themselves.
 #[test]
-fn the_value_and_encode_paths_agree() {
-    let cases: [(&[&str], Option<Value>); 10] = [
-        (&[], None),                              // whole object, listing
-        (&["used_percent"], None),                // accessor read
-        (&["used_percent"], Some(json!(25.0))),   // accessor write
-        (&["used_percent"], Some(json!("fast"))), // write, wrong type
-        (&["version"], None),                     // read-only accessor read
-        (&["version"], Some(json!("2.0"))),       // read-only rejection
-        (&["offset"], None),                      // fallible read
-        (&["offset"], Some(json!(64))),           // fallible write, refused
-        (&["used_percent", "extra"], None),       // InvalidSubpath
-        (&["reset"], None),                       // ordinary method, alongside
+fn every_accessor_arm_writes_what_it_should() {
+    use repe::structs::RequestBody;
+
+    /// `Ok` with the exact JSON text expected, or `Err` with the error's
+    /// `to_string()`.
+    type Expected = Result<&'static str, &'static str>;
+
+    let cases: [(&[&str], Option<&str>, Expected); 10] = [
+        // A field-shaped endpoint lists by value, not by signature.
+        (
+            &[],
+            None,
+            Ok(concat!(
+                r#"{"used":512,"total":4096,"tier":1,"read_count":0,"#,
+                r#""reset":"fn(&mut self) -> ()","used_percent":12.5,"version":"1.4.2","#,
+                r#""weights":[1,0.5,0.25,0.125],"reads":1,"offset":2}"#
+            )),
+        ),
+        (&["used_percent"], None, Ok("12.5")),
+        (&["used_percent"], Some("25.0"), Ok("null")),
+        // A setter's parameter type is enforced: a string is not a percentage.
+        (
+            &["used_percent"],
+            Some(r#""fast""#),
+            Err("could not decode body for `/used_percent`: expected a number at byte 0"),
+        ),
+        (&["version"], None, Ok(r#""1.4.2""#)),
+        (
+            &["version"],
+            Some(r#""2.0""#),
+            Err("body not allowed for `/version`"),
+        ),
+        (&["offset"], None, Ok("2")),
+        // A fallible setter's own refusal reaches the caller intact.
+        (
+            &["offset"],
+            Some("64"),
+            Err("method `/offset` failed: out of range: offset must be within ±8"),
+        ),
+        (
+            &["used_percent", "extra"],
+            None,
+            Err("unexpected additional path segments at `/used_percent/extra`"),
+        ),
+        (&["reset"], None, Ok("null")),
     ];
 
-    for (segments, body) in cases {
-        let mut via_value = budget();
-        let mut via_encode = budget();
-
-        let value_result = via_value.repe_handle(segments, body.clone());
+    for (segments, body, expected) in cases {
+        let mut subject = budget();
+        let body = body.map(|text| RequestBody::new(text.as_bytes(), BodyFormat::Json));
 
         let mut buf = Vec::new();
         let mut out = ResponseBody::new(&mut buf);
-        let encode_result = via_encode.repe_handle_into(segments, body.clone(), &mut out);
+        let result = subject.repe_handle_into(segments, body, &mut out);
 
-        match (&value_result, &encode_result) {
-            (Ok(value), Ok(())) => {
-                let expected = value.clone().unwrap_or(Value::Null);
-                let encoded: Value = serde_json::from_slice(&buf)
-                    .unwrap_or_else(|e| panic!("{segments:?} produced invalid JSON: {e}"));
-                assert_eq!(encoded, expected, "payload diverged at {segments:?}");
+        match (result, expected) {
+            (Ok(()), Ok(want)) => {
+                let got = std::str::from_utf8(&buf).expect("a JSON response is UTF-8");
+                assert_eq!(got, want, "payload diverged at {segments:?}");
             }
-            (Err(value_err), Err(encode_err)) => assert_eq!(
-                value_err.to_string(),
-                encode_err.to_string(),
-                "error text diverged at {segments:?}"
-            ),
-            _ => panic!("outcome diverged at {segments:?}: {value_result:?} vs {encode_result:?}"),
+            (Err(err), Err(want)) => {
+                assert_eq!(err.to_string(), want, "error text diverged at {segments:?}");
+            }
+            (got, want) => panic!("outcome diverged at {segments:?}: {got:?} vs {want:?}"),
         }
-
-        assert_eq!(
-            serde_json::to_value(&via_value).unwrap(),
-            serde_json::to_value(&via_encode).unwrap(),
-            "struct state diverged at {segments:?}"
-        );
     }
 }
 
-/// A `#[repe(typed)]` accessor read on its own carries a BEVE body; through the
-/// `Value` path it is a JSON array, the same sanctioned divergence a typed field
-/// has.
+/// A `#[repe(typed)]` accessor read on its own carries a BEVE body, the same as
+/// a `#[repe(typed)]` field. Inside a listing it is a JSON array, because the
+/// enclosing frame is already JSON.
 #[test]
-fn a_typed_accessor_is_the_one_sanctioned_divergence() {
+fn a_typed_accessor_reads_as_beve_directly() {
     let mut budget = budget();
-    assert_eq!(
-        budget.repe_handle(&["weights"], None).unwrap(),
-        Some(json!([1.0, 0.5, 0.25, 0.125]))
-    );
-
     let mut buf = Vec::new();
     let mut out = ResponseBody::new(&mut buf);
     budget
         .repe_handle_into(&["weights"], None, &mut out)
         .unwrap();
     assert_eq!(out.format(), BodyFormat::Beve);
+    assert_eq!(
+        buf,
+        Message::builder()
+            .body_typed_slice(&[1.0f64, 0.5, 0.25, 0.125])
+            .build()
+            .body
+    );
 }

@@ -231,7 +231,7 @@ fn a_whole_child_write_reaches_the_child_s_own_impl() {
     for (kind, router) in routers(service) {
         answer(
             &router,
-            &write("/service/settings", &json!({ "retries": 5 })),
+            &write("/service/settings", r##"{ "retries": 5 }"##),
         );
         assert_eq!(
             body(&router, &read("/service/settings")),
@@ -243,7 +243,7 @@ fn a_whole_child_write_reaches_the_child_s_own_impl() {
         // reset `retries` to the default.
         answer(
             &router,
-            &write("/service/settings", &json!({ "timeout": 3 })),
+            &write("/service/settings", r##"{ "timeout": 3 }"##),
         );
         assert_eq!(
             body(&router, &read("/service/settings")),
@@ -256,7 +256,7 @@ fn a_whole_child_write_reaches_the_child_s_own_impl() {
 #[test]
 fn a_whole_child_write_reports_the_child_s_own_error() {
     for (kind, router) in routers(service) {
-        let message = answer(&router, &write("/service/settings", &json!({ "nope": 1 })));
+        let message = answer(&router, &write("/service/settings", r##"{ "nope": 1 }"##));
         assert_eq!(
             message.error_code(),
             Some(ErrorCode::MethodNotFound),
@@ -280,7 +280,7 @@ fn a_derived_child_is_still_replaced_by_a_whole_child_write() {
     for (kind, router) in routers(service) {
         answer(
             &router,
-            &write("/service/counter", &json!({ "ticks": 5, "source": "beta" })),
+            &write("/service/counter", r##"{ "ticks": 5, "source": "beta" }"##),
         );
         assert_eq!(
             body(&router, &read("/service/counter")),
@@ -309,7 +309,7 @@ fn a_per_field_write_below_a_child_is_unchanged() {
 #[test]
 fn a_whole_object_write_against_a_no_replace_struct_is_refused() {
     for (kind, router) in routers(service) {
-        let message = answer(&router, &write("/service", &json!({ "version": 9 })));
+        let message = answer(&router, &write("/service", r##"{ "version": 9 }"##));
         assert_eq!(
             message.error_code(),
             Some(ErrorCode::InvalidBody),
@@ -327,20 +327,20 @@ fn every_write_answers_the_same_under_both_locks() {
     for (name, request) in [
         (
             "no_replace root",
-            write("/service", &json!({ "version": 9 })),
+            write("/service", r##"{ "version": 9 }"##),
         ),
         ("field write", write("/service/version", &9u32)),
         (
             "whole child apply",
-            write("/service/settings", &json!({ "retries": 5 })),
+            write("/service/settings", r##"{ "retries": 5 }"##),
         ),
         (
             "whole child refusal",
-            write("/service/settings", &json!({ "nope": 1 })),
+            write("/service/settings", r##"{ "nope": 1 }"##),
         ),
         (
             "derived child replace",
-            write("/service/counter", &json!({ "ticks": 5, "source": "beta" })),
+            write("/service/counter", r##"{ "ticks": 5, "source": "beta" }"##),
         ),
         (
             "nested field write",
@@ -348,7 +348,7 @@ fn every_write_answers_the_same_under_both_locks() {
         ),
         (
             "absent child write",
-            write("/service/aux", &json!({ "ticks": 1, "source": "x" })),
+            write("/service/aux", r##"{ "ticks": 1, "source": "x" }"##),
         ),
     ] {
         assert_eq!(
@@ -371,11 +371,11 @@ fn a_readonly_refusal_is_served_without_the_exclusive_guard() {
     for (name, request) in [
         (
             "no_replace root",
-            write("/service", &json!({ "version": 9 })),
+            write("/service", r##"{ "version": 9 }"##),
         ),
         (
             "readonly child, whole",
-            write("/service/fixed", &json!({ "ticks": 9, "source": "x" })),
+            write("/service/fixed", r##"{ "ticks": 9, "source": "x" }"##),
         ),
         (
             "readonly child, sub-path",
@@ -404,7 +404,7 @@ fn readonly_on_a_nested_field_refuses_every_write_through_it() {
         for (name, request) in [
             (
                 "whole child",
-                write("/service/fixed", &json!({ "ticks": 9, "source": "x" })),
+                write("/service/fixed", r##"{ "ticks": 9, "source": "x" }"##),
             ),
             ("sub-path", write("/service/fixed/ticks", &9u64)),
         ] {
@@ -478,7 +478,7 @@ fn an_absent_child_reads_as_null_and_refuses_everything_else() {
         assert_eq!(
             answer(
                 &router,
-                &write("/service/aux", &json!({ "ticks": 1, "source": "x" }))
+                &write("/service/aux", r##"{ "ticks": 1, "source": "x" }"##)
             )
             .error_code(),
             Some(ErrorCode::MethodNotFound),
@@ -509,7 +509,7 @@ fn a_present_child_forwards_everything_to_the_inner_value() {
         );
         answer(
             &router,
-            &write("/service/aux", &json!({ "ticks": 1, "source": "beta" })),
+            &write("/service/aux", r##"{ "ticks": 1, "source": "beta" }"##),
         );
         assert_eq!(
             body(&router, &read("/service/aux")),
@@ -628,7 +628,7 @@ fn presence_is_not_settable_through_the_child_s_own_path() {
         answer(
             &Router::new()
                 .with_struct_shared::<Service, _>("/service", Arc::new(RwLock::new(with_aux()))),
-            &write("/service", &json!({ "aux": null })),
+            &write("/service", r##"{ "aux": null }"##),
         )
         .error_code(),
         Some(ErrorCode::InvalidBody),
