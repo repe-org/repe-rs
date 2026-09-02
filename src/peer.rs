@@ -26,8 +26,6 @@
 //! with a populated [`CallContext`].
 
 use crate::constants::BodyFormat;
-use crate::error::RepeError;
-use serde::Serialize;
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::future::Future;
@@ -642,15 +640,16 @@ impl PeerRegistry {
         &self,
         path: P,
         body: &T,
-    ) -> Result<HashMap<PeerId, Result<(), PeerSendError>>, RepeError>
+    ) -> HashMap<PeerId, Result<(), PeerSendError>>
     where
         P: AsRef<str>,
-        T: Serialize + ?Sized,
+        T: structio::json::Write + ?Sized,
     {
-        let encoded = serde_json::to_vec(body)?;
-        Ok(self.broadcast_each(path.as_ref(), |_peer, prefix_room| {
+        let mut encoded = Vec::new();
+        structio::append(body, &mut encoded);
+        self.broadcast_each(path.as_ref(), |_peer, prefix_room| {
             NotifyBody::Json(clone_with_prefix_room(&encoded, prefix_room))
-        }))
+        })
     }
 
     /// BEVE-bodied broadcast. See [`broadcast_notify_json`] for
@@ -661,15 +660,16 @@ impl PeerRegistry {
         &self,
         path: P,
         body: &T,
-    ) -> Result<HashMap<PeerId, Result<(), PeerSendError>>, RepeError>
+    ) -> HashMap<PeerId, Result<(), PeerSendError>>
     where
         P: AsRef<str>,
-        T: Serialize,
+        T: structio::beve::Write + ?Sized,
     {
-        let encoded = beve::to_vec(body)?;
-        Ok(self.broadcast_each(path.as_ref(), |_peer, prefix_room| {
+        let mut encoded = Vec::new();
+        structio::beve::append(body, &mut encoded);
+        self.broadcast_each(path.as_ref(), |_peer, prefix_room| {
             NotifyBody::Beve(clone_with_prefix_room(&encoded, prefix_room))
-        }))
+        })
     }
 
     /// UTF-8-bodied broadcast. Plain text is advertised with
@@ -755,6 +755,15 @@ impl std::fmt::Debug for PeerRegistry {
 
 #[cfg(test)]
 mod tests {
+    /// A body with a declared encoding, standing in for whatever a caller
+    /// broadcasts. There is no `json!` to reach for now: a type is what carries
+    /// the shape.
+    #[derive(Default)]
+    struct Notification {
+        n: u64,
+    }
+    structio::object!(Notification { n });
+
     use super::*;
 
     #[derive(Default)]
@@ -1015,12 +1024,8 @@ mod tests {
         registry.insert(PeerHandle::new(PeerId(1), sink.clone()));
 
         let path = "/broadcast/prefix_room";
-        registry
-            .broadcast_notify_json(path, &serde_json::json!({ "n": 1 }))
-            .unwrap();
-        registry
-            .broadcast_notify_beve(path, &vec![1u8, 2, 3])
-            .unwrap();
+        registry.broadcast_notify_json(path, &Notification { n: 1 });
+        registry.broadcast_notify_beve(path, &vec![1u8, 2, 3]);
         registry.broadcast_notify_utf8(path, "hello");
         registry.broadcast_notify_raw(path, BodyFormat::RawBinary, &[9u8; 64]);
 

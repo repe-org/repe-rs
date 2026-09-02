@@ -67,9 +67,9 @@ pub fn write_message<W: Write>(w: &mut W, msg: &Message) -> Result<(), RepeError
 /// either block (short body) or misinterpret subsequent frames (long body).
 ///
 /// `body_writer`'s error type only has to be convertible into [`RepeError`], so
-/// a raw `w.write_all(..)` (yielding [`std::io::Error`] → [`RepeError::Io`]) and
-/// a streaming encode such as `beve::to_writer_streaming` (yielding
-/// [`beve::Error`] → [`RepeError::Beve`]) both work without wrapping, and the
+/// a raw `w.write_all(..)` and a streaming encode such as
+/// [`structio::to_beve_writer`] — which reports [`std::io::Error`], because a
+/// BEVE *write* cannot fail on content — both work without wrapping, and the
 /// failure keeps its original error variant.
 ///
 /// Because REPE frames are length-prefixed, `body_len` has to be known before
@@ -78,8 +78,8 @@ pub fn write_message<W: Write>(w: &mut W, msg: &Message) -> Result<(), RepeError
 ///
 /// * **Reusable scratch buffer** (recommended for a writer sending many
 ///   frames): serialize the body once into a caller-owned `Vec<u8>` with
-///   [`beve::to_vec_into`], which reuses the buffer's allocation and clears it
-///   on each call, then pass `scratch.len()` as `body_len` and
+///   [`structio::write_beve_into`], which reuses the buffer's allocation and
+///   clears it on each call, then pass `scratch.len()` as `body_len` and
 ///   `|w| w.write_all(&scratch)` as the writer. One encode per message and,
 ///   once the buffer has grown to fit the largest body, no further allocation.
 ///   See `examples/beve_streaming_body.rs`.
@@ -87,32 +87,32 @@ pub fn write_message<W: Write>(w: &mut W, msg: &Message) -> Result<(), RepeError
 ///   chunk, a pre-sized buffer), pass it directly and have `body_writer` emit
 ///   the bytes with `w.write_all(..)` — no body buffer at all.
 /// * **Zero-buffer streaming** (for a body too large to hold in memory):
-///   measure the encoded length with [`beve::serialized_size`], then stream the
-///   body straight to the sink with [`beve::to_writer_streaming`] inside
+///   measure the encoded length with [`structio::beve_size`], then stream the
+///   body straight to the sink with [`structio::to_beve_writer`] inside
 ///   `body_writer` — the body is never materialized as a `Vec`:
 ///
 ///   ```no_run
 ///   # use repe::{Header, RepeError, write_message_streaming};
-///   # use serde::Serialize;
-///   # fn frame<W: std::io::Write, T: Serialize>(w: &mut W, header: Header, query: &[u8], value: &T) -> Result<(), RepeError> {
-///   let body_len = beve::serialized_size(value)?;
+///   # fn frame<W: std::io::Write, T: structio::beve::Write>(w: &mut W, header: Header, query: &[u8], value: &T) -> Result<(), RepeError> {
+///   let body_len = structio::beve_size(value) as u64;
 ///   write_message_streaming(w, header, query, body_len, |w| {
-///       beve::to_writer_streaming(w, value)
+///       structio::to_beve_writer(value, w)
 ///   })
 ///   # }
 ///   ```
 ///
 /// The zero-buffer path costs a size pass over the value before the write pass.
 /// That pass allocates nothing and moves no bytes (each leaf is an integer add):
-/// it is O(1) for a `&[u8]`/`serde_bytes` blob or a `beve::TypedSlice<T>`, but
-/// O(payload) for a bare numeric `Vec<T>` or a nested structure, which beve
-/// walks element by element. Prefer it only when not holding the whole body at
+/// it is O(1) for a `&[u8]` blob or a numeric slice, whose encoded length is
+/// arithmetic on the element count, but O(payload) for a nested structure, which
+/// is walked member by member. Prefer it only when not holding the whole body at
 /// once outweighs that second traversal; otherwise the reusable scratch buffer
-/// is a single encode. One caveat on error fidelity: beve owns the sink during a
-/// streaming encode and folds any write failure into a `beve::Error`, so a
-/// mid-body sink error surfaces as [`RepeError::Beve`] rather than
-/// [`RepeError::Io`] — the scratch buffer keeps that distinction, since its
-/// `write_all` goes straight through repe.
+/// is a single encode.
+///
+/// Error fidelity is no longer a caveat: a structio write cannot fail on
+/// content, so the only failure a streaming encode can report is the sink's own
+/// [`std::io::Error`], and it arrives as [`RepeError::Io`] exactly as the
+/// scratch buffer's `write_all` does.
 pub fn write_message_streaming<W, F, E>(
     w: &mut W,
     mut header: Header,
@@ -140,11 +140,11 @@ where
 /// BEVE typed array straight to the sink with no intermediate body buffer.
 ///
 /// This is the whole-body streaming fast path for a large numeric payload: the
-/// body length is computed in closed form with [`beve::typed_slice_size`] (O(1),
-/// no traversal) and the payload is written by [`beve::to_writer_typed_slice`]
+/// body length is computed in closed form with [`structio::beve_size`] (O(1),
+/// no traversal) and the payload is written by [`structio::to_beve_writer`]
 /// (a single `write_all` of the slice's bytes on little-endian targets). So
 /// framing a multi-MiB `&[f64]` costs a header write plus one bulk write, versus
-/// the two element-by-element walks (size, then encode) a serde body would take.
+/// the two element-by-element walks (size, then encode) a member-wise body takes.
 ///
 /// `header.body_format` is set to [`BodyFormat::Beve`]; `query_length`,
 /// `body_length`, and `length` are filled in from `query` and the slice (as in
@@ -169,12 +169,12 @@ pub fn write_message_typed_slice<W, T>(
 ) -> Result<(), RepeError>
 where
     W: Write,
-    T: beve::BeveTypedSlice,
+    T: structio::beve::NumericBytes + structio::beve::Write,
 {
     header.body_format = crate::constants::BodyFormat::Beve as u16;
-    let body_len = beve::typed_slice_size(slice);
+    let body_len = structio::beve_size(slice) as u64;
     write_message_streaming(w, header, query, body_len, |w| {
-        beve::to_writer_typed_slice(w, slice)
+        structio::to_beve_writer(slice, w)
     })
 }
 
@@ -182,9 +182,9 @@ where
 /// BEVE complex extension array straight to the sink with no intermediate body
 /// buffer — the complex counterpart of [`write_message_typed_slice`].
 ///
-/// The body length is computed in closed form with [`beve::complex_slice_size`]
+/// The body length is computed in closed form with [`structio::beve_size`]
 /// (O(1), no traversal) and the payload is written by
-/// [`beve::to_writer_complex_slice`] (a single `write_all` of the interleaved
+/// [`structio::to_beve_writer`] (a single `write_all` of the interleaved
 /// `(re, im)` bytes on little-endian targets). So framing a large
 /// `&[Complex<f64>]` costs a header write plus one bulk write, versus building and
 /// allocating the whole body up front via
@@ -203,16 +203,16 @@ pub fn write_message_complex_slice<W, T>(
     w: &mut W,
     mut header: Header,
     query: &[u8],
-    slice: &[beve::Complex<T>],
+    slice: &[structio::Complex<T>],
 ) -> Result<(), RepeError>
 where
     W: Write,
-    T: beve::BeveTypedSlice,
+    structio::Complex<T>: structio::beve::NumericBytes + structio::beve::Write,
 {
     header.body_format = crate::constants::BodyFormat::Beve as u16;
-    let body_len = beve::complex_slice_size(slice);
+    let body_len = structio::beve_size(slice) as u64;
     write_message_streaming(w, header, query, body_len, |w| {
-        beve::to_writer_complex_slice(w, slice)
+        structio::to_beve_writer(slice, w)
     })
 }
 
@@ -236,14 +236,19 @@ mod tests {
     use crate::constants::{BodyFormat, QueryFormat};
     use std::io::Cursor;
 
+    #[derive(Default, Debug, PartialEq)]
+    struct Point {
+        x: i32,
+    }
+    structio::object!(Point { x });
+
     #[test]
     fn read_write_roundtrip() {
         let msg = Message::builder()
             .id(7)
             .query_str("/echo")
             .query_format(QueryFormat::JsonPointer)
-            .body_json(&serde_json::json!({"x": 1}))
-            .unwrap()
+            .body_json(&Point { x: 1 })
             .build();
 
         // Write to a buffer
@@ -259,8 +264,8 @@ mod tests {
         assert_eq!(parsed.header.id, 7);
         assert_eq!(parsed.header.query_format, QueryFormat::JsonPointer as u16);
         assert_eq!(parsed.header.body_format, BodyFormat::Json as u16);
-        let v: serde_json::Value = parsed.json_body().unwrap();
-        assert_eq!(v["x"], 1);
+        let v: Point = parsed.json_body().unwrap();
+        assert_eq!(v.x, 1);
     }
 
     #[test]
@@ -294,13 +299,12 @@ mod tests {
 
     #[test]
     fn streaming_beve_body_via_reused_scratch() {
-        use serde::{Deserialize, Serialize};
-
-        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        #[derive(Default, Debug, PartialEq)]
         struct SensorFrame {
             id: u64,
             samples: Vec<f64>,
         }
+        structio::object!(SensorFrame { id, samples });
 
         let query = b"/ingest/frame";
         // One scratch buffer for the writer; reused across every frame.
@@ -312,7 +316,7 @@ mod tests {
         };
 
         // Serialize the body once into the caller-owned buffer, then frame it.
-        beve::to_vec_into(&mut scratch, &big).unwrap();
+        structio::write_beve_into(&big, &mut scratch);
         let mut header = Header::new();
         header.id = big.id;
         header.query_format = QueryFormat::JsonPointer as u16;
@@ -328,7 +332,7 @@ mod tests {
             .id(big.id)
             .query_bytes(query.to_vec())
             .query_format(QueryFormat::JsonPointer)
-            .body_bytes(beve::to_vec(&big).unwrap())
+            .body_bytes(structio::to_beve(&big))
             .body_format(BodyFormat::Beve)
             .build()
             .to_vec();
@@ -347,7 +351,7 @@ mod tests {
             id: 2,
             samples: vec![0.0; 16],
         };
-        beve::to_vec_into(&mut scratch, &small).unwrap();
+        structio::write_beve_into(&small, &mut scratch);
         assert!(
             scratch.capacity() <= cap_after_big,
             "smaller body must reuse the scratch allocation, not grow it"
@@ -357,13 +361,12 @@ mod tests {
 
     #[test]
     fn streaming_beve_body_zero_buffer_via_serialized_size() {
-        use serde::{Deserialize, Serialize};
-
-        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        #[derive(Default, Debug, PartialEq)]
         struct SensorFrame {
             id: u64,
             samples: Vec<f64>,
         }
+        structio::object!(SensorFrame { id, samples });
 
         let query = b"/ingest/frame";
         let frame = SensorFrame {
@@ -373,24 +376,24 @@ mod tests {
 
         // Measure the encoded length up front, then stream the body straight to
         // the sink -- the body is never materialized as a `Vec`.
-        let body_len = beve::serialized_size(&frame).unwrap();
+        let body_len = structio::beve_size(&frame) as u64;
         let mut header = Header::new();
         header.id = frame.id;
         header.query_format = QueryFormat::JsonPointer as u16;
         header.body_format = BodyFormat::Beve as u16;
         let mut streamed = Vec::new();
-        // The body_writer returns beve::Result directly -- its error type only
+        // The body_writer returns io::Result directly -- its error type only
         // needs to be Into<RepeError>, so no manual error mapping.
         write_message_streaming(&mut streamed, header, query, body_len, |w| {
-            beve::to_writer_streaming(w, &frame)
+            structio::to_beve_writer(&frame, w)
         })
         .unwrap();
 
-        // The core framing contract: serialized_size must predict exactly what
-        // to_writer_streaming emits, so the advertised body_length matches the
+        // The core framing contract: `beve_size` must predict exactly what
+        // `to_beve_writer` emits, so the advertised body_length matches the
         // bytes actually written. A wrong prediction would desync the wire.
         let mut streamed_body = Vec::new();
-        beve::to_writer_streaming(&mut streamed_body, &frame).unwrap();
+        structio::to_beve_writer(&frame, &mut streamed_body).unwrap();
         assert_eq!(body_len, streamed_body.len() as u64);
 
         let parsed = Message::from_slice(&streamed).unwrap();
@@ -405,17 +408,39 @@ mod tests {
 
     #[test]
     fn streaming_body_writer_error_keeps_repe_error_variant() {
-        // A beve error raised inside body_writer surfaces as RepeError::Beve,
-        // not a flattened RepeError::Io.
+        // Whatever variant `body_writer` reports reaches the caller intact,
+        // rather than being flattened into `RepeError::Io`. A BEVE *write*
+        // cannot fail on content under structio, so what a streaming body
+        // reports is a `StreamError`, and the format it is attributed to is the
+        // caller's to name — `StreamError` does not carry one.
         let mut sink = Vec::new();
         let beve_err = write_message_streaming(&mut sink, Header::new(), b"/x", 3, |_w| {
-            Err(beve::Error::msg("encode failed"))
+            Err(RepeError::decode_stream(
+                crate::constants::BodyFormat::Beve,
+                structio::StreamError::Parse(structio::Error::new(
+                    structio::ErrorCode::ExpectedObject,
+                    0,
+                )),
+            ))
         })
         .unwrap_err();
         assert!(
             matches!(beve_err, RepeError::Beve(_)),
             "expected RepeError::Beve, got {beve_err:?}"
         );
+
+        // The same failure under a JSON frame is a JSON error. A `From` impl
+        // could not have told these apart.
+        assert!(matches!(
+            RepeError::decode_stream(
+                crate::constants::BodyFormat::Json,
+                structio::StreamError::Parse(structio::Error::new(
+                    structio::ErrorCode::ExpectedObject,
+                    0,
+                )),
+            ),
+            RepeError::Json(_)
+        ));
 
         // And an io::Error keeps RepeError::Io with its ErrorKind intact.
         let mut sink = Vec::new();

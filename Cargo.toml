@@ -11,7 +11,7 @@ exclude = ["bench/grpc-shootout"]
 
 [package]
 name = "repe"
-version = "12.0.0"
+version = "13.0.0"
 edition = "2024"
 rust-version = "1.96.1"
 description = "Rust implementation of the REPE RPC protocol (JSON-focused)"
@@ -131,56 +131,36 @@ name = "stream_pull_vs_push"
 required-features = ["value-stream"]
 
 [dependencies]
-# beve's default feature set is already lean (core ser/de + streaming +
-# typed/complex bulk slice helpers); the heavy MATLAB/HDF5 `mat` interop is opt-in
-# there, so repe never needs `default-features = false`. repe uses beve's aligned
-# typed-array primitives (`write_aligned_typed_slice_at` /
-# `aligned_typed_slice_size` / `read_aligned_typed_slice` /
-# `read_aligned_typed_slice_ref`) behind `MessageBuilder::body_aligned_typed_slice`
-# and the zero-copy borrowing route (`Router::with_typed_slice_ref` /
-# `*::call_typed_slice_aligned`), the streaming complex primitives
-# (`to_writer_complex_slice` / `complex_slice_size` behind
-# `write_message_complex_slice`), and the `read_typed_slice` / `read_complex_slice`
-# bulk decoders behind the typed-numeric body fast path. Pinned to beve 10. Of
-# the seven majors since 3, only 5 and 9 reach repe. 5 is BEVE Version 2
-# compliance, which changes how a serde enum encodes (see CHANGELOG) and removes
-# a serializer-options API repe never used. 9 bounds decoder recursion, which is
-# a security fix repe needs on every leg that decodes an untrusted body, and
-# makes `beve::Error` `#[non_exhaustive]`; repe only wraps that type, never
-# matches it exhaustively. 4, 6, 7, and 10 are all about the optional `mat`
-# dependency, which repe does not enable — 10 stops re-exporting hdf5-pure's
-# types and drops the `From<hdf5_pure::Error> for beve::Error` impls, none of
-# which repe names. 8 constrains beve's `complex::*_array` / `complex_array::*`
-# serde helpers with the unsafe `ComplexElement` trait; repe reaches complex
-# arrays only through the `fast` module's `Complex<T>` functions, which that
-# bound does not touch. Every primitive named above is unchanged.
+# JSON and BEVE from one struct declaration, with no dependencies of its own
+# and no intermediate `Value`. It replaces `serde`, `serde_json` and `beve`
+# together, because the three were never separable here: the bulk numeric paths
+# are BEVE, the ordinary ones are serde-bound, and the registry that joined them
+# was a `serde_json::Value` tree.
 #
-# The pin is still a repe major on every beve major, reached or not: `beve` types
-# are in repe's public API, so a graph holding `beve = "9"` alongside this crate
-# must move in step or end up with two `beve::Error` types.
-beve = "10"
-serde = { version = "1", features = ["derive" ] }
-serde_json = "1"
+# What repe uses beyond ordinary read/write: `beve_size` and `to_beve_writer`
+# for zero-buffer framing (measure, write the length, stream the body);
+# `beve_size_aligned_after` with `beve::Writer::appending(..).aligned().at(..)`
+# for a typed array padded against its offset *within the frame* rather than
+# within the send buffer; `beve_slice_ref` for the zero-copy borrow behind
+# `Router::with_typed_slice_ref`; `read_beve_array_into` for the bulk decode;
+# and `minify` / `prettify` for the CLI, which reformats a body it has no type
+# for.
+structio = "0.2.1"
 thiserror = "1"
 # Moves in lockstep with this crate: the generated code names items that only
-# exist alongside a matching release — `repe_shared_into` at 9.0.0, and now
-# `__private::serde_json`, which 10.x does not carry. The 0.5 -> 0.6 bump is
-# what keeps a `repe = "10"` graph (`repe-derive = "^0.5.0"`) from resolving a
-# derive that emits paths its `repe` has no module for.
-repe-derive = { path = "repe-derive", version = "0.6.0" }
+# exist alongside a matching release. 0.6 -> 0.7 is what keeps a `repe = "12"`
+# graph from resolving a derive that emits structio paths its `repe` has no
+# module for.
+repe-derive = { path = "repe-derive", version = "0.7.0" }
 # The `RepeStruct` surface, split out so a crate that only *declares* a served
 # type — a pure-logic crate with a no-I/O charter, say — can implement the trait
 # without acquiring the server, the client, and the transport. Re-exported here
 # at the paths it has always had, so nothing moved for a caller of `repe`.
 #
-# `typed` is on unconditionally and is not re-exposed as a feature of `repe`.
-# It carries `beve` into `repe-core` for `ResponseBody::write_typed_slice`, and
-# `repe` already depends on `beve` directly for the builder-side half of that
-# same encoding — so here the feature costs nothing, and `#[repe(typed)]` works
-# through `repe` with no opt-in. It is off by default in `repe-core` because a
-# crate that depends on that one *directly* is doing so precisely to keep the
-# encoder out; see that crate's `[features]`.
-repe-core = { path = "repe-core", version = "3.0.0", features = ["typed"] }
+# It has no features any more. `typed` existed to keep `beve` and its six
+# transitive packages out of a crate that only declares a served type; structio
+# has no dependencies, so there is nothing left to gate.
+repe-core = { path = "repe-core", version = "4.0.0" }
 parking_lot = { version = "0.12", optional = true }
 # 0.3.32 for `UnboundedReceiver::try_recv`, which the `notify_slot` tests use
 # (`try_next` is deprecated there, and CI builds tests at `-D warnings`).
