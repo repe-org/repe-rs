@@ -507,14 +507,14 @@ impl WasmClient {
     ) -> Result<Message, RepeError>
     where
         P: AsRef<str>,
-        F: FnOnce(MessageBuilder) -> Result<MessageBuilder, RepeError>,
+        F: FnOnce(MessageBuilder) -> MessageBuilder,
     {
         let id = self.next_request_id();
         let builder = Message::builder()
             .id(id)
             .query_str(path.as_ref())
             .query_format_code(query_format);
-        let msg = body_fn(builder)?.build();
+        let msg = body_fn(builder).build();
 
         let (sender, receiver) = oneshot::channel();
         let mut pending_guard = PendingRequestGuard::register(&self.inner, id, sender)?;
@@ -589,7 +589,7 @@ impl WasmClient {
     async fn notify_with_body<P, F>(&self, path: P, body_fn: F) -> Result<(), RepeError>
     where
         P: AsRef<str>,
-        F: FnOnce(MessageBuilder) -> Result<MessageBuilder, RepeError>,
+        F: FnOnce(MessageBuilder) -> MessageBuilder,
     {
         self.notify_with_builder(path, QueryFormat::JsonPointer as u16, body_fn)
             .await
@@ -603,7 +603,7 @@ impl WasmClient {
     ) -> Result<(), RepeError>
     where
         P: AsRef<str>,
-        F: FnOnce(MessageBuilder) -> Result<MessageBuilder, RepeError>,
+        F: FnOnce(MessageBuilder) -> MessageBuilder,
     {
         let id = self.next_request_id();
         let builder = Message::builder()
@@ -611,7 +611,7 @@ impl WasmClient {
             .notify(true)
             .query_str(path.as_ref())
             .query_format_code(query_format);
-        let msg = body_fn(builder)?.build();
+        let msg = body_fn(builder).build();
         self.write_request(&msg)
     }
 
@@ -624,14 +624,13 @@ impl WasmClient {
         timeout_duration: Option<Duration>,
     ) -> Result<Message, RepeError> {
         self.call_with_body_and_timeout(path, query_format, timeout_duration, |builder| {
-            let builder = if let Some(bytes) = body {
+            if let Some(bytes) = body {
                 builder
                     .body_bytes(bytes.to_vec())
                     .body_format_code(body_format)
             } else {
                 builder.body_format_code(body_format)
-            };
-            Ok(builder)
+            }
         })
         .await
     }
@@ -644,14 +643,13 @@ impl WasmClient {
         body_format: u16,
     ) -> Result<(), RepeError> {
         self.notify_with_builder(path, query_format, |builder| {
-            let builder = if let Some(bytes) = body {
+            if let Some(bytes) = body {
                 builder
                     .body_bytes(bytes.to_vec())
                     .body_format_code(body_format)
             } else {
                 builder.body_format_code(body_format)
-            };
-            Ok(builder)
+            }
         })
         .await
     }

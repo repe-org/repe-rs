@@ -48,9 +48,9 @@
 //! {"path":"/counter","status":"ok"}
 //! ```
 
-use crate::constants::ErrorCode;
+use crate::constants::{BodyFormat, ErrorCode};
 use crate::registry::{Registry, RegistryError};
-use serde_json::{Value, json};
+use crate::structs::{RequestBody, ResponseBody};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -61,17 +61,15 @@ pub const MEDIA_BEVE: &str = "application/x-beve";
 /// `application/problem+json`, RFC 9457 problem details, used for every failure.
 pub const MEDIA_PROBLEM: &str = "application/problem+json";
 
-/// The `Allow` set for a path holding a value (or holding nothing yet, which a
-/// `PUT` may create).
-const ALLOW_VALUE: &str = "GET, HEAD, PUT, OPTIONS";
-/// The `Allow` set for a path holding a registered function.
-const ALLOW_FUNCTION: &str = "GET, HEAD, POST, OPTIONS";
-/// The `Allow` set when policy forbids mutation, or for a target no policy
-/// permits writing.
+/// The `Allow` set for a registered path.
+///
+/// `PUT` and `POST` are both here because both call the function. The registry
+/// no longer stores values, so there is no second kind of target to reserve a
+/// verb for, and refusing one of the two would only make a caller guess which
+/// alias this deployment happens to accept.
+const ALLOW_CALL: &str = "GET, HEAD, PUT, POST, OPTIONS";
+/// The `Allow` set when policy forbids mutation.
 const ALLOW_READ_ONLY: &str = "GET, HEAD, OPTIONS";
-/// The `Allow` set reported for `OPTIONS *`, which asks about the server rather
-/// than any one resource.
-const ALLOW_SERVER: &str = "GET, HEAD, PUT, POST, OPTIONS";
 
 /// Which of the two supported representations a body is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +83,27 @@ impl Repr {
         match self {
             Repr::Json => MEDIA_JSON,
             Repr::Beve => MEDIA_BEVE,
+        }
+    }
+
+    /// The REPE body format that carries this representation.
+    fn body_format(self) -> BodyFormat {
+        match self {
+            Repr::Json => BodyFormat::Json,
+            Repr::Beve => BodyFormat::Beve,
+        }
+    }
+
+    /// The representation a settled response format names.
+    ///
+    /// [`ResponseBody`] only ever settles on JSON or BEVE, so the fallback is
+    /// unreachable rather than a guess: it exists because `BodyFormat` is
+    /// `#[non_exhaustive]`, and JSON is the representation this gateway
+    /// documents as its default.
+    fn from_body_format(format: BodyFormat) -> Self {
+        match format {
+            BodyFormat::Beve => Repr::Beve,
+            _ => Repr::Json,
         }
     }
 }
@@ -295,15 +314,13 @@ impl RestResponse {
 
     /// An RFC 9457 problem-details failure.
     fn problem(status: u16, detail: impl Into<String>, repe_code: Option<u32>) -> Self {
-        let mut problem = json!({
-            "type": "about:blank",
-            "title": reason_phrase(status),
-            "status": status,
-            "detail": detail.into(),
-        });
-        if let Some(code) = repe_code {
-            problem["repe_code"] = json!(code);
-        }
+        let problem = Problem {
+            kind: "about:blank",
+            title: reason_phrase(status),
+            status,
+            detail: detail.into(),
+            repe_code,
+        };
         Self {
             content_type: Some(MEDIA_PROBLEM),
             // RFC 9111 §4.2.2 makes 404 and 405 heuristically cacheable. A
@@ -312,13 +329,41 @@ impl RestResponse {
             // correct verb; a cached 404 outlives the path being registered.
             cache_control: Some("no-store".to_string()),
             repe_error_code: repe_code,
-            // `to_vec` on a Value built from object literals cannot fail: every
-            // node is a plain JSON type with no custom Serialize impl to error.
-            body: serde_json::to_vec(&problem).unwrap_or_default(),
+            // Encoding a `Problem` cannot fail: structio writes are infallible,
+            // and every field here is a plain scalar or string.
+            body: structio::json::to_vec_with::<structio::SkipNull, _>(&problem),
             ..Self::empty(status)
         }
     }
 }
+
+/// The RFC 9457 problem-details body this gateway sends for every failure.
+///
+/// `type` is a Rust keyword, so the field is `kind` and the wire name is set
+/// explicitly. It is written with [`SkipNull`](structio::SkipNull) so that
+/// `repe_code` is *absent* rather than `null` when there is no REPE error
+/// behind the failure, which is what RFC 9457 §3.2 asks of an extension member
+/// that does not apply.
+/// The lifetime is here only because `structio::object!` declares both
+/// directions and a `&str` field has to be able to borrow from the input to be
+/// readable. This gateway only ever writes a `Problem`; every value it builds
+/// is `'static`.
+#[derive(Default)]
+struct Problem<'a> {
+    kind: &'a str,
+    title: &'a str,
+    status: u16,
+    detail: String,
+    repe_code: Option<u32>,
+}
+
+structio::object!(['de] Problem<'de> {
+    "type" => kind,
+    title,
+    status,
+    detail,
+    repe_code,
+});
 
 /// An HTTP gateway mapping REST onto a [`Registry`].
 ///
@@ -385,7 +430,7 @@ impl RestGateway {
             let allow = if self.config.read_only {
                 ALLOW_READ_ONLY
             } else {
-                ALLOW_SERVER
+                ALLOW_CALL
             };
             return RestResponse {
                 allow: Some(allow),
@@ -406,55 +451,50 @@ impl RestGateway {
             Err(detail) => return RestResponse::problem(400, detail, None),
         };
 
-        // A read needs no target probe: its `Allow` is never sent, and this is
-        // the volume path the caching argument is about. Everything else pays
-        // one lock acquisition to learn which verbs the target actually admits.
         match request.method {
             "GET" | "HEAD" => self.read(&pointer, request),
-            _ => {
-                let is_function = self.registry.is_function(&pointer);
-                let allow = self.allow_for(is_function);
-                match request.method {
-                    "PUT" if is_function => method_not_allowed(
-                        allow,
-                        "this path is a function; a PUT would call it, which is not idempotent — use POST",
-                    ),
-                    "POST" if !is_function => method_not_allowed(
-                        allow,
-                        "this path is a value; a POST would write it, which is idempotent — use PUT",
-                    ),
-                    "PUT" | "POST" => self.write_or_call(&pointer, request, allow, is_function),
-                    "OPTIONS" => RestResponse {
-                        allow: Some(allow),
-                        ..RestResponse::empty(204)
-                    },
-                    _ => method_not_allowed(allow, "unsupported method"),
-                }
-            }
+            // `PUT` and `POST` are aliases: both call the function at the
+            // pointer, with the request body as its arguments. The registry
+            // stores no values, so there is no assignment for `PUT` to mean
+            // instead, and the two verbs cannot be told apart by what they do.
+            //
+            // Neither is idempotent, because a call is not. A caller that wants
+            // RFC 9110 §9.2.2 idempotence out of `PUT` is relying on a promise
+            // the registry never made; the honest reading is that this gateway
+            // exposes calls and nothing else.
+            "PUT" | "POST" => self.call(&pointer, request),
+            "OPTIONS" => RestResponse {
+                allow: Some(self.allow()),
+                ..RestResponse::empty(204)
+            },
+            _ => method_not_allowed(self.allow(), "unsupported method"),
         }
     }
 
-    /// The `Allow` set for a target, narrowed by policy so that discovery
-    /// reports what this gateway will actually do rather than what the registry
-    /// could in principle support.
-    fn allow_for(&self, is_function: bool) -> &'static str {
-        match (self.config.read_only, is_function) {
-            (true, _) => ALLOW_READ_ONLY,
-            (false, true) => ALLOW_FUNCTION,
-            (false, false) => ALLOW_VALUE,
+    /// The `Allow` set this gateway reports, narrowed by policy so discovery
+    /// says what it will actually do rather than what the registry could in
+    /// principle support.
+    fn allow(&self) -> &'static str {
+        if self.config.read_only {
+            ALLOW_READ_ONLY
+        } else {
+            ALLOW_CALL
         }
     }
 
-    /// `GET` / `HEAD`: a registry READ, plus validators and conditional handling.
+    /// `GET` / `HEAD`: call the function at `pointer` with no arguments, plus
+    /// validators and conditional handling.
+    ///
+    /// **The handler runs before a `304` can be answered.** The `ETag` is a
+    /// hash of the response bytes, so producing it requires producing them; a
+    /// conditional request saves the *transfer*, not the work. That is a real
+    /// change from a value store, where the current value could be read and
+    /// hashed without invoking anything. A handler that is expensive enough for
+    /// this to matter should cache on its own side.
     fn read(&self, pointer: &str, request: RestRequest<'_>) -> RestResponse {
-        let value = match self.registry.dispatch(pointer, None) {
-            Ok(value) => value,
-            Err(err) => return self.problem_for(err),
-        };
-
-        let (body, media) = match encode(&value, negotiate(request.accept)) {
+        let (body, media) = match self.invoke(pointer, None, negotiate(request.accept)) {
             Ok(encoded) => encoded,
-            Err(detail) => return RestResponse::problem(500, detail, None),
+            Err(err) => return self.problem_for(err),
         };
 
         let etag = etag_for(&body);
@@ -484,34 +524,25 @@ impl RestGateway {
         }
     }
 
-    /// `PUT` / `POST`: a registry WRITE or CALL. The verb was already checked
-    /// against the target kind by [`respond`](Self::respond).
-    fn write_or_call(
-        &self,
-        pointer: &str,
-        request: RestRequest<'_>,
-        allow: &'static str,
-        is_function: bool,
-    ) -> RestResponse {
+    /// `PUT` / `POST`: call the function at `pointer` with the request body as
+    /// its arguments.
+    ///
+    /// There are no preconditions here. `If-Match` and `If-None-Match` compared
+    /// a tag against a stored value, and there is no stored value to compare
+    /// against: a call's effect is the handler's business, and a gateway that
+    /// evaluated a validator against the *previous call's output* would be
+    /// answering `412` on a question nobody asked. A handler that needs
+    /// compare-and-swap takes the expected state as an argument, where it is
+    /// inside the handler's own lock rather than racing outside it.
+    fn call(&self, pointer: &str, request: RestRequest<'_>) -> RestResponse {
         if self.config.read_only {
-            return method_not_allowed(allow, "this gateway is configured read-only");
+            return method_not_allowed(ALLOW_READ_ONLY, "this gateway is configured read-only");
         }
 
-        // The empty pointer is the registry root, where a write is a merge of
-        // the caller's object into the tree rather than an assignment at a path
-        // the caller named. That admits arbitrary new keys and unbounded growth,
-        // so it is its own decision rather than part of "writes are allowed".
-        if crate::registry::addresses_root(pointer) && !self.config.allow_root_write {
-            return method_not_allowed(
-                ALLOW_READ_ONLY,
-                "a write at the mount root would merge arbitrary keys into the registry; \
-                 enable `RestConfig::allow_root_write` to permit it",
-            );
-        }
-
-        // An empty body is how the registry spells READ. Letting one through
-        // here would turn a write into a silent read that answers `200` with the
-        // old value, so it is refused rather than reinterpreted.
+        // An empty body is how REPE spells "no arguments", which is what a GET
+        // already does. Letting one through here would make PUT and GET the
+        // same request under a verb that says otherwise, so it is refused
+        // rather than reinterpreted.
         if request.body.is_empty() {
             return RestResponse::problem(
                 400,
@@ -520,46 +551,17 @@ impl RestGateway {
             );
         }
 
-        let repr = match self.body_repr(request.content_type) {
-            Ok(repr) => repr,
+        let format = match self.body_format(request.content_type) {
+            Ok(format) => format,
             Err(detail) => {
                 return RestResponse::problem(415, detail, Some(ErrorCode::InvalidBody as u32));
             }
         };
 
-        let payload = match decode(request.body, repr) {
-            Ok(payload) => payload,
-            Err(detail) => {
-                return RestResponse::problem(400, detail, Some(ErrorCode::InvalidBody as u32));
-            }
-        };
-
-        // The verb was resolved against the target kind before we got here, so
-        // dispatch stays committed to it. `Registry::dispatch` would re-decide
-        // from the body alone, which reopens the window between the two: a
-        // pointer that gains a function turns this PUT into a call taking the
-        // write payload as arguments, and one that loses a function turns this
-        // POST into a write.
-        let value = if is_function {
-            match self.registry.call(
-                pointer,
-                Some(payload),
-                &crate::CallContext::detached(pointer),
-            ) {
-                Ok(value) => value,
-                Err(err) => return self.problem_for(err),
-            }
-        } else {
-            match self.conditional_write(pointer, payload, &request) {
-                Ok(Some(value)) => value,
-                Ok(None) => return precondition_failed(),
-                Err(err) => return self.problem_for(err),
-            }
-        };
-
-        let (body, media) = match encode(&value, negotiate(request.accept)) {
+        let params = RequestBody::new(request.body, format);
+        let (body, media) = match self.invoke(pointer, Some(params), negotiate(request.accept)) {
             Ok(encoded) => encoded,
-            Err(detail) => return RestResponse::problem(500, detail, None),
+            Err(err) => return self.problem_for(err),
         };
 
         RestResponse {
@@ -569,65 +571,53 @@ impl RestGateway {
             // for it whenever that is true, and it stops being a formality the
             // moment anyone gives these responses a freshness directive.
             vary: Some("Accept"),
-            // No validator: `ETag` is a read concern, and the body here is an
-            // acknowledgement rather than the resource's representation.
+            // No validator: `ETag` is a read concern, and the body here is what
+            // one call returned rather than a resource's representation.
             body,
             ..RestResponse::empty(200)
         }
     }
 
-    /// Write `payload`, honoring `If-Match` and `If-None-Match`.
+    /// Call the registry and hand back the encoded response body and its media
+    /// type.
     ///
-    /// `Ok(None)` means a precondition failed and nothing was written.
+    /// The handler writes straight into the response buffer in the negotiated
+    /// format, so nothing is transcoded and no value exists between the
+    /// function and the socket. `repr` is what the caller asked for; the format
+    /// the handler actually settled on is what names the media type, because a
+    /// handler is free to answer in the other one.
     ///
-    /// The comparison runs *inside* the registry's write lock rather than
-    /// before it. Evaluating a validator with a separate read and then writing
-    /// is check-then-act: two clients holding the same tag both see it match and
-    /// both write, so the lost update the precondition exists to prevent happens
-    /// anyway. RFC 9110 §13.1 asks for the evaluation and the action to be
-    /// atomic for exactly this reason.
-    fn conditional_write(
+    /// The error is the registry's, not an HTTP response: grading it into a
+    /// status belongs to [`problem_for`](Self::problem_for), at the layer that
+    /// knows about statuses.
+    fn invoke(
         &self,
         pointer: &str,
-        payload: Value,
-        request: &RestRequest<'_>,
-    ) -> Result<Option<Value>, RegistryError> {
-        let if_match = request.if_match;
-        let if_none_match = request.if_none_match;
-        if if_match.is_none() && if_none_match.is_none() {
-            return self.registry.write_if(pointer, payload, |_| true);
-        }
-
-        self.registry.write_if(pointer, payload, |current| {
-            // §13.1.1 (`If-Match`) and §13.1.2 (`If-None-Match`) are evaluated
-            // against the same observation of the resource, so a caller may send
-            // both and get a coherent answer.
-            if let Some(header) = if_match
-                && !precondition_present(current, header, if_match_matches)
-            {
-                return false;
-            }
-            if let Some(header) = if_none_match
-                && precondition_present(current, header, if_none_match_matches)
-            {
-                return false;
-            }
-            true
-        })
+        params: Option<RequestBody<'_>>,
+        repr: Repr,
+    ) -> Result<(Vec<u8>, &'static str), RegistryError> {
+        let mut buf = Vec::new();
+        let mut out = ResponseBody::with_format(&mut buf, repr.body_format());
+        let ctx = crate::CallContext::detached(pointer);
+        self.registry.call(pointer, params, &ctx, &mut out)?;
+        let media = Repr::from_body_format(out.format()).media_type();
+        Ok((buf, media))
     }
 
-    /// Pick a request-body representation from `Content-Type`. A missing header
-    /// is JSON, which is what `curl -d` sends.
-    fn body_repr(&self, content_type: Option<&str>) -> Result<Repr, &'static str> {
+    /// Pick a request-body format from `Content-Type`. A missing header is
+    /// JSON, which is what `curl -d` sends.
+    fn body_format(&self, content_type: Option<&str>) -> Result<BodyFormat, &'static str> {
         let Some(content_type) = content_type else {
-            return Ok(Repr::Json);
+            return Ok(BodyFormat::Json);
         };
         match bare_media(content_type, ';').as_str() {
-            "" | MEDIA_JSON | "text/json" => Ok(Repr::Json),
+            "" | MEDIA_JSON | "text/json" => Ok(BodyFormat::Json),
             // `curl -d` defaults to this and means JSON often enough that
             // rejecting it would be pedantry at the cost of the primary use case.
-            "application/x-www-form-urlencoded" => Ok(Repr::Json),
-            MEDIA_BEVE | "application/beve" if self.config.accept_beve_bodies => Ok(Repr::Beve),
+            "application/x-www-form-urlencoded" => Ok(BodyFormat::Json),
+            MEDIA_BEVE | "application/beve" if self.config.accept_beve_bodies => {
+                Ok(BodyFormat::Beve)
+            }
             MEDIA_BEVE | "application/beve" => Err(
                 "BEVE request bodies are disabled; enable `RestConfig::accept_beve_bodies` \
                  or send application/json",
@@ -705,7 +695,7 @@ fn path_to_pointer(path: &str) -> Result<String, &'static str> {
     let mut pointer = String::with_capacity(path.len());
     for segment in path.split('/').skip(1) {
         pointer.push('/');
-        pointer.push_str(&crate::registry::escape_token(&percent_decode(segment)?));
+        pointer.push_str(&crate::json_pointer::escape_token(&percent_decode(segment)?));
     }
     Ok(pointer)
 }
@@ -797,14 +787,6 @@ fn parse_quality(value: &str) -> u32 {
         .map_or(1000, |q| (q.clamp(0.0, 1.0) * 1000.0).round() as u32)
 }
 
-fn encode(value: &Value, repr: Repr) -> Result<(Vec<u8>, &'static str), &'static str> {
-    let bytes = match repr {
-        Repr::Json => serde_json::to_vec(value).map_err(|_| "response is not encodable as JSON")?,
-        Repr::Beve => beve::to_vec(value).map_err(|_| "response is not encodable as BEVE")?,
-    };
-    Ok((bytes, repr.media_type()))
-}
-
 /// The bare media type from a header value: everything before the first
 /// `delimiter`, trimmed and lowercased.
 fn bare_media(value: &str, delimiter: char) -> String {
@@ -814,13 +796,6 @@ fn bare_media(value: &str, delimiter: char) -> String {
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase()
-}
-
-fn decode(body: &[u8], repr: Repr) -> Result<Value, &'static str> {
-    match repr {
-        Repr::Json => serde_json::from_slice(body).map_err(|_| "request body is not valid JSON"),
-        Repr::Beve => beve::from_slice(body).map_err(|_| "request body is not valid BEVE"),
-    }
 }
 
 /// A strong `ETag` over the exact bytes sent, as FNV-1a/64.
@@ -842,46 +817,6 @@ fn etag_for(body: &[u8]) -> String {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     format!("\"{hash:016x}\"")
-}
-
-/// Evaluate one precondition header against the resource's current state.
-///
-/// `true` means the header's condition *holds* — `If-Match` matched, or
-/// `If-None-Match` found a match. `*` means "any current representation", so it
-/// holds exactly when the resource exists.
-///
-/// A tag is compared against both representations, because the tag the client
-/// holds came from whichever one it negotiated on its read. That cannot wrongly
-/// admit a stale write: changing the value changes both encodings, so a match in
-/// either proves the state is unchanged.
-fn precondition_present(
-    current: Option<&Value>,
-    header: &str,
-    matches: fn(&str, &str) -> bool,
-) -> bool {
-    let Some(current) = current else {
-        return false;
-    };
-    if header.split(',').any(|candidate| candidate.trim() == "*") {
-        return true;
-    }
-    [Repr::Json, Repr::Beve]
-        .into_iter()
-        .any(|repr| encode(current, repr).is_ok_and(|(body, _)| matches(header, &etag_for(&body))))
-}
-
-fn precondition_failed() -> RestResponse {
-    RestResponse::problem(
-        412,
-        "a precondition failed: the resource has changed, or does not exist, or already exists",
-        None,
-    )
-}
-
-/// `If-Match` uses the *strong* comparison function (RFC 9110 §13.1.1), so a
-/// weak validator never satisfies it — unlike [`if_none_match_matches`].
-fn if_match_matches(header: &str, etag: &str) -> bool {
-    header.split(',').any(|candidate| candidate.trim() == etag)
 }
 
 fn if_none_match_matches(header: &str, etag: &str) -> bool {

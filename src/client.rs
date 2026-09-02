@@ -2,10 +2,7 @@ use crate::constants::{BodyFormat, ErrorCode, QueryFormat, REPE_VERSION};
 use crate::error::RepeError;
 use crate::io::{read_message, write_message};
 use crate::message::{Message, MessageBuilder};
-use beve::from_slice as beve_from_slice;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
-use serde_json::Value;
+use repe_core::structs::ServableOwned;
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufReader, BufWriter, ErrorKind, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
@@ -17,7 +14,7 @@ use std::time::Duration;
 
 type PendingSender = mpsc::Sender<Result<Message, RepeError>>;
 type PendingRequests = HashMap<u64, PendingSender>;
-type BatchResults = Vec<Option<Result<Value, RepeError>>>;
+type BatchResults<R> = Vec<Option<Result<R, RepeError>>>;
 
 const MAX_BATCH_WORKERS: usize = 64;
 
@@ -89,63 +86,56 @@ impl Client {
         self.inner.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Send a JSON-pointer request with JSON body and receive JSON result.
-    pub fn call_json<P: AsRef<str>, T: Serialize>(
-        &self,
-        path: P,
-        body: &T,
-    ) -> Result<Value, RepeError> {
-        self.call_json_with_optional_timeout(path, body, None)
-    }
-
-    /// Send a JSON-pointer request with JSON body and receive JSON result,
-    /// failing if no response arrives before `timeout`.
-    pub fn call_json_with_timeout<P: AsRef<str>, T: Serialize>(
-        &self,
-        path: P,
-        body: &T,
-        timeout: Duration,
-    ) -> Result<Value, RepeError> {
-        self.call_json_with_optional_timeout(path, body, Some(timeout))
-    }
-
-    /// Send a JSON-pointer request with JSON body and deserialize the typed result.
-    pub fn call_typed_json<P: AsRef<str>, T: Serialize, R: DeserializeOwned>(
-        &self,
-        path: P,
-        body: &T,
-    ) -> Result<R, RepeError> {
+    /// Send a JSON-pointer request with a JSON body and decode the response
+    /// into `R`.
+    ///
+    /// `R` is decoded from whichever format the response header declares, not
+    /// from the one the request used: a server may answer a JSON request in
+    /// BEVE, and [`ServableOwned`] is both halves for that reason.
+    pub fn call_typed_json<P: AsRef<str>, T, R>(&self, path: P, body: &T) -> Result<R, RepeError>
+    where
+        T: structio::json::Write + ?Sized,
+        R: ServableOwned,
+    {
         self.call_typed_json_with_optional_timeout(path, body, None)
     }
 
-    /// Send a JSON-pointer request with JSON body and deserialize the typed result,
-    /// failing if no response arrives before `timeout`.
-    pub fn call_typed_json_with_timeout<P: AsRef<str>, T: Serialize, R: DeserializeOwned>(
+    /// Timeout-bearing twin of [`call_typed_json`](Self::call_typed_json).
+    pub fn call_typed_json_with_timeout<P: AsRef<str>, T, R>(
         &self,
         path: P,
         body: &T,
         timeout: Duration,
-    ) -> Result<R, RepeError> {
+    ) -> Result<R, RepeError>
+    where
+        T: structio::json::Write + ?Sized,
+        R: ServableOwned,
+    {
         self.call_typed_json_with_optional_timeout(path, body, Some(timeout))
     }
 
-    /// Send a JSON-pointer request with BEVE body and deserialize the typed result.
-    pub fn call_typed_beve<P: AsRef<str>, T: Serialize, R: DeserializeOwned>(
-        &self,
-        path: P,
-        body: &T,
-    ) -> Result<R, RepeError> {
+    /// Send a JSON-pointer request with a BEVE body and decode the response
+    /// into `R`. The BEVE-bodied twin of
+    /// [`call_typed_json`](Self::call_typed_json).
+    pub fn call_typed_beve<P: AsRef<str>, T, R>(&self, path: P, body: &T) -> Result<R, RepeError>
+    where
+        T: structio::beve::Write + ?Sized,
+        R: ServableOwned,
+    {
         self.call_typed_beve_with_optional_timeout(path, body, None)
     }
 
-    /// Send a JSON-pointer request with BEVE body and deserialize the typed result,
-    /// failing if no response arrives before `timeout`.
-    pub fn call_typed_beve_with_timeout<P: AsRef<str>, T: Serialize, R: DeserializeOwned>(
+    /// Timeout-bearing twin of [`call_typed_beve`](Self::call_typed_beve).
+    pub fn call_typed_beve_with_timeout<P: AsRef<str>, T, R>(
         &self,
         path: P,
         body: &T,
         timeout: Duration,
-    ) -> Result<R, RepeError> {
+    ) -> Result<R, RepeError>
+    where
+        T: structio::beve::Write + ?Sized,
+        R: ServableOwned,
+    {
         self.call_typed_beve_with_optional_timeout(path, body, Some(timeout))
     }
 
@@ -158,8 +148,8 @@ impl Client {
     pub fn call_typed_slice<P, T, R>(&self, path: P, body: &[T]) -> Result<Vec<R>, RepeError>
     where
         P: AsRef<str>,
-        T: beve::BeveTypedSlice,
-        R: beve::BeveTypedSlice,
+        T: structio::beve::NumericBytes + structio::beve::Write,
+        R: structio::beve::NumericBytes + for<'de> structio::beve::Read<'de> + Default,
     {
         self.call_typed_slice_with_optional_timeout(path, body, None)
     }
@@ -174,8 +164,8 @@ impl Client {
     ) -> Result<Vec<R>, RepeError>
     where
         P: AsRef<str>,
-        T: beve::BeveTypedSlice,
-        R: beve::BeveTypedSlice,
+        T: structio::beve::NumericBytes + structio::beve::Write,
+        R: structio::beve::NumericBytes + for<'de> structio::beve::Read<'de> + Default,
     {
         self.call_typed_slice_with_optional_timeout(path, body, Some(timeout))
     }
@@ -196,8 +186,8 @@ impl Client {
     ) -> Result<Vec<R>, RepeError>
     where
         P: AsRef<str>,
-        T: beve::BeveTypedSlice,
-        R: beve::BeveTypedSlice,
+        T: structio::beve::NumericBytes + structio::beve::Write,
+        R: structio::beve::NumericBytes + for<'de> structio::beve::Read<'de> + Default,
     {
         self.call_typed_slice_aligned_with_optional_timeout(path, body, None)
     }
@@ -211,8 +201,8 @@ impl Client {
     ) -> Result<Vec<R>, RepeError>
     where
         P: AsRef<str>,
-        T: beve::BeveTypedSlice,
-        R: beve::BeveTypedSlice,
+        T: structio::beve::NumericBytes + structio::beve::Write,
+        R: structio::beve::NumericBytes + for<'de> structio::beve::Read<'de> + Default,
     {
         self.call_typed_slice_aligned_with_optional_timeout(path, body, Some(timeout))
     }
@@ -277,33 +267,23 @@ impl Client {
         )
     }
 
-    /// Registry helper: send an empty-body request and decode the JSON response.
-    pub fn registry_read<P: AsRef<str>>(&self, path: P) -> Result<Value, RepeError> {
-        let resp = self.call_message(path)?;
-        resp.json_body::<Value>()
-    }
-
-    /// Registry helper: send an empty-body request and deserialize the JSON response as `R`.
-    pub fn registry_read_typed<P: AsRef<str>, R: DeserializeOwned>(
+    /// Registry helper: send an empty-body request and decode the JSON response
+    /// as `R`.
+    ///
+    /// There is no untyped twin. A registry read used to be able to land in a
+    /// `serde_json::Value` and be indexed; with no document model the caller
+    /// names the shape it expects, and a response that does not match it is a
+    /// decode error rather than a `None` discovered three lines later.
+    pub fn registry_read_typed<P: AsRef<str>, R: ServableOwned>(
         &self,
         path: P,
     ) -> Result<R, RepeError> {
         let resp = self.call_message(path)?;
         resp.json_body::<R>()
-    }
-
-    /// Timeout variant of [`Client::registry_read`].
-    pub fn registry_read_with_timeout<P: AsRef<str>>(
-        &self,
-        path: P,
-        timeout: Duration,
-    ) -> Result<Value, RepeError> {
-        let resp = self.call_message_with_timeout(path, timeout)?;
-        resp.json_body::<Value>()
     }
 
     /// Timeout variant of [`Client::registry_read_typed`].
-    pub fn registry_read_typed_with_timeout<P: AsRef<str>, R: DeserializeOwned>(
+    pub fn registry_read_typed_with_timeout<P: AsRef<str>, R: ServableOwned>(
         &self,
         path: P,
         timeout: Duration,
@@ -312,48 +292,19 @@ impl Client {
         resp.json_body::<R>()
     }
 
-    /// Registry helper: send a JSON body (WRITE semantics for non-function targets).
-    pub fn registry_write_json<P: AsRef<str>, T: Serialize>(
-        &self,
-        path: P,
-        body: &T,
-    ) -> Result<Value, RepeError> {
-        self.call_json(path, body)
-    }
-
-    /// Registry helper: send a JSON body (CALL semantics for function targets).
-    pub fn registry_call_json<P: AsRef<str>, T: Serialize>(
-        &self,
-        path: P,
-        body: &T,
-    ) -> Result<Value, RepeError> {
-        self.call_json(path, body)
-    }
-
     /// Send a JSON-pointer notify request (no response expected).
-    pub fn notify_json<P: AsRef<str>, T: Serialize>(
-        &self,
-        path: P,
-        body: &T,
-    ) -> Result<(), RepeError> {
+    pub fn notify_json<P: AsRef<str>, T>(&self, path: P, body: &T) -> Result<(), RepeError>
+    where
+        T: structio::json::Write + ?Sized,
+    {
         self.notify_with_body(path, |builder| builder.body_json(body))
     }
 
-    /// Notify a typed handler with a JSON payload, without waiting for a response.
-    pub fn notify_typed_json<P: AsRef<str>, T: Serialize>(
-        &self,
-        path: P,
-        body: &T,
-    ) -> Result<(), RepeError> {
-        self.notify_with_body(path, |builder| builder.body_json(body))
-    }
-
-    /// Notify a typed handler with a BEVE payload, without waiting for a response.
-    pub fn notify_typed_beve<P: AsRef<str>, T: Serialize>(
-        &self,
-        path: P,
-        body: &T,
-    ) -> Result<(), RepeError> {
+    /// Notify with a BEVE payload, without waiting for a response.
+    pub fn notify_beve<P: AsRef<str>, T>(&self, path: P, body: &T) -> Result<(), RepeError>
+    where
+        T: structio::beve::Write + ?Sized,
+    {
         self.notify_with_body(path, |builder| builder.body_beve(body))
     }
 
@@ -370,38 +321,59 @@ impl Client {
         self.notify_with_message_formats(path, query_format, body, body_format)
     }
 
-    /// Execute JSON calls in parallel over this single connection and keep request order.
-    pub fn batch_json(&self, requests: Vec<(String, Value)>) -> Vec<Result<Value, RepeError>> {
+    /// Execute JSON calls in parallel over this single connection and keep
+    /// request order.
+    ///
+    /// One body type and one result type for the whole batch. A `Vec` of
+    /// `serde_json::Value` used to make a batch implicitly heterogeneous; with
+    /// no document model the uniform case is the one that stays ergonomic, and
+    /// a genuinely mixed batch pre-encodes its bodies and batches
+    /// `Vec<(String, Vec<u8>)>` through [`call_with_formats`] instead.
+    ///
+    /// [`call_with_formats`]: Self::call_with_formats
+    pub fn batch_json<T, R>(&self, requests: Vec<(String, T)>) -> Vec<Result<R, RepeError>>
+    where
+        T: structio::json::Write + Send + 'static,
+        R: ServableOwned + Send + 'static,
+    {
         self.batch_json_inner(requests, None)
     }
 
     /// Execute JSON calls in parallel over this single connection with a per-request timeout.
-    pub fn batch_json_with_timeout(
+    pub fn batch_json_with_timeout<T, R>(
         &self,
-        requests: Vec<(String, Value)>,
+        requests: Vec<(String, T)>,
         timeout: Duration,
-    ) -> Vec<Result<Value, RepeError>> {
+    ) -> Vec<Result<R, RepeError>>
+    where
+        T: structio::json::Write + Send + 'static,
+        R: ServableOwned + Send + 'static,
+    {
         self.batch_json_inner(requests, Some(timeout))
     }
 
-    fn batch_json_inner(
+    fn batch_json_inner<T, R>(
         &self,
-        requests: Vec<(String, Value)>,
+        requests: Vec<(String, T)>,
         timeout: Option<Duration>,
-    ) -> Vec<Result<Value, RepeError>> {
+    ) -> Vec<Result<R, RepeError>>
+    where
+        T: structio::json::Write + Send + 'static,
+        R: ServableOwned + Send + 'static,
+    {
         let request_count = requests.len();
         if request_count == 0 {
             return Vec::new();
         }
 
         let worker_count = batch_worker_count(request_count);
-        let queue: VecDeque<(usize, String, Value)> = requests
+        let queue: VecDeque<(usize, String, T)> = requests
             .into_iter()
             .enumerate()
             .map(|(index, (path, body))| (index, path, body))
             .collect();
         let work_queue = Arc::new(Mutex::new(queue));
-        let results: Arc<Mutex<BatchResults>> = Arc::new(Mutex::new(
+        let results: Arc<Mutex<BatchResults<R>>> = Arc::new(Mutex::new(
             std::iter::repeat_with(|| None)
                 .take(request_count)
                 .collect(),
@@ -426,7 +398,7 @@ impl Client {
                         break;
                     };
 
-                    let result = client.call_json_with_optional_timeout(path, &body, timeout);
+                    let result = client.call_typed_json_with_optional_timeout(path, &body, timeout);
                     let mut out = match results.lock() {
                         Ok(guard) => guard,
                         Err(poisoned) => poisoned.into_inner(),
@@ -467,49 +439,42 @@ impl Client {
             .collect()
     }
 
-    fn call_json_with_optional_timeout<P: AsRef<str>, T: Serialize>(
+    fn call_typed_json_with_optional_timeout<P: AsRef<str>, T, R>(
         &self,
         path: P,
         body: &T,
         timeout: Option<Duration>,
-    ) -> Result<Value, RepeError> {
+    ) -> Result<R, RepeError>
+    where
+        T: structio::json::Write + ?Sized,
+        R: ServableOwned,
+    {
         let resp = self.call_with_body_and_timeout(
             path,
             QueryFormat::JsonPointer as u16,
             timeout,
             |builder| builder.body_json(body),
         )?;
-        resp.json_body::<Value>()
+        resp.decode_body()
     }
 
-    fn call_typed_json_with_optional_timeout<P: AsRef<str>, T: Serialize, R: DeserializeOwned>(
+    fn call_typed_beve_with_optional_timeout<P: AsRef<str>, T, R>(
         &self,
         path: P,
         body: &T,
         timeout: Option<Duration>,
-    ) -> Result<R, RepeError> {
-        let resp = self.call_with_body_and_timeout(
-            path,
-            QueryFormat::JsonPointer as u16,
-            timeout,
-            |builder| builder.body_json(body),
-        )?;
-        Self::decode_typed_response(&resp)
-    }
-
-    fn call_typed_beve_with_optional_timeout<P: AsRef<str>, T: Serialize, R: DeserializeOwned>(
-        &self,
-        path: P,
-        body: &T,
-        timeout: Option<Duration>,
-    ) -> Result<R, RepeError> {
+    ) -> Result<R, RepeError>
+    where
+        T: structio::beve::Write + ?Sized,
+        R: ServableOwned,
+    {
         let resp = self.call_with_body_and_timeout(
             path,
             QueryFormat::JsonPointer as u16,
             timeout,
             |builder| builder.body_beve(body),
         )?;
-        Self::decode_typed_response(&resp)
+        resp.decode_body()
     }
 
     fn call_typed_slice_with_optional_timeout<P, T, R>(
@@ -520,14 +485,14 @@ impl Client {
     ) -> Result<Vec<R>, RepeError>
     where
         P: AsRef<str>,
-        T: beve::BeveTypedSlice,
-        R: beve::BeveTypedSlice,
+        T: structio::beve::NumericBytes + structio::beve::Write,
+        R: structio::beve::NumericBytes + for<'de> structio::beve::Read<'de> + Default,
     {
         let resp = self.call_with_body_and_timeout(
             path,
             QueryFormat::JsonPointer as u16,
             timeout,
-            |builder| Ok(builder.body_typed_slice(body)),
+            |builder| builder.body_typed_slice(body),
         )?;
         resp.decode_typed_slice()
     }
@@ -540,14 +505,14 @@ impl Client {
     ) -> Result<Vec<R>, RepeError>
     where
         P: AsRef<str>,
-        T: beve::BeveTypedSlice,
-        R: beve::BeveTypedSlice,
+        T: structio::beve::NumericBytes + structio::beve::Write,
+        R: structio::beve::NumericBytes + for<'de> structio::beve::Read<'de> + Default,
     {
         let resp = self.call_with_body_and_timeout(
             path,
             QueryFormat::JsonPointer as u16,
             timeout,
-            |builder| Ok(builder.body_aligned_typed_slice(body)),
+            |builder| builder.body_aligned_typed_slice(body),
         )?;
         resp.decode_typed_slice()
     }
@@ -561,14 +526,14 @@ impl Client {
     ) -> Result<Message, RepeError>
     where
         P: AsRef<str>,
-        F: FnOnce(MessageBuilder) -> Result<MessageBuilder, RepeError>,
+        F: FnOnce(MessageBuilder) -> MessageBuilder,
     {
         let id = self.next_request_id();
         let builder = Message::builder()
             .id(id)
             .query_str(path.as_ref())
             .query_format_code(query_format);
-        let msg = body_fn(builder)?.build();
+        let msg = body_fn(builder).build();
 
         let (sender, receiver) = mpsc::channel();
         {
@@ -657,7 +622,7 @@ impl Client {
     fn notify_with_body<P, F>(&self, path: P, body_fn: F) -> Result<(), RepeError>
     where
         P: AsRef<str>,
-        F: FnOnce(MessageBuilder) -> Result<MessageBuilder, RepeError>,
+        F: FnOnce(MessageBuilder) -> MessageBuilder,
     {
         self.notify_with_builder(path, QueryFormat::JsonPointer as u16, body_fn)
     }
@@ -670,7 +635,7 @@ impl Client {
     ) -> Result<(), RepeError>
     where
         P: AsRef<str>,
-        F: FnOnce(MessageBuilder) -> Result<MessageBuilder, RepeError>,
+        F: FnOnce(MessageBuilder) -> MessageBuilder,
     {
         let id = self.next_request_id();
         let builder = Message::builder()
@@ -678,7 +643,7 @@ impl Client {
             .notify(true)
             .query_str(path.as_ref())
             .query_format_code(query_format);
-        let msg = body_fn(builder)?.build();
+        let msg = body_fn(builder).build();
         self.write_request(&msg)
     }
 
@@ -691,14 +656,13 @@ impl Client {
         timeout: Option<Duration>,
     ) -> Result<Message, RepeError> {
         self.call_with_body_and_timeout(path, query_format, timeout, |builder| {
-            let builder = if let Some(bytes) = body {
+            if let Some(bytes) = body {
                 builder
                     .body_bytes(bytes.to_vec())
                     .body_format_code(body_format)
             } else {
                 builder.body_format_code(body_format)
-            };
-            Ok(builder)
+            }
         })
     }
 
@@ -710,37 +674,16 @@ impl Client {
         body_format: u16,
     ) -> Result<(), RepeError> {
         self.notify_with_builder(path, query_format, |builder| {
-            let builder = if let Some(bytes) = body {
+            if let Some(bytes) = body {
                 builder
                     .body_bytes(bytes.to_vec())
                     .body_format_code(body_format)
             } else {
                 builder.body_format_code(body_format)
-            };
-            Ok(builder)
+            }
         })
     }
 
-    fn decode_typed_response<R: DeserializeOwned>(resp: &Message) -> Result<R, RepeError> {
-        match BodyFormat::try_from(resp.header.body_format) {
-            Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => {
-                serde_json::from_slice(&resp.body).map_err(RepeError::from)
-            }
-            Ok(BodyFormat::Beve) => beve_from_slice(&resp.body).map_err(RepeError::from),
-            Ok(BodyFormat::RawBinary) => {
-                let io_err = std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "response body is neither JSON nor BEVE",
-                );
-                Err(RepeError::Json(serde_json::Error::io(io_err)))
-            }
-            // A code this build does not recognize, or a `BodyFormat` variant
-            // it does not know: `BodyFormat` is `#[non_exhaustive]`, so the spec
-            // can add one, and an unknown name decodes no better than an unknown
-            // number.
-            Ok(_) | Err(_) => Err(RepeError::UnknownEnumValue(resp.header.body_format as u64)),
-        }
-    }
 }
 
 fn spawn_response_loop(mut reader: BufReader<TcpStream>, inner: std::sync::Weak<ClientInner>) {
@@ -841,13 +784,12 @@ fn clone_fatal_error_for_waiter(err: &RepeError, request_id: u64) -> RepeError {
             io_err.kind(),
             format!("request {request_id}: {io_err}"),
         )),
-        RepeError::Json(json_err) => RepeError::Json(serde_json::Error::io(std::io::Error::new(
-            ErrorKind::InvalidData,
-            format!("request {request_id}: {json_err}"),
-        ))),
-        RepeError::Beve(beve_err) => RepeError::Beve(beve::Error::msg(format!(
-            "request {request_id}: {beve_err}"
-        ))),
+        // `structio::Error` is a `Copy` code-and-offset pair with no message
+        // to prefix, so these pass through unannotated. The request id is
+        // still on the `Io` arm, which is the one a dead connection actually
+        // produces.
+        RepeError::Json(err) => RepeError::Json(*err),
+        RepeError::Beve(err) => RepeError::Beve(*err),
         RepeError::UnknownEnumValue(value) => RepeError::UnknownEnumValue(*value),
         RepeError::UnexpectedBodyFormat { expected, got } => RepeError::UnexpectedBodyFormat {
             expected: *expected,

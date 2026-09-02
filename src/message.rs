@@ -254,6 +254,46 @@ impl Message {
         self.beve_body()
     }
 
+    /// Decode the body into `R` using whichever format the frame header
+    /// declares.
+    ///
+    /// The counterpart to [`json_body`](Self::json_body) and
+    /// [`beve_body`](Self::beve_body), which each demand one format and reject
+    /// the other. This is what a *client* wants: it chose the request's format,
+    /// but the response's is the server's to pick, so the decoder follows the
+    /// header rather than an assumption.
+    ///
+    /// [`BodyFormat::Utf8`] is parsed as JSON, which is what that code has
+    /// always meant on this path. [`BodyFormat::RawBinary`] has no structured
+    /// decode and is reported as [`RepeError::UnexpectedBodyFormat`], as is a
+    /// format code this build does not recognize — `BodyFormat` is
+    /// `#[non_exhaustive]`, so the spec can add one, and an unknown name
+    /// decodes no better than an unknown number.
+    pub fn decode_body<R: crate::structs::ServableOwned>(&self) -> Result<R, RepeError> {
+        let mut value = R::default();
+        match BodyFormat::try_from(self.header.body_format) {
+            Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => {
+                let text = std::str::from_utf8(&self.body).map_err(|err| {
+                    RepeError::Json(structio::Error::new(
+                        structio::ErrorCode::InvalidUtf8,
+                        err.valid_up_to(),
+                    ))
+                })?;
+                structio::json::read_into(&mut value, text).map_err(RepeError::Json)?;
+            }
+            Ok(BodyFormat::Beve) => {
+                structio::beve::read_into(&mut value, &self.body).map_err(RepeError::Beve)?;
+            }
+            Ok(_) | Err(_) => {
+                return Err(RepeError::UnexpectedBodyFormat {
+                    expected: BodyFormat::Json,
+                    got: self.header.body_format,
+                });
+            }
+        }
+        Ok(value)
+    }
+
     /// `Ok(())` if the body's format matches `expected`, else
     /// [`RepeError::UnexpectedBodyFormat`]. The shared format guard for the
     /// body decoders ([`json_body`](Self::json_body), [`beve_body`](Self::beve_body),

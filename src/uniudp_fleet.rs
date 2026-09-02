@@ -1,6 +1,6 @@
 use crate::fleet::FleetError;
 use crate::udp_client::UniUdpClient;
-use serde_json::Value;
+use repe_core::structs::ServableWrite;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::sync::{Arc, RwLock};
@@ -301,11 +301,11 @@ impl UniUdpFleet {
     /// Sends notify-style UDP messages to nodes matching all provided tags.
     ///
     /// Passing an empty `tags` slice matches all nodes.
-    pub fn send_notify<T: AsRef<str>>(
+    pub fn send_notify<Tag: AsRef<str>, T: ServableWrite + ?Sized>(
         &self,
         method: &str,
-        params: Option<&Value>,
-        tags: &[T],
+        params: Option<&T>,
+        tags: &[Tag],
     ) -> HashMap<String, SendResult> {
         self.send_with_selection(method, params, tags, true)
     }
@@ -313,55 +313,54 @@ impl UniUdpFleet {
     /// Sends request-style UDP messages to nodes matching all provided tags.
     ///
     /// Passing an empty `tags` slice matches all nodes.
-    pub fn send_request<T: AsRef<str>>(
+    pub fn send_request<Tag: AsRef<str>, T: ServableWrite + ?Sized>(
         &self,
         method: &str,
-        params: Option<&Value>,
-        tags: &[T],
+        params: Option<&T>,
+        tags: &[Tag],
     ) -> HashMap<String, SendResult> {
         self.send_with_selection(method, params, tags, false)
     }
 
     /// Sends notify-style UDP messages to all nodes.
-    pub fn notify_all(&self, method: &str, params: Option<&Value>) -> HashMap<String, SendResult> {
+    pub fn notify_all<T: ServableWrite + ?Sized>(
+        &self,
+        method: &str,
+        params: Option<&T>,
+    ) -> HashMap<String, SendResult> {
         self.send_notify(method, params, &[] as &[&str])
     }
 
-    pub fn send_notify_to(
+    pub fn send_notify_to<T: ServableWrite + ?Sized>(
         &self,
         node_name: &str,
         method: &str,
-        params: Option<&Value>,
+        params: Option<&T>,
     ) -> Result<SendResult, FleetError> {
         let node = self
             .node_state(node_name)
             .ok_or_else(|| FleetError::NodeNotFound(node_name.to_string()))?;
-        Ok(send_to_node(
-            node,
-            method.to_string(),
-            params.cloned(),
-            true,
-        ))
+        Ok(send_to_node(node, method, params, true))
     }
 
-    fn send_with_selection<T: AsRef<str>>(
+    fn send_with_selection<Tag: AsRef<str>, T: ServableWrite + ?Sized>(
         &self,
         method: &str,
-        params: Option<&Value>,
-        tags: &[T],
+        params: Option<&T>,
+        tags: &[Tag],
         notify: bool,
     ) -> HashMap<String, SendResult> {
         let target_nodes = self.snapshot_target_nodes(tags);
         let mut results = HashMap::new();
         for node in target_nodes {
-            let result = send_to_node(node, method.to_string(), params.cloned(), notify);
+            let result = send_to_node(node, method, params, notify);
             results.insert(result.node.clone(), result);
         }
 
         results
     }
 
-    fn snapshot_target_nodes<T: AsRef<str>>(&self, tags: &[T]) -> Vec<Arc<UniUdpNodeState>> {
+    fn snapshot_target_nodes<Tag: AsRef<str>>(&self, tags: &[Tag]) -> Vec<Arc<UniUdpNodeState>> {
         let tag_set: BTreeSet<String> = tags.iter().map(|tag| tag.as_ref().to_string()).collect();
         read_nodes(&self.nodes)
             .values()
@@ -381,19 +380,22 @@ impl Display for UniUdpFleet {
     }
 }
 
-fn send_to_node(
+/// Send one message to one node, sequentially. The params are borrowed rather
+/// than cloned per node: this loop is not spawned, so every node can read the
+/// caller's value in place.
+fn send_to_node<T: ServableWrite + ?Sized>(
     node: Arc<UniUdpNodeState>,
-    method: String,
-    params: Option<Value>,
+    method: &str,
+    params: Option<&T>,
     notify: bool,
 ) -> SendResult {
     let started = Instant::now();
 
     let operation = || {
         if notify {
-            node.client.send_notify(&method, params.as_ref())
+            node.client.send_notify(method, params)
         } else {
-            node.client.send_request(&method, params.as_ref())
+            node.client.send_request(method, params)
         }
     };
 

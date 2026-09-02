@@ -12,11 +12,9 @@ use crate::peer::{CallContext, PeerHandle};
 use crate::registry::Registry;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::server_request::route_request_view;
-use crate::structs::{RepeStruct, ResponseBody, StructResult};
-use beve::from_slice as beve_from_slice;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
-use serde_json::Value;
+use crate::structs::{
+    RepeStruct, RequestBody, ResponseBody, ServableOwned, ServableWrite, StructResult,
+};
 use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::io::Write;
@@ -283,98 +281,6 @@ impl HandlerErased for Arc<dyn HandlerErased> {
     }
 }
 
-fn decode_json_param(req: &Message) -> Result<Result<Value, Message>, RepeError> {
-    let value: Value = match BodyFormat::try_from(req.header.body_format) {
-        // JSON requires UTF-8, so a Utf8-framed body parses straight from the
-        // bytes too — strict and allocation-free, matching the borrowing path.
-        Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => serde_json::from_slice(&req.body)?,
-        Ok(BodyFormat::Beve) => beve_from_slice(&req.body)?,
-        _ => {
-            return Ok(Err(create_error_response_like(
-                req,
-                ErrorCode::InvalidBody,
-                "Expected JSON body",
-            )));
-        }
-    };
-    Ok(Ok(value))
-}
-
-/// Borrowing twin of [`decode_json_param`]: decode the request body straight
-/// from the borrowed view, with no owned `Message`. The UTF-8 branch parses the
-/// bytes directly (`from_slice`) rather than via an intermediate `String`.
-fn decode_json_param_view(view: &MessageView) -> Result<Result<Value, Message>, RepeError> {
-    let value: Value = match BodyFormat::try_from(view.header.body_format) {
-        Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => serde_json::from_slice(view.body)?,
-        Ok(BodyFormat::Beve) => beve_from_slice(view.body)?,
-        _ => {
-            return Ok(Err(create_error_response_unstamped_view(
-                view,
-                ErrorCode::InvalidBody,
-                "Expected JSON body",
-            )));
-        }
-    };
-    Ok(Ok(value))
-}
-
-struct JsonHandler<F>(F)
-where
-    F: Fn(Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static;
-
-impl<F> HandlerErased for JsonHandler<F>
-where
-    F: Fn(Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static,
-{
-    fn handle(&self, req: &Message) -> Result<Message, RepeError> {
-        let param = match decode_json_param(req)? {
-            Ok(v) => v,
-            Err(err) => return Ok(err),
-        };
-        match (self.0)(param) {
-            Ok(value) => create_response_unstamped(req, value, BodyFormat::Json),
-            Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
-        }
-    }
-
-    fn handle_view(&self, view: &MessageView, _ctx: &CallContext) -> Result<Message, RepeError> {
-        let param = match decode_json_param_view(view)? {
-            Ok(v) => v,
-            Err(err) => return Ok(err),
-        };
-        match (self.0)(param) {
-            Ok(value) => create_response_unstamped_view(view, value, BodyFormat::Json),
-            Err((code, msg)) => Ok(create_error_response_unstamped_view(view, code, msg)),
-        }
-    }
-}
-
-struct JsonHandlerCtx<F>(F)
-where
-    F: Fn(&CallContext, Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static;
-
-impl<F> HandlerErased for JsonHandlerCtx<F>
-where
-    F: Fn(&CallContext, Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static,
-{
-    fn handle(&self, req: &Message) -> Result<Message, RepeError> {
-        let path = req.query_str().unwrap_or("");
-        let ctx = CallContext::detached(path);
-        self.handle_with_ctx(req, &ctx)
-    }
-
-    fn handle_with_ctx(&self, req: &Message, ctx: &CallContext) -> Result<Message, RepeError> {
-        let param = match decode_json_param(req)? {
-            Ok(v) => v,
-            Err(err) => return Ok(err),
-        };
-        match (self.0)(ctx, param) {
-            Ok(value) => create_response_unstamped(req, value, BodyFormat::Json),
-            Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
-        }
-    }
-}
-
 /// Wrapper that lets typed handlers override the response [`BodyFormat`].
 /// Use helpers like [`TypedResponse::json`] or [`TypedResponse::beve`] to keep call sites concise.
 pub struct TypedResponse<R> {
@@ -422,8 +328,8 @@ impl<R> IntoTypedResponse<R> for TypedResponse<R> {
 
 pub trait TypedHandlerFn<T, R>: Send + Sync + 'static
 where
-    T: DeserializeOwned + Send + Sync + 'static,
-    R: Serialize + Send + Sync + 'static,
+    T: ServableOwned + Send + Sync + 'static,
+    R: ServableWrite + Send + Sync + 'static,
 {
     type Response: IntoTypedResponse<R>;
     fn call(&self, input: T) -> Result<Self::Response, (ErrorCode, String)>;
@@ -431,8 +337,8 @@ where
 
 impl<T, R, S, F> TypedHandlerFn<T, R> for F
 where
-    T: DeserializeOwned + Send + Sync + 'static,
-    R: Serialize + Send + Sync + 'static,
+    T: ServableOwned + Send + Sync + 'static,
+    R: ServableWrite + Send + Sync + 'static,
     S: IntoTypedResponse<R>,
     F: Fn(T) -> Result<S, (ErrorCode, String)> + Send + Sync + 'static,
 {
@@ -443,55 +349,62 @@ where
     }
 }
 
-fn decode_typed_param<T>(req: &Message) -> Result<Result<T, Message>, RepeError>
-where
-    T: DeserializeOwned,
-{
-    let value: T = match BodyFormat::try_from(req.header.body_format) {
-        Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => serde_json::from_slice(&req.body)?,
-        Ok(BodyFormat::Beve) => beve_from_slice(&req.body)?,
-        _ => {
-            return Ok(Err(create_error_response_like(
-                req,
-                ErrorCode::InvalidBody,
-                "Expected JSON body",
-            )));
+/// Decode a request body into `T` under whichever format the frame declared.
+///
+/// JSON and UTF-8 both parse as JSON: JSON requires UTF-8, so a `Utf8`-framed
+/// body parses straight from the bytes with no intermediate `String`. Anything
+/// else has no value structure to decode and is answered with
+/// [`ErrorCode::InvalidBody`] rather than coerced.
+fn decode_typed_body<T: ServableOwned>(
+    body: &[u8],
+    body_format: u16,
+    on_bad_format: impl FnOnce() -> Message,
+) -> Result<Result<T, Message>, RepeError> {
+    let mut value = T::default();
+    match BodyFormat::try_from(body_format) {
+        Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => {
+            let text = std::str::from_utf8(body).map_err(|err| {
+                RepeError::Json(structio::Error::new(
+                    structio::ErrorCode::InvalidUtf8,
+                    err.valid_up_to(),
+                ))
+            })?;
+            structio::json::read_into(&mut value, text).map_err(RepeError::Json)?;
         }
-    };
+        Ok(BodyFormat::Beve) => {
+            structio::beve::read_into(&mut value, body).map_err(RepeError::Beve)?;
+        }
+        _ => return Ok(Err(on_bad_format())),
+    }
     Ok(Ok(value))
 }
 
-/// Borrowing twin of [`decode_typed_param`]: deserialize `T` straight from the
-/// borrowed view body, with no owned `Message` and no intermediate `String` on
-/// the UTF-8 branch.
-fn decode_typed_param_view<T>(view: &MessageView) -> Result<Result<T, Message>, RepeError>
-where
-    T: DeserializeOwned,
-{
-    let value: T = match BodyFormat::try_from(view.header.body_format) {
-        Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => serde_json::from_slice(view.body)?,
-        Ok(BodyFormat::Beve) => beve_from_slice(view.body)?,
-        _ => {
-            return Ok(Err(create_error_response_unstamped_view(
-                view,
-                ErrorCode::InvalidBody,
-                "Expected JSON body",
-            )));
-        }
-    };
-    Ok(Ok(value))
+fn decode_typed_param<T: ServableOwned>(req: &Message) -> Result<Result<T, Message>, RepeError> {
+    decode_typed_body(&req.body, req.header.body_format, || {
+        create_error_response_like(req, ErrorCode::InvalidBody, "Expected JSON body")
+    })
+}
+
+/// Borrowing twin of [`decode_typed_param`]: decode `T` straight from the
+/// borrowed view body, with no owned `Message`.
+fn decode_typed_param_view<T: ServableOwned>(
+    view: &MessageView,
+) -> Result<Result<T, Message>, RepeError> {
+    decode_typed_body(view.body, view.header.body_format, || {
+        create_error_response_unstamped_view(view, ErrorCode::InvalidBody, "Expected JSON body")
+    })
 }
 
 struct TypedHandler<T, R, F>(F, std::marker::PhantomData<(T, R)>)
 where
-    T: DeserializeOwned + Send + Sync + 'static,
-    R: Serialize + Send + Sync + 'static,
+    T: ServableOwned + Send + Sync + 'static,
+    R: ServableWrite + Send + Sync + 'static,
     F: TypedHandlerFn<T, R>;
 
 impl<T, R, F> HandlerErased for TypedHandler<T, R, F>
 where
-    T: DeserializeOwned + Send + Sync + 'static,
-    R: Serialize + Send + Sync + 'static,
+    T: ServableOwned + Send + Sync + 'static,
+    R: ServableWrite + Send + Sync + 'static,
     F: TypedHandlerFn<T, R>,
 {
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
@@ -502,7 +415,7 @@ where
         match self.0.call(t) {
             Ok(r) => {
                 let (value, format) = r.into_typed_response();
-                create_response_unstamped(req, value, format)
+                Ok(create_response_unstamped(req, &value, format))
             }
             Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
         }
@@ -516,7 +429,7 @@ where
         match self.0.call(t) {
             Ok(r) => {
                 let (value, format) = r.into_typed_response();
-                create_response_unstamped_view(view, value, format)
+                Ok(create_response_unstamped_view(view, &value, format))
             }
             Err((code, msg)) => Ok(create_error_response_unstamped_view(view, code, msg)),
         }
@@ -527,18 +440,53 @@ where
 /// `read_typed_slice` path (one `copy_nonoverlapping`, no serde walk). The
 /// typed-slice twin of [`decode_typed_param`].
 ///
-/// Unlike the serde decoders, this accepts only [`BodyFormat::Beve`]: a typed
-/// numeric array has no JSON/UTF-8 on-wire form, so any other body format is a
-/// client error rather than something to coerce. A `Beve` body that is not a
-/// typed array of `T` (wrong element class/width, or truncated) surfaces as a
-/// [`RepeError::Beve`], matching how [`decode_typed_param`] propagates a serde
-/// parse failure.
+/// The element type of a bulk numeric route: a scalar whose in-memory bytes
+/// *are* its BEVE payload, which is what makes the encode and decode one
+/// `copy_nonoverlapping` rather than a per-element walk.
+///
+/// One name for both halves of a [`with_typed_slice`] route. The request side
+/// has to be readable and the response side writable, but the scalars this can
+/// be (`f32`, `f64`, the integer widths, ...) are all of those things, so
+/// splitting the bound in two would name a distinction with no members on
+/// either side of it.
+///
+/// [`with_typed_slice`]: Router::with_typed_slice
+pub trait SliceElement:
+    structio::beve::NumericBytes + structio::beve::Write + for<'de> structio::beve::Read<'de> + Default
+{
+}
+
+impl<T> SliceElement for T where
+    T: structio::beve::NumericBytes
+        + structio::beve::Write
+        + for<'de> structio::beve::Read<'de>
+        + Default
+{
+}
+
+/// Bulk-decode a `Vec<T>` out of a BEVE typed array.
+///
+/// One reader takes both the regular and the aligned wire forms, so this is
+/// just a `Vec<T>` read: structio recognizes the payload as contiguous and
+/// bulk-copies it.
+fn read_typed_slice<T: SliceElement>(body: &[u8]) -> Result<Vec<T>, RepeError> {
+    let mut out = Vec::new();
+    structio::beve::read_into(&mut out, body).map_err(RepeError::Beve)?;
+    Ok(out)
+}
+
+/// This accepts only [`BodyFormat::Beve`]: a typed numeric array has no
+/// JSON/UTF-8 on-wire form, so any other body format is a client error rather
+/// than something to coerce. A `Beve` body that is not a typed array of `T`
+/// (wrong element class or width, or truncated) surfaces as a
+/// [`RepeError::Beve`], matching how [`decode_typed_param`] propagates a parse
+/// failure.
 fn decode_typed_slice_param<T>(req: &Message) -> Result<Result<Vec<T>, Message>, RepeError>
 where
-    T: beve::BeveTypedSlice,
+    T: SliceElement,
 {
     match BodyFormat::try_from(req.header.body_format) {
-        Ok(BodyFormat::Beve) => Ok(Ok(beve::read_typed_slice(&req.body)?)),
+        Ok(BodyFormat::Beve) => Ok(Ok(read_typed_slice(&req.body)?)),
         _ => Ok(Err(create_error_response_like(
             req,
             ErrorCode::InvalidBody,
@@ -553,10 +501,10 @@ fn decode_typed_slice_param_view<T>(
     view: &MessageView,
 ) -> Result<Result<Vec<T>, Message>, RepeError>
 where
-    T: beve::BeveTypedSlice,
+    T: SliceElement,
 {
     match BodyFormat::try_from(view.header.body_format) {
-        Ok(BodyFormat::Beve) => Ok(Ok(beve::read_typed_slice(view.body)?)),
+        Ok(BodyFormat::Beve) => Ok(Ok(read_typed_slice(view.body)?)),
         _ => Ok(Err(create_error_response_unstamped_view(
             view,
             ErrorCode::InvalidBody,
@@ -571,14 +519,14 @@ where
 /// the hot numeric path.
 struct TypedSliceHandler<T, R, F>(F, std::marker::PhantomData<(T, R)>)
 where
-    T: beve::BeveTypedSlice + Send + Sync + 'static,
-    R: beve::BeveTypedSlice + Send + Sync + 'static,
+    T: SliceElement + Send + Sync + 'static,
+    R: SliceElement + Send + Sync + 'static,
     F: Fn(Vec<T>) -> Result<Vec<R>, (ErrorCode, String)> + Send + Sync + 'static;
 
 impl<T, R, F> HandlerErased for TypedSliceHandler<T, R, F>
 where
-    T: beve::BeveTypedSlice + Send + Sync + 'static,
-    R: beve::BeveTypedSlice + Send + Sync + 'static,
+    T: SliceElement + Send + Sync + 'static,
+    R: SliceElement + Send + Sync + 'static,
     F: Fn(Vec<T>) -> Result<Vec<R>, (ErrorCode, String)> + Send + Sync + 'static,
 {
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
@@ -604,15 +552,6 @@ where
     }
 }
 
-/// BEVE aligned-typed-array marker byte (`0x5C`): a typed array (type 4) in the
-/// bool/string/aligned sub-category (3) with the aligned discriminator (2), per
-/// BEVE spec §4. It opens the aligned wire form that
-/// [`MessageBuilder::body_aligned_typed_slice`](crate::message::MessageBuilder::body_aligned_typed_slice)
-/// emits and the borrowing route decodes. Kept as a local constant rather than reaching into BEVE's
-/// header internals; [`aligned_marker_matches_beve`] pins it to BEVE's actual
-/// output so a future BEVE change cannot drift past us silently.
-const BEVE_ALIGNED_TYPED_ARRAY_MARKER: u8 = 0x5C;
-
 /// A decoded typed-slice request body: either borrowed straight from the receive
 /// buffer (the zero-copy win) or owned after a bulk copy (the fallback). Both
 /// expose the payload as `&[T]`, so the handler closure is oblivious to which
@@ -635,33 +574,22 @@ impl<T> SliceInput<'_, T> {
 /// Decode a typed-slice request body for the borrowing route, preferring a
 /// zero-copy borrow and degrading gracefully.
 ///
-/// Accepts both wire forms so a [`Router::with_typed_slice_ref`] route is a
-/// drop-in superset of [`Router::with_typed_slice`]:
-///
-/// * An *aligned* typed array (marker `0x5C`, what `call_typed_slice_aligned`
-///   sends) is borrowed as `&[T]` when the buffer permits, else bulk-copied (the
-///   aligned payload is unaligned in this particular buffer). A genuine
-///   element-type mismatch or truncation surfaces as an error from the owned
-///   re-read.
-/// * A *regular* typed array (what `call_typed_slice` / the serde path send) has
-///   no padding to borrow through, so it is always bulk-copied via
-///   [`beve::read_typed_slice`].
+/// Accepts both wire forms, so a [`Router::with_typed_slice_ref`] route is a
+/// drop-in superset of [`Router::with_typed_slice`]. There is no branch on the
+/// wire form because there is nothing to branch on:
+/// [`structio::beve_slice_ref`] declines with `None` for every reason a borrow
+/// can be unavailable — the payload is the regular unpadded form, the buffer's
+/// base address is not aligned for `T`, the target is big-endian, or the
+/// document is simply not a typed array of `T`. `None` is not a diagnosis, so
+/// the fallback is the owned read, which copies and then either succeeds or
+/// reports what is actually wrong with the bytes.
 fn decode_typed_slice_ref_body<T>(body: &[u8]) -> Result<SliceInput<'_, T>, RepeError>
 where
-    T: beve::BeveTypedSlice,
+    T: SliceElement,
 {
-    if body.first() == Some(&BEVE_ALIGNED_TYPED_ARRAY_MARKER) {
-        match beve::read_aligned_typed_slice_ref::<T>(body) {
-            Ok(slice) => Ok(SliceInput::Borrowed(slice)),
-            // Borrow refused (buffer base not aligned, or big-endian target) or a
-            // real decode error: re-read owned, which copies and either succeeds
-            // or reports the definitive error.
-            Err(_) => Ok(SliceInput::Owned(beve::read_aligned_typed_slice::<T>(
-                body,
-            )?)),
-        }
-    } else {
-        Ok(SliceInput::Owned(beve::read_typed_slice::<T>(body)?))
+    match structio::beve_slice_ref::<T>(body) {
+        Some(slice) => Ok(SliceInput::Borrowed(slice)),
+        None => Ok(SliceInput::Owned(read_typed_slice(body)?)),
     }
 }
 
@@ -676,7 +604,7 @@ fn decode_typed_slice_ref_param<'a, T>(
     on_bad_format: impl FnOnce() -> Message,
 ) -> Result<Result<SliceInput<'a, T>, Message>, RepeError>
 where
-    T: beve::BeveTypedSlice,
+    T: SliceElement,
 {
     match BodyFormat::try_from(body_format) {
         Ok(BodyFormat::Beve) => Ok(Ok(decode_typed_slice_ref_body::<T>(body)?)),
@@ -691,14 +619,14 @@ where
 /// and buffer alignment allow it.
 struct TypedSliceRefHandler<T, R, F>(F, std::marker::PhantomData<(T, R)>)
 where
-    T: beve::BeveTypedSlice + Send + Sync + 'static,
-    R: beve::BeveTypedSlice + Send + Sync + 'static,
+    T: SliceElement + Send + Sync + 'static,
+    R: SliceElement + Send + Sync + 'static,
     F: Fn(&[T]) -> Result<Vec<R>, (ErrorCode, String)> + Send + Sync + 'static;
 
 impl<T, R, F> HandlerErased for TypedSliceRefHandler<T, R, F>
 where
-    T: beve::BeveTypedSlice + Send + Sync + 'static,
-    R: beve::BeveTypedSlice + Send + Sync + 'static,
+    T: SliceElement + Send + Sync + 'static,
+    R: SliceElement + Send + Sync + 'static,
     F: Fn(&[T]) -> Result<Vec<R>, (ErrorCode, String)> + Send + Sync + 'static,
 {
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
@@ -743,8 +671,8 @@ where
 /// `Fn(&CallContext, T) -> Result<R, (ErrorCode, String)>`.
 pub trait TypedHandlerFnCtx<T, R>: Send + Sync + 'static
 where
-    T: DeserializeOwned + Send + Sync + 'static,
-    R: Serialize + Send + Sync + 'static,
+    T: ServableOwned + Send + Sync + 'static,
+    R: ServableWrite + Send + Sync + 'static,
 {
     type Response: IntoTypedResponse<R>;
     fn call(&self, ctx: &CallContext, input: T) -> Result<Self::Response, (ErrorCode, String)>;
@@ -752,8 +680,8 @@ where
 
 impl<T, R, S, F> TypedHandlerFnCtx<T, R> for F
 where
-    T: DeserializeOwned + Send + Sync + 'static,
-    R: Serialize + Send + Sync + 'static,
+    T: ServableOwned + Send + Sync + 'static,
+    R: ServableWrite + Send + Sync + 'static,
     S: IntoTypedResponse<R>,
     F: Fn(&CallContext, T) -> Result<S, (ErrorCode, String)> + Send + Sync + 'static,
 {
@@ -766,14 +694,14 @@ where
 
 struct TypedHandlerCtx<T, R, F>(F, std::marker::PhantomData<(T, R)>)
 where
-    T: DeserializeOwned + Send + Sync + 'static,
-    R: Serialize + Send + Sync + 'static,
+    T: ServableOwned + Send + Sync + 'static,
+    R: ServableWrite + Send + Sync + 'static,
     F: TypedHandlerFnCtx<T, R>;
 
 impl<T, R, F> HandlerErased for TypedHandlerCtx<T, R, F>
 where
-    T: DeserializeOwned + Send + Sync + 'static,
-    R: Serialize + Send + Sync + 'static,
+    T: ServableOwned + Send + Sync + 'static,
+    R: ServableWrite + Send + Sync + 'static,
     F: TypedHandlerFnCtx<T, R>,
 {
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
@@ -790,7 +718,7 @@ where
         match self.0.call(ctx, t) {
             Ok(r) => {
                 let (value, format) = r.into_typed_response();
-                create_response_unstamped(req, value, format)
+                Ok(create_response_unstamped(req, &value, format))
             }
             Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
         }
@@ -1186,16 +1114,6 @@ impl Router {
         self.inner = Arc::new(map);
     }
 
-    /// Add a JSON Value-based handler. Alias: `with`.
-    pub fn with_json(
-        mut self,
-        path: &str,
-        handler: impl Fn(Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static,
-    ) -> Self {
-        self.insert_route(path, Arc::new(JsonHandler(handler)));
-        self
-    }
-
     /// Register a custom [`HandlerErased`] at `path`, the low-level escape hatch
     /// beneath the typed/JSON registrars.
     ///
@@ -1507,22 +1425,13 @@ impl Router {
         arc
     }
 
-    /// Backwards-compatible alias for `with_json`.
-    pub fn with(
-        self,
-        path: &str,
-        handler: impl Fn(Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static,
-    ) -> Self {
-        self.with_json(path, handler)
-    }
-
     /// Add a typed handler that auto-deserializes JSON/UTF-8/BEVE into `T` and serializes `R`.
     /// Return `Ok(value)` for JSON responses or wrap results with [`TypedResponse`] to pick a
     /// different [`BodyFormat`].
     pub fn with_typed<T, R, F>(mut self, path: &str, f: F) -> Self
     where
-        T: DeserializeOwned + Send + Sync + 'static,
-        R: Serialize + Send + Sync + 'static,
+        T: ServableOwned + Send + Sync + 'static,
+        R: ServableWrite + Send + Sync + 'static,
         F: TypedHandlerFn<T, R>,
     {
         self.insert_route(
@@ -1562,8 +1471,8 @@ impl Router {
     /// [`MessageBuilder::body_typed_slice`]: crate::message::MessageBuilder::body_typed_slice
     pub fn with_typed_slice<T, R, F>(mut self, path: &str, f: F) -> Self
     where
-        T: beve::BeveTypedSlice + Send + Sync + 'static,
-        R: beve::BeveTypedSlice + Send + Sync + 'static,
+        T: SliceElement + Send + Sync + 'static,
+        R: SliceElement + Send + Sync + 'static,
         F: Fn(Vec<T>) -> Result<Vec<R>, (ErrorCode, String)> + Send + Sync + 'static,
     {
         self.insert_route(
@@ -1605,8 +1514,8 @@ impl Router {
     /// [`Client::call_typed_slice_aligned`]: crate::Client::call_typed_slice_aligned
     pub fn with_typed_slice_ref<T, R, F>(mut self, path: &str, f: F) -> Self
     where
-        T: beve::BeveTypedSlice + Send + Sync + 'static,
-        R: beve::BeveTypedSlice + Send + Sync + 'static,
+        T: SliceElement + Send + Sync + 'static,
+        R: SliceElement + Send + Sync + 'static,
         F: Fn(&[T]) -> Result<Vec<R>, (ErrorCode, String)> + Send + Sync + 'static,
     {
         self.insert_route(
@@ -1616,51 +1525,14 @@ impl Router {
         self
     }
 
-    /// Context-aware JSON handler. Same shape as [`with_json`] but the
-    /// closure also receives a [`CallContext`] carrying the calling
-    /// peer (when one is available) and the dispatched method.
-    ///
-    /// Typical use: push a notify back to the calling peer during
-    /// request handling, e.g. progress updates while a long-running
-    /// call is in flight.
-    ///
-    /// ```ignore
-    /// use repe::server::Router;
-    /// use repe::NotifyBody;
-    ///
-    /// let router = Router::new().with_json_ctx("/start", |ctx, params| {
-    ///     if let Some(peer) = ctx.peer() {
-    ///         let _ = peer.send_notify(
-    ///             "/progress",
-    ///             NotifyBody::Json(serde_json::to_vec(&serde_json::json!({
-    ///                 "stage": "begin"
-    ///             })).unwrap()),
-    ///         );
-    ///     }
-    ///     Ok(serde_json::json!({ "started": true }))
-    /// });
-    /// ```
-    ///
-    /// When dispatched without a peer (TCP transports, direct
-    /// in-process calls), `ctx.peer()` returns `None`.
-    ///
-    /// [`with_json`]: Self::with_json
-    pub fn with_json_ctx<F>(mut self, path: &str, handler: F) -> Self
-    where
-        F: Fn(&CallContext, Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static,
-    {
-        self.insert_route(path, Arc::new(JsonHandlerCtx(handler)));
-        self
-    }
-
     /// Context-aware typed handler. Same shape as [`with_typed`] but
     /// the closure also receives a [`CallContext`].
     ///
     /// [`with_typed`]: Self::with_typed
     pub fn with_typed_ctx<T, R, F>(mut self, path: &str, f: F) -> Self
     where
-        T: DeserializeOwned + Send + Sync + 'static,
-        R: Serialize + Send + Sync + 'static,
+        T: ServableOwned + Send + Sync + 'static,
+        R: ServableWrite + Send + Sync + 'static,
         F: TypedHandlerFnCtx<T, R>,
     {
         self.insert_route(
@@ -1670,38 +1542,17 @@ impl Router {
         self
     }
 
-    /// Off-reader variant of [`with_json`](Self::with_json): on the
+    /// Off-reader variant of [`with_typed`](Self::with_typed): on the
     /// WebSocket server the handler runs on a blocking thread (see
     /// [`Execution::OffReader`]) so the reader stays free to decode
     /// further inbound frames while it runs or parks. Use for handlers
     /// that block — e.g. a `repe::stream` producer waiting on
     /// `wait_for_credit`. On the TCP servers it behaves exactly like
-    /// [`with_json`](Self::with_json).
-    pub fn with_json_blocking(
-        mut self,
-        path: &str,
-        handler: impl Fn(Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static,
-    ) -> Self {
-        self.insert_route(path, Arc::new(OffReaderHandler(JsonHandler(handler))));
-        self
-    }
-
-    /// Off-reader variant of [`with_json_ctx`](Self::with_json_ctx).
-    /// See [`with_json_blocking`](Self::with_json_blocking).
-    pub fn with_json_ctx_blocking<F>(mut self, path: &str, handler: F) -> Self
-    where
-        F: Fn(&CallContext, Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static,
-    {
-        self.insert_route(path, Arc::new(OffReaderHandler(JsonHandlerCtx(handler))));
-        self
-    }
-
-    /// Off-reader variant of [`with_typed`](Self::with_typed).
-    /// See [`with_json_blocking`](Self::with_json_blocking).
+    /// [`with_typed`](Self::with_typed).
     pub fn with_typed_blocking<T, R, F>(mut self, path: &str, f: F) -> Self
     where
-        T: DeserializeOwned + Send + Sync + 'static,
-        R: Serialize + Send + Sync + 'static,
+        T: ServableOwned + Send + Sync + 'static,
+        R: ServableWrite + Send + Sync + 'static,
         F: TypedHandlerFn<T, R>,
     {
         self.insert_route(
@@ -1715,11 +1566,11 @@ impl Router {
     }
 
     /// Off-reader variant of [`with_typed_ctx`](Self::with_typed_ctx).
-    /// See [`with_json_blocking`](Self::with_json_blocking).
+    /// See [`with_typed_blocking`](Self::with_typed_blocking).
     pub fn with_typed_ctx_blocking<T, R, F>(mut self, path: &str, f: F) -> Self
     where
-        T: DeserializeOwned + Send + Sync + 'static,
-        R: Serialize + Send + Sync + 'static,
+        T: ServableOwned + Send + Sync + 'static,
+        R: ServableWrite + Send + Sync + 'static,
         F: TypedHandlerFnCtx<T, R>,
     {
         self.insert_route(
@@ -2035,43 +1886,50 @@ impl RegisteredRegistry {
     }
 }
 
+impl RegisteredRegistry {
+    /// The body of both [`HandlerErased`] entry points, which differ only in
+    /// whether they have a calling peer to offer the function.
+    ///
+    /// The registry writes its result straight into the response buffer, so
+    /// there is no intermediate value between the function and the frame. The
+    /// response format follows the request's, the same rule the struct
+    /// dispatcher uses.
+    fn dispatch(&self, req: &Message, ctx: &CallContext) -> Message {
+        let path = req.query_str().unwrap_or("");
+        let Some(pointer) = self.pointer_for(path) else {
+            return create_error_response_like(
+                req,
+                ErrorCode::MethodNotFound,
+                format!("path is not below registry prefix: {path}"),
+            );
+        };
+        let params = match Registry::body_of(req) {
+            Ok(params) => params,
+            Err(err) => return create_error_response_like(req, err.code(), err.to_string()),
+        };
+
+        let mut buf = response_buffer(req);
+        let requested = BodyFormat::try_from(req.header.body_format).unwrap_or(BodyFormat::Json);
+        let mut out = ResponseBody::with_format(&mut buf, requested);
+        match self.registry.call(pointer, params, ctx, &mut out) {
+            Ok(()) => {
+                let body_format = out.format();
+                create_body_response_unstamped(req, buf, body_format)
+            }
+            Err(err) => create_error_response_like(req, err.code(), err.to_string()),
+        }
+    }
+}
+
 impl HandlerErased for RegisteredRegistry {
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
         let path = req.query_str().unwrap_or("");
-        let Some(pointer) = self.pointer_for(path) else {
-            return Ok(create_error_response_like(
-                req,
-                ErrorCode::MethodNotFound,
-                format!("path is not below registry prefix: {path}"),
-            ));
-        };
-        let body = match Registry::decode_body(req) {
-            Ok(value) => value,
-            Err(err) => return Ok(create_error_response_like(req, err.code(), err.to_string())),
-        };
-        match self.registry.dispatch(pointer, body) {
-            Ok(value) => create_response_unstamped(req, value, BodyFormat::Json),
-            Err(err) => Ok(create_error_response_like(req, err.code(), err.to_string())),
-        }
+        let ctx = CallContext::detached(path);
+        Ok(self.dispatch(req, &ctx))
     }
 
     fn handle_with_ctx(&self, req: &Message, ctx: &CallContext) -> Result<Message, RepeError> {
-        let path = req.query_str().unwrap_or("");
-        let Some(pointer) = self.pointer_for(path) else {
-            return Ok(create_error_response_like(
-                req,
-                ErrorCode::MethodNotFound,
-                format!("path is not below registry prefix: {path}"),
-            ));
-        };
-        let body = match Registry::decode_body(req) {
-            Ok(value) => value,
-            Err(err) => return Ok(create_error_response_like(req, err.code(), err.to_string())),
-        };
-        match self.registry.dispatch_with_ctx(pointer, body, ctx) {
-            Ok(value) => create_response_unstamped(req, value, BodyFormat::Json),
-            Err(err) => Ok(create_error_response_like(req, err.code(), err.to_string())),
-        }
+        Ok(self.dispatch(req, ctx))
     }
 }
 
@@ -2128,32 +1986,38 @@ where
             ));
         };
 
-        // Decoded before either attempt, because the shared one is offered the
+        // Wrapped, not parsed. The body reaches the struct as the bytes that
+        // arrived plus the format the header declared, and is decoded once
+        // directly into the live member it is destined for. Nothing here knows
+        // what shape the endpoint expects, and a request no endpoint claims
+        // never parses at all.
+        //
+        // Prepared before either attempt, because the shared one is offered the
         // body too: a `&self` method taking arguments is a call, not a
         // mutation, and gating the shared path on an empty frame put every such
         // call behind the write guard. The struct decides from the receiver it
         // was generated from; this side only has to make the body available.
-        let mut body = if req.body.is_empty() {
+        let body_format = match BodyFormat::try_from(req.header.body_format) {
+            Ok(format @ (BodyFormat::Json | BodyFormat::Utf8 | BodyFormat::Beve)) => format,
+            // Raw binary, an unrecognized code, and a `BodyFormat` this build
+            // does not know. An empty frame is a read and carries no body to
+            // have a format, so it is exempt.
+            _ if req.body.is_empty() => BodyFormat::Json,
+            _ => {
+                return Ok(create_error_response_like(
+                    req,
+                    ErrorCode::InvalidBody,
+                    format!(
+                        "struct handler `{path}` requires JSON or BEVE body, got format {}",
+                        req.header.body_format
+                    ),
+                ));
+            }
+        };
+        let body = if req.body.is_empty() {
             None
         } else {
-            match BodyFormat::try_from(req.header.body_format) {
-                Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => {
-                    Some(serde_json::from_slice::<Value>(&req.body).map_err(RepeError::from)?)
-                }
-                Ok(BodyFormat::Beve) => Some(beve_from_slice(&req.body)?),
-                // Raw binary, an unrecognized code, and a `BodyFormat` this
-                // build does not know: none of them is a JSON tree.
-                Ok(_) | Err(_) => {
-                    return Ok(create_error_response_like(
-                        req,
-                        ErrorCode::InvalidBody,
-                        format!(
-                            "struct handler `{path}` requires JSON or BEVE body, got format {}",
-                            req.header.body_format
-                        ),
-                    ));
-                }
-            }
+            Some(RequestBody::new(&req.body, body_format))
         };
 
         // One buffer for both attempts: a declining shared attempt leaves it
@@ -2181,7 +2045,7 @@ where
             // identically.
             if body.is_none() || T::REPE_SHARED_SERVES_BODIES {
                 match self.shared.with_read(|handler| {
-                    shared_struct_segments(handler, segments, &mut body, &mut buf, req)
+                    shared_struct_segments(handler, segments, body, body_format, &mut buf, req)
                 }) {
                     Some(Ok(Some(response))) => return response,
                     // The struct declined: this path needs `&mut self`. Nothing
@@ -2199,7 +2063,7 @@ where
                 Err(err) => return lock_error_response(req, path, err),
             };
 
-            dispatch_struct_segments(&mut *guard, segments, body, buf, req)
+            dispatch_struct_segments(&mut *guard, segments, body, body_format, buf, req)
         });
         Ok(response)
     }
@@ -2238,8 +2102,12 @@ where
     const STACK_SEGS: usize = 16;
 
     if relative.contains('~') {
-        let owned = crate::json_pointer::parse(relative);
-        let seg_refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        // A malformed escape has no segments to dispatch on. The derived
+        // impls answer `InvalidPath` for a segment list that names nothing,
+        // and an unparseable pointer names nothing, so the empty list reaches
+        // the same answer through the same door.
+        let owned = crate::json_pointer::parse(relative).unwrap_or_default();
+        let seg_refs: Vec<&str> = owned.iter().map(AsRef::as_ref).collect();
         return f(&seg_refs);
     }
     if relative.is_empty() {
@@ -2300,14 +2168,15 @@ fn response_buffer(req: &Message) -> Vec<u8> {
 fn dispatch_struct_segments<T>(
     handler: &mut T,
     segments: &[&str],
-    body: Option<Value>,
+    body: Option<RequestBody<'_>>,
+    requested: BodyFormat,
     mut buf: Vec<u8>,
     req: &Message,
 ) -> Message
 where
     T: RepeStruct + ?Sized,
 {
-    let mut out = ResponseBody::new(&mut buf);
+    let mut out = ResponseBody::with_format(&mut buf, requested);
     let result = handler.repe_handle_into(segments, body, &mut out);
     let body_format = out.format();
     finish_struct_response(req, buf, body_format, result)
@@ -2327,14 +2196,15 @@ where
 fn shared_struct_segments<T>(
     handler: &T,
     segments: &[&str],
-    body: &mut Option<Value>,
+    body: Option<RequestBody<'_>>,
+    requested: BodyFormat,
     buf: &mut Vec<u8>,
     req: &Message,
 ) -> Option<Message>
 where
     T: RepeStruct + ?Sized,
 {
-    let mut out = ResponseBody::new(buf);
+    let mut out = ResponseBody::with_format(buf, requested);
     let Some(result) = handler.repe_shared_into(segments, body, &mut out) else {
         buf.clear();
         return None;
@@ -2365,8 +2235,8 @@ fn finish_struct_response(
 /// Pluggable trait for typed JSON handlers: auto-deserializes request JSON to `In`,
 /// returns `Out` which is serialized to JSON response.
 pub trait JsonTypedHandler: Send + Sync {
-    type In: DeserializeOwned + Send + 'static;
-    type Out: Serialize + Send + 'static;
+    type In: ServableOwned + Send + 'static;
+    type Out: ServableWrite + Send + 'static;
     fn call(&self, input: Self::In) -> Result<Self::Out, (ErrorCode, String)>;
 }
 
@@ -2374,19 +2244,12 @@ struct JsonTypedAdapter<H: JsonTypedHandler>(H);
 
 impl<H: JsonTypedHandler> HandlerErased for JsonTypedAdapter<H> {
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
-        let t: H::In = match BodyFormat::try_from(req.header.body_format) {
-            Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => serde_json::from_slice(&req.body)?,
-            Ok(BodyFormat::Beve) => beve_from_slice(&req.body)?,
-            _ => {
-                return Ok(create_error_response_like(
-                    req,
-                    ErrorCode::InvalidBody,
-                    "Expected JSON body",
-                ));
-            }
+        let t: H::In = match decode_typed_param(req)? {
+            Ok(v) => v,
+            Err(err) => return Ok(err),
         };
         match self.0.call(t) {
-            Ok(r) => create_response_unstamped(req, r, BodyFormat::Json),
+            Ok(r) => Ok(create_response_unstamped(req, &r, BodyFormat::Json)),
             Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
         }
     }

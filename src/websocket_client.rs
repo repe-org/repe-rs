@@ -1,11 +1,8 @@
 use crate::constants::{BodyFormat, ErrorCode, QueryFormat, REPE_VERSION};
 use crate::error::RepeError;
 use crate::message::{Message, MessageBuilder};
-use beve::from_slice as beve_from_slice;
 use futures_util::{SinkExt, StreamExt};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
-use serde_json::Value;
+use repe_core::structs::ServableOwned;
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -241,58 +238,67 @@ impl WebSocketClient {
         self.inner.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    pub async fn call_json<P: AsRef<str>, T: Serialize>(
+    /// Send a JSON-pointer request with a JSON body and decode the response
+    /// into `R`.
+    ///
+    /// `R` is decoded from whichever format the response header declares, not
+    /// from the one the request used: a server may answer a JSON request in
+    /// BEVE, and [`ServableOwned`] is both halves for that reason.
+    pub async fn call_typed_json<P: AsRef<str>, T, R>(
         &self,
         path: P,
         body: &T,
-    ) -> Result<Value, RepeError> {
-        self.call_json_with_optional_timeout(path, body, None).await
-    }
-
-    pub async fn call_json_with_timeout<P: AsRef<str>, T: Serialize>(
-        &self,
-        path: P,
-        body: &T,
-        timeout_duration: Duration,
-    ) -> Result<Value, RepeError> {
-        self.call_json_with_optional_timeout(path, body, Some(timeout_duration))
-            .await
-    }
-
-    pub async fn call_typed_json<P: AsRef<str>, T: Serialize, R: DeserializeOwned>(
-        &self,
-        path: P,
-        body: &T,
-    ) -> Result<R, RepeError> {
+    ) -> Result<R, RepeError>
+    where
+        T: structio::json::Write + ?Sized,
+        R: ServableOwned,
+    {
         self.call_typed_json_with_optional_timeout(path, body, None)
             .await
     }
 
-    pub async fn call_typed_json_with_timeout<P: AsRef<str>, T: Serialize, R: DeserializeOwned>(
+    /// Timeout-bearing twin of [`call_typed_json`](Self::call_typed_json).
+    pub async fn call_typed_json_with_timeout<P: AsRef<str>, T, R>(
         &self,
         path: P,
         body: &T,
         timeout_duration: Duration,
-    ) -> Result<R, RepeError> {
+    ) -> Result<R, RepeError>
+    where
+        T: structio::json::Write + ?Sized,
+        R: ServableOwned,
+    {
         self.call_typed_json_with_optional_timeout(path, body, Some(timeout_duration))
             .await
     }
 
-    pub async fn call_typed_beve<P: AsRef<str>, T: Serialize, R: DeserializeOwned>(
+    /// Send a JSON-pointer request with a BEVE body and decode the response
+    /// into `R`. The BEVE-bodied twin of
+    /// [`call_typed_json`](Self::call_typed_json).
+    pub async fn call_typed_beve<P: AsRef<str>, T, R>(
         &self,
         path: P,
         body: &T,
-    ) -> Result<R, RepeError> {
+    ) -> Result<R, RepeError>
+    where
+        T: structio::beve::Write + ?Sized,
+        R: ServableOwned,
+    {
         self.call_typed_beve_with_optional_timeout(path, body, None)
             .await
     }
 
-    pub async fn call_typed_beve_with_timeout<P: AsRef<str>, T: Serialize, R: DeserializeOwned>(
+    /// Timeout-bearing twin of [`call_typed_beve`](Self::call_typed_beve).
+    pub async fn call_typed_beve_with_timeout<P: AsRef<str>, T, R>(
         &self,
         path: P,
         body: &T,
         timeout_duration: Duration,
-    ) -> Result<R, RepeError> {
+    ) -> Result<R, RepeError>
+    where
+        T: structio::beve::Write + ?Sized,
+        R: ServableOwned,
+    {
         self.call_typed_beve_with_optional_timeout(path, body, Some(timeout_duration))
             .await
     }
@@ -352,12 +358,14 @@ impl WebSocketClient {
         .await
     }
 
-    pub async fn registry_read<P: AsRef<str>>(&self, path: P) -> Result<Value, RepeError> {
-        let resp = self.call_message(path).await?;
-        resp.json_body::<Value>()
-    }
-
-    pub async fn registry_read_typed<P: AsRef<str>, R: DeserializeOwned>(
+    /// Registry helper: send an empty-body request and decode the JSON
+    /// response as `R`.
+    ///
+    /// There is no untyped twin. A registry read used to be able to land in a
+    /// `serde_json::Value` and be indexed; with no document model the caller
+    /// names the shape it expects, and a response that does not match it is a
+    /// decode error rather than a `None` discovered three lines later.
+    pub async fn registry_read_typed<P: AsRef<str>, R: ServableOwned>(
         &self,
         path: P,
     ) -> Result<R, RepeError> {
@@ -365,18 +373,8 @@ impl WebSocketClient {
         resp.json_body::<R>()
     }
 
-    pub async fn registry_read_with_timeout<P: AsRef<str>>(
-        &self,
-        path: P,
-        timeout_duration: Duration,
-    ) -> Result<Value, RepeError> {
-        let resp = self
-            .call_message_with_timeout(path, timeout_duration)
-            .await?;
-        resp.json_body::<Value>()
-    }
-
-    pub async fn registry_read_typed_with_timeout<P: AsRef<str>, R: DeserializeOwned>(
+    /// Timeout variant of [`registry_read_typed`](Self::registry_read_typed).
+    pub async fn registry_read_typed_with_timeout<P: AsRef<str>, R: ServableOwned>(
         &self,
         path: P,
         timeout_duration: Duration,
@@ -387,45 +385,20 @@ impl WebSocketClient {
         resp.json_body::<R>()
     }
 
-    pub async fn registry_write_json<P: AsRef<str>, T: Serialize>(
-        &self,
-        path: P,
-        body: &T,
-    ) -> Result<Value, RepeError> {
-        self.call_json(path, body).await
-    }
-
-    pub async fn registry_call_json<P: AsRef<str>, T: Serialize>(
-        &self,
-        path: P,
-        body: &T,
-    ) -> Result<Value, RepeError> {
-        self.call_json(path, body).await
-    }
-
-    pub async fn notify_json<P: AsRef<str>, T: Serialize>(
-        &self,
-        path: P,
-        body: &T,
-    ) -> Result<(), RepeError> {
+    /// Send a JSON-pointer notify request (no response expected).
+    pub async fn notify_json<P: AsRef<str>, T>(&self, path: P, body: &T) -> Result<(), RepeError>
+    where
+        T: structio::json::Write + ?Sized,
+    {
         self.notify_with_body(path, |builder| builder.body_json(body))
             .await
     }
 
-    pub async fn notify_typed_json<P: AsRef<str>, T: Serialize>(
-        &self,
-        path: P,
-        body: &T,
-    ) -> Result<(), RepeError> {
-        self.notify_with_body(path, |builder| builder.body_json(body))
-            .await
-    }
-
-    pub async fn notify_typed_beve<P: AsRef<str>, T: Serialize>(
-        &self,
-        path: P,
-        body: &T,
-    ) -> Result<(), RepeError> {
+    /// Notify with a BEVE payload, without waiting for a response.
+    pub async fn notify_beve<P: AsRef<str>, T>(&self, path: P, body: &T) -> Result<(), RepeError>
+    where
+        T: structio::beve::Write + ?Sized,
+    {
         self.notify_with_body(path, |builder| builder.body_beve(body))
             .await
     }
@@ -441,27 +414,47 @@ impl WebSocketClient {
             .await
     }
 
-    pub async fn batch_json(
-        &self,
-        requests: Vec<(String, Value)>,
-    ) -> Vec<Result<Value, RepeError>> {
+    /// Execute JSON calls in parallel over this single connection and keep
+    /// request order.
+    ///
+    /// One body type and one result type for the whole batch. A `Vec` of
+    /// `serde_json::Value` used to make a batch implicitly heterogeneous; with
+    /// no document model the uniform case is the one that stays ergonomic, and
+    /// a genuinely mixed batch pre-encodes its bodies and batches
+    /// `Vec<(String, Vec<u8>)>` through [`call_with_formats`] instead.
+    ///
+    /// [`call_with_formats`]: Self::call_with_formats
+    pub async fn batch_json<T, R>(&self, requests: Vec<(String, T)>) -> Vec<Result<R, RepeError>>
+    where
+        T: structio::json::Write + Send + Sync + 'static,
+        R: ServableOwned + Send + 'static,
+    {
         self.batch_json_inner(requests, None).await
     }
 
-    pub async fn batch_json_with_timeout(
+    /// Execute JSON calls in parallel with a per-request timeout.
+    pub async fn batch_json_with_timeout<T, R>(
         &self,
-        requests: Vec<(String, Value)>,
+        requests: Vec<(String, T)>,
         timeout_duration: Duration,
-    ) -> Vec<Result<Value, RepeError>> {
+    ) -> Vec<Result<R, RepeError>>
+    where
+        T: structio::json::Write + Send + Sync + 'static,
+        R: ServableOwned + Send + 'static,
+    {
         self.batch_json_inner(requests, Some(timeout_duration))
             .await
     }
 
-    async fn batch_json_inner(
+    async fn batch_json_inner<T, R>(
         &self,
-        requests: Vec<(String, Value)>,
+        requests: Vec<(String, T)>,
         timeout_duration: Option<Duration>,
-    ) -> Vec<Result<Value, RepeError>> {
+    ) -> Vec<Result<R, RepeError>>
+    where
+        T: structio::json::Write + Send + Sync + 'static,
+        R: ServableOwned + Send + 'static,
+    {
         let mut workers = Vec::with_capacity(requests.len());
 
         for (index, (path, body)) in requests.into_iter().enumerate() {
@@ -470,13 +463,13 @@ impl WebSocketClient {
                 index,
                 tokio::spawn(async move {
                     client
-                        .call_json_with_optional_timeout(path, &body, timeout_duration)
+                        .call_typed_json_with_optional_timeout(path, &body, timeout_duration)
                         .await
                 }),
             ));
         }
 
-        let mut out: Vec<Option<Result<Value, RepeError>>> = std::iter::repeat_with(|| None)
+        let mut out: Vec<Option<Result<R, RepeError>>> = std::iter::repeat_with(|| None)
             .take(workers.len())
             .collect();
 
@@ -493,12 +486,16 @@ impl WebSocketClient {
             .collect()
     }
 
-    async fn call_json_with_optional_timeout<P: AsRef<str>, T: Serialize>(
+    async fn call_typed_json_with_optional_timeout<P: AsRef<str>, T, R>(
         &self,
         path: P,
         body: &T,
         timeout_duration: Option<Duration>,
-    ) -> Result<Value, RepeError> {
+    ) -> Result<R, RepeError>
+    where
+        T: structio::json::Write + ?Sized,
+        R: ServableOwned,
+    {
         let resp = self
             .call_with_body_and_timeout(
                 path,
@@ -507,40 +504,19 @@ impl WebSocketClient {
                 |builder| builder.body_json(body),
             )
             .await?;
-        resp.json_body::<Value>()
+        resp.decode_body()
     }
 
-    async fn call_typed_json_with_optional_timeout<
-        P: AsRef<str>,
-        T: Serialize,
-        R: DeserializeOwned,
-    >(
+    async fn call_typed_beve_with_optional_timeout<P: AsRef<str>, T, R>(
         &self,
         path: P,
         body: &T,
         timeout_duration: Option<Duration>,
-    ) -> Result<R, RepeError> {
-        let resp = self
-            .call_with_body_and_timeout(
-                path,
-                QueryFormat::JsonPointer as u16,
-                timeout_duration,
-                |builder| builder.body_json(body),
-            )
-            .await?;
-        Self::decode_typed_response(&resp)
-    }
-
-    async fn call_typed_beve_with_optional_timeout<
-        P: AsRef<str>,
-        T: Serialize,
-        R: DeserializeOwned,
-    >(
-        &self,
-        path: P,
-        body: &T,
-        timeout_duration: Option<Duration>,
-    ) -> Result<R, RepeError> {
+    ) -> Result<R, RepeError>
+    where
+        T: structio::beve::Write + ?Sized,
+        R: ServableOwned,
+    {
         let resp = self
             .call_with_body_and_timeout(
                 path,
@@ -549,7 +525,7 @@ impl WebSocketClient {
                 |builder| builder.body_beve(body),
             )
             .await?;
-        Self::decode_typed_response(&resp)
+        resp.decode_body()
     }
 
     async fn call_with_body_and_timeout<P, F>(
@@ -561,14 +537,14 @@ impl WebSocketClient {
     ) -> Result<Message, RepeError>
     where
         P: AsRef<str>,
-        F: FnOnce(MessageBuilder) -> Result<MessageBuilder, RepeError>,
+        F: FnOnce(MessageBuilder) -> MessageBuilder,
     {
         let id = self.next_request_id();
         let builder = Message::builder()
             .id(id)
             .query_str(path.as_ref())
             .query_format_code(query_format);
-        let msg = body_fn(builder)?.build();
+        let msg = body_fn(builder).build();
 
         let (sender, receiver) = oneshot::channel();
         let mut pending_guard = PendingRequestGuard::register(&self.inner, id, sender)?;
@@ -627,31 +603,10 @@ impl WebSocketClient {
         Ok(resp)
     }
 
-    fn decode_typed_response<R: DeserializeOwned>(resp: &Message) -> Result<R, RepeError> {
-        match BodyFormat::try_from(resp.header.body_format) {
-            Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => {
-                serde_json::from_slice(&resp.body).map_err(RepeError::from)
-            }
-            Ok(BodyFormat::Beve) => beve_from_slice(&resp.body).map_err(RepeError::from),
-            Ok(BodyFormat::RawBinary) => {
-                let io_err = std::io::Error::new(
-                    ErrorKind::InvalidData,
-                    "response body is neither JSON nor BEVE",
-                );
-                Err(RepeError::Json(serde_json::Error::io(io_err)))
-            }
-            // A code this build does not recognize, or a `BodyFormat` variant
-            // it does not know: `BodyFormat` is `#[non_exhaustive]`, so the spec
-            // can add one, and an unknown name decodes no better than an unknown
-            // number.
-            Ok(_) | Err(_) => Err(RepeError::UnknownEnumValue(resp.header.body_format as u64)),
-        }
-    }
-
     async fn notify_with_body<P, F>(&self, path: P, body_fn: F) -> Result<(), RepeError>
     where
         P: AsRef<str>,
-        F: FnOnce(MessageBuilder) -> Result<MessageBuilder, RepeError>,
+        F: FnOnce(MessageBuilder) -> MessageBuilder,
     {
         self.notify_with_builder(path, QueryFormat::JsonPointer as u16, body_fn)
             .await
@@ -665,7 +620,7 @@ impl WebSocketClient {
     ) -> Result<(), RepeError>
     where
         P: AsRef<str>,
-        F: FnOnce(MessageBuilder) -> Result<MessageBuilder, RepeError>,
+        F: FnOnce(MessageBuilder) -> MessageBuilder,
     {
         let id = self.next_request_id();
         let builder = Message::builder()
@@ -673,7 +628,7 @@ impl WebSocketClient {
             .notify(true)
             .query_str(path.as_ref())
             .query_format_code(query_format);
-        let msg = body_fn(builder)?.build();
+        let msg = body_fn(builder).build();
         self.write_request(&msg).await
     }
 
@@ -686,14 +641,13 @@ impl WebSocketClient {
         timeout_duration: Option<Duration>,
     ) -> Result<Message, RepeError> {
         self.call_with_body_and_timeout(path, query_format, timeout_duration, |builder| {
-            let builder = if let Some(bytes) = body {
+            if let Some(bytes) = body {
                 builder
                     .body_bytes(bytes.to_vec())
                     .body_format_code(body_format)
             } else {
                 builder.body_format_code(body_format)
-            };
-            Ok(builder)
+            }
         })
         .await
     }
@@ -706,14 +660,13 @@ impl WebSocketClient {
         body_format: u16,
     ) -> Result<(), RepeError> {
         self.notify_with_builder(path, query_format, |builder| {
-            let builder = if let Some(bytes) = body {
+            if let Some(bytes) = body {
                 builder
                     .body_bytes(bytes.to_vec())
                     .body_format_code(body_format)
             } else {
                 builder.body_format_code(body_format)
-            };
-            Ok(builder)
+            }
         })
         .await
     }
@@ -907,13 +860,12 @@ fn clone_fatal_error_for_waiter(err: &RepeError, request_id: u64) -> RepeError {
             io_err.kind(),
             format!("request {request_id}: {io_err}"),
         )),
-        RepeError::Json(json_err) => RepeError::Json(serde_json::Error::io(std::io::Error::new(
-            ErrorKind::InvalidData,
-            format!("request {request_id}: {json_err}"),
-        ))),
-        RepeError::Beve(beve_err) => RepeError::Beve(beve::Error::msg(format!(
-            "request {request_id}: {beve_err}"
-        ))),
+        // `structio::Error` is a `Copy` code-and-offset pair with no message
+        // to prefix, so these pass through unannotated. The request id is
+        // still on the `Io` arm, which is the one a dead connection actually
+        // produces.
+        RepeError::Json(err) => RepeError::Json(*err),
+        RepeError::Beve(err) => RepeError::Beve(*err),
         RepeError::UnknownEnumValue(value) => RepeError::UnknownEnumValue(*value),
         RepeError::UnexpectedBodyFormat { expected, got } => RepeError::UnexpectedBodyFormat {
             expected: *expected,

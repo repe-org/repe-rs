@@ -81,11 +81,9 @@ use crate::constants::{BodyFormat, ErrorCode, QueryFormat};
 use crate::error::RepeError;
 use crate::message::{Message, create_error_message};
 use crate::server::{Execution, HandlerErased, Router};
-use beve::Complex;
-use beve::from_slice as beve_from_slice;
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use repe_core::structs::{ServableOwned, ServableWrite};
 use std::collections::HashMap;
+use structio::Complex;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -159,12 +157,13 @@ impl Default for StreamOpts {
 
 // ---- wire message bodies (BEVE) ------------------------------------------------
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default)]
 struct OpenRequest {
     resource: String,
 }
+structio::object!(OpenRequest { resource });
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default)]
 struct OpenResponse {
     version: u8,
     stream_id: u64,
@@ -174,17 +173,25 @@ struct OpenResponse {
     /// Codec over the serialized bytes (`0` = none, `1` = zstd).
     compression: u8,
 }
+structio::object!(OpenResponse {
+    version,
+    stream_id,
+    format,
+    compression
+});
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default)]
 struct NextRequest {
     stream_id: u64,
 }
+structio::object!(NextRequest { stream_id });
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default)]
 struct CancelRequest {
     stream_id: u64,
     reason: String,
 }
+structio::object!(CancelRequest { stream_id, reason });
 
 // ---- server: producer session -------------------------------------------------
 
@@ -259,16 +266,14 @@ impl Write for ChunkSink {
     }
 }
 
-/// A producer-side closure that writes the full logical body to a sink: a
-/// generic serde value (`to_writer_streaming`), a bulk typed numeric array
-/// (`to_writer_typed_slice`), or a bulk complex array (`to_writer_complex_slice`).
+/// A producer-side closure that writes the full logical body to a sink.
 /// Boxed so one producer engine serves every body shape.
+///
+/// The `io::Result` is the *sink's*: a structio encode is infallible, so the
+/// only thing on this path that can fail is the socket or the file underneath
+/// it. That is why the three BEVE producers below all reduce to the same
+/// `to_writer` call.
 type BodyWriter = Box<dyn FnOnce(&mut dyn Write) -> io::Result<()> + Send>;
-
-/// Map a beve encode error to an `io::Error` for the producer pipeline.
-fn beve_to_io(e: beve::Error) -> io::Error {
-    io::Error::other(e.to_string())
-}
 
 /// Run the (write→compress→chunk) pipeline to completion, reporting the outcome
 /// through the channel. Always ends with exactly one `End` or `Fail` before the
@@ -379,7 +384,7 @@ where
     F: Fn(&str) -> Option<BodyWriter> + Send + Sync + 'static,
 {
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
-        let open: OpenRequest = match beve_from_slice(&req.body) {
+        let open: OpenRequest = match structio::from_beve(&req.body) {
             Ok(v) => v,
             Err(_) => {
                 return Ok(error_like(
@@ -417,7 +422,7 @@ where
             format: self.format,
             compression: self.opts.compression as u8,
         };
-        beve_response(req, &resp)
+        Ok(beve_response(req, &resp))
     }
 }
 
@@ -434,7 +439,7 @@ impl HandlerErased for NextHandler {
     }
 
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
-        let next: NextRequest = match beve_from_slice(&req.body) {
+        let next: NextRequest = match structio::from_beve(&req.body) {
             Ok(v) => v,
             Err(_) => {
                 return Ok(error_like(
@@ -490,20 +495,21 @@ impl HandlerErased for CancelHandler {
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
         // A malformed cancel still releases nothing but must not error a notify;
         // parse leniently and drop whatever stream_id we can read.
-        if let Ok(cancel) = beve_from_slice::<CancelRequest>(&req.body) {
+        if let Ok(cancel) = structio::from_beve::<CancelRequest>(&req.body) {
             self.table.remove(cancel.stream_id);
         }
         // Dropping the session drops the receiver, which aborts a parked producer
         // send. Acknowledge so a request-form cancel gets a reply (a notify-form
         // cancel ignores it).
-        beve_response(req, &CancelAck { ok: true })
+        Ok(beve_response(req, &CancelAck { ok: true }))
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default)]
 struct CancelAck {
     ok: bool,
 }
+structio::object!(CancelAck { ok });
 
 /// Register the three SVS routes onto `router` backed by `make_body`, the
 /// producer-side factory mapping a resource to a [`BodyWriter`] (or `None`).
@@ -545,27 +551,39 @@ where
 /// See the [module docs](crate::value_stream) for where the producer may run
 /// (sync or WebSocket server, not the inline async server).
 pub trait RouterValueStreamExt: Sized {
-    /// Stream an arbitrary `Serialize` value, decoded by the consumer with
-    /// [`pull_value`] (generic, per-element serde).
+    /// Stream an arbitrary BEVE-writable value, decoded by the consumer with
+    /// [`pull_value`].
     fn with_value_stream<T, F>(self, resolve: F, opts: StreamOpts) -> Self
     where
-        T: Serialize + Send + 'static,
+        T: structio::beve::Write + Send + 'static,
         F: Fn(&str) -> Option<T> + Send + Sync + 'static;
 
     /// Stream a bulk numeric array `Vec<T>` in BEVE typed-array form, so the
-    /// consumer can decode it at memcpy speed with [`pull_typed_slice`]. Use this
-    /// over [`with_value_stream`](Self::with_value_stream) for large primitive
-    /// arrays (samples, matrices) where per-element serde is the bottleneck.
+    /// consumer can decode it at memcpy speed with [`pull_typed_slice`].
+    ///
+    /// This *is* [`with_value_stream`](Self::with_value_stream) over a
+    /// `Vec<T>` — structio has one writer, and it already takes the bulk path
+    /// for a numeric vector, one `copy_nonoverlapping` rather than a
+    /// per-element walk. Under `beve` these were separate serializers, which is
+    /// why they were separate methods. The name and the [`NumericBytes`] bound
+    /// are kept so a registration cannot claim the bulk form for an element
+    /// type that would not take it.
+    ///
+    /// [`NumericBytes`]: structio::beve::NumericBytes
     fn with_typed_value_stream<T, F>(self, resolve: F, opts: StreamOpts) -> Self
     where
-        T: beve::BeveTypedSlice + Send + 'static,
+        T: structio::beve::NumericBytes + structio::beve::Write + Send + 'static,
         F: Fn(&str) -> Option<Vec<T>> + Send + Sync + 'static;
 
     /// Stream a bulk complex array `Vec<Complex<T>>` in BEVE complex-array form,
     /// decoded by the consumer with [`pull_complex_slice`]. For large IQ buffers.
+    /// The complex twin of
+    /// [`with_typed_value_stream`](Self::with_typed_value_stream), and the same
+    /// note applies.
     fn with_complex_value_stream<T, F>(self, resolve: F, opts: StreamOpts) -> Self
     where
-        T: beve::BeveTypedSlice + Send + 'static,
+        Complex<T>: structio::beve::NumericBytes + structio::beve::Write,
+        T: Send + 'static,
         F: Fn(&str) -> Option<Vec<Complex<T>>> + Send + Sync + 'static;
 
     /// Stream **opaque, already-serialized bytes** verbatim from a producer-side
@@ -633,16 +651,15 @@ pub trait RouterValueStreamExt: Sized {
 impl RouterValueStreamExt for Router {
     fn with_value_stream<T, F>(self, resolve: F, opts: StreamOpts) -> Self
     where
-        T: Serialize + Send + 'static,
+        T: structio::beve::Write + Send + 'static,
         F: Fn(&str) -> Option<T> + Send + Sync + 'static,
     {
         register_svs(
             self,
             move |resource| {
                 resolve(resource).map(|value| {
-                    Box::new(move |w: &mut dyn Write| {
-                        beve::to_writer_streaming(w, &value).map_err(beve_to_io)
-                    }) as BodyWriter
+                    Box::new(move |w: &mut dyn Write| structio::beve::to_writer(&value, w))
+                        as BodyWriter
                 })
             },
             BodyFormat::Beve as u16,
@@ -652,40 +669,19 @@ impl RouterValueStreamExt for Router {
 
     fn with_typed_value_stream<T, F>(self, resolve: F, opts: StreamOpts) -> Self
     where
-        T: beve::BeveTypedSlice + Send + 'static,
+        T: structio::beve::NumericBytes + structio::beve::Write + Send + 'static,
         F: Fn(&str) -> Option<Vec<T>> + Send + Sync + 'static,
     {
-        register_svs(
-            self,
-            move |resource| {
-                resolve(resource).map(|values| {
-                    Box::new(move |w: &mut dyn Write| {
-                        beve::to_writer_typed_slice(w, &values).map_err(beve_to_io)
-                    }) as BodyWriter
-                })
-            },
-            BodyFormat::Beve as u16,
-            opts,
-        )
+        self.with_value_stream(resolve, opts)
     }
 
     fn with_complex_value_stream<T, F>(self, resolve: F, opts: StreamOpts) -> Self
     where
-        T: beve::BeveTypedSlice + Send + 'static,
+        Complex<T>: structio::beve::NumericBytes + structio::beve::Write,
+        T: Send + 'static,
         F: Fn(&str) -> Option<Vec<Complex<T>>> + Send + Sync + 'static,
     {
-        register_svs(
-            self,
-            move |resource| {
-                resolve(resource).map(|values| {
-                    Box::new(move |w: &mut dyn Write| {
-                        beve::to_writer_complex_slice(w, &values).map_err(beve_to_io)
-                    }) as BodyWriter
-                })
-            },
-            BodyFormat::Beve as u16,
-            opts,
-        )
+        self.with_value_stream(resolve, opts)
     }
 
     fn with_reader_stream<R, F>(self, resolve: F, opts: StreamOpts) -> Self
@@ -728,12 +724,11 @@ fn error_like(req: &Message, code: ErrorCode, msg: impl AsRef<str>) -> Message {
     err
 }
 
-fn beve_response<T: Serialize>(req: &Message, value: &T) -> Result<Message, RepeError> {
-    Ok(Message::builder()
+fn beve_response<T: ServableWrite + ?Sized>(req: &Message, value: &T) -> Message {
+    Message::builder()
         .id(req.header.id)
-        .body_bytes(beve::to_vec(value)?)
-        .body_format(BodyFormat::Beve)
-        .build())
+        .body_beve(value)
+        .build()
 }
 
 /// Frame a `next` response: the `last` flag rides in a 1-byte raw-binary query so
@@ -782,7 +777,7 @@ pub enum StreamOutput<'a> {
 /// outputs. File outputs are written to a temporary sibling path and renamed only
 /// after the terminating `last = 1` chunk and a flush, so a dropped connection
 /// never leaves a truncated file that looks complete (SVS §4).
-pub fn pull_stream<T: DeserializeOwned>(
+pub fn pull_stream<T: ServableOwned>(
     client: &Client,
     resource: &str,
     out: StreamOutput<'_>,
@@ -819,10 +814,8 @@ pub fn pull_stream<T: DeserializeOwned>(
         StreamOutput::Value => {
             let reader = ChunkReader::new(client, open.stream_id);
             let value = match open.compression {
-                Compression::None => beve::from_reader_streaming::<_, T>(reader)?,
-                Compression::Zstd => {
-                    beve::from_reader_streaming::<_, T>(zstandard::io::Reader::new(reader))?
-                }
+                Compression::None => read_one_value::<T, _>(reader)?,
+                Compression::Zstd => read_one_value::<T, _>(zstandard::io::Reader::new(reader))?,
             };
             // The value decoded fully; release any remainder of the stream the
             // decoder did not need to read. Best-effort.
@@ -849,7 +842,7 @@ pub fn pull_stream<T: DeserializeOwned>(
 }
 
 /// Convenience: pull `resource` and decode it into a `T` ([`StreamOutput::Value`]).
-pub fn pull_value<T: DeserializeOwned>(client: &Client, resource: &str) -> Result<T, RepeError> {
+pub fn pull_value<T: ServableOwned>(client: &Client, resource: &str) -> Result<T, RepeError> {
     pull_stream::<T>(client, resource, StreamOutput::Value)
         .map(|v| v.expect("StreamOutput::Value always yields Some"))
 }
@@ -984,15 +977,21 @@ where
 }
 
 /// Pull `resource` as a bulk numeric array decoded straight into a `Vec<T>` at
-/// memcpy speed (beve's `read_typed_slice_from_reader`), skipping the per-element
-/// serde walk [`pull_value`] would do for a `Vec<T>`.
+/// memcpy speed, skipping the per-element walk [`pull_value`] would do.
+///
+/// This is genuinely a different call from `pull_value::<Vec<T>>`, and the
+/// difference is memory rather than speed: [`structio::beve::read_array_into`]
+/// moves the payload from the reader into the vector's own memory, while
+/// [`pull_value`] buffers the whole encoded body first and then parses it. For
+/// a multi-gigabyte array that is the difference between one copy of the data
+/// and two.
 ///
 /// Pair with a server registered via
 /// [`RouterValueStreamExt::with_typed_value_stream`], which emits the BEVE
 /// typed-array wire form this reader requires. A compressed stream is decompressed
 /// on the way in. Errors if the stream is not a typed array of `T` (e.g. a generic
 /// `with_value_stream` producer, or a mismatched element type).
-pub fn pull_typed_slice<T: beve::BeveTypedSlice>(
+pub fn pull_typed_slice<T: structio::beve::NumericBytes>(
     client: &Client,
     resource: &str,
 ) -> Result<Vec<T>, RepeError> {
@@ -1006,14 +1005,9 @@ pub fn pull_typed_slice<T: beve::BeveTypedSlice>(
         return Err(e);
     }
     let reader = ChunkReader::new(client, open.stream_id);
-    let result: Result<Vec<T>, RepeError> = match open.compression {
-        Compression::None => {
-            beve::read_typed_slice_from_reader::<T, _>(reader).map_err(RepeError::from)
-        }
-        Compression::Zstd => {
-            beve::read_typed_slice_from_reader::<T, _>(zstandard::io::Reader::new(reader))
-                .map_err(RepeError::from)
-        }
+    let result = match open.compression {
+        Compression::None => read_array::<T, _>(reader),
+        Compression::Zstd => read_array::<T, _>(zstandard::io::Reader::new(reader)),
     };
     // Release the stream whether or not the decode used every chunk (and on error).
     let _ = cancel_stream(client, open.stream_id, "bulk typed slice complete");
@@ -1021,13 +1015,13 @@ pub fn pull_typed_slice<T: beve::BeveTypedSlice>(
 }
 
 /// Complex twin of [`pull_typed_slice`]: pull `resource` as a bulk
-/// `Vec<Complex<T>>` (beve's `read_complex_slice_from_reader`). Pair with a server
+/// `Vec<Complex<T>>`, with the same memory property. Pair with a server
 /// registered via [`RouterValueStreamExt::with_complex_value_stream`]. For large
 /// IQ buffers.
-pub fn pull_complex_slice<T: beve::BeveTypedSlice>(
-    client: &Client,
-    resource: &str,
-) -> Result<Vec<Complex<T>>, RepeError> {
+pub fn pull_complex_slice<T>(client: &Client, resource: &str) -> Result<Vec<Complex<T>>, RepeError>
+where
+    Complex<T>: structio::beve::NumericBytes,
+{
     let open = open_stream(client, resource)?;
     if let Err(e) = require_beve(&open) {
         let _ = cancel_stream(
@@ -1038,17 +1032,45 @@ pub fn pull_complex_slice<T: beve::BeveTypedSlice>(
         return Err(e);
     }
     let reader = ChunkReader::new(client, open.stream_id);
-    let result: Result<Vec<Complex<T>>, RepeError> = match open.compression {
-        Compression::None => {
-            beve::read_complex_slice_from_reader::<T, _>(reader).map_err(RepeError::from)
-        }
-        Compression::Zstd => {
-            beve::read_complex_slice_from_reader::<T, _>(zstandard::io::Reader::new(reader))
-                .map_err(RepeError::from)
-        }
+    let result = match open.compression {
+        Compression::None => read_array::<Complex<T>, _>(reader),
+        Compression::Zstd => read_array::<Complex<T>, _>(zstandard::io::Reader::new(reader)),
     };
     let _ = cancel_stream(client, open.stream_id, "bulk complex slice complete");
     result
+}
+
+/// Decode one whole BEVE value out of a stream.
+///
+/// The body is buffered before it is parsed, which is a change from `beve`'s
+/// incremental `from_reader_streaming`. structio reads through a slice-backed
+/// reader so a `&'de str` field can point into the input, and a stream has
+/// nothing to point at; making the reader source-generic would put a refill
+/// check on every scalar read, which the ordinary request path would pay for
+/// nothing. Peak memory is therefore the encoded bytes plus the decoded value
+/// rather than the value alone.
+///
+/// [`read_array`] is the way out for the case where that actually costs
+/// something, and [`pull_typed_slice`] is the call that takes it.
+fn read_one_value<T, R>(reader: R) -> Result<T, RepeError>
+where
+    T: ServableOwned,
+    R: Read,
+{
+    structio::beve::from_reader(reader).map_err(|err| RepeError::decode_stream(BodyFormat::Beve, err))
+}
+
+/// Bulk-decode a BEVE array straight into a `Vec<T>`, without buffering the
+/// encoded form first.
+fn read_array<T, R>(reader: R) -> Result<Vec<T>, RepeError>
+where
+    T: structio::beve::NumericBytes,
+    R: Read,
+{
+    let mut out = Vec::new();
+    structio::beve::read_array_into(&mut out, reader)
+        .map_err(|err| RepeError::decode_stream(BodyFormat::Beve, err))?;
+    Ok(out)
 }
 
 /// The bulk slice readers require the stream's logical format to be BEVE (the
@@ -1073,23 +1095,23 @@ struct OpenInfo {
 }
 
 /// BEVE body of an `open` request for `resource`.
-fn open_request_body(resource: &str) -> Result<Vec<u8>, RepeError> {
-    Ok(beve::to_vec(&OpenRequest {
+fn open_request_body(resource: &str) -> Vec<u8> {
+    structio::to_beve(&OpenRequest {
         resource: resource.to_string(),
-    })?)
+    })
 }
 
 /// BEVE body of a `next` request for `stream_id`.
-fn next_request_body(stream_id: u64) -> Result<Vec<u8>, RepeError> {
-    Ok(beve::to_vec(&NextRequest { stream_id })?)
+fn next_request_body(stream_id: u64) -> Vec<u8> {
+    structio::to_beve(&NextRequest { stream_id })
 }
 
 /// BEVE body of a `cancel` request for `stream_id` carrying a human `reason`.
-fn cancel_request_body(stream_id: u64, reason: &str) -> Result<Vec<u8>, RepeError> {
-    Ok(beve::to_vec(&CancelRequest {
+fn cancel_request_body(stream_id: u64, reason: &str) -> Vec<u8> {
+    structio::to_beve(&CancelRequest {
         stream_id,
         reason: reason.to_string(),
-    })?)
+    })
 }
 
 /// Validate and parse an `open` response into the stream's [`OpenInfo`]. Shared
@@ -1119,7 +1141,7 @@ fn parse_open_response(resp: &Message) -> Result<OpenInfo, RepeError> {
 }
 
 fn open_stream(client: &Client, resource: &str) -> Result<OpenInfo, RepeError> {
-    let body = open_request_body(resource)?;
+    let body = open_request_body(resource);
     let resp = client.call_with_formats(
         ROUTE_OPEN,
         QueryFormat::JsonPointer as u16,
@@ -1294,10 +1316,7 @@ impl<'a> ChunkReader<'a> {
     }
 
     fn fetch(&mut self) -> io::Result<()> {
-        let body = beve::to_vec(&NextRequest {
-            stream_id: self.stream_id,
-        })
-        .map_err(|e| io::Error::other(e.to_string()))?;
+        let body = next_request_body(self.stream_id);
         let resp = self
             .client
             .call_with_formats(
@@ -1338,7 +1357,7 @@ impl Read for ChunkReader<'_> {
 }
 
 fn cancel_stream(client: &Client, stream_id: u64, reason: &str) -> Result<(), RepeError> {
-    let body = cancel_request_body(stream_id, reason)?;
+    let body = cancel_request_body(stream_id, reason);
     // Notify form: best-effort, no reply awaited (SVS §2.3).
     client.notify_with_formats(
         ROUTE_CANCEL,
@@ -1500,7 +1519,7 @@ async fn pull_loop_async<C: AsyncSvsClient>(
     stream_id: u64,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 ) -> Result<(), RepeError> {
-    let body = next_request_body(stream_id)?;
+    let body = next_request_body(stream_id);
     loop {
         let resp = client
             .svs_call(
@@ -1527,7 +1546,7 @@ async fn cancel_stream_async<C: AsyncSvsClient>(
     stream_id: u64,
     reason: &str,
 ) -> Result<(), RepeError> {
-    let body = cancel_request_body(stream_id, reason)?;
+    let body = cancel_request_body(stream_id, reason);
     client
         .svs_notify(
             ROUTE_CANCEL,
@@ -1542,7 +1561,7 @@ async fn cancel_stream_async<C: AsyncSvsClient>(
 /// [`OpenInfo`]. Shared by every async puller; the per-puller format check (if
 /// any) runs on the returned `OpenInfo`.
 async fn open_async<C: AsyncSvsClient>(client: &C, resource: &str) -> Result<OpenInfo, RepeError> {
-    let body = open_request_body(resource)?;
+    let body = open_request_body(resource);
     let resp = client
         .svs_call(
             ROUTE_OPEN,
@@ -1624,42 +1643,36 @@ where
 /// producer must run on a server that honours
 /// [`Execution::OffReader`](crate::Execution) (the sync [`Server`](crate::Server)
 /// or the WebSocket server), not the inline async server.
-pub async fn pull_value_async<T: DeserializeOwned + Send + 'static, C: AsyncSvsClient>(
+pub async fn pull_value_async<T: ServableOwned + Send + 'static, C: AsyncSvsClient>(
     client: &C,
     resource: &str,
 ) -> Result<T, RepeError> {
-    pull_beve_async(client, resource, |reader| {
-        beve::from_reader_streaming::<_, T>(reader).map_err(RepeError::from)
-    })
-    .await
+    pull_beve_async(client, resource, read_one_value::<T, _>).await
 }
 
 /// Async counterpart of [`pull_typed_slice`]: bulk-decode a streamed numeric
 /// array straight into a `Vec<T>` (memcpy of the little-endian payload). Accepts
 /// any [`AsyncSvsClient`].
-pub async fn pull_typed_slice_async<T: beve::BeveTypedSlice + Send + 'static, C: AsyncSvsClient>(
-    client: &C,
-    resource: &str,
-) -> Result<Vec<T>, RepeError> {
-    pull_beve_async(client, resource, |reader| {
-        beve::read_typed_slice_from_reader::<T, _>(reader).map_err(RepeError::from)
-    })
-    .await
-}
-
-/// Async counterpart of [`pull_complex_slice`]: bulk-decode a streamed complex
-/// array straight into a `Vec<Complex<T>>`. Accepts any [`AsyncSvsClient`].
-pub async fn pull_complex_slice_async<
-    T: beve::BeveTypedSlice + Send + 'static,
+pub async fn pull_typed_slice_async<
+    T: structio::beve::NumericBytes + Send + 'static,
     C: AsyncSvsClient,
 >(
     client: &C,
     resource: &str,
-) -> Result<Vec<Complex<T>>, RepeError> {
-    pull_beve_async(client, resource, |reader| {
-        beve::read_complex_slice_from_reader::<T, _>(reader).map_err(RepeError::from)
-    })
-    .await
+) -> Result<Vec<T>, RepeError> {
+    pull_beve_async(client, resource, read_array::<T, _>).await
+}
+
+/// Async counterpart of [`pull_complex_slice`]: bulk-decode a streamed complex
+/// array straight into a `Vec<Complex<T>>`. Accepts any [`AsyncSvsClient`].
+pub async fn pull_complex_slice_async<T: Send + 'static, C: AsyncSvsClient>(
+    client: &C,
+    resource: &str,
+) -> Result<Vec<Complex<T>>, RepeError>
+where
+    Complex<T>: structio::beve::NumericBytes,
+{
+    pull_beve_async(client, resource, read_array::<Complex<T>, _>).await
 }
 
 /// Async, format-agnostic escape hatch: pull `resource` and hand its logical

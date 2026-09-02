@@ -5,7 +5,7 @@ use crate::fleet::{
     ReconnectSummary, RemoteResult, validate_fleet_options, validate_node_config,
 };
 use crate::message::Message;
-use serde_json::Value;
+use repe_core::structs::ServableOwned;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -247,15 +247,22 @@ impl AsyncFleet {
         Ok(state.client.lock().await.is_some())
     }
 
-    pub async fn call_json(
+    /// Call one node with an optional JSON body and decode its response as `R`.
+    ///
+    /// `params: None` sends an empty body, which is a registry READ.
+    pub async fn call_json<T, R>(
         &self,
         node_name: &str,
         method: &str,
-        params: Option<&Value>,
-    ) -> Result<RemoteResult<Value>, FleetError> {
+        params: Option<&T>,
+    ) -> Result<RemoteResult<R>, FleetError>
+    where
+        T: structio::json::Write + ?Sized,
+        R: ServableOwned,
+    {
         let state = self.node_state(node_name).await?;
         Ok(self
-            .call_json_with_retry(state, method.to_string(), params.cloned())
+            .call_json_with_retry(state, method.to_string(), encode_params(params))
             .await)
     }
 
@@ -273,21 +280,30 @@ impl AsyncFleet {
     /// Broadcasts to nodes matching all provided tags.
     ///
     /// Passing an empty `tags` slice matches all nodes.
-    pub async fn broadcast_json<T: AsRef<str>>(
+    pub async fn broadcast_json<Tag, T, R>(
         &self,
         method: &str,
-        params: Option<&Value>,
-        tags: &[T],
-    ) -> HashMap<String, RemoteResult<Value>> {
+        params: Option<&T>,
+        tags: &[Tag],
+    ) -> HashMap<String, RemoteResult<R>>
+    where
+        Tag: AsRef<str>,
+        T: structio::json::Write + ?Sized,
+        R: ServableOwned + Send + 'static,
+    {
         let states = self.snapshot_target_nodes(tags).await;
         let mut tasks = Vec::with_capacity(states.len());
+        // Encoded once for the whole broadcast rather than per node. The body
+        // is byte-identical everywhere it goes, and cloning `Vec<u8>` is what
+        // the per-node `Value` clone was paying for anyway.
+        let body = encode_params(params);
 
         for state in states {
             let fleet = self.clone();
             let method = method.to_string();
-            let params = params.cloned();
+            let body = body.clone();
             tasks.push(tokio::spawn(async move {
-                let result = fleet.call_json_with_retry(state, method, params).await;
+                let result = fleet.call_json_with_retry(state, method, body).await;
                 (result.node.clone(), result)
             }));
         }
@@ -305,15 +321,18 @@ impl AsyncFleet {
     /// Broadcasts and reduces over nodes matching all provided tags.
     ///
     /// Passing an empty `tags` slice matches all nodes.
-    pub async fn map_reduce_json<T: AsRef<str>, R, F>(
+    pub async fn map_reduce_json<Tag, T, V, R, F>(
         &self,
         method: &str,
-        params: Option<&Value>,
-        tags: &[T],
+        params: Option<&T>,
+        tags: &[Tag],
         reduce_fn: F,
     ) -> R
     where
-        F: FnOnce(Vec<RemoteResult<Value>>) -> R,
+        Tag: AsRef<str>,
+        T: structio::json::Write + ?Sized,
+        V: ServableOwned + Send + 'static,
+        F: FnOnce(Vec<RemoteResult<V>>) -> R,
     {
         let results = self.broadcast_json(method, params, tags).await;
         reduce_fn(results.into_values().collect())
@@ -391,12 +410,12 @@ impl AsyncFleet {
             .ok_or_else(|| FleetError::NodeNotFound(name.to_string()))
     }
 
-    async fn call_json_with_retry(
+    async fn call_json_with_retry<R: ServableOwned>(
         &self,
         state: Arc<AsyncNodeState>,
         method: String,
-        params: Option<Value>,
-    ) -> RemoteResult<Value> {
+        body: Option<Vec<u8>>,
+    ) -> RemoteResult<R> {
         let started = Instant::now();
         let mut last_error = None;
 
@@ -404,12 +423,21 @@ impl AsyncFleet {
             let timeout = state.config.timeout;
             let call = async {
                 let client = ensure_connected(&state).await?;
-                if let Some(ref value) = params {
-                    client.call_json_with_timeout(&method, value, timeout).await
-                } else {
-                    let message = client.call_message_with_timeout(&method, timeout).await?;
-                    message.json_body::<Value>()
-                }
+                let message = match body {
+                    Some(ref bytes) => {
+                        client
+                            .call_with_formats_and_timeout(
+                                &method,
+                                crate::constants::QueryFormat::JsonPointer as u16,
+                                Some(bytes),
+                                crate::constants::BodyFormat::Json as u16,
+                                timeout,
+                            )
+                            .await?
+                    }
+                    None => client.call_message_with_timeout(&method, timeout).await?,
+                };
+                message.decode_body::<R>()
             }
             .await;
 
@@ -530,4 +558,11 @@ fn is_retryable_error(err: &RepeError) -> bool {
         RepeError::ServerError { .. } => false,
         _ => false,
     }
+}
+
+/// Encode an optional JSON body once, so a broadcast pays for one encode and
+/// then clones bytes rather than re-encoding per node. The async twin of
+/// [`crate::fleet`]'s helper of the same name.
+fn encode_params<T: structio::json::Write + ?Sized>(params: Option<&T>) -> Option<Vec<u8>> {
+    params.map(structio::json::to_vec)
 }

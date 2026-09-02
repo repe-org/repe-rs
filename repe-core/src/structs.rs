@@ -94,6 +94,27 @@ impl<T: for<'de> ServableRead<'de> + ServableWrite> Servable for T {}
 pub trait ServableRead<'de>: structio::json::Read<'de> + structio::beve::Read<'de> {}
 impl<'de, T> ServableRead<'de> for T where T: structio::json::Read<'de> + structio::beve::Read<'de> {}
 
+/// A response a client decodes into: readable in both formats, and owning its
+/// own contents.
+///
+/// [`ServableRead`] carries the frame's lifetime, which is what lets a *server*
+/// borrow out of the body it was handed. A client cannot: it decodes out of a
+/// response message it owns locally and then returns the value, so the value
+/// has to outlive the frame it came from. `for<'de>` says exactly that, and
+/// `Default` is there because structio reads *into* an existing value.
+///
+/// The bound is both formats rather than the one the request used, because a
+/// server answers in the format the frame asked for and a client that names a
+/// result type does not get to assume which one came back.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot be decoded from a REPE response",
+    label = "not decodable as an owned JSON/BEVE value",
+    note = "declare it with `structio::object!({Self} {{ field, .. }})` — or `tagged_enum!` / `array!` / `unit_enum!`",
+    note = "a type whose fields borrow (`&'de str`) satisfies `ServableRead` but not this: a decoded response outlives the frame, so borrowing fields must be owned (`String`)"
+)]
+pub trait ServableOwned: for<'de> ServableRead<'de> + Default {}
+impl<T: for<'de> ServableRead<'de> + Default> ServableOwned for T {}
+
 /// The write half of [`Servable`]: encodable into either body format.
 ///
 /// Both halves, because the frame header picks the format per request and a
