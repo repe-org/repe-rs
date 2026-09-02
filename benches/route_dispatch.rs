@@ -27,11 +27,12 @@ use std::sync::{Arc, Mutex};
 struct Empty;
 structio::object!(Empty {});
 
-#[derive(Default, serde::Serialize, serde::Deserialize, repe::RepeStruct)]
+#[derive(Default, repe::RepeStruct)]
 #[repe(methods(get_number(&self) -> i32))]
 struct BenchStruct {
     counter: i32,
 }
+structio::object!(BenchStruct { counter });
 
 impl BenchStruct {
     fn get_number(&self) -> i32 {

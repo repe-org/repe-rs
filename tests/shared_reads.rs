@@ -35,16 +35,17 @@ use repe::server::Router;
 // Fixtures
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+#[derive(Clone, Default, RepeStruct)]
 struct Clock {
     ticks: u64,
     source: String,
 }
+structio::object!(Clock { ticks, source });
 
 /// One struct carrying every shape the read path has to decide about: plain
 /// fields, a typed numeric field, a nested child, a `&self` method, a `&mut self`
 /// method, and a field-shaped accessor pair.
-#[derive(Clone, Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+#[derive(Clone, Default, RepeStruct)]
 #[repe(methods)]
 struct Instrument {
     firmware: String,
@@ -60,6 +61,7 @@ struct Instrument {
     #[repe(rename = "odd/name~x")]
     oddly_named: u32,
 }
+structio::object!(Instrument { firmware, channel, gains, clock, calibrations, "odd/name~x" => oddly_named });
 
 #[repe::methods]
 impl Instrument {
@@ -144,12 +146,13 @@ fn instrument() -> Instrument {
 /// A struct whose only accessor has a `&mut self` getter, so every read of it
 /// declines. Nested below, it is what forces a parent's listing to rewind an
 /// object it had already started writing.
-#[derive(Clone, Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+#[derive(Clone, Default, RepeStruct)]
 #[repe(methods)]
 struct Counter {
     label: String,
     hits: u32,
 }
+structio::object!(Counter { label, hits });
 
 #[repe::methods]
 impl Counter {
@@ -161,12 +164,13 @@ impl Counter {
     }
 }
 
-#[derive(Clone, Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+#[derive(Clone, Default, RepeStruct)]
 struct Rack {
     name: String,
     #[repe(nested)]
     counter: Counter,
 }
+structio::object!(Rack { name, counter });
 
 fn rack() -> Rack {
     Rack {
@@ -181,11 +185,12 @@ fn rack() -> Rack {
 /// A `&self` getter and a `&self` method that both fail. The shared path serves
 /// them, so it is the path that has to turn an `Err` into an error frame — and
 /// has to rewind the listing it was partway through when it does.
-#[derive(Clone, Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+#[derive(Clone, Default, RepeStruct)]
 #[repe(methods)]
 struct Faulty {
     label: String,
 }
+structio::object!(Faulty { label });
 
 #[repe::methods]
 impl Faulty {
@@ -595,11 +600,12 @@ fn rendezvous() -> &'static Barrier {
     BARRIER.get_or_init(|| Barrier::new(2))
 }
 
-#[derive(Clone, Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+#[derive(Clone, Default, RepeStruct)]
 #[repe(methods)]
 struct Gate {
     opened: u32,
 }
+structio::object!(Gate { opened });
 
 #[repe::methods]
 impl Gate {
@@ -647,11 +653,12 @@ fn slow_call_gates() -> &'static (Barrier, Barrier) {
 /// The friction this rule exists to remove, in miniature: a `&self` call that
 /// takes arguments and runs for a long time, next to a plain read of the same
 /// object.
-#[derive(Clone, Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+#[derive(Clone, Default, RepeStruct)]
 #[repe(methods)]
 struct Slow {
     version: String,
 }
+structio::object!(Slow { version });
 
 #[repe::methods]
 impl Slow {
@@ -790,28 +797,28 @@ fn an_unknown_path_is_method_not_found_on_the_shared_path() {
 /// walked the entries in order, called `sample`, reached `calibration`, gave up,
 /// and the exclusive retry called `sample` again — so the very first read of the
 /// object reported `2`. A listing now declines before it calls anything.
-#[derive(Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+#[derive(Default, RepeStruct)]
 #[repe(methods)]
 struct Meter {
     name: String,
     #[repe(skip)]
-    #[serde(skip)]
     samples: AtomicU32,
 }
+structio::object!(Meter { name, samples });
 
 /// A struct whose only accessor is a `&self` getter **with a side effect**, so
 /// its own listing is served shared *and invokes something*. That combination is
 /// what makes a nested decline elsewhere in the tree observable, and it is the
 /// shape `Meter` cannot provide — `Meter` has a `&mut self` getter of its own, so
 /// it declines before `sample` is ever reached.
-#[derive(Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+#[derive(Default, RepeStruct)]
 #[repe(methods)]
 struct Tally {
     label: String,
     #[repe(skip)]
-    #[serde(skip)]
     reads: AtomicU32,
 }
+structio::object!(Tally { label, reads });
 
 #[repe::methods]
 impl Tally {
@@ -926,7 +933,7 @@ fn a_listing_whose_getters_only_read_carries_their_values() {
 /// listing that decided per struct rather than per subtree would invoke
 /// `Meter::sample` and only then discover that `Counter` declines. See
 /// `a_declining_sibling_does_not_make_an_earlier_getter_run_twice`.
-#[derive(Clone, Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+#[derive(Clone, Default, RepeStruct)]
 struct Bench {
     site: String,
     #[repe(nested)]
@@ -936,16 +943,23 @@ struct Bench {
     #[repe(nested)]
     counter: Counter,
 }
+structio::object!(Bench {
+    site,
+    inst,
+    tally,
+    counter
+});
 
 /// A hand-written `RepeStruct`: it overrides neither `repe_shared_into` nor
 /// `repe_listing_declines`, so it declines every shared read and says so. This
 /// is the ordinary shape — most hand-written impls are exactly this — and it is
 /// the second way a nested child can force a parent's listing exclusive, with no
 /// accessor anywhere in sight.
-#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[derive(Default)]
 struct Manual {
     note: String,
 }
+structio::object!(Manual { note });
 
 impl RepeStruct for Manual {
     fn repe_handle(
@@ -964,13 +978,14 @@ impl RepeStruct for Manual {
 }
 
 /// `tally` before `manual`, for the same reason `Bench` orders its fields.
-#[derive(Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+#[derive(Default, RepeStruct)]
 struct Console {
     #[repe(nested)]
     tally: Tally,
     #[repe(nested)]
     manual: Manual,
 }
+structio::object!(Console { tally, manual });
 
 #[test]
 fn a_hand_written_child_declines_its_parent_s_listing_before_anything_runs() {
@@ -1172,7 +1187,7 @@ fn a_listing_with_nothing_to_invoke_is_served_shared() {
 /// The struct-attribute method list, the other way a method reaches the wire.
 /// Its receivers are declared by hand rather than read off a signature, and the
 /// read path is what acts on that declaration.
-#[derive(Clone, Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+#[derive(Clone, Default, RepeStruct)]
 #[repe(methods(
     describe(&self) -> String,
     bump(&mut self) -> u32,
@@ -1181,6 +1196,7 @@ fn a_listing_with_nothing_to_invoke_is_served_shared() {
 struct Listed {
     gain: f64,
 }
+structio::object!(Listed { gain });
 
 impl Listed {
     fn describe(&self) -> String {
@@ -1213,12 +1229,13 @@ fn the_attribute_list_form_answers_the_same_either_way() {
     }
 }
 
-#[derive(Clone, Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+#[derive(Clone, Default, RepeStruct)]
 struct Bay {
     slot: u32,
     #[repe(nested)]
     sensor: Faulty,
 }
+structio::object!(Bay { slot, sensor });
 
 #[test]
 fn an_error_from_a_nested_child_is_prefixed_the_same_either_way() {
@@ -1291,53 +1308,61 @@ fn parking_lot_rwlock_answers_the_same_as_a_mutex() {
 mod shared_serves_bodies {
     use super::*;
 
-    #[derive(Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+    #[derive(Default, RepeStruct)]
     struct Plain {
         a: u64,
     }
+    structio::object!(Plain { a });
 
-    #[derive(Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+    #[derive(Default, RepeStruct)]
     struct ReadonlyField {
         a: u64,
         #[repe(readonly)]
         ro: u64,
     }
+    structio::object!(ReadonlyField { a, ro });
 
-    #[derive(Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+    #[derive(Default, RepeStruct)]
     #[repe(no_replace)]
     struct NoReplaceStruct {
         a: u64,
     }
+    structio::object!(NoReplaceStruct { a });
 
-    #[derive(Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+    #[derive(Default, RepeStruct)]
     struct NestsPlain {
         #[repe(nested)]
         child: Plain,
     }
+    structio::object!(NestsPlain { child });
 
-    #[derive(Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+    #[derive(Default, RepeStruct)]
     struct NestsReadonly {
         #[repe(nested)]
         child: ReadonlyField,
     }
+    structio::object!(NestsReadonly { child });
 
-    #[derive(Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+    #[derive(Default, RepeStruct)]
     struct OptionalPlain {
         #[repe(nested)]
         child: Option<Plain>,
     }
+    structio::object!(OptionalPlain { child });
 
-    #[derive(Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+    #[derive(Default, RepeStruct)]
     struct OptionalReadonly {
         #[repe(nested)]
         child: Option<ReadonlyField>,
     }
+    structio::object!(OptionalReadonly { child });
 
-    #[derive(Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+    #[derive(Default, RepeStruct)]
     #[repe(methods)]
     struct ExclusiveMethod {
         a: u64,
     }
+    structio::object!(ExclusiveMethod { a });
 
     #[repe::methods]
     impl ExclusiveMethod {
@@ -1347,11 +1372,12 @@ mod shared_serves_bodies {
         }
     }
 
-    #[derive(Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+    #[derive(Default, RepeStruct)]
     #[repe(methods)]
     struct SharedCallWithArgs {
         a: u64,
     }
+    structio::object!(SharedCallWithArgs { a });
 
     #[repe::methods]
     impl SharedCallWithArgs {
@@ -1360,11 +1386,12 @@ mod shared_serves_bodies {
         }
     }
 
-    #[derive(Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+    #[derive(Default, RepeStruct)]
     #[repe(methods)]
     struct SharedCallNoArgs {
         a: u64,
     }
+    structio::object!(SharedCallNoArgs { a });
 
     #[repe::methods]
     impl SharedCallNoArgs {
@@ -1373,11 +1400,12 @@ mod shared_serves_bodies {
         }
     }
 
-    #[derive(Default, serde::Serialize, serde::Deserialize, RepeStruct)]
+    #[derive(Default, RepeStruct)]
     #[repe(methods(probe(&self, x: u64) -> u64))]
     struct StructListedCall {
         a: u64,
     }
+    structio::object!(StructListedCall { a });
 
     impl StructListedCall {
         fn probe(&self, x: u64) -> u64 {
