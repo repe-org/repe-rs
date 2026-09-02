@@ -79,6 +79,36 @@ pub struct Kind {
 }
 structio::object!(Kind { kind, n });
 
+/// A node's `/status` answer.
+#[derive(Default, Debug, PartialEq)]
+pub struct Status {
+    pub status: String,
+    pub node: i64,
+}
+structio::object!(Status { status, node });
+
+/// A `/compute` request: one number to transform.
+#[derive(Default, Debug, PartialEq)]
+pub struct Input {
+    pub value: i64,
+}
+structio::object!(Input { value });
+
+/// A `/compute` answer, tagged with the node that produced it.
+#[derive(Default, Debug, PartialEq)]
+pub struct Computed {
+    pub result: i64,
+    pub node: i64,
+}
+structio::object!(Computed { result, node });
+
+/// An `/echo` body: a bare identifier, echoed back unchanged.
+#[derive(Default, Debug, PartialEq)]
+pub struct Id {
+    pub id: i64,
+}
+structio::object!(Id { id });
+
 #[derive(Default, Debug, PartialEq)]
 pub struct Attempt {
     pub success: bool,
