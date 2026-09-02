@@ -93,11 +93,19 @@ fn request_empty(path: &str) -> Message {
         .build()
 }
 
-fn request_json(path: &str, body: &Value) -> Message {
+/// A request whose body is the given JSON text, sent verbatim.
+///
+/// These tests are about the *wire* contract — which argument forms dispatch
+/// accepts, and what a wrong one does — so the body is written as the text a
+/// client would send rather than built from a declared type. Declaring one
+/// would put a shape between the test and the thing it is testing, and the
+/// malformed cases could not be expressed at all.
+fn request_json(path: &str, body: &str) -> Message {
     Message::builder()
         .query_str(path)
         .query_format(QueryFormat::JsonPointer)
-        .body_json(body)
+        .body_bytes(body.as_bytes().to_vec())
+        .body_format(BodyFormat::Json)
         .build()
 }
 
@@ -109,8 +117,13 @@ fn call(router: &Router, path: &str, request: &Message) -> Message {
         .expect("dispatch")
 }
 
-fn parse_body(resp: &Message) -> Value {
-    serde_json::from_slice(&resp.body).expect("response body should be JSON")
+/// The response body as JSON text.
+///
+/// Compared as text throughout, which is what a response *is*: with no document
+/// model there is nothing between the bytes and the assertion, and the key
+/// order a listing emits becomes assertable rather than being normalized away.
+fn body_text(resp: &Message) -> &str {
+    std::str::from_utf8(&resp.body).expect("response body should be UTF-8 JSON")
 }
 
 fn router_with(device: Device) -> Router {
@@ -122,11 +135,11 @@ fn methods_come_from_the_impl_block() {
     let router = router_with(Device::with_id("sensor-42"));
 
     let resp = call(&router, "/greet", &request_empty("/greet"));
-    assert_eq!(parse_body(&resp), json!("device sensor-42"));
+    assert_eq!(body_text(&resp), r#""device sensor-42""#);
 
     // Renamed by attribute; the original name is not an endpoint.
     let resp = call(&router, "/identity", &request_empty("/identity"));
-    assert_eq!(parse_body(&resp), json!("sensor-42"));
+    assert_eq!(body_text(&resp), r#""sensor-42""#);
     let resp = call(&router, "/id_string", &request_empty("/id_string"));
     assert_eq!(resp.header.ec, ErrorCode::MethodNotFound as u32);
 
@@ -150,9 +163,9 @@ fn mutating_methods_take_the_body_as_their_argument() {
     let resp = call(
         &router,
         "/set_armed",
-        &request_json("/set_armed", &json!(true)),
+        &request_json("/set_armed", r##"true"##),
     );
-    assert_eq!(parse_body(&resp), Value::Null);
+    assert_eq!(body_text(&resp), "null");
     assert!(handle.lock().unwrap().armed);
 }
 
@@ -163,16 +176,16 @@ fn multi_argument_methods_accept_a_positional_array() {
     let resp = call(
         &router,
         "/scale",
-        &request_json("/scale", &json!([3.0, 1.5])),
+        &request_json("/scale", r##"[3.0, 1.5]"##),
     );
-    assert_eq!(parse_body(&resp), json!(7.5));
+    assert_eq!(body_text(&resp), "7.5");
 
     let resp = call(
         &router,
         "/label",
-        &request_json("/label", &json!(["ch", 7, "raw"])),
+        &request_json("/label", r##"["ch", 7, "raw"]"##),
     );
-    assert_eq!(parse_body(&resp), json!("ch-7-raw"));
+    assert_eq!(body_text(&resp), r#""ch-7-raw""#);
 }
 
 #[test]
@@ -182,26 +195,26 @@ fn multi_argument_methods_accept_an_object_keyed_by_parameter_name() {
     let resp = call(
         &router,
         "/scale",
-        &request_json("/scale", &json!({"offset": 1.5, "factor": 3.0})),
+        &request_json("/scale", r##"{"offset": 1.5, "factor": 3.0}"##),
     );
-    assert_eq!(parse_body(&resp), json!(7.5));
+    assert_eq!(body_text(&resp), "7.5");
 
     let resp = call(
         &router,
         "/label",
         &request_json(
             "/label",
-            &json!({"prefix": "ch", "index": 7, "suffix": "raw"}),
+            r##"{"prefix": "ch", "index": 7, "suffix": "raw"}"##,
         ),
     );
-    assert_eq!(parse_body(&resp), json!("ch-7-raw"));
+    assert_eq!(body_text(&resp), r#""ch-7-raw""#);
 }
 
 #[test]
 fn a_multi_argument_body_of_the_wrong_shape_is_an_error() {
     let router = router_with(Device::with_id("sensor-42"));
 
-    let short = call(&router, "/scale", &request_json("/scale", &json!([3.0])));
+    let short = call(&router, "/scale", &request_json("/scale", r##"[3.0]"##));
     assert_eq!(short.header.ec, ErrorCode::InvalidBody as u32);
     assert!(
         String::from_utf8_lossy(&short.body).contains("expected 2 arguments, got 1"),
@@ -209,7 +222,7 @@ fn a_multi_argument_body_of_the_wrong_shape_is_an_error() {
         String::from_utf8_lossy(&short.body)
     );
 
-    let scalar = call(&router, "/scale", &request_json("/scale", &json!(3.0)));
+    let scalar = call(&router, "/scale", &request_json("/scale", r##"3.0"##));
     assert_eq!(scalar.header.ec, ErrorCode::InvalidBody as u32);
     assert!(
         String::from_utf8_lossy(&scalar.body).contains("factor, offset"),
@@ -220,7 +233,7 @@ fn a_multi_argument_body_of_the_wrong_shape_is_an_error() {
     let wrong_type = call(
         &router,
         "/scale",
-        &request_json("/scale", &json!({"factor": "three", "offset": 1.5})),
+        &request_json("/scale", r##"{"factor": "three", "offset": 1.5}"##),
     );
     assert_eq!(wrong_type.header.ec, ErrorCode::InvalidBody as u32);
     assert!(
@@ -239,12 +252,12 @@ fn a_result_return_maps_ok_to_the_payload_and_err_to_an_error_frame() {
 
     let ok = call(&router, "/arm", &request_empty("/arm"));
     assert_eq!(ok.header.ec, ErrorCode::Ok as u32);
-    assert_eq!(parse_body(&ok), Value::Null);
+    assert_eq!(body_text(&ok), "null");
     assert!(handle.lock().unwrap().armed);
 
     let ok = call(&router, "/checked_id", &request_empty("/checked_id"));
     assert_eq!(ok.header.ec, ErrorCode::Ok as u32);
-    assert_eq!(parse_body(&ok), json!("sensor-42"));
+    assert_eq!(body_text(&ok), r#""sensor-42""#);
 
     let (router, _handle) = Router::new().with_struct("", Device::default());
     let err = call(&router, "/arm", &request_empty("/arm"));
@@ -261,26 +274,26 @@ fn a_result_return_maps_ok_to_the_payload_and_err_to_an_error_frame() {
 fn the_whole_struct_listing_publishes_impl_block_signatures() {
     let router = router_with(Device::with_id("sensor-42"));
 
-    let body = parse_body(&call(&router, "", &request_empty("")));
-    assert_eq!(body["id"], json!("sensor-42"));
-    assert_eq!(body["greet"], json!("fn(&self) -> String"));
-    assert_eq!(
-        body["scale"],
-        json!("fn(&self, factor: f64, offset: f64) -> f64")
-    );
-    assert_eq!(body["set_armed"], json!("fn(&mut self, armed: bool) -> ()"));
-    assert_eq!(
-        body["arm"],
-        json!("fn(&mut self) -> Result<(), DeviceError>")
-    );
-    assert_eq!(body["identity"], json!("fn(&self) -> String"));
-    assert!(body.get("id_string").is_none());
-    assert!(body.get("internal_checksum").is_none());
-    assert!(body.get("with_id").is_none());
+    let listing = call(&router, "", &request_empty(""));
+    let body = body_text(&listing);
 
-    // A typed field is a plain JSON array inside the listing: the frame is
-    // already JSON, so the BEVE encoding is reachable only per-field.
-    assert_eq!(body["samples"], json!([0, 0, 0, 0, 0, 0, 0, 0]));
+    for expected in [
+        r#""id":"sensor-42""#,
+        r#""greet":"fn(&self) -> String""#,
+        r#""scale":"fn(&self, factor: f64, offset: f64) -> f64""#,
+        r#""set_armed":"fn(&mut self, armed: bool) -> ()""#,
+        r#""arm":"fn(&mut self) -> Result<(), DeviceError>""#,
+        r#""identity":"fn(&self) -> String""#,
+        // A typed field is a plain JSON array inside the listing: the frame is
+        // already JSON, so the BEVE encoding is reachable only per-field.
+        r#""samples":[0,0,0,0,0,0,0,0]"#,
+    ] {
+        assert!(body.contains(expected), "missing {expected} in {body}");
+    }
+
+    for absent in ["id_string", "internal_checksum", "with_id"] {
+        assert!(!body.contains(absent), "unexpected {absent} in {body}");
+    }
 }
 
 #[test]
@@ -318,9 +331,9 @@ fn a_typed_field_still_accepts_a_json_write() {
     let resp = call(
         &router,
         "/trace",
-        &request_json("/trace", &json!([9.0, 8.0])),
+        &request_json("/trace", r##"[9.0, 8.0]"##),
     );
-    assert_eq!(parse_body(&resp), Value::Null);
+    assert_eq!(body_text(&resp), "null");
     assert_eq!(handle.lock().unwrap().trace, vec![9.0, 8.0]);
 }
 
@@ -359,18 +372,22 @@ fn a_nested_struct_reaches_its_own_impl_block_methods() {
         "/channel/describe",
         &request_empty("/channel/describe"),
     );
-    assert_eq!(parse_body(&resp), json!("gain=2"));
+    assert_eq!(body_text(&resp), r#""gain=2""#);
 
     let resp = call(
         &router,
         "/channel/blend",
-        &request_json("/channel/blend", &json!([1.0, 3.0])),
+        &request_json("/channel/blend", r##"[1.0, 3.0]"##),
     );
-    assert_eq!(parse_body(&resp), json!(8.0));
+    assert_eq!(body_text(&resp), "8");
 
-    let listing = parse_body(&call(&router, "", &request_empty("")));
-    assert_eq!(listing["channel"]["gain"], json!(2.0));
-    assert_eq!(listing["channel"]["describe"], json!("fn(&self) -> String"));
+    let listing = call(&router, "", &request_empty(""));
+    let listing = body_text(&listing);
+    assert!(listing.contains(r#""gain":2"#), "{listing}");
+    assert!(
+        listing.contains(r#""describe":"fn(&self) -> String""#),
+        "{listing}"
+    );
 
     let missing = call(&router, "/channel/nope", &request_empty("/channel/nope"));
     assert_eq!(missing.header.ec, ErrorCode::MethodNotFound as u32);
@@ -456,15 +473,15 @@ fn the_struct_level_list_also_takes_several_arguments() {
     let (router, handle) = Router::new().with_struct("", MixedSurface::default());
     handle.lock().unwrap().base = 10;
 
-    let resp = call(&router, "/listed", &request_json("/listed", &json!([1, 2])));
-    assert_eq!(parse_body(&resp), json!(13));
+    let resp = call(&router, "/listed", &request_json("/listed", r##"[1, 2]"##));
+    assert_eq!(body_text(&resp), "13");
 
     let resp = call(
         &router,
         "/listed",
-        &request_json("/listed", &json!({"left": 1, "right": 2})),
+        &request_json("/listed", r##"{"left": 1, "right": 2}"##),
     );
-    assert_eq!(parse_body(&resp), json!(13));
+    assert_eq!(body_text(&resp), "13");
 }
 
 #[test]
@@ -475,19 +492,20 @@ fn a_listed_method_and_an_impl_block_coexist() {
     let resp = call(
         &router,
         "/via_impl_block",
-        &request_json("/via_impl_block", &json!([1, 2, 3])),
+        &request_json("/via_impl_block", r##"[1, 2, 3]"##),
     );
-    assert_eq!(parse_body(&resp), json!(16));
+    assert_eq!(body_text(&resp), "16");
 
-    let listing = parse_body(&call(&router, "", &request_empty("")));
-    assert_eq!(listing["base"], json!(10));
-    assert_eq!(
-        listing["listed"],
-        json!("fn(&self, left: i32, right: i32) -> i32")
+    let listing = call(&router, "", &request_empty(""));
+    let listing = body_text(&listing);
+    assert!(listing.contains(r#""base":10"#), "{listing}");
+    assert!(
+        listing.contains(r#""listed":"fn(&self, left: i32, right: i32) -> i32""#),
+        "{listing}"
     );
-    assert_eq!(
-        listing["via_impl_block"],
-        json!("fn(&self, a: i32, b: i32, c: i32) -> i32")
+    assert!(
+        listing.contains(r#""via_impl_block":"fn(&self, a: i32, b: i32, c: i32) -> i32""#),
+        "{listing}"
     );
 }
 
@@ -501,7 +519,10 @@ fn a_beve_request_body_reaches_a_multi_argument_method() {
         .body_beve(&(3.0f64, 1.5f64))
         .build();
     let resp = call(&router, "/scale", &request);
-    assert_eq!(parse_body(&resp), json!(7.5));
+    // A BEVE request is answered in BEVE, so the response is read through
+    // `decode_body`, which follows the header rather than assuming a format.
+    assert_eq!(resp.header.body_format, BodyFormat::Beve as u16);
+    assert_eq!(resp.decode_body::<f64>().expect("body"), 7.5);
 }
 
 // --- The invariant the whole `Sink` factoring exists to hold ------------------
@@ -555,78 +576,112 @@ fn outer() -> Outer {
     }
 }
 
-/// `repe_handle` and `repe_handle_into` are generated from one set of specs and
-/// must produce the same answer for every arm shape. `#[repe(typed)]` is the one
-/// sanctioned exception, pinned separately below.
+/// Every arm the derive generates, checked against the bytes it writes.
+///
+/// This used to be an agreement test: `repe_handle` built a `Value` and
+/// `repe_handle_into` wrote bytes, and the two had to answer identically for
+/// every shape. There is one path now — a response is written into the caller's
+/// buffer as it is produced — so what is left to pin is the arms themselves.
 #[test]
-fn the_value_and_encode_paths_agree() {
-    use repe::structs::{RepeStruct, ResponseBody};
+fn every_dispatch_arm_writes_what_it_should() {
+    use repe::structs::{RepeStruct, RequestBody, ResponseBody, StructError};
 
-    let cases: [(&[&str], Option<Value>); 12] = [
-        (&[], None),                         // whole object
-        (&["name"], None),                   // leaf read
-        (&["name"], Some(json!("renamed"))), // leaf write
-        (&["inner"], None),                  // nested read
+    /// `Ok` with the exact JSON text expected, or `Err` with the error's
+    /// `to_string()`.
+    type Expected = Result<&'static str, &'static str>;
+
+    let cases: [(&[&str], Option<&str>, Expected); 12] = [
+        // Whole object: a listing, in declaration order.
+        (
+            &[],
+            None,
+            Ok(
+                r#"{"name":"rack","inner":{"scale":1.5,"window":[1,-2,3,-4],"serial":"SN-1","doubled":"fn(&self) -> f64"}}"#,
+            ),
+        ),
+        (&["name"], None, Ok(r#""rack""#)),
+        (&["name"], Some(r#""renamed""#), Ok("null")),
         (
             &["inner"],
-            Some(json!({"scale": 4.0, "window": [0, 0, 0, 0], "serial": "SN-2"})),
+            None,
+            Ok(
+                r#"{"scale":1.5,"window":[1,-2,3,-4],"serial":"SN-1","doubled":"fn(&self) -> f64"}"#,
+            ),
         ),
-        (&["inner", "scale"], None),                 // nested leaf read
-        (&["inner", "scale"], Some(json!(9.5))),     // nested leaf write
-        (&["inner", "doubled"], None),               // nested impl-block method
-        (&["inner", "serial"], Some(json!("nope"))), // readonly rejection
-        (&["hidden"], None),                         // skipped field
-        (&["name", "extra"], None),                  // InvalidSubpath
-        (&["nope"], None),                           // InvalidPath
+        (
+            &["inner"],
+            Some(r#"{"scale": 4.0, "window": [0, 0, 0, 0], "serial": "SN-2"}"#),
+            Ok("null"),
+        ),
+        (&["inner", "scale"], None, Ok("1.5")),
+        (&["inner", "scale"], Some("9.5"), Ok("null")),
+        (&["inner", "doubled"], None, Ok("3")),
+        // A read-only field refuses a write rather than silently ignoring it.
+        (
+            &["inner", "serial"],
+            Some(r#""nope""#),
+            Err("body not allowed for `/inner/serial`"),
+        ),
+        (&["hidden"], None, Err("invalid path `/hidden`")),
+        (
+            &["name", "extra"],
+            None,
+            Err("unexpected additional path segments at `/name/extra`"),
+        ),
+        (&["nope"], None, Err("invalid path `/nope`")),
     ];
 
-    for (segments, body) in cases {
-        let mut via_value = outer();
-        let mut via_encode = outer();
-
-        let value_result = via_value.repe_handle(segments, body.clone());
+    for (segments, body, expected) in cases {
+        let mut subject = outer();
+        let body = body.map(|text| RequestBody::new(text.as_bytes(), BodyFormat::Json));
 
         let mut buf = Vec::new();
         let mut out = ResponseBody::new(&mut buf);
-        let encode_result = via_encode.repe_handle_into(segments, body.clone(), &mut out);
+        let result = subject.repe_handle_into(segments, body, &mut out);
 
-        match (&value_result, &encode_result) {
-            (Ok(value), Ok(())) => {
-                let expected = value.clone().unwrap_or(Value::Null);
-                let encoded: Value = serde_json::from_slice(&buf)
-                    .unwrap_or_else(|e| panic!("{segments:?} produced invalid JSON: {e}"));
-                assert_eq!(encoded, expected, "payload diverged at {segments:?}");
+        match (result, expected) {
+            (Ok(()), Ok(want)) => {
+                let got = std::str::from_utf8(&buf).expect("a JSON response is UTF-8");
+                assert_eq!(got, want, "payload diverged at {segments:?}");
             }
-            (Err(value_err), Err(encode_err)) => assert_eq!(
-                value_err.to_string(),
-                encode_err.to_string(),
-                "error text diverged at {segments:?}"
-            ),
-            _ => panic!("outcome diverged at {segments:?}: {value_result:?} vs {encode_result:?}"),
+            (Err(err), Err(want)) => {
+                assert_eq!(err.to_string(), want, "error text diverged at {segments:?}");
+            }
+            (got, want) => panic!("outcome diverged at {segments:?}: {got:?} vs {want:?}"),
         }
-
-        // The write arms must leave the struct in the same state, too.
-        assert_eq!(
-            serde_json::to_value(&via_value).unwrap(),
-            serde_json::to_value(&via_encode).unwrap(),
-            "struct state diverged at {segments:?}"
-        );
     }
+
+    // A write that succeeded actually landed.
+    let mut subject = outer();
+    let body = RequestBody::new(br#"9.5"#, BodyFormat::Json);
+    let mut buf = Vec::new();
+    let mut out = ResponseBody::new(&mut buf);
+    subject
+        .repe_handle_into(&["inner", "scale"], Some(body), &mut out)
+        .expect("a nested leaf write");
+    assert_eq!(subject.inner.scale, 9.5);
+
+    // And the error type is the one the trait declares, not a stringly one.
+    let mut subject = outer();
+    let mut buf = Vec::new();
+    let mut out = ResponseBody::new(&mut buf);
+    assert!(matches!(
+        subject.repe_handle_into(&["nope"], None, &mut out),
+        Err(StructError::InvalidPath { .. })
+    ));
 }
 
-/// The one divergence, asserted rather than assumed: a `Value` has no
-/// representation for a BEVE typed body, so `repe_handle` yields the JSON array.
+/// A `#[repe(typed)]` field answers a *direct* read in BEVE and appears as a
+/// plain JSON array inside a listing.
+///
+/// The two are not in tension: the listing's frame is already JSON, so there is
+/// nowhere in it to put a BEVE body, while a direct read owns its whole frame
+/// and can declare whichever format it likes.
 #[test]
-fn a_typed_field_is_the_one_sanctioned_divergence() {
+fn a_typed_field_reads_as_beve_directly_and_as_json_in_a_listing() {
     use repe::structs::{RepeStruct, ResponseBody};
 
     let mut device = outer();
-    assert_eq!(
-        device.repe_handle(&["inner", "window"], None).unwrap(),
-        Some(json!([1, -2, 3, -4])),
-        "the Value path has nowhere to put a typed body"
-    );
-
     let mut buf = Vec::new();
     let mut out = ResponseBody::new(&mut buf);
     device
@@ -642,44 +697,55 @@ fn a_typed_field_is_the_one_sanctioned_divergence() {
     );
 
     // Inside the listing the frame is already JSON, at any depth.
-    let listing = parse_body(&call(
+    let listing = call(
         &Router::new().with_struct("", outer()).0,
         "",
         &request_empty(""),
-    ));
-    assert_eq!(listing["inner"]["window"], json!([1, -2, 3, -4]));
+    );
+    let listing = body_text(&listing);
+    assert!(listing.contains(r#""window":[1,-2,3,-4]"#), "{listing}");
 }
 
-/// A `Result` under an alias that is not *named* `Result` cannot be recognized
-/// by a macro, so `Err` ships as data. Pinned so the boundary is a decision on
-/// record rather than a surprise; see `docs/server.md`.
+/// A `Result` return spelled by name becomes a REPE error response.
+///
+/// The counterpart case — a `Result` behind an alias that is not *named*
+/// `Result` — cannot be recognized by a macro, so the derive treats it as an
+/// ordinary return type. Under serde that shipped a surprising `{"Err": ".."}`
+/// body, and this test pinned it as a decision on record. It is now a *compile*
+/// error instead: `Result<T, E>` has no structio declaration, so a method
+/// returning one through an alias does not build, and the diagnostic names the
+/// missing declaration. Better caught there than on the wire, and there is no
+/// longer a runtime behavior to assert. See `docs/server.md`.
 #[test]
-fn a_result_alias_not_named_result_is_serialized_as_data() {
-    type DeviceResult<T> = std::result::Result<T, String>;
-
+fn a_result_return_becomes_an_error_response() {
     #[derive(Default, repe::RepeStruct)]
     #[repe(methods)]
-    struct Aliased {
+    struct Fallible {
         v: i32,
     }
-    structio::object!(Aliased { v });
+    structio::object!(Fallible { v });
 
     #[repe::methods]
-    impl Aliased {
+    impl Fallible {
         fn spelled(&self) -> Result<i32, String> {
             Err("spelled".into())
         }
-        fn aliased(&self) -> DeviceResult<i32> {
-            Err("aliased".into())
+        fn succeeds(&self) -> Result<i32, String> {
+            Ok(7)
         }
     }
 
-    let router = Router::new().with_struct("", Aliased::default()).0;
+    let router = Router::new().with_struct("", Fallible::default()).0;
 
-    let spelled = call(&router, "/spelled", &request_empty("/spelled"));
-    assert_eq!(spelled.header.ec, ErrorCode::ParseError as u32);
+    let failed = call(&router, "/spelled", &request_empty("/spelled"));
+    assert_eq!(failed.header.ec, ErrorCode::ParseError as u32);
+    assert!(
+        String::from_utf8_lossy(&failed.body).contains("spelled"),
+        "the error message should carry the handler's own text"
+    );
 
-    let aliased = call(&router, "/aliased", &request_empty("/aliased"));
-    assert_eq!(aliased.header.ec, ErrorCode::Ok as u32);
-    assert_eq!(parse_body(&aliased), json!({"Err": "aliased"}));
+    // And the `Ok` arm is the plain value, with no wrapper around it.
+    let ok = call(&router, "/succeeds", &request_empty("/succeeds"));
+    assert_eq!(ok.header.ec, ErrorCode::Ok as u32);
+    assert_eq!(body_text(&ok), "7");
 }
