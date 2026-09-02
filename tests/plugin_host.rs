@@ -118,7 +118,7 @@ fn read(query: &str, id: u64) -> Vec<u8> {
         .to_vec()
 }
 
-fn write<T: serde::Serialize>(query: &str, id: u64, value: &T) -> Vec<u8> {
+fn write<T: structio::json::Write + ?Sized>(query: &str, id: u64, value: &T) -> Vec<u8> {
     Message::builder()
         .id(id)
         .query_str(query)

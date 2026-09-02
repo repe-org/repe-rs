@@ -348,7 +348,7 @@ fn writer_digest_router(payload: Payload, corrupt: bool, compression: Compressio
                 let value = payload.clone();
                 move |w: &mut dyn Write| -> io::Result<()> {
                     let mut tee = FnvHash::new(&mut *w);
-                    beve::to_writer_streaming(&mut tee, &value)
+                    structio::beve::to_writer(&value, &mut tee)
                         .map_err(|e| io::Error::other(e.to_string()))?;
                     let mut digest = tee.finish();
                     if corrupt {
@@ -363,10 +363,10 @@ fn writer_digest_router(payload: Payload, corrupt: bool, compression: Compressio
     )
 }
 
-/// The exact bytes `beve::to_writer_streaming` produces for `payload`.
+/// The exact bytes `structio::beve::to_writer` produces for `payload`.
 fn streamed_payload_bytes(payload: &Payload) -> Vec<u8> {
     let mut buf = Vec::new();
-    beve::to_writer_streaming(&mut buf, payload).expect("stream-encode payload");
+    structio::beve::to_writer(payload, &mut buf).expect("stream-encode payload");
     buf
 }
 

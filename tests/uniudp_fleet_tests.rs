@@ -7,6 +7,43 @@ use uniudp::message::SourcePolicy;
 use uniudp::options::ReceiveOptions;
 use uniudp::receiver::Receiver;
 
+// ---- wire fixtures ----
+
+/// An empty body: `{}` on the wire, and the type parameter for a bodiless send.
+#[derive(Default, Debug, PartialEq)]
+struct Empty;
+structio::object!(Empty {});
+
+#[derive(Default, Debug, PartialEq)]
+struct Flag {
+    broadcast: bool,
+}
+structio::object!(Flag { broadcast });
+
+#[derive(Default, Debug, PartialEq)]
+struct Named {
+    name: String,
+}
+structio::object!(Named { name });
+
+#[derive(Default, Debug, PartialEq)]
+struct Ack {
+    ok: bool,
+}
+structio::object!(Ack { ok });
+
+#[derive(Default, Debug, PartialEq)]
+struct Input {
+    value: i64,
+}
+structio::object!(Input { value });
+
+#[derive(Default, Debug, PartialEq)]
+struct Id {
+    id: i64,
+}
+structio::object!(Id { id });
+
 fn recv_message(receiver: &mut Receiver, socket: &mut UdpSocket) -> Message {
     let report = receiver
         .receive_message(
@@ -98,7 +135,7 @@ fn uniudp_fleet_send_operations_and_filtering() {
     ])
     .unwrap();
 
-    let broadcast = fleet.send_notify("/ping", Some(&json!({"broadcast": true})), &[] as &[&str]);
+    let broadcast = fleet.send_notify("/ping", Some(&Flag { broadcast: true }), &[] as &[&str]);
     assert_eq!(broadcast.len(), 2);
     assert!(broadcast["server-1"].succeeded());
     assert!(broadcast["server-2"].succeeded());
@@ -109,23 +146,17 @@ fn uniudp_fleet_send_operations_and_filtering() {
     let msg2 = recv_message(&mut rx2, &mut server2);
     assert_eq!(msg1.query_utf8(), "/ping");
     assert_eq!(msg2.query_utf8(), "/ping");
-    assert_eq!(
-        msg1.json_body::<serde_json::Value>().unwrap()["broadcast"],
-        true
-    );
-    assert_eq!(
-        msg2.json_body::<serde_json::Value>().unwrap()["broadcast"],
-        true
-    );
+    assert!(msg1.json_body::<Flag>().unwrap().broadcast);
+    assert!(msg2.json_body::<Flag>().unwrap().broadcast);
 
-    let only_a = fleet.send_notify("/group", Some(&json!({"name": "a"})), &["group-a"]);
+    let only_a = fleet.send_notify("/group", Some(&Named { name: "a".into() }), &["group-a"]);
     assert_eq!(only_a.len(), 1);
     assert!(only_a.contains_key("server-1"));
     assert!(only_a["server-1"].succeeded());
 
     let msg_a = recv_message(&mut rx1, &mut server1);
     assert_eq!(msg_a.query_utf8(), "/group");
-    assert_eq!(msg_a.json_body::<serde_json::Value>().unwrap()["name"], "a");
+    assert_eq!(msg_a.json_body::<Named>().unwrap().name, "a");
 
     let filtered_miss = rx2.receive_message(
         &mut server2,
@@ -136,7 +167,7 @@ fn uniudp_fleet_send_operations_and_filtering() {
     );
     assert!(filtered_miss.is_err());
 
-    let notify_all = fleet.notify_all("/heartbeat", Some(&json!({"ok": true})));
+    let notify_all = fleet.notify_all("/heartbeat", Some(&Ack { ok: true }));
     assert_eq!(notify_all.len(), 2);
     assert!(notify_all["server-1"].succeeded());
     assert!(notify_all["server-2"].succeeded());
@@ -146,8 +177,7 @@ fn uniudp_fleet_send_operations_and_filtering() {
     assert_eq!(hb1.query_utf8(), "/heartbeat");
     assert_eq!(hb2.query_utf8(), "/heartbeat");
 
-    let request_results =
-        fleet.send_request("/request", Some(&json!({"value": 7})), &[] as &[&str]);
+    let request_results = fleet.send_request("/request", Some(&Input { value: 7 }), &[] as &[&str]);
     assert_eq!(request_results.len(), 2);
     assert!(request_results["server-1"].succeeded());
     assert!(request_results["server-2"].succeeded());
@@ -160,18 +190,15 @@ fn uniudp_fleet_send_operations_and_filtering() {
     assert_eq!(req2.header.notify, 0);
 
     let single = fleet
-        .send_notify_to("server-1", "/single", Some(&json!({"id": 42})))
+        .send_notify_to("server-1", "/single", Some(&Id { id: 42 }))
         .unwrap();
     assert!(single.succeeded());
 
     let single_msg = recv_message(&mut rx1, &mut server1);
     assert_eq!(single_msg.query_utf8(), "/single");
-    assert_eq!(
-        single_msg.json_body::<serde_json::Value>().unwrap()["id"],
-        42
-    );
+    assert_eq!(single_msg.json_body::<Id>().unwrap().id, 42);
 
-    let missing = fleet.send_notify_to("missing", "/single", None);
+    let missing = fleet.send_notify_to("missing", "/single", None::<&Empty>);
     assert!(matches!(missing, Err(FleetError::NodeNotFound(_))));
 }
 
@@ -201,14 +228,14 @@ fn uniudp_fleet_dynamic_nodes_and_close() {
     );
     assert!(matches!(duplicate, Err(FleetError::DuplicateNodeName(_))));
 
-    let sent = fleet.send_notify("/before-close", None, &[] as &[&str]);
+    let sent = fleet.send_notify("/before-close", None::<&Empty>, &[] as &[&str]);
     assert!(sent["node-1"].succeeded());
     let msg = recv_message(&mut rx, &mut server);
     assert_eq!(msg.query_utf8(), "/before-close");
 
     fleet.close();
 
-    let closed = fleet.send_notify("/after-close", None, &[] as &[&str]);
+    let closed = fleet.send_notify("/after-close", None::<&Empty>, &[] as &[&str]);
     assert!(closed["node-1"].failed());
 
     assert!(fleet.remove_node("node-1"));

@@ -1019,12 +1019,19 @@ pub fn pull_typed_slice<T: structio::beve::NumericBytes>(
 }
 
 /// Complex twin of [`pull_typed_slice`]: pull `resource` as a bulk
-/// `Vec<Complex<T>>`, with the same memory property. Pair with a server
-/// registered via [`RouterValueStreamExt::with_complex_value_stream`]. For large
-/// IQ buffers.
+/// `Vec<Complex<T>>`. Pair with a server registered via
+/// [`RouterValueStreamExt::with_complex_value_stream`]. For large IQ buffers.
+///
+/// **This one buffers**, unlike [`pull_typed_slice`].
+/// [`structio::beve::read_array_into`] reads a *typed* array's header and
+/// refuses a complex array's, so there is no reader that moves an interleaved
+/// `(re, im)` payload from a stream into the vector's own memory. The whole
+/// encoded body is held while it is decoded, so peak memory is roughly twice
+/// the result. Everything else — the wire form, the element type, the
+/// compression — is the same as the typed path's.
 pub fn pull_complex_slice<T>(client: &Client, resource: &str) -> Result<Vec<Complex<T>>, RepeError>
 where
-    Complex<T>: structio::beve::NumericBytes,
+    Vec<Complex<T>>: ServableOwned,
 {
     let open = open_stream(client, resource)?;
     if let Err(e) = require_beve(&open) {
@@ -1037,8 +1044,10 @@ where
     }
     let reader = ChunkReader::new(client, open.stream_id);
     let result = match open.compression {
-        Compression::None => read_array::<Complex<T>, _>(reader),
-        Compression::Zstd => read_array::<Complex<T>, _>(zstandard::io::Reader::new(reader)),
+        Compression::None => read_one_value::<Vec<Complex<T>>, _>(reader),
+        Compression::Zstd => {
+            read_one_value::<Vec<Complex<T>>, _>(zstandard::io::Reader::new(reader))
+        }
     };
     let _ = cancel_stream(client, open.stream_id, "bulk complex slice complete");
     result
@@ -1675,9 +1684,9 @@ pub async fn pull_complex_slice_async<T: Send + 'static, C: AsyncSvsClient>(
     resource: &str,
 ) -> Result<Vec<Complex<T>>, RepeError>
 where
-    Complex<T>: structio::beve::NumericBytes,
+    Vec<Complex<T>>: ServableOwned,
 {
-    pull_beve_async(client, resource, read_array::<Complex<T>, _>).await
+    pull_beve_async(client, resource, read_one_value::<Vec<Complex<T>>, _>).await
 }
 
 /// Async, format-agnostic escape hatch: pull `resource` and hand its logical

@@ -349,7 +349,7 @@ fn writer_stream_with_beve_tag_pulls_as_a_value() {
             (resource == "payload").then(|| {
                 let value = payload.clone();
                 move |w: &mut dyn Write| -> std::io::Result<()> {
-                    beve::to_writer_streaming(w, &value)
+                    structio::beve::to_writer(&value, w)
                         .map_err(|e| std::io::Error::other(e.to_string()))
                 }
             })
@@ -374,7 +374,7 @@ fn serve_writer_digest(payload: Payload, opts: StreamOpts) -> Client {
                     // the logical bytes, then append the digest as a trailer. No
                     // second serialization pass, no buffering of the whole value.
                     let mut tee = HashTee::new(w);
-                    beve::to_writer_streaming(&mut tee, &value)
+                    structio::beve::to_writer(&value, &mut tee)
                         .map_err(|e| std::io::Error::other(e.to_string()))?;
                     let digest = tee.finish();
                     w.write_all(&digest.to_le_bytes())?;
@@ -481,11 +481,11 @@ fn check_fnv(digest: FnvDigest, trailer: &[u8]) -> Result<(), RepeError> {
     }
 }
 
-/// The exact bytes `beve::to_writer_streaming` produces for `payload` — what the
+/// The exact bytes `structio::beve::to_writer` produces for `payload` — what the
 /// committed file must equal once the 8-byte trailer is stripped.
 fn streamed_payload_bytes(payload: &Payload) -> Vec<u8> {
     let mut buf = Vec::new();
-    beve::to_writer_streaming(&mut buf, payload).expect("stream-encode payload");
+    structio::beve::to_writer(payload, &mut buf).expect("stream-encode payload");
     buf
 }
 
@@ -547,7 +547,7 @@ fn serve_writer_bad_digest(payload: Payload, opts: StreamOpts) -> Client {
                 let value = payload.clone();
                 move |w: &mut dyn Write| -> std::io::Result<()> {
                     let mut tee = HashTee::new(w);
-                    beve::to_writer_streaming(&mut tee, &value)
+                    structio::beve::to_writer(&value, &mut tee)
                         .map_err(|e| std::io::Error::other(e.to_string()))?;
                     let corrupt = tee.finish() ^ u64::MAX;
                     w.write_all(&corrupt.to_le_bytes())?;
@@ -688,7 +688,8 @@ fn pull_consume_decodes_a_value_through_the_reader_hatch() {
     let payload = sample_payload();
     let client = serve(payload.clone(), small_chunks(Compression::Zstd));
     let got: Payload = pull_consume(&client, "payload", |reader| {
-        beve::from_reader_streaming(reader).map_err(RepeError::from)
+        structio::beve::from_reader(reader)
+            .map_err(|err| RepeError::decode_stream(repe::BodyFormat::Beve, err))
     })
     .expect("consume decode");
     assert_eq!(got, payload);
