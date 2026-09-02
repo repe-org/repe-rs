@@ -118,11 +118,12 @@ struct AttributeStruct {
     #[repe(rename = "renamed_value")]
     value: i32,
     #[repe(skip)]
+    #[allow(dead_code)]
     hidden: bool,
     #[repe(readonly)]
     name: String,
 }
-structio::object!(AttributeStruct { value, name, .. });
+structio::object!(AttributeStruct { "renamed_value" => value, name, .. });
 
 impl AttributeStruct {
     fn describe(&self) -> String {
