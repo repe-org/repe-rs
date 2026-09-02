@@ -160,7 +160,9 @@ fn an_escaped_pointer_registers_and_resolves() {
         })
         .expect("register escaped-slash function");
     registry
-        .register_function("/m~0n", |_: Option<RequestBody<'_>>| Ok("tilded".to_string()))
+        .register_function("/m~0n", |_: Option<RequestBody<'_>>| {
+            Ok("tilded".to_string())
+        })
         .expect("register escaped-tilde function");
     let router = Router::new().with_registry("", Arc::clone(&registry));
 
@@ -210,7 +212,11 @@ fn a_function_error_code_propagates() {
         .expect("register function");
     let router = Router::new().with_registry("", Arc::clone(&registry));
 
-    let response = serve(&router, "/boom", &request_json("/boom", &Operands::default()));
+    let response = serve(
+        &router,
+        "/boom",
+        &request_json("/boom", &Operands::default()),
+    );
     assert_eq!(response.header.ec, ErrorCode::ApplicationErrorBase as u32);
     assert_eq!(response.error_message_utf8().as_deref(), Some("denied"));
 }

@@ -33,7 +33,12 @@ struct Budget {
     /// to differ, and the derive refuses them if they do not.
     read_count: u32,
 }
-structio::object!(Budget { used, total, tier, read_count });
+structio::object!(Budget {
+    used,
+    total,
+    tier,
+    read_count
+});
 
 #[repe::methods]
 impl Budget {
@@ -117,7 +122,7 @@ fn request_json(path: &str, body: &Value) -> Message {
         .query_str(path)
         .query_format(QueryFormat::JsonPointer)
         .body_json(body)
-                .build()
+        .build()
 }
 
 fn call(router: &Router, path: &str, request: &Message) -> Message {

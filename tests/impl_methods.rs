@@ -25,7 +25,12 @@ struct Device {
     #[repe(typed)]
     trace: Vec<f64>,
 }
-structio::object!(Device { id, armed, samples, trace });
+structio::object!(Device {
+    id,
+    armed,
+    samples,
+    trace
+});
 
 #[repe::methods]
 impl Device {
@@ -93,7 +98,7 @@ fn request_json(path: &str, body: &Value) -> Message {
         .query_str(path)
         .query_format(QueryFormat::JsonPointer)
         .body_json(body)
-                .build()
+        .build()
 }
 
 fn call(router: &Router, path: &str, request: &Message) -> Message {
@@ -494,7 +499,7 @@ fn a_beve_request_body_reaches_a_multi_argument_method() {
         .query_str("/scale")
         .query_format(QueryFormat::JsonPointer)
         .body_beve(&(3.0f64, 1.5f64))
-                .build();
+        .build();
     let resp = call(&router, "/scale", &request);
     assert_eq!(parse_body(&resp), json!(7.5));
 }
@@ -510,7 +515,11 @@ struct Inner {
     #[repe(readonly)]
     serial: String,
 }
-structio::object!(Inner { scale, window, serial });
+structio::object!(Inner {
+    scale,
+    window,
+    serial
+});
 
 #[repe::methods]
 impl Inner {
@@ -528,7 +537,11 @@ struct Outer {
     #[allow(dead_code)]
     hidden: u8,
 }
-structio::object!(Outer { name, inner, hidden });
+structio::object!(Outer {
+    name,
+    inner,
+    hidden
+});
 
 fn outer() -> Outer {
     Outer {

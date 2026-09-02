@@ -51,7 +51,11 @@ struct Settings {
     /// distinguishable from a *replace* by more than its result.
     writes: u32,
 }
-structio::object!(Settings { retries, timeout, writes });
+structio::object!(Settings {
+    retries,
+    timeout,
+    writes
+});
 
 impl RepeStruct for Settings {
     fn repe_handle(
@@ -140,7 +144,13 @@ struct Service {
     #[repe(readonly)]
     fixed: Counter,
 }
-structio::object!(Service { version, settings, counter, aux, fixed });
+structio::object!(Service {
+    version,
+    settings,
+    counter,
+    aux,
+    fixed
+});
 
 fn service() -> Service {
     Service {
@@ -177,7 +187,7 @@ fn write<T: Serialize>(query: &str, value: &T) -> Vec<u8> {
         .query_str(query)
         .query_format(QueryFormat::JsonPointer)
         .body_json(value)
-                .build()
+        .build()
         .to_vec()
 }
 

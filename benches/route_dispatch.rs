@@ -20,6 +20,13 @@ use repe::{BodyFormat, Message, QueryFormat};
 use std::hint::black_box;
 use std::sync::{Arc, Mutex};
 
+// ---- wire fixtures ----
+
+/// An empty body: `{}` on the wire.
+#[derive(Default, Debug, PartialEq)]
+struct Empty;
+structio::object!(Empty {});
+
 #[derive(Default, serde::Serialize, serde::Deserialize, repe::RepeStruct)]
 #[repe(methods(get_number(&self) -> i32))]
 struct BenchStruct {
@@ -113,7 +120,7 @@ fn build_request(path: &str) -> Message {
         .query_str(path)
         .query_format(QueryFormat::JsonPointer)
         .body_json(&json!({}))
-                .body_format(BodyFormat::Json)
+        .body_format(BodyFormat::Json)
         .build()
 }
 

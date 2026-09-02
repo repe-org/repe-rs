@@ -42,7 +42,12 @@ struct Instrument {
     #[repe(typed)]
     samples: [f64; 8],
 }
-structio::object!(Instrument { gain, channel, firmware, samples });
+structio::object!(Instrument {
+    gain,
+    channel,
+    firmware,
+    samples
+});
 
 /// A command failed on the device. Any `Display` error works; the crate turns it
 /// into a REPE error response.

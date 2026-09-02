@@ -20,7 +20,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pong = client.call_typed_json("/ping", &json!({})).await?;
     println!("/ping => {}", pong);
 
-    let mul = client.call_typed_json("/mul", &json!({"x": 6, "y": 7})).await?;
+    let mul = client
+        .call_typed_json("/mul", &json!({"x": 6, "y": 7}))
+        .await?;
     println!("/mul => {}", mul);
 
     let sum: AddResp = client

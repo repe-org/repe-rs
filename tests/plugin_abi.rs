@@ -69,7 +69,7 @@ fn request(path: &str, body: &serde_json::Value, notify: bool) -> Vec<u8> {
         .query_str(path)
         .query_format(QueryFormat::JsonPointer)
         .body_json(body)
-                .build()
+        .build()
         .to_vec()
 }
 
@@ -118,7 +118,7 @@ fn the_plugin_abi_behaves_as_a_host_expects() {
     // --- dispatch ----------------------------------------------------------
     let response = host_call(&request(
         "/counter/echo",
-        &serde_json::json!({"n": 1}),
+        &serde_json::Count { n: 1 },
         false,
     ))
     .expect("a non-notify request produces a response");

@@ -3,7 +3,7 @@
 mod common;
 
 use common::{
-    TestServer, TransportFlakyServer, error_response_for, json_response_for, unused_port,
+    Empty, TestServer, TransportFlakyServer, error_response_for, json_response_for, unused_port,
 };
 use repe::{
     ErrorCode, Fleet, FleetError, FleetOptions, NodeConfig, RemoteResult, RepeError, RetryPolicy,
@@ -259,7 +259,7 @@ fn fleet_retry_policy_recovers_from_transport_errors() {
     assert_eq!(connected.connected, vec!["flaky".to_string()]);
 
     let result = fleet
-        .call_typed_json("flaky", "/flaky", Some(&json!({})))
+        .call_typed_json("flaky", "/flaky", Some(&Empty))
         .unwrap();
     assert!(result.succeeded());
     let payload = result.value.as_ref().unwrap();
@@ -303,7 +303,7 @@ fn fleet_retry_policy_does_not_retry_application_errors() {
     assert_eq!(connected.connected, vec!["flaky".to_string()]);
 
     let result = fleet
-        .call_typed_json("flaky", "/flaky", Some(&json!({})))
+        .call_typed_json("flaky", "/flaky", Some(&Empty))
         .unwrap();
     assert!(result.failed());
     assert!(matches!(

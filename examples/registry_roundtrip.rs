@@ -15,7 +15,7 @@ fn request_json(path: &str, body: &Value) -> Message {
         .query_str(path)
         .query_format(QueryFormat::JsonPointer)
         .body_json(body)
-                .build()
+        .build()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

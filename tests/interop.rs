@@ -34,7 +34,12 @@ struct Manifest {
     note: String,
     fixtures: Vec<Fixture>,
 }
-structio::object!(Manifest { repe_version, glaze_version, note, fixtures });
+structio::object!(Manifest {
+    repe_version,
+    glaze_version,
+    note,
+    fixtures
+});
 
 #[derive(Default, Debug)]
 struct Fixture {
@@ -59,7 +64,23 @@ struct Fixture {
     /// Whether tier 4 (from-scratch byte identity) should be asserted.
     encoder_parity: bool,
 }
-structio::object!(Fixture { name, description, id, notify, ec, query_format, body_format, query_length, body_length, length, query, body_kind, body_json, body_text, encoder_parity });
+structio::object!(Fixture {
+    name,
+    description,
+    id,
+    notify,
+    ec,
+    query_format,
+    body_format,
+    query_length,
+    body_length,
+    length,
+    query,
+    body_kind,
+    body_json,
+    body_text,
+    encoder_parity
+});
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("interop/fixtures")
@@ -239,7 +260,13 @@ struct DemoBodyV1 {
     active: bool,
     values: Vec<i32>,
 }
-structio::object!(DemoBodyV1 { name, count, ratio, active, values });
+structio::object!(DemoBodyV1 {
+    name,
+    count,
+    ratio,
+    active,
+    values
+});
 
 /// The version-skew guarantee, pinned against bytes repe did not author: a
 /// request body a newer client produced with object keys an older server never

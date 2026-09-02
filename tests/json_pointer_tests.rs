@@ -2,6 +2,13 @@
 
 use repe::{eval_json_pointer, parse_json_pointer};
 
+// ---- wire fixtures ----
+
+/// An empty body: `{}` on the wire.
+#[derive(Default, Debug, PartialEq)]
+struct Empty;
+structio::object!(Empty {});
+
 #[test]
 fn parse_json_pointer_basic() {
     let toks = parse_json_pointer("/a/b~1c/~0~0");

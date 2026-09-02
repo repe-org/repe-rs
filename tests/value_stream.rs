@@ -20,7 +20,12 @@ struct Payload {
     samples: Vec<f64>,
     tags: Vec<String>,
 }
-structio::object!(Payload { id, label, samples, tags });
+structio::object!(Payload {
+    id,
+    label,
+    samples,
+    tags
+});
 
 fn sample_payload() -> Payload {
     // Large enough (~1.6 MiB of f64 plus strings) to span many chunks once the

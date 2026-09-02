@@ -218,7 +218,7 @@ fn write<T: serde::Serialize>(query: &str, value: &T) -> Vec<u8> {
         .query_str(query)
         .query_format(QueryFormat::JsonPointer)
         .body_json(value)
-                .build()
+        .build()
         .to_vec()
 }
 

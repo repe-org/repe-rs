@@ -73,7 +73,7 @@ fn request(path: &str, body: serde_json::Value) -> Vec<u8> {
         .query_str(path)
         .query_format(QueryFormat::JsonPointer)
         .body_json(&body)
-                .build()
+        .build()
         .to_vec()
 }
 

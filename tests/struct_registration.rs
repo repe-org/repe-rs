@@ -75,7 +75,11 @@ struct MyNestedFunctions {
     meta_functions: MetaFunctions,
     my_string: String,
 }
-structio::object!(MyNestedFunctions { my_functions, meta_functions, my_string });
+structio::object!(MyNestedFunctions {
+    my_functions,
+    meta_functions,
+    my_string
+});
 
 impl MyNestedFunctions {
     fn append_awesome(&self, input: String) -> String {
@@ -117,7 +121,11 @@ struct AttributeStruct {
     #[repe(readonly)]
     name: String,
 }
-structio::object!(AttributeStruct { value, hidden, name });
+structio::object!(AttributeStruct {
+    value,
+    hidden,
+    name
+});
 
 impl AttributeStruct {
     fn describe(&self) -> String {
@@ -144,7 +152,7 @@ fn request_json(path: &str, body: &Value) -> Message {
         .query_str(path)
         .query_format(QueryFormat::JsonPointer)
         .body_json(body)
-                .build()
+        .build()
 }
 
 fn parse_body(resp: &Message) -> Value {
@@ -564,7 +572,7 @@ fn root_write_replaces_struct() {
         .query_str("")
         .query_format(QueryFormat::JsonPointer)
         .body_json(&json!({"foo": 5, "bar": "five"}))
-                .build();
+        .build();
     let resp = router.get("").unwrap().handle(&replace).unwrap();
     assert_eq!(parse_body(&resp), Value::Null);
 

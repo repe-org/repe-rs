@@ -27,6 +27,13 @@ use repe::{
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
+// ---- wire fixtures ----
+
+/// An empty body: `{}` on the wire.
+#[derive(Default, Debug, PartialEq)]
+struct Empty;
+structio::object!(Empty {});
+
 fn echo_router() -> Router {
     Router::new().with_typed("/echo", |payload: Value| Ok(json!({ "saw": payload })))
 }
@@ -202,7 +209,7 @@ async fn hooks_and_the_peer_registry_fire_on_an_adopted_connection() {
     // Round-trip first: the connect hook runs before traffic is processed, so a
     // completed call proves it has already fired without polling for it.
     let _: Value = client
-        .call_typed_json::<_, _, Value>("/echo", &json!({}))
+        .call_typed_json::<_, _, Value>("/echo", &Empty)
         .await
         .expect("call");
 
@@ -243,7 +250,7 @@ async fn disconnect_teardown_runs_on_an_adopted_connection() {
             .await
             .expect("connect");
         let _: Value = client
-            .call_typed_json::<_, _, Value>("/echo", &json!({}))
+            .call_typed_json::<_, _, Value>("/echo", &Empty)
             .await
             .expect("call");
         assert_eq!(peers.len(), 1);
@@ -283,7 +290,7 @@ async fn handshake_hooks_fire_when_the_embedder_captures_the_request() {
         .await
         .expect("connect");
     let _: Value = client
-        .call_typed_json::<_, _, Value>("/echo", &json!({}))
+        .call_typed_json::<_, _, Value>("/echo", &Empty)
         .await
         .expect("call");
 
@@ -377,7 +384,7 @@ async fn cancelling_the_shared_token_winds_down_an_adopted_connection() {
         .await
         .expect("connect");
     let _: Value = client
-        .call_typed_json::<_, _, Value>("/echo", &json!({}))
+        .call_typed_json::<_, _, Value>("/echo", &Empty)
         .await
         .expect("call");
     assert_eq!(peers.len(), 1);
@@ -471,7 +478,7 @@ fn request_bytes(n: u64) -> Vec<u8> {
         .query_format(QueryFormat::JsonPointer)
         .query_str("/echo")
         .body_json(&json!({ "n": n }))
-                .build()
+        .build()
         .into_wire_bytes()
 }
 

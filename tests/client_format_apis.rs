@@ -6,6 +6,16 @@ use std::net::TcpListener;
 use std::thread;
 use std::time::Duration;
 
+// ---- wire fixtures ----
+
+/// A tagged response, for tests driving several routes through one server.
+#[derive(Default, Debug, PartialEq)]
+struct Kind {
+    kind: String,
+    n: i64,
+}
+structio::object!(Kind { kind, n });
+
 #[derive(Default, Debug)]
 struct ReadPayload {
     kind: String,
@@ -13,7 +23,7 @@ struct ReadPayload {
 }
 structio::object!(ReadPayload { kind, n });
 
-fn json_response_for(req: &Message, body: &Value) -> Message {
+fn json_response_for<T: structio::json::Write + ?Sized>(req: &Message, body: &T) -> Message {
     Message::builder()
         .id(req.header.id)
         .query_bytes(req.query.clone())
@@ -21,7 +31,7 @@ fn json_response_for(req: &Message, body: &Value) -> Message {
             QueryFormat::try_from(req.header.query_format).unwrap_or(QueryFormat::RawBinary),
         )
         .body_json(body)
-                .build()
+        .build()
 }
 
 #[test]
@@ -41,7 +51,13 @@ fn sync_call_message_and_registry_read_send_empty_body() {
         assert_eq!(first.header.body_length, 0);
         assert!(first.body.is_empty());
 
-        let first_response = json_response_for(&first, &json!({"kind": "message"}));
+        let first_response = json_response_for(
+            &first,
+            &Kind {
+                kind: "message".into(),
+                n: 0,
+            },
+        );
         write_message(&mut writer, &first_response).expect("write first response");
         writer.flush().expect("flush first response");
 
@@ -52,7 +68,13 @@ fn sync_call_message_and_registry_read_send_empty_body() {
         assert_eq!(second.header.body_length, 0);
         assert!(second.body.is_empty());
 
-        let second_response = json_response_for(&second, &json!({"kind": "read", "n": 5}));
+        let second_response = json_response_for(
+            &second,
+            &Kind {
+                kind: "read".into(),
+                n: 5,
+            },
+        );
         write_message(&mut writer, &second_response).expect("write second response");
         writer.flush().expect("flush second response");
 
@@ -63,7 +85,13 @@ fn sync_call_message_and_registry_read_send_empty_body() {
         assert_eq!(third.header.body_length, 0);
         assert!(third.body.is_empty());
 
-        let third_response = json_response_for(&third, &json!({"kind": "typed", "n": 7}));
+        let third_response = json_response_for(
+            &third,
+            &Kind {
+                kind: "typed".into(),
+                n: 7,
+            },
+        );
         write_message(&mut writer, &third_response).expect("write third response");
         writer.flush().expect("flush third response");
     });
@@ -74,7 +102,9 @@ fn sync_call_message_and_registry_read_send_empty_body() {
     let decoded = message.json_body::<Value>().expect("decode JSON");
     assert_eq!(decoded["kind"], "message");
 
-    let read_value = client.registry_read_typed("/second").expect("registry_read");
+    let read_value = client
+        .registry_read_typed("/second")
+        .expect("registry_read");
     assert_eq!(read_value["kind"], "read");
     assert_eq!(read_value["n"], 5);
 
@@ -139,7 +169,13 @@ fn sync_registry_read_typed_deserializes_target_type() {
         assert_eq!(request.query_utf8(), "/typed");
         assert_eq!(request.header.body_length, 0);
 
-        let response = json_response_for(&request, &json!({"kind": "typed", "n": 11}));
+        let response = json_response_for(
+            &request,
+            &Kind {
+                kind: "typed".into(),
+                n: 11,
+            },
+        );
         write_message(&mut writer, &response).expect("write response");
         writer.flush().expect("flush response");
     });

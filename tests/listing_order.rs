@@ -40,7 +40,12 @@ struct Ordered {
     #[repe(skip)]
     ratio: f64,
 }
-structio::object!(Ordered { name, count, total, ratio });
+structio::object!(Ordered {
+    name,
+    count,
+    total,
+    ratio
+});
 
 #[repe::methods]
 impl Ordered {
@@ -72,7 +77,12 @@ struct Appended {
     #[repe(skip)]
     ratio: f64,
 }
-structio::object!(Appended { name, count, total, ratio });
+structio::object!(Appended {
+    name,
+    count,
+    total,
+    ratio
+});
 
 #[repe::methods]
 impl Appended {

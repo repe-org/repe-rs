@@ -53,6 +53,32 @@ pub struct Sum {
 }
 structio::object!(Sum { sum });
 
+/// A response that echoes back the request's own query, for tests that only
+/// need to prove which request a response belongs to.
+#[derive(Default, Debug, PartialEq)]
+pub struct Echo {
+    pub path: String,
+}
+structio::object!(Echo { path });
+
+/// [`Echo`] plus the request id, for the multiplexing tests, where the pairing
+/// of response to request is the thing under test.
+#[derive(Default, Debug, PartialEq)]
+pub struct EchoId {
+    pub path: String,
+    pub id: u64,
+}
+structio::object!(EchoId { path, id });
+
+/// A tagged response, for tests that drive several routes through one server
+/// and need to tell the answers apart.
+#[derive(Default, Debug, PartialEq)]
+pub struct Kind {
+    pub kind: String,
+    pub n: i64,
+}
+structio::object!(Kind { kind, n });
+
 #[derive(Default, Debug, PartialEq)]
 pub struct Attempt {
     pub success: bool,

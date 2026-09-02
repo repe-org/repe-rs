@@ -166,9 +166,7 @@ fn write_message_complex_slice_frames_identically_to_owned() {
 fn decode_typed_slice_rejects_non_beve_body() {
     // A JSON body is not a BEVE typed array; decode must report the format
     // mismatch as `UnexpectedBodyFormat`, not attempt a bulk read.
-    let msg = Message::builder()
-        .body_json(&vec![1.0f64, 2.0])
-                .build();
+    let msg = Message::builder().body_json(&vec![1.0f64, 2.0]).build();
     let err = msg.decode_typed_slice::<f64>().unwrap_err();
     assert!(
         matches!(
