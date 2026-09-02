@@ -99,15 +99,15 @@ async fn async_call_message_and_registry_read_send_empty_body() {
     let client = AsyncClient::connect(addr).await.expect("connect client");
 
     let message = client.call_message("/first").await.expect("call_message");
-    let decoded = message.json_body::<Value>().expect("decode JSON");
-    assert_eq!(decoded["kind"], "message");
+    let decoded = message.json_body::<Kind>().expect("decode JSON");
+    assert_eq!(decoded.kind, "message");
 
-    let read_value = client
+    let read_value: Kind = client
         .registry_read_typed("/second")
         .await
-        .expect("registry_read");
-    assert_eq!(read_value["kind"], "read");
-    assert_eq!(read_value["n"], 5);
+        .expect("registry_read_typed");
+    assert_eq!(read_value.kind, "read");
+    assert_eq!(read_value.n, 5);
 
     let typed: ReadPayload = client
         .registry_read_typed_with_timeout("/third", Duration::from_secs(1))

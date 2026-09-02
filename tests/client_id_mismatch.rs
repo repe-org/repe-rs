@@ -51,7 +51,7 @@ fn client_unrecognized_response_id_is_discarded() {
     let client = client::Client::connect(addr).unwrap();
     let (done_tx, done_rx) = mpsc::channel();
     let worker = thread::spawn(move || {
-        let result = client.call_typed_json("/x", &Operands { a: 1, b: 0 });
+        let result = client.call_typed_json::<_, _, Ack>("/x", &Operands { a: 1, b: 0 });
         let _ = done_tx.send(result);
     });
 
@@ -90,7 +90,7 @@ fn client_preserves_structured_fatal_response_loop_error() {
 
     let client = client::Client::connect(addr).unwrap();
     let err = client
-        .call_typed_json("/fatal", &Operands { a: 1, b: 0 })
+        .call_typed_json::<_, _, Ack>("/fatal", &Operands { a: 1, b: 0 })
         .unwrap_err();
     match err {
         RepeError::InvalidSpec(0) => {}
@@ -122,12 +122,11 @@ fn client_notify_sets_flag_and_does_not_wait_for_response() {
         let msg = read_message(&mut reader).unwrap();
         assert_eq!(msg.header.notify, 1);
         assert_eq!(msg.query_utf8(), "/notify");
-        let body: serde_json::Value = serde_json::from_slice(&msg.body).unwrap();
-        assert_eq!(body["ok"], true);
+        assert!(structio::from_slice::<Ack>(&msg.body).unwrap().ok);
         let typed_msg = read_message(&mut reader).unwrap();
         assert_eq!(typed_msg.header.notify, 1);
         assert_eq!(typed_msg.query_utf8(), "/notify_typed_json");
-        let typed_body: NotifyPayload = serde_json::from_slice(&typed_msg.body).unwrap();
+        let typed_body: NotifyPayload = structio::from_slice(&typed_msg.body).unwrap();
         assert_eq!(typed_body, NotifyPayload { ok: true });
 
         let beve_msg = read_message(&mut reader).unwrap();
