@@ -29,13 +29,45 @@ use tokio::net::{TcpListener, TcpStream};
 
 // ---- wire fixtures ----
 
+#[derive(Default, Debug, PartialEq)]
+struct Count {
+    n: i64,
+}
+structio::object!(Count { n });
+
+#[derive(Default, Debug, PartialEq)]
+struct BlobRequest {
+    len: usize,
+}
+structio::object!(BlobRequest { len });
+
+#[derive(Default, Debug, PartialEq)]
+struct Blob {
+    data: String,
+}
+structio::object!(Blob { data });
+
+#[derive(Default, Debug, PartialEq)]
+struct Echo {
+    saw: Count,
+}
+structio::object!(Echo { saw });
+
+#[derive(Default, Debug, PartialEq)]
+struct Ping {
+    hello: bool,
+}
+structio::object!(Ping { hello });
+
+// ---- wire fixtures ----
+
 /// An empty body: `{}` on the wire.
 #[derive(Default, Debug, PartialEq)]
 struct Empty;
 structio::object!(Empty {});
 
 fn echo_router() -> Router {
-    Router::new().with_typed("/echo", |payload: Value| Ok(json!({ "saw": payload })))
+    Router::new().with_typed("/echo", |payload: Count| Ok(Echo { saw: payload }))
 }
 
 /// Read the upgrade request off `stream` and answer `101`, the way an HTTP
@@ -168,19 +200,19 @@ async fn an_adopted_connection_serves_requests() {
         .await
         .expect("connect");
 
-    let got: Value = client
-        .call_typed_json::<_, _, Value>("/echo", &json!({ "n": 7 }))
+    let got: Echo = client
+        .call_typed_json::<_, _, Echo>("/echo", &Count { n: 7 })
         .await
         .expect("call");
-    assert_eq!(got["saw"]["n"], 7);
+    assert_eq!(got.saw.n, 7);
 
     // Not a one-shot: the reader/writer pair keeps running on the adopted
     // stream the same as on an accepted one.
-    let again: Value = client
-        .call_typed_json::<_, _, Value>("/echo", &json!({ "n": 8 }))
+    let again: Echo = client
+        .call_typed_json::<_, _, Echo>("/echo", &Count { n: 8 })
         .await
         .expect("second call");
-    assert_eq!(again["saw"]["n"], 8);
+    assert_eq!(again.saw.n, 8);
 }
 
 /// Push works on an adopted connection: connect hooks fire and an attached
@@ -208,17 +240,15 @@ async fn hooks_and_the_peer_registry_fire_on_an_adopted_connection() {
         .expect("connect");
     // Round-trip first: the connect hook runs before traffic is processed, so a
     // completed call proves it has already fired without polling for it.
-    let _: Value = client
-        .call_typed_json::<_, _, Value>("/echo", &Empty)
+    let _: Echo = client
+        .call_typed_json::<_, _, Echo>("/echo", &Count::default())
         .await
         .expect("call");
 
     assert_eq!(connects.load(Ordering::SeqCst), 1);
     assert_eq!(peers.len(), 1, "the adopted peer should be registered");
 
-    let delivered = peers
-        .broadcast_notify_json("/ping", &json!({ "hello": true }))
-        .expect("encode notify");
+    let delivered = peers.broadcast_notify_json("/ping", &Ping { hello: true });
     assert_eq!(delivered.len(), 1);
     assert!(
         delivered.values().all(Result::is_ok),
@@ -249,8 +279,8 @@ async fn disconnect_teardown_runs_on_an_adopted_connection() {
         let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
             .await
             .expect("connect");
-        let _: Value = client
-            .call_typed_json::<_, _, Value>("/echo", &Empty)
+        let _: Echo = client
+            .call_typed_json::<_, _, Echo>("/echo", &Count::default())
             .await
             .expect("call");
         assert_eq!(peers.len(), 1);
@@ -289,8 +319,8 @@ async fn handshake_hooks_fire_when_the_embedder_captures_the_request() {
     let client = WebSocketClient::connect(&format!("ws://{addr}/repe?token=abc123"))
         .await
         .expect("connect");
-    let _: Value = client
-        .call_typed_json::<_, _, Value>("/echo", &Empty)
+    let _: Echo = client
+        .call_typed_json::<_, _, Echo>("/echo", &Count::default())
         .await
         .expect("call");
 
@@ -344,9 +374,10 @@ async fn adopt_upgraded_fixes_the_servers_configured_inbound_thresholds() {
 /// substituted rather than sent.
 #[tokio::test]
 async fn an_adopted_connection_enforces_the_outbound_guard() {
-    let router = Router::new().with_typed("/blob", |payload: Value| {
-        let len = payload.get("len").and_then(Value::as_u64).unwrap_or(0) as usize;
-        Ok(json!({ "data": "x".repeat(len) }))
+    let router = Router::new().with_typed("/blob", |payload: BlobRequest| {
+        Ok(Blob {
+            data: "x".repeat(payload.len),
+        })
     });
     let small = WebSocketLimits::default().with_assumed_peer_frame_limit(Some(4096));
     let (addr, _) = spawn_adopting_server(
@@ -359,7 +390,7 @@ async fn an_adopted_connection_enforces_the_outbound_guard() {
         .await
         .expect("connect");
     let err = client
-        .call_typed_json::<_, _, Value>("/blob", &json!({ "len": 64 * 1024 }))
+        .call_typed_json::<_, _, Blob>("/blob", &BlobRequest { len: 64 * 1024 })
         .await
         .expect_err("the configured outbound guard must refuse this response");
     assert!(
@@ -383,8 +414,8 @@ async fn cancelling_the_shared_token_winds_down_an_adopted_connection() {
     let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
         .await
         .expect("connect");
-    let _: Value = client
-        .call_typed_json::<_, _, Value>("/echo", &Empty)
+    let _: Echo = client
+        .call_typed_json::<_, _, Echo>("/echo", &Count::default())
         .await
         .expect("call");
     assert_eq!(peers.len(), 1);
@@ -408,7 +439,7 @@ async fn a_connection_that_is_not_a_tcp_stream_can_be_served() {
     tokio::spawn(async move { shared.serve_connection(ws).await });
 
     let mut client = raw_client(client_io).await;
-    assert_eq!(round_trip(&mut client, 9).await["saw"]["n"], 9);
+    assert_eq!(round_trip(&mut client, 9).await.saw.n, 9);
 }
 
 /// Bytes a framework read past the upgrade request are decoded ahead of the
@@ -456,7 +487,7 @@ async fn buffered_bytes_are_decoded_before_the_stream() {
         .await
         .expect("a response frame")
         .expect("frame is not an error");
-    assert_eq!(decode(frame)["saw"]["n"], 11);
+    assert_eq!(decode(frame).saw.n, 11);
 }
 
 // ---- helpers for the handshake-free (raw stream) tests ----
@@ -477,12 +508,12 @@ fn request_bytes(n: u64) -> Vec<u8> {
         .id(1)
         .query_format(QueryFormat::JsonPointer)
         .query_str("/echo")
-        .body_json(&json!({ "n": n }))
+        .body_json(&Count { n: n as i64 })
         .build()
         .into_wire_bytes()
 }
 
-fn decode(frame: repe::tokio_tungstenite::tungstenite::Message) -> Value {
+fn decode(frame: repe::tokio_tungstenite::tungstenite::Message) -> Echo {
     use repe::tokio_tungstenite::tungstenite::Message as WsMessage;
     let WsMessage::Binary(bytes) = frame else {
         panic!("expected a binary REPE frame, got {frame:?}");
@@ -493,7 +524,7 @@ fn decode(frame: repe::tokio_tungstenite::tungstenite::Message) -> Value {
         .expect("json body")
 }
 
-async fn round_trip(client: &mut RawClient, n: u64) -> Value {
+async fn round_trip(client: &mut RawClient, n: u64) -> Echo {
     use futures_util::{SinkExt, StreamExt};
     use repe::tokio_tungstenite::tungstenite::Message as WsMessage;
     client

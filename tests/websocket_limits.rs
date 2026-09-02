@@ -13,6 +13,26 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use repe::server::Router;
 use repe::{RepeError, WebSocketClient, WebSocketLimits, WebSocketServer};
 
+// ---- wire fixtures ----
+
+#[derive(Default, Debug, PartialEq)]
+struct BlobRequest {
+    len: usize,
+}
+structio::object!(BlobRequest { len });
+
+#[derive(Default, Debug, PartialEq)]
+struct Padding {
+    pad: String,
+}
+structio::object!(Padding { pad });
+
+#[derive(Default, Debug, PartialEq)]
+struct Blob {
+    data: String,
+}
+structio::object!(Blob { data });
+
 /// Spawn a detached server for `router` on an ephemeral port and connect a
 /// client, both with the given limits.
 async fn pair(
@@ -35,9 +55,10 @@ async fn pair(
 
 /// A router whose one route returns a body of `len` bytes.
 fn echo_sized_router() -> Router {
-    Router::new().with_typed("/blob", |payload: Value| {
-        let len = payload.get("len").and_then(Value::as_u64).unwrap_or(0) as usize;
-        Ok(json!({ "data": "x".repeat(len) }))
+    Router::new().with_typed("/blob", |payload: BlobRequest| {
+        Ok(Blob {
+            data: "x".repeat(payload.len),
+        })
     })
 }
 
@@ -53,7 +74,7 @@ async fn an_oversized_response_becomes_an_error_and_the_connection_survives() {
     let client = pair(echo_sized_router(), small, small).await;
 
     let err = client
-        .call_typed_json::<_, _, Value>("/blob", &json!({ "len": 256 * 1024 }))
+        .call_typed_json::<_, _, Blob>("/blob", &BlobRequest { len: 256 * 1024 })
         .await
         .expect_err("an undeliverable response must not look like success");
     let text = err.to_string();
@@ -64,11 +85,11 @@ async fn an_oversized_response_becomes_an_error_and_the_connection_survives() {
 
     // The point of substituting an error rather than sending: the socket is
     // still usable. A torn-down connection would fail this.
-    let ok: Value = client
-        .call_typed_json::<_, _, Value>("/blob", &json!({ "len": 8 }))
+    let ok: Blob = client
+        .call_typed_json::<_, _, Blob>("/blob", &BlobRequest { len: 8 })
         .await
         .expect("connection must survive a refused response");
-    assert_eq!(ok["data"], "xxxxxxxx");
+    assert_eq!(ok.data, "xxxxxxxx");
 }
 
 /// The refusal is reported to the server's own error hooks too, so an operator
@@ -97,7 +118,7 @@ async fn the_server_reports_a_refused_response_through_its_error_hooks() {
         .expect("connect");
 
     let _ = client
-        .call_typed_json::<_, _, Value>("/blob", &json!({ "len": 64 * 1024 }))
+        .call_typed_json::<_, _, Blob>("/blob", &BlobRequest { len: 64 * 1024 })
         .await;
     assert_eq!(
         seen.load(Ordering::SeqCst),
@@ -114,7 +135,12 @@ async fn an_oversized_request_is_refused_locally_without_dropping_the_connection
     let client = pair(echo_sized_router(), small, small).await;
 
     let err = client
-        .call_typed_json::<_, _, Value>("/blob", &json!({ "pad": "y".repeat(32 * 1024) }))
+        .call_typed_json::<_, _, Blob>(
+            "/blob",
+            &Padding {
+                pad: "y".repeat(32 * 1024),
+            },
+        )
         .await
         .expect_err("an oversized request must be refused");
     assert!(
@@ -122,11 +148,11 @@ async fn an_oversized_request_is_refused_locally_without_dropping_the_connection
         "expected MessageTooLarge, got: {err}"
     );
 
-    let ok: Value = client
-        .call_typed_json::<_, _, Value>("/blob", &json!({ "len": 4 }))
+    let ok: Blob = client
+        .call_typed_json::<_, _, Blob>("/blob", &BlobRequest { len: 4 })
         .await
         .expect("connection must survive a locally refused request");
-    assert_eq!(ok["data"], "xxxx");
+    assert_eq!(ok.data, "xxxx");
 }
 
 /// Raising the limits on both ends carries a payload that the defaults refuse,
@@ -144,7 +170,7 @@ async fn raising_the_limits_on_both_ends_carries_a_payload_the_defaults_refuse()
     let strict = pair(echo_sized_router(), Default::default(), Default::default()).await;
     assert!(
         strict
-            .call_typed_json::<_, _, Value>("/blob", &json!({ "len": big_len }))
+            .call_typed_json::<_, _, Blob>("/blob", &BlobRequest { len: big_len })
             .await
             .is_err(),
         "the default limits should refuse a 20 MiB response"
@@ -152,11 +178,11 @@ async fn raising_the_limits_on_both_ends_carries_a_payload_the_defaults_refuse()
 
     // ...and raising both ends carries it.
     let client = pair(echo_sized_router(), generous, generous).await;
-    let got: Value = client
-        .call_typed_json::<_, _, Value>("/blob", &json!({ "len": big_len }))
+    let got: Blob = client
+        .call_typed_json::<_, _, Blob>("/blob", &BlobRequest { len: big_len })
         .await
         .expect("raised limits should carry a 20 MiB response");
-    assert_eq!(got["data"].as_str().expect("data").len(), big_len);
+    assert_eq!(got.data.len(), big_len);
 }
 
 /// Turning the guard off restores the unguarded behavior, for a peer whose
@@ -167,9 +193,9 @@ async fn clearing_the_assumed_peer_limit_sends_without_checking() {
     // The client sends without checking; the server accepts it because its own
     // inbound thresholds are the generous defaults.
     let client = pair(echo_sized_router(), Default::default(), unguarded).await;
-    let got: Value = client
-        .call_typed_json::<_, _, Value>("/blob", &json!({ "len": 16 }))
+    let got: Blob = client
+        .call_typed_json::<_, _, Blob>("/blob", &BlobRequest { len: 16 })
         .await
         .expect("a request under the peer's inbound limit still works");
-    assert_eq!(got["data"].as_str().expect("data").len(), 16);
+    assert_eq!(got.data.len(), 16);
 }
