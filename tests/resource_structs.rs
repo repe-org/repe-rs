@@ -32,8 +32,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use repe::constants::{ErrorCode, QueryFormat};
-use repe::structs::{StructError, StructResult, path_from_segments};
+use repe::constants::{BodyFormat, ErrorCode, QueryFormat};
+use repe::structs::{RequestBody, ResponseBody, StructError, StructResult, path_from_segments};
 use repe::{Message, RepeStruct, Router};
 
 // ---------------------------------------------------------------------------
@@ -57,12 +57,27 @@ structio::object!(Settings {
     writes
 });
 
+/// What a whole-object write means for `Settings`: only the keys the caller
+/// named move, and each one counts.
+///
+/// Declared separately from [`Settings`] itself because it is a different
+/// shape: every field is optional, so `{"retries": 5}` is a legal document and
+/// says nothing about `timeout`. Under a document model this was a map walked
+/// key by key; here it is a type, and the absent members simply stay `None`.
+#[derive(Default)]
+struct SettingsPatch {
+    retries: Option<u32>,
+    timeout: Option<u32>,
+}
+structio::object!(SettingsPatch { retries, timeout });
+
 impl RepeStruct for Settings {
-    fn repe_handle(
+    fn repe_handle_into(
         &mut self,
         segments: &[&str],
-        body: Option<Value>,
-    ) -> StructResult<Option<Value>> {
+        body: Option<RequestBody<'_>>,
+        out: &mut ResponseBody<'_>,
+    ) -> StructResult<()> {
         let field = |this: &Settings, name: &str| match name {
             "retries" => Some(this.retries),
             "timeout" => Some(this.timeout),
@@ -70,42 +85,33 @@ impl RepeStruct for Settings {
             _ => None,
         };
         match (segments, body) {
-            ([], None) => Ok(Some(json!({
-                "retries": self.retries,
-                "timeout": self.timeout,
-                "writes": self.writes,
-            }))),
+            ([], None) => {
+                out.write(self);
+                Ok(())
+            }
             // The applying semantics: only the named keys move.
-            ([], Some(Value::Object(map))) => {
-                for (key, value) in map {
-                    let value: u32 = serde_json::from_value(value).map_err(|source| {
-                        StructError::Deserialize {
-                            path: format!("/{key}"),
-                            source,
-                        }
-                    })?;
-                    match key.as_str() {
+            ([], Some(body)) => {
+                let patch: SettingsPatch = body.read("")?;
+                for (name, value) in [("retries", patch.retries), ("timeout", patch.timeout)] {
+                    let Some(value) = value else { continue };
+                    match name {
                         "retries" => self.retries = value,
-                        "timeout" => self.timeout = value,
-                        _ => {
-                            return Err(StructError::InvalidPath {
-                                path: format!("/{key}"),
-                            });
-                        }
+                        _ => self.timeout = value,
                     }
                     self.writes += 1;
                 }
-                Ok(None)
+                out.write_null();
+                Ok(())
             }
-            ([], Some(_)) => Err(StructError::Deserialize {
-                path: String::new(),
-                source: serde::de::Error::custom("settings are written as an object"),
-            }),
-            ([name], None) => field(self, name)
-                .map(|value| Some(json!(value)))
-                .ok_or_else(|| StructError::InvalidPath {
+            ([name], None) => match field(self, name) {
+                Some(value) => {
+                    out.write(&value);
+                    Ok(())
+                }
+                None => Err(StructError::InvalidPath {
                     path: path_from_segments(segments),
                 }),
+            },
             _ => Err(StructError::InvalidPath {
                 path: path_from_segments(segments),
             }),
@@ -181,12 +187,17 @@ fn read(query: &str) -> Vec<u8> {
         .to_vec()
 }
 
-fn write<T: Serialize>(query: &str, value: &T) -> Vec<u8> {
+/// A write whose body is the given JSON text, sent verbatim.
+///
+/// These tests are about what a *body* means to a struct that owns something,
+/// so the body is the text a client would send rather than a declared type.
+fn write(query: &str, body: &str) -> Vec<u8> {
     Message::builder()
         .id(1)
         .query_str(query)
         .query_format(QueryFormat::JsonPointer)
-        .body_json(value)
+        .body_bytes(body.as_bytes().to_vec())
+        .body_format(BodyFormat::Json)
         .build()
         .to_vec()
 }
@@ -198,10 +209,13 @@ fn answer(router: &Router, request: &[u8]) -> Message {
     Message::from_slice(&frame).expect("the response is a REPE frame")
 }
 
-fn body(router: &Router, request: &[u8]) -> Value {
-    answer(router, request)
-        .json_body::<Value>()
-        .expect("the response body is valid JSON")
+/// The response body as JSON text. Compared as text throughout: with no
+/// document model there is nothing between the bytes and the assertion.
+fn body(router: &Router, request: &[u8]) -> String {
+    let message = answer(router, request);
+    std::str::from_utf8(&message.body)
+        .expect("the response body is UTF-8 JSON")
+        .to_string()
 }
 
 /// One router per lock kind: a `Mutex` always takes the exclusive path, an
@@ -235,7 +249,7 @@ fn a_whole_child_write_reaches_the_child_s_own_impl() {
         );
         assert_eq!(
             body(&router, &read("/service/settings")),
-            json!({ "retries": 5, "timeout": 0, "writes": 1 }),
+            r##"{"retries":5,"timeout":0,"writes":1}"##,
             "under a {kind} the child applied one key rather than being replaced"
         );
 
@@ -247,7 +261,7 @@ fn a_whole_child_write_reaches_the_child_s_own_impl() {
         );
         assert_eq!(
             body(&router, &read("/service/settings")),
-            json!({ "retries": 5, "timeout": 3, "writes": 2 }),
+            r##"{"retries":5,"timeout":3,"writes":2}"##,
             "under a {kind} the second apply left the first key alone"
         );
     }
@@ -255,19 +269,30 @@ fn a_whole_child_write_reaches_the_child_s_own_impl() {
 
 #[test]
 fn a_whole_child_write_reports_the_child_s_own_error() {
+    // The child decides, and its refusal is what reaches the client rather than
+    // a generic parent-level one.
+    //
+    // *Which* refusal changed with the codec. The child used to walk the body
+    // key by key and could name the offending one (`/settings/nope`); it now
+    // reads into a declared `SettingsPatch`, and an unknown key is refused by
+    // the reader before the handler sees it. So the error is `InvalidBody`
+    // rather than `MethodNotFound`, and it names the byte the parse stopped at
+    // rather than the key — a worse message, bought with a decode that does not
+    // walk a map. What the test is about is unchanged: the message is the
+    // child's, carried up under the field that owns it.
     for (kind, router) in routers(service) {
         let message = answer(&router, &write("/service/settings", r##"{ "nope": 1 }"##));
         assert_eq!(
             message.error_code(),
-            Some(ErrorCode::MethodNotFound),
+            Some(ErrorCode::InvalidBody),
             "under a {kind} the child's refusal is what reaches the client"
         );
         let detail = message
             .error_message_utf8()
             .expect("an error frame carries a message");
         assert!(
-            detail.contains("/settings/nope"),
-            "under a {kind} the child's path is prefixed with the field: {detail}"
+            detail.contains("/settings"),
+            "under a {kind} the child's error is prefixed with the field: {detail}"
         );
     }
 }
@@ -284,7 +309,7 @@ fn a_derived_child_is_still_replaced_by_a_whole_child_write() {
         );
         assert_eq!(
             body(&router, &read("/service/counter")),
-            json!({ "ticks": 5, "source": "beta" }),
+            r##"{"ticks":5,"source":"beta"}"##,
             "under a {kind} a derived child still replaces"
         );
     }
@@ -293,10 +318,10 @@ fn a_derived_child_is_still_replaced_by_a_whole_child_write() {
 #[test]
 fn a_per_field_write_below_a_child_is_unchanged() {
     for (kind, router) in routers(service) {
-        answer(&router, &write("/service/counter/ticks", &42u64));
+        answer(&router, &write("/service/counter/ticks", "42"));
         assert_eq!(
             body(&router, &read("/service/counter/ticks")),
-            json!(42),
+            "42",
             "under a {kind} a write below the child still lands on the field"
         );
     }
@@ -329,7 +354,7 @@ fn every_write_answers_the_same_under_both_locks() {
             "no_replace root",
             write("/service", r##"{ "version": 9 }"##),
         ),
-        ("field write", write("/service/version", &9u32)),
+        ("field write", write("/service/version", "9")),
         (
             "whole child apply",
             write("/service/settings", r##"{ "retries": 5 }"##),
@@ -342,10 +367,7 @@ fn every_write_answers_the_same_under_both_locks() {
             "derived child replace",
             write("/service/counter", r##"{ "ticks": 5, "source": "beta" }"##),
         ),
-        (
-            "nested field write",
-            write("/service/counter/ticks", &42u64),
-        ),
+        ("nested field write", write("/service/counter/ticks", "42")),
         (
             "absent child write",
             write("/service/aux", r##"{ "ticks": 1, "source": "x" }"##),
@@ -379,7 +401,7 @@ fn a_readonly_refusal_is_served_without_the_exclusive_guard() {
         ),
         (
             "readonly child, sub-path",
-            write("/service/fixed/ticks", &9u64),
+            write("/service/fixed/ticks", "9"),
         ),
     ] {
         let router = router.clone();
@@ -406,7 +428,7 @@ fn readonly_on_a_nested_field_refuses_every_write_through_it() {
                 "whole child",
                 write("/service/fixed", r##"{ "ticks": 9, "source": "x" }"##),
             ),
-            ("sub-path", write("/service/fixed/ticks", &9u64)),
+            ("sub-path", write("/service/fixed/ticks", "9")),
         ] {
             assert_eq!(
                 answer(&router, &request).error_code(),
@@ -417,10 +439,10 @@ fn readonly_on_a_nested_field_refuses_every_write_through_it() {
         // Reads are untouched, at the child and below it.
         assert_eq!(
             body(&router, &read("/service/fixed")),
-            json!({ "ticks": 1, "source": "static" }),
+            r##"{"ticks":1,"source":"static"}"##,
             "under a {kind} the child still reads whole"
         );
-        assert_eq!(body(&router, &read("/service/fixed/ticks")), json!(1));
+        assert_eq!(body(&router, &read("/service/fixed/ticks")), "1");
     }
 }
 
@@ -429,19 +451,17 @@ fn a_no_replace_struct_still_reads_and_still_writes_its_parts() {
     for (kind, router) in routers(service) {
         assert_eq!(
             body(&router, &read("/service")),
-            json!({
-                "version": 7,
-                "settings": { "retries": 0, "timeout": 0, "writes": 0 },
-                "counter": { "ticks": 990, "source": "local" },
-                "aux": null,
-                "fixed": { "ticks": 1, "source": "static" },
-            }),
+            concat!(
+                r#"{"version":7,"settings":{"retries":0,"timeout":0,"writes":0},"#,
+                r#""counter":{"ticks":990,"source":"local"},"aux":null,"#,
+                r#""fixed":{"ticks":1,"source":"static"}}"#
+            ),
             "under a {kind} the listing is unaffected by `#[repe(no_replace)]`"
         );
-        answer(&router, &write("/service/version", &9u32));
+        answer(&router, &write("/service/version", "9"));
         assert_eq!(
             body(&router, &read("/service/version")),
-            json!(9),
+            "9",
             "under a {kind} `#[repe(no_replace)]` refuses one operation on the whole object, \
              and leaves its fields writable"
         );
@@ -467,7 +487,7 @@ fn an_absent_child_reads_as_null_and_refuses_everything_else() {
     for (kind, router) in routers(service) {
         assert_eq!(
             body(&router, &read("/service/aux")),
-            Value::Null,
+            "null",
             "under a {kind} an absent child reads as null at its own path"
         );
         assert_eq!(
@@ -485,7 +505,7 @@ fn an_absent_child_reads_as_null_and_refuses_everything_else() {
             "under a {kind} configuring an absent child is an error, not a silent no-op"
         );
         assert_eq!(
-            answer(&router, &write("/service/aux/ticks", &1u64)).error_code(),
+            answer(&router, &write("/service/aux/ticks", "1")).error_code(),
             Some(ErrorCode::MethodNotFound),
             "under a {kind} a subpath write against an absent child is an error too"
         );
@@ -497,14 +517,14 @@ fn a_present_child_forwards_everything_to_the_inner_value() {
     for (kind, router) in routers(with_aux) {
         assert_eq!(
             body(&router, &read("/service/aux")),
-            json!({ "ticks": 12, "source": "alpha" }),
+            r##"{"ticks":12,"source":"alpha"}"##,
             "under a {kind} a present child reads as itself"
         );
-        assert_eq!(body(&router, &read("/service/aux/ticks")), json!(12));
-        answer(&router, &write("/service/aux/ticks", &34u64));
+        assert_eq!(body(&router, &read("/service/aux/ticks")), "12");
+        answer(&router, &write("/service/aux/ticks", "34"));
         assert_eq!(
             body(&router, &read("/service/aux/ticks")),
-            json!(34),
+            "34",
             "under a {kind} a write below a present child lands on the inner field"
         );
         answer(
@@ -513,7 +533,7 @@ fn a_present_child_forwards_everything_to_the_inner_value() {
         );
         assert_eq!(
             body(&router, &read("/service/aux")),
-            json!({ "ticks": 1, "source": "beta" }),
+            r##"{"ticks":1,"source":"beta"}"##,
             "under a {kind} a whole-child write reaches the inner value's own impl"
         );
     }
@@ -522,17 +542,15 @@ fn a_present_child_forwards_everything_to_the_inner_value() {
 #[test]
 fn an_absent_child_appears_in_its_parent_s_listing() {
     for (kind, router) in routers(service) {
-        assert_eq!(
-            body(&router, &read("/service"))["aux"],
-            Value::Null,
+        assert!(
+            body(&router, &read("/service")).contains(r#""aux":null"#),
             "under a {kind} the key is present with nothing behind it, rather than the listing \
              failing"
         );
     }
     for (kind, router) in routers(with_aux) {
-        assert_eq!(
-            body(&router, &read("/service"))["aux"],
-            json!({ "ticks": 12, "source": "alpha" }),
+        assert!(
+            body(&router, &read("/service")).contains(r#""aux":{"ticks":12,"source":"alpha"}"#),
             "under a {kind} a present child is listed as itself"
         );
     }
@@ -576,17 +594,17 @@ fn presence_is_not_settable_through_the_child_s_own_path() {
     for (kind, router) in routers(with_aux) {
         assert_eq!(
             body(&router, &read("/service/aux")),
-            json!({ "ticks": 12, "source": "alpha" }),
+            r##"{"ticks":12,"source":"alpha"}"##,
             "under a {kind} the child is present to begin with"
         );
         assert_eq!(
-            answer(&router, &write("/service/aux", &Value::Null)).error_code(),
+            answer(&router, &write("/service/aux", "null")).error_code(),
             Some(ErrorCode::InvalidBody),
             "under a {kind} a `null` write does not clear a present child"
         );
         assert_eq!(
             body(&router, &read("/service/aux")),
-            json!({ "ticks": 12, "source": "alpha" }),
+            r##"{"ticks":12,"source":"alpha"}"##,
             "under a {kind} it is still there"
         );
     }
@@ -594,11 +612,11 @@ fn presence_is_not_settable_through_the_child_s_own_path() {
     for (kind, router) in routers(service) {
         assert_eq!(
             body(&router, &read("/service/aux")),
-            Value::Null,
+            "null",
             "under a {kind} an absent child reads as null"
         );
         assert_eq!(
-            answer(&router, &write("/service/aux", &Value::Null)).error_code(),
+            answer(&router, &write("/service/aux", "null")).error_code(),
             Some(ErrorCode::InvalidBody),
             "under a {kind} writing that value back is refused rather than a silent no-op"
         );
@@ -610,7 +628,7 @@ fn presence_is_not_settable_through_the_child_s_own_path() {
     let held = state.read().expect("the lock is not poisoned");
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let _ = tx.send(router.call(&write("/service/aux", &Value::Null)));
+        let _ = tx.send(router.call(&write("/service/aux", "null")));
     });
     let frame = rx
         .recv_timeout(Duration::from_secs(10))
