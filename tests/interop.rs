@@ -82,6 +82,34 @@ structio::object!(Fixture {
     encoder_parity
 });
 
+/// The body every non-empty fixture carries, as the type a consumer declares.
+///
+/// The `*_unknown_key` fixtures carry members this declaration does not name;
+/// they decode all the same, because every REPE body is read under
+/// [`repe::WirePolicy`]. That is the schema-evolution guarantee, pinned here
+/// against bytes repe did not author.
+#[derive(Default, Debug, PartialEq)]
+struct DemoBody {
+    name: String,
+    count: i64,
+    ratio: f64,
+    active: bool,
+    values: Vec<i64>,
+}
+structio::object!(DemoBody {
+    name,
+    count,
+    ratio,
+    active,
+    values
+});
+
+/// The manifest's `body_json` for `fixture`, decoded.
+fn expected_body(fixture: &Fixture) -> DemoBody {
+    structio::json::from_str_with::<repe::WirePolicy, _>(&fixture.body_json)
+        .unwrap_or_else(|e| panic!("{}: manifest body_json: {e:?}", fixture.name))
+}
+
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("interop/fixtures")
 }
@@ -90,7 +118,11 @@ fn load_manifest() -> Manifest {
     let path = fixtures_dir().join("manifest.json");
     let text =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
+    // Read under the wire policy, so a manifest written against a newer version
+    // of this test — one carrying a field this build does not declare — is read
+    // rather than refused. The manifest is a fixture the C++ side also writes.
+    structio::json::from_str_with::<repe::WirePolicy, _>(&text)
+        .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
 }
 
 fn load_frame(name: &str) -> Vec<u8> {
@@ -171,27 +203,37 @@ fn glaze_fixtures_roundtrip_and_decode() {
 fn decode_and_check_body(f: &Fixture, msg: &Message) {
     match f.body_kind.as_str() {
         "none" => assert!(msg.body.is_empty(), "{}: expected empty body", f.name),
+        // The manifest's `body_json` is the expected body as canonical JSON. It
+        // is read into the same declared type the frame is, so the comparison
+        // is between two decoded values rather than between two trees — which
+        // is what a consumer of these frames actually does.
         "json" => {
-            let got: serde_json::Value = msg
+            let got: DemoBody = msg
                 .json_body()
                 .unwrap_or_else(|e| panic!("{}: json_body: {e:?}", f.name));
-            let want: serde_json::Value =
-                serde_json::from_str(&f.body_json).expect("manifest body_json");
-            assert_eq!(got, want, "{}: JSON body value mismatch", f.name);
+            assert_eq!(
+                got,
+                expected_body(f),
+                "{}: JSON body value mismatch",
+                f.name
+            );
         }
         "beve_struct" => {
-            let got: serde_json::Value = msg
+            let got: DemoBody = msg
                 .beve_body()
                 .unwrap_or_else(|e| panic!("{}: beve_body: {e:?}", f.name));
-            let want: serde_json::Value =
-                serde_json::from_str(&f.body_json).expect("manifest body_json");
-            assert_eq!(got, want, "{}: BEVE object body value mismatch", f.name);
+            assert_eq!(
+                got,
+                expected_body(f),
+                "{}: BEVE object body value mismatch",
+                f.name
+            );
         }
         "beve_f64" => {
             let got: Vec<f64> = msg
                 .decode_typed_slice()
                 .unwrap_or_else(|e| panic!("{}: decode_typed_slice: {e:?}", f.name));
-            let want: Vec<f64> = serde_json::from_str(&f.body_json).expect("manifest body_json");
+            let want: Vec<f64> = structio::from_str(&f.body_json).expect("manifest body_json");
             assert_eq!(got, want, "{}: BEVE numeric body mismatch", f.name);
         }
         "utf8" => {
@@ -230,7 +272,7 @@ fn build_equivalent(f: &Fixture) -> Message {
     match f.body_kind.as_str() {
         "none" => {}
         "beve_f64" => {
-            let nums: Vec<f64> = serde_json::from_str(&f.body_json).expect("manifest body_json");
+            let nums: Vec<f64> = structio::from_str(&f.body_json).expect("manifest body_json");
             b = b.body_typed_slice(&nums);
         }
         "utf8" => {

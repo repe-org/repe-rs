@@ -384,16 +384,17 @@ where
     F: Fn(&str) -> Option<BodyWriter> + Send + Sync + 'static,
 {
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
-        let open: OpenRequest = match structio::from_beve(&req.body) {
-            Ok(v) => v,
-            Err(_) => {
-                return Ok(error_like(
-                    req,
-                    ErrorCode::InvalidBody,
-                    "svs open: expected BEVE { resource: string }",
-                ));
-            }
-        };
+        let open: OpenRequest =
+            match structio::beve::from_slice_with::<crate::structs::WirePolicy, _>(&req.body) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Ok(error_like(
+                        req,
+                        ErrorCode::InvalidBody,
+                        "svs open: expected BEVE { resource: string }",
+                    ));
+                }
+            };
         let Some(body) = (self.make_body)(&open.resource) else {
             return Ok(error_like(
                 req,
@@ -439,16 +440,17 @@ impl HandlerErased for NextHandler {
     }
 
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
-        let next: NextRequest = match structio::from_beve(&req.body) {
-            Ok(v) => v,
-            Err(_) => {
-                return Ok(error_like(
-                    req,
-                    ErrorCode::InvalidBody,
-                    "svs next: expected BEVE { stream_id: u64 }",
-                ));
-            }
-        };
+        let next: NextRequest =
+            match structio::beve::from_slice_with::<crate::structs::WirePolicy, _>(&req.body) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Ok(error_like(
+                        req,
+                        ErrorCode::InvalidBody,
+                        "svs next: expected BEVE { stream_id: u64 }",
+                    ));
+                }
+            };
         let Some(session) = self.table.get(next.stream_id) else {
             return Ok(error_like(
                 req,
@@ -495,7 +497,9 @@ impl HandlerErased for CancelHandler {
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
         // A malformed cancel still releases nothing but must not error a notify;
         // parse leniently and drop whatever stream_id we can read.
-        if let Ok(cancel) = structio::from_beve::<CancelRequest>(&req.body) {
+        if let Ok(cancel) =
+            structio::beve::from_slice_with::<crate::structs::WirePolicy, CancelRequest>(&req.body)
+        {
             self.table.remove(cancel.stream_id);
         }
         // Dropping the session drops the receiver, which aborts a parked producer
@@ -1057,7 +1061,7 @@ where
     T: ServableOwned,
     R: Read,
 {
-    structio::beve::from_reader(reader)
+    structio::beve::from_reader_with::<crate::structs::WirePolicy, _, _>(reader)
         .map_err(|err| RepeError::decode_stream(BodyFormat::Beve, err))
 }
 

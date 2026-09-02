@@ -147,7 +147,7 @@ pub use stream::{
 /// The complex element type for the complex-array body path, re-exported from
 /// `structio` for the same reason as [`NumericBytes`].
 pub use structio::Complex;
-pub use structs::{RepeStruct, ResponseBody, StructError};
+pub use structs::{RepeStruct, ResponseBody, StructError, WirePolicy};
 #[cfg(all(feature = "fleet-udp", not(target_arch = "wasm32")))]
 pub use udp_client::UniUdpClient;
 #[cfg(all(feature = "fleet-udp", not(target_arch = "wasm32")))]

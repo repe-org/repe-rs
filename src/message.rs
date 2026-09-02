@@ -207,7 +207,8 @@ impl Message {
             ))
         })?;
         let mut value = T::default();
-        structio::json::read_into(&mut value, text).map_err(RepeError::Json)?;
+        structio::json::read_into_with::<crate::structs::WirePolicy, _>(&mut value, text)
+            .map_err(RepeError::Json)?;
         Ok(value)
     }
 
@@ -219,7 +220,8 @@ impl Message {
     {
         self.require_body_format(BodyFormat::Beve)?;
         let mut value = T::default();
-        structio::beve::read_into(&mut value, &self.body).map_err(RepeError::Beve)?;
+        structio::beve::read_into_with::<crate::structs::WirePolicy, _>(&mut value, &self.body)
+            .map_err(RepeError::Beve)?;
         Ok(value)
     }
 
@@ -279,10 +281,14 @@ impl Message {
                         err.valid_up_to(),
                     ))
                 })?;
-                structio::json::read_into(&mut value, text).map_err(RepeError::Json)?;
+                structio::json::read_into_with::<crate::structs::WirePolicy, _>(&mut value, text)
+                    .map_err(RepeError::Json)?;
             }
             Ok(BodyFormat::Beve) => {
-                structio::beve::read_into(&mut value, &self.body).map_err(RepeError::Beve)?;
+                structio::beve::read_into_with::<crate::structs::WirePolicy, _>(
+                    &mut value, &self.body,
+                )
+                .map_err(RepeError::Beve)?;
             }
             Ok(_) | Err(_) => {
                 return Err(RepeError::UnexpectedBodyFormat {

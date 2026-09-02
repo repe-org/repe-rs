@@ -369,10 +369,12 @@ fn decode_typed_body<T: ServableOwned>(
                     err.valid_up_to(),
                 ))
             })?;
-            structio::json::read_into(&mut value, text).map_err(RepeError::Json)?;
+            structio::json::read_into_with::<crate::structs::WirePolicy, _>(&mut value, text)
+                .map_err(RepeError::Json)?;
         }
         Ok(BodyFormat::Beve) => {
-            structio::beve::read_into(&mut value, body).map_err(RepeError::Beve)?;
+            structio::beve::read_into_with::<crate::structs::WirePolicy, _>(&mut value, body)
+                .map_err(RepeError::Beve)?;
         }
         _ => return Ok(Err(on_bad_format())),
     }

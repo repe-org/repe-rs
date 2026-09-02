@@ -94,6 +94,22 @@ impl<T: for<'de> ServableRead<'de> + ServableWrite> Servable for T {}
 pub trait ServableRead<'de>: structio::json::Read<'de> + structio::beve::Read<'de> {}
 impl<'de, T> ServableRead<'de> for T where T: structio::json::Read<'de> + structio::beve::Read<'de> {}
 
+/// The read policy every REPE body is decoded under: unknown keys are stepped
+/// over rather than refused.
+///
+/// This is the protocol's rule, not a preference. REPE's schema-evolution
+/// guarantee is that a peer may add object members without breaking one built
+/// against an older declaration — see `docs/protocol.md` — and it is pinned
+/// cross-language by Glaze-authored interop fixtures that carry a key this
+/// crate never declared. structio's [`Standard`](structio::Standard) refuses an
+/// unknown key, which is the right default for a document you own and the wrong
+/// one for a frame that arrived from someone else's build.
+///
+/// It applies to what the *body* may contain, and not to what a type demands of
+/// it: an endpoint marks its mandatory members `#[required]` in its structio
+/// declaration, and that is unaffected by this.
+pub type WirePolicy = structio::SkipUnknown;
+
 /// A response a client decodes into: readable in both formats, and owning its
 /// own contents.
 ///
@@ -195,6 +211,9 @@ impl<'a> RequestBody<'a> {
     /// write wants — a client updating one key of a wide object should not
     /// blank the rest.
     ///
+    /// Read under [`WirePolicy`], so a member the sender added and this build
+    /// never declared is stepped over rather than refusing the frame.
+    ///
     /// An endpoint that wants some members to be mandatory marks them
     /// `#[required]` in its structio declaration, which is per field and unions
     /// with whatever policy is in force.
@@ -202,7 +221,7 @@ impl<'a> RequestBody<'a> {
     where
         T: ServableRead<'a>,
     {
-        self.read_into_with::<structio::Standard, T>(path, value)
+        self.read_into_with::<WirePolicy, T>(path, value)
     }
 
     /// [`read_into`](Self::read_into) under an explicit structio
@@ -210,7 +229,9 @@ impl<'a> RequestBody<'a> {
     ///
     /// For a policy that changes what the *body* may contain:
     /// [`AllowComments`](structio::AllowComments) for a body written by hand,
-    /// [`SkipUnknown`](structio::SkipUnknown) for one from a newer peer.
+    /// or [`Standard`](structio::Standard) to refuse a key this build does not
+    /// declare — the opposite of [`WirePolicy`], and a deliberate narrowing of
+    /// what the protocol permits.
     ///
     /// Not for making members mandatory. [`RequireKeys`](structio::RequireKeys)
     /// demands *every* declared member, and an `Option<T>` is not exempt — the
@@ -236,7 +257,7 @@ impl<'a> RequestBody<'a> {
     where
         T: ServableRead<'a>,
     {
-        self.read_raw_with::<structio::Standard, T>(value)
+        self.read_raw_with::<WirePolicy, T>(value)
     }
 
     fn read_raw_with<O, T>(&self, value: &mut T) -> Result<(), structio::Error>
@@ -1285,7 +1306,7 @@ enum ArgSource<'a> {
     /// left out, which [`MethodArgs::next_arg`] reads as `null`.
     Spans(Vec<Option<&'a [u8]>>),
     /// Elements pulled in order from an array whose headers the reader supplies.
-    Cursor(structio::beve::Documents<&'a [u8]>),
+    Cursor(structio::beve::Documents<&'a [u8], WirePolicy>),
 }
 
 impl<'a> MethodArgs<'a> {
@@ -1493,7 +1514,9 @@ fn split_beve<'a>(path: &str, names: &[&str], bytes: &'a [u8]) -> StructResult<A
             // never grows. The body is an argument list, so this is bounded by
             // the arity and the element width, not by any payload.
             Ok(ArgSource::Cursor(
-                structio::beve::Documents::array(bytes).read_size(bytes.len().max(1)),
+                structio::beve::Documents::array(bytes)
+                    .with_options::<WirePolicy>()
+                    .read_size(bytes.len().max(1)),
             ))
         }
         _ => Err(shape_error(path, names)),
