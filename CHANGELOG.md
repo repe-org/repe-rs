@@ -1,5 +1,84 @@
 # Changelog
 
+## [13.0.0] - 2026-09-02
+
+**`serde`, `serde_json` and `beve` are gone, replaced by [`structio`](https://crates.io/crates/structio).** One declaration serves both wire formats, and the codec brings nothing with it: structio has no dependencies and no proc macro, so `repe-core`'s whole graph is now `structio`, `thiserror`, and repe's own `repe-derive`. That replaces `serde`, `serde_derive`, `serde_json`, `beve`, and the six packages behind `beve` (`bytemuck`, `half`, `cfg-if`, `simdutf8`, `zerocopy`, `zerocopy-derive`).
+
+`repe-derive` stays: it is repe's own derive for *publishing endpoints*, which is a separate job from encoding.
+
+This is a source-breaking release for anything that names a body type. The wire is unchanged: the same JSON and the same BEVE bytes, pinned against Glaze-authored interop fixtures that this crate did not write.
+
+### Declaring a type
+
+`#[derive(Serialize, Deserialize)]` becomes `structio::object!`:
+
+```rust
+#[derive(Default)]
+struct Reading { channel: String, samples: Vec<f64> }
+structio::object!(Reading { channel, samples });
+```
+
+It is a `macro_rules!` macro — no proc macro, no build script — and it works on a type from a crate you do not own, which is the case `#[repe(nested_serde)]` existed for.
+
+`#[derive(RepeStruct)]` is unchanged and still publishes endpoints. A served type needs both: the derive says what is reachable, the declaration says how it crosses the wire.
+
+### There is no `Value`
+
+Every place that took or returned a `serde_json::Value` now names a type.
+
+| Before | Now |
+|---|---|
+| `Router::with_json(path, fn)` / `with(path, fn)` | `Router::with_typed(path, fn)` |
+| `with_json_ctx`, `with_json_blocking`, `with_json_ctx_blocking` | the `with_typed_*` twins |
+| `Client::call_json(path, &body)` | `Client::call_typed_json(path, &body)` |
+| `Client::registry_read(path)` | `Client::registry_read_typed::<_, R>(path)` |
+| `registry_write_json` / `registry_call_json` | `call_typed_json` — they built the same frame |
+| `notify_typed_json` / `notify_typed_beve` | `notify_json` / `notify_beve` |
+| `batch_json(Vec<(String, Value)>)` | `batch_json(Vec<(String, T)>) -> Vec<Result<R, _>>` |
+| `RepeStruct::repe_handle` | `repe_handle_into`, the only method |
+| `eval_json_pointer` | gone; a pointer names an endpoint, not a tree node |
+
+A body is now parsed **once, directly into the live member it is destined for**, and a response is written straight into the outgoing frame. A request no endpoint claims never parses at all.
+
+### The registry stores functions only
+
+`register_value`, `read_value`, `write_if`, `set_root`, `merge_root`, `merge_at` and `dispatch` are gone. A pointer names a function; the body is its arguments; what the function writes is the response.
+
+A stateful endpoint is a function that owns its state — which is also what lets it validate, reject, or *apply* a body rather than being assigned to blind. Where the value has a type, `with_struct` is the better home: the derive publishes every field as an endpoint, which is what `register_value` was approximating.
+
+`Registry::dispatch` / `dispatch_with_ctx` become `Registry::call_detached` / `call`, which write into a `ResponseBody` rather than returning a value.
+
+### REST: `PUT` and `POST` are aliases
+
+With no stored values there is no assignment for `PUT` to mean instead of a call, so both verbs call the function at the pointer and `Allow` reports `GET, HEAD, PUT, POST, OPTIONS`. Neither is idempotent, because a call is not.
+
+`If-Match` / `If-None-Match` on a write are gone with the values they compared against. A handler needing compare-and-swap takes the expected state as an argument, where it is inside the handler's own lock rather than racing outside it.
+
+`ETag` is now a hash of the response bytes the handler produced, so **a conditional `GET` runs the handler before it can answer `304`** — the transfer is saved, not the work. A handler expensive enough for that to matter should cache on its own side.
+
+### Behavior changes on the wire
+
+- **Unknown object keys are still ignored**, and it is now written down as `repe::WirePolicy`. structio's own default refuses them; REPE's schema-evolution guarantee says otherwise, and it is pinned cross-language by Glaze-authored fixtures carrying a key this crate never declares. An endpoint that wants the strict reading opts in with `RequestBody::read_into_with::<structio::Standard, _>`.
+- **A numeric array is read at the width the caller asks for.** A stored `f64` array read as `f32` converts element by element; the bulk path is taken wherever the widths agree. This was an error before. An *integer* that does not fit the requested width is still refused.
+- **The aligned typed-slice form is not a distinct type.** One reader takes both forms, so an aligned body reaches a plain `with_typed_slice` route (without the borrow). What the aligned form buys is the borrow on a `with_typed_slice_ref` route.
+- **A whole-object listing emits members in declaration order**, and that order now reaches the wire. It previously went through a `serde_json::Map`, which sorted the keys.
+- **Half floats (`f16` / `bf16`) no longer cross the wire.** structio has no value-level codec for a two-byte float. Its header layer and BEVE-to-JSON transcoder both know the widths, so this is a missing codec rather than a missing format.
+
+### Removed
+
+- `#[repe(nested_serde)]`. `structio::object!` covers a type you do not own, and `repe-core` carries `RepeStruct` without the server, so the dependency edge it worked around no longer exists.
+- `repe-core`'s `typed` feature. It gated `beve` and its six transitive packages; structio has no dependencies, so there is nothing left to gate.
+- `Router::with(path, fn)`, the alias for `with_json`.
+
+### Also
+
+- Errors: `RepeError::Json` and `RepeError::Beve` carry a `structio::Error` (a `Copy` code-and-offset pair). `RepeError::decode_stream(format, err)` replaces the `From<StreamError>` impl, which had to guess a format and guessed BEVE.
+- Encoding is infallible. `MessageBuilder::body_json` / `body_beve` return `Self`, not `Result<Self, _>`; the `?` at those call sites goes away.
+- The CLI never builds a document: it validates the `--body` text and ships it verbatim, prettifies a JSON response as text, and transcodes a BEVE response with `structio::beve_to_json`.
+- `pull_value` buffers the encoded body before decoding it, where `beve` decoded incrementally. `pull_typed_slice` still reads a numeric array straight into the vector's memory; `pull_complex_slice` buffers, because structio's streaming bulk read does not accept a complex array's header.
+- Per-request allocations went **down** across every measured path (see `tests/allocations.rs`): a `with_typed` dispatch from 5 to 4, its borrowing form from 3 to 2, the WebSocket inline path from 4 to 3. Framing a typed-slice body gained structio's one fixed 8 KiB sink buffer, and is otherwise unchanged — the payload still bypasses it in a single `write_all`.
+- **`repe-core` 4.0.0** and **`repe-derive` 0.7.0**, both for the same reason. Bump all three or none.
+
 ## [12.0.0] - 2026-08-29
 
 A **major** release for one reason: the `beve` pin moves to 10. No `repe` API changed and no source change is needed.
