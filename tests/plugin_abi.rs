@@ -26,6 +26,12 @@ struct Counter {
 }
 structio::object!(Counter { value });
 
+#[derive(Default, Debug, PartialEq)]
+struct Count {
+    n: i64,
+}
+structio::object!(Count { n });
+
 #[repe::methods]
 impl Counter {
     fn bump(&mut self, by: i64) -> i64 {
@@ -37,7 +43,7 @@ impl Counter {
 #[repe::plugin(name = "counter", version = "2.5.0", root = "/counter")]
 fn build() -> Router {
     Router::new()
-        .with_typed("/counter/echo", Ok)
+        .with_typed("/counter/echo", |v: Count| Ok(v))
         .with_struct("/counter", Counter::default())
         .0
 }
@@ -62,7 +68,7 @@ mod host_abi {
     }
 }
 
-fn request(path: &str, body: &serde_json::Value, notify: bool) -> Vec<u8> {
+fn request<T: structio::json::Write + ?Sized>(path: &str, body: &T, notify: bool) -> Vec<u8> {
     Message::builder()
         .id(4)
         .notify(notify)
@@ -116,23 +122,22 @@ fn the_plugin_abi_behaves_as_a_host_expects() {
     );
 
     // --- dispatch ----------------------------------------------------------
-    let response = host_call(&request(
-        "/counter/echo",
-        &serde_json::Count { n: 1 },
-        false,
-    ))
-    .expect("a non-notify request produces a response");
+    let response = host_call(&request("/counter/echo", &Count { n: 1 }, false))
+        .expect("a non-notify request produces a response");
     let message = Message::from_slice(&response).unwrap();
     assert_eq!(message.header.id, 4, "the request id is echoed");
     assert_eq!(message.query_str().unwrap(), "/counter/echo");
-    assert_eq!(message.json_body::<serde_json::Value>().unwrap()["n"], 1);
+    assert_eq!(message.json_body::<Count>().unwrap().n, 1);
 
     // Everything the plugin serves really does live under the root it claims,
     // which is what lets a host route by prefix.
     let root = cstr(info.root_path);
     for path in ["/counter/echo", "/counter/value", "/counter/bump"] {
         assert!(path.starts_with(&root));
-        let response = host_call(&request(path, &serde_json::json!(1), false)).unwrap();
+        // One body for three routes that do not agree on a type, because what
+        // is being asserted is that each path *resolves*. A route that decodes
+        // it differently still answers something other than `MethodNotFound`.
+        let response = host_call(&request(path, &1i64, false)).unwrap();
         assert_ne!(
             Message::from_slice(&response).unwrap().error_code(),
             Some(ErrorCode::MethodNotFound),
@@ -143,8 +148,8 @@ fn the_plugin_abi_behaves_as_a_host_expects() {
     // A field write then a derived method reading and mutating it, which is what
     // makes the object on the far side of the ABI stateful rather than a
     // request-scoped value: both calls reach the same long-lived `Counter`.
-    host_call(&request("/counter/value", &serde_json::json!(10), false)).unwrap();
-    let response = host_call(&request("/counter/bump", &serde_json::json!(7), false)).unwrap();
+    host_call(&request("/counter/value", &10i64, false)).unwrap();
+    let response = host_call(&request("/counter/bump", &7i64, false)).unwrap();
     assert_eq!(
         Message::from_slice(&response)
             .unwrap()
@@ -156,7 +161,7 @@ fn the_plugin_abi_behaves_as_a_host_expects() {
 
     // --- notify ------------------------------------------------------------
     assert!(
-        host_call(&request("/counter/echo", &serde_json::json!(0), true)).is_none(),
+        host_call(&request("/counter/echo", &Count { n: 0 }, true)).is_none(),
         "a notify answers with size 0, which a host must read as `send nothing`"
     );
 
@@ -175,13 +180,16 @@ fn the_plugin_abi_behaves_as_a_host_expects() {
                 scope.spawn(move || {
                     for _ in 0..64 {
                         let response =
-                            host_call(&request("/counter/echo", &serde_json::json!(n), false))
+                            host_call(&request("/counter/echo", &Count { n: n as i64 }, false))
                                 .unwrap();
                         let echoed = Message::from_slice(&response)
                             .unwrap()
-                            .json_body::<i64>()
+                            .json_body::<Count>()
                             .unwrap();
-                        assert_eq!(echoed, n, "thread {n} read another thread's buffer");
+                        assert_eq!(
+                            echoed.n, n as i64,
+                            "thread {n} read another thread's buffer"
+                        );
                     }
                 })
             })
@@ -193,7 +201,7 @@ fn the_plugin_abi_behaves_as_a_host_expects() {
 
     // --- shutdown, last, because it is visible to everything above ----------
     unsafe { host_abi::repe_plugin_shutdown() };
-    let response = host_call(&request("/counter/echo", &serde_json::json!(0), false)).unwrap();
+    let response = host_call(&request("/counter/echo", &Count { n: 0 }, false)).unwrap();
     let message = Message::from_slice(&response).unwrap();
     assert_eq!(
         message.error_code(),
@@ -209,13 +217,14 @@ fn the_plugin_abi_behaves_as_a_host_expects() {
 fn the_router_constructor_is_still_a_plain_function() {
     let router = build();
     let response = router
-        .call(&request("/counter/echo", &serde_json::json!("hi"), false))
+        .call(&request("/counter/echo", &Count { n: 42 }, false))
         .expect("a non-notify request produces a response");
     assert_eq!(
         Message::from_slice(&response)
             .unwrap()
-            .json_body::<String>()
-            .unwrap(),
-        "hi"
+            .json_body::<Count>()
+            .unwrap()
+            .n,
+        42
     );
 }

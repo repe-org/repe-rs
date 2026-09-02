@@ -71,11 +71,6 @@ impl HttpResponse {
     fn json<T: repe::structs::ServableOwned>(&self) -> T {
         structio::from_slice(&self.body).expect("response body is JSON")
     }
-
-    /// The body as JSON text, for the cases where the shape is the assertion.
-    fn text(&self) -> &str {
-        std::str::from_utf8(&self.body).expect("response body is UTF-8 JSON")
-    }
 }
 
 /// Write one request and read exactly one response, leaving the connection open
