@@ -37,6 +37,29 @@ use std::sync::Arc;
 /// parents finds a hash where a profile name should be. Asking cargo removes the
 /// guess, and the profile with it — the plugin is built with the default one
 /// whatever this test was compiled with, since all it has to do is load.
+/// The part of a `cargo --message-format=json` line this test reads.
+///
+/// Declared rather than walked as a tree, and read under
+/// [`repe::WirePolicy`]: cargo's messages carry a great many members this does
+/// not name, and a strict read would refuse every one of them.
+#[derive(Default)]
+struct CargoMessage {
+    reason: String,
+    target: CargoTarget,
+    filenames: Vec<String>,
+}
+structio::object!(CargoMessage {
+    reason,
+    target,
+    filenames
+});
+
+#[derive(Default)]
+struct CargoTarget {
+    name: String,
+}
+structio::object!(CargoTarget { name });
+
 fn plugin_library() -> PathBuf {
     let output = Command::new(env!("CARGO"))
         .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -63,14 +86,15 @@ fn plugin_library() -> PathBuf {
     let library = String::from_utf8(output.stdout)
         .expect("cargo's JSON output is UTF-8")
         .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter(|message| message["reason"] == "compiler-artifact")
-        .filter(|message| message["target"]["name"] == "repe_plugin")
+        .filter_map(|line| {
+            structio::json::from_str_with::<repe::WirePolicy, CargoMessage>(line).ok()
+        })
+        .filter(|message| message.reason == "compiler-artifact")
+        .filter(|message| message.target.name == "repe_plugin")
         .filter_map(|message| {
-            message["filenames"]
-                .as_array()?
-                .iter()
-                .filter_map(|name| name.as_str())
+            message
+                .filenames
+                .into_iter()
                 .find(|name| name.ends_with(std::env::consts::DLL_SUFFIX))
                 .map(PathBuf::from)
         })
@@ -253,15 +277,13 @@ fn a_real_shared_library_loads_and_serves() {
         let mounted = unsafe { Plugin::load(&path) }.expect("already resident");
         assert_eq!(mounted.load_origin(), LoadOrigin::AlreadyResident);
         let router = Router::new()
-            .with_typed("/local", |_| Ok(serde_json::json!("served by the host")))
+            .with_typed("/local", |_: Option<i64>| {
+                Ok("served by the host".to_string())
+            })
             .with_fallback(Arc::new(mounted));
 
         // A route the host owns is untouched by the fallback.
-        let message = parse(
-            &router
-                .call(&write("/local", 11, &serde_json::Value::Null))
-                .unwrap(),
-        );
+        let message = parse(&router.call(&write("/local", 11, &None::<i64>)).unwrap());
         assert_eq!(message.json_body::<String>().unwrap(), "served by the host");
 
         // Under the plugin's root, the plugin's own frame comes back whole —
