@@ -83,13 +83,13 @@ use crate::message::{Message, create_error_message};
 use crate::server::{Execution, HandlerErased, Router};
 use repe_core::structs::{ServableOwned, ServableWrite};
 use std::collections::HashMap;
-use structio::Complex;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use structio::Complex;
 
 /// The SVS contract version this implementation speaks, reported in the `open`
 /// response and validated by the client.
@@ -1057,7 +1057,8 @@ where
     T: ServableOwned,
     R: Read,
 {
-    structio::beve::from_reader(reader).map_err(|err| RepeError::decode_stream(BodyFormat::Beve, err))
+    structio::beve::from_reader(reader)
+        .map_err(|err| RepeError::decode_stream(BodyFormat::Beve, err))
 }
 
 /// Bulk-decode a BEVE array straight into a `Vec<T>`, without buffering the

@@ -955,6 +955,26 @@ fn lock_pending_map(
 mod tests {
     use super::*;
     use crate::constants::QueryFormat;
+
+    /// The test fixtures. Nothing here inspects a body beyond its shape, so one
+    /// flag object and one tagged object cover every route in this module.
+    #[derive(Default, Debug, PartialEq)]
+    struct Ok_ {
+        ok: bool,
+    }
+    structio::object!(Ok_ { ok });
+
+    #[derive(Default, Debug, PartialEq)]
+    struct Kind {
+        kind: String,
+    }
+    structio::object!(Kind { kind });
+
+    /// An empty request body: `{}` on the wire.
+    #[derive(Default)]
+    struct Empty;
+    structio::object!(Empty {});
+
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
 
@@ -976,8 +996,7 @@ mod tests {
                 .id(request.header.id)
                 .query_str("/bad")
                 .query_format(QueryFormat::JsonPointer)
-                .body_json(&serde_json::json!({ "ok": true }))
-                .unwrap()
+                .body_json(&Ok_ { ok: true })
                 .build()
                 .to_vec();
             response.extend_from_slice(&[0xAA, 0xBB]);
@@ -989,7 +1008,7 @@ mod tests {
             .await
             .unwrap();
         let err = client
-            .call_json("/bad", &serde_json::json!({}))
+            .call_typed_json::<_, _, Ok_>("/bad", &Empty)
             .await
             .unwrap_err();
 
@@ -1028,8 +1047,9 @@ mod tests {
                 .notify(true)
                 .query_str("/push")
                 .query_format(QueryFormat::JsonPointer)
-                .body_json(&serde_json::json!({ "kind": "hello" }))
-                .unwrap()
+                .body_json(&Kind {
+                    kind: "hello".into(),
+                })
                 .build();
             ws.send(WsMessage::Binary(notify.to_vec())).await.unwrap();
 
@@ -1037,8 +1057,7 @@ mod tests {
                 .id(request.header.id)
                 .query_str("/echo")
                 .query_format(QueryFormat::JsonPointer)
-                .body_json(&serde_json::json!({ "ok": true }))
-                .unwrap()
+                .body_json(&Ok_ { ok: true })
                 .build();
             ws.send(WsMessage::Binary(response.to_vec())).await.unwrap();
         });
@@ -1049,10 +1068,10 @@ mod tests {
         let mut notifies = client.subscribe_notifies().expect("first subscribe");
 
         let resp = client
-            .call_json("/echo", &serde_json::json!({}))
+            .call_typed_json::<_, _, Ok_>("/echo", &Empty)
             .await
             .unwrap();
-        assert_eq!(resp, serde_json::json!({ "ok": true }));
+        assert_eq!(resp, Ok_ { ok: true });
 
         let pushed = tokio::time::timeout(Duration::from_secs(2), notifies.recv())
             .await
@@ -1060,8 +1079,8 @@ mod tests {
             .expect("subscriber channel closed");
         assert!(pushed.header.notify != 0);
         assert_eq!(pushed.query_str().unwrap(), "/push");
-        let body: serde_json::Value = pushed.json_body().unwrap();
-        assert_eq!(body, serde_json::json!({ "kind": "hello" }));
+        let body: Kind = pushed.json_body().unwrap();
+        assert_eq!(body.kind, "hello");
 
         drop(client);
         server_task.await.unwrap();
@@ -1167,8 +1186,7 @@ mod tests {
                 .id(request.header.id)
                 .query_str("/ack")
                 .query_format(QueryFormat::JsonPointer)
-                .body_json(&serde_json::json!({ "ok": true }))
-                .unwrap()
+                .body_json(&Ok_ { ok: true })
                 .build();
             ws.send(WsMessage::Binary(ack.to_vec())).await.unwrap();
 
@@ -1177,8 +1195,7 @@ mod tests {
                 .notify(true)
                 .query_str("/push")
                 .query_format(QueryFormat::JsonPointer)
-                .body_json(&serde_json::json!({}))
-                .unwrap()
+                .body_json(&Empty)
                 .build();
             ws.send(WsMessage::Binary(pushed.to_vec())).await.unwrap();
             ws.close(None).await.unwrap();
@@ -1189,7 +1206,7 @@ mod tests {
             .unwrap();
         let mut notifies = client.subscribe_notifies().expect("subscribe");
         client
-            .call_json("/ready", &serde_json::json!({}))
+            .call_typed_json::<_, _, Ok_>("/ready", &Empty)
             .await
             .unwrap();
 
@@ -1234,8 +1251,7 @@ mod tests {
                 .notify(true)
                 .query_str("/dropped")
                 .query_format(QueryFormat::JsonPointer)
-                .body_json(&serde_json::json!({}))
-                .unwrap()
+                .body_json(&Empty)
                 .build();
             ws.send(WsMessage::Binary(dropped.to_vec())).await.unwrap();
 
@@ -1248,8 +1264,7 @@ mod tests {
                     .id(request.header.id)
                     .query_str("/ack")
                     .query_format(QueryFormat::JsonPointer)
-                    .body_json(&serde_json::json!({ "ok": true }))
-                    .unwrap()
+                    .body_json(&Ok_ { ok: true })
                     .build();
                 ws.send(WsMessage::Binary(response.to_vec())).await.unwrap();
             }
@@ -1259,8 +1274,7 @@ mod tests {
                 .notify(true)
                 .query_str("/observed")
                 .query_format(QueryFormat::JsonPointer)
-                .body_json(&serde_json::json!({}))
-                .unwrap()
+                .body_json(&Empty)
                 .build();
             ws.send(WsMessage::Binary(observed.to_vec())).await.unwrap();
         });
@@ -1273,7 +1287,7 @@ mod tests {
         // processed every frame the server sent before the response,
         // including /dropped.
         client
-            .call_json("/flush", &serde_json::json!({}))
+            .call_typed_json::<_, _, Ok_>("/flush", &Empty)
             .await
             .unwrap();
 
@@ -1291,7 +1305,7 @@ mod tests {
         // /observed cannot reach the response loop before we
         // subscribed.
         client
-            .call_json("/ready", &serde_json::json!({}))
+            .call_typed_json::<_, _, Ok_>("/ready", &Empty)
             .await
             .unwrap();
 

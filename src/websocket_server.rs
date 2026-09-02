@@ -2013,9 +2013,106 @@ mod tests {
     use super::*;
     use crate::constants::BodyFormat;
     use crate::websocket_client::WebSocketClient;
-    use serde_json::json;
     use std::sync::Mutex;
     use std::time::Duration;
+
+    // ---- test fixtures -----------------------------------------------------
+    //
+    // Every body in this module is either a marker (the frame needs *a* body)
+    // or one asserted field. `Ack` covers the markers; the rest exist because a
+    // test names the field.
+
+    /// An empty request body: `{}` on the wire.
+    #[derive(Default, Debug, PartialEq)]
+    struct Empty;
+    structio::object!(Empty {});
+
+    #[derive(Default, Debug, PartialEq)]
+    struct Ack {
+        ok: bool,
+    }
+    structio::object!(Ack { ok });
+
+    #[derive(Default, Debug, PartialEq)]
+    struct Operands {
+        a: i64,
+        b: i64,
+    }
+    structio::object!(Operands { a, b });
+
+    #[derive(Default, Debug, PartialEq)]
+    struct Product {
+        prod: i64,
+    }
+    structio::object!(Product { prod });
+
+    #[derive(Default, Debug, PartialEq)]
+    struct Greeting {
+        hello: String,
+    }
+    structio::object!(Greeting { hello });
+
+    #[derive(Default, Debug, PartialEq)]
+    struct Count {
+        n: i64,
+    }
+    structio::object!(Count { n });
+
+    #[derive(Default, Debug, PartialEq)]
+    struct Index {
+        i: i64,
+    }
+    structio::object!(Index { i });
+
+    #[derive(Default, Debug, PartialEq)]
+    struct Stage {
+        stage: String,
+    }
+    structio::object!(Stage { stage });
+
+    #[derive(Default, Debug, PartialEq)]
+    struct Done {
+        done: bool,
+    }
+    structio::object!(Done { done });
+
+    #[derive(Default, Debug, PartialEq)]
+    struct HasPeer {
+        has_peer: bool,
+    }
+    structio::object!(HasPeer { has_peer });
+
+    #[derive(Default, Debug, PartialEq)]
+    struct PeerIdBody {
+        id: u64,
+    }
+    structio::object!(PeerIdBody { id });
+
+    // The credit-transfer test's three bodies.
+
+    #[derive(Default, Debug, PartialEq)]
+    struct Progress {
+        through: u64,
+        last: bool,
+    }
+    structio::object!(Progress { through, last });
+
+    #[derive(Default, Debug, PartialEq)]
+    struct AckRequest {
+        file_index: u64,
+        through: u64,
+    }
+    structio::object!(AckRequest {
+        file_index,
+        through
+    });
+
+    #[derive(Default, Debug, PartialEq)]
+    struct Sent {
+        sent: u64,
+        bytes: u64,
+    }
+    structio::object!(Sent { sent, bytes });
 
     async fn run_default_connection(
         ws_stream: WebSocketStream<TcpStream>,
@@ -2037,10 +2134,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn websocket_server_roundtrip() {
-        let router = Router::new().with_json("/mul", |value| {
-            let a = value.get("a").and_then(|v| v.as_i64()).unwrap_or_default();
-            let b = value.get("b").and_then(|v| v.as_i64()).unwrap_or_default();
-            Ok(json!({ "prod": a * b }))
+        let router = Router::new().with_typed("/mul", |value: Operands| {
+            Ok(Product {
+                prod: value.a * value.b,
+            })
         });
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -2058,11 +2155,11 @@ mod tests {
         let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
             .await
             .unwrap();
-        let out = client
-            .call_json("/mul", &json!({ "a": 6, "b": 7 }))
+        let out: Product = client
+            .call_typed_json("/mul", &Operands { a: 6, b: 7 })
             .await
             .unwrap();
-        assert_eq!(out["prod"], 42);
+        assert_eq!(out.prod, 42);
 
         drop(client);
         server_task.await.unwrap();
@@ -2076,7 +2173,7 @@ mod tests {
         // succeeds. Driven through serve_listener_with_shutdown (the
         // single accept loop) with a pre-bound listener to avoid a
         // port-reuse race.
-        let router = Router::new().with_json("/ping", |_| Ok(json!({ "ok": true })));
+        let router = Router::new().with_typed("/ping", |_: Empty| Ok(Ack { ok: true }));
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2094,8 +2191,11 @@ mod tests {
         let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
             .await
             .unwrap();
-        let resp = client.call_json("/ping", &json!({})).await.unwrap();
-        assert_eq!(resp, json!({ "ok": true }));
+        let resp = client
+            .call_typed_json::<_, _, Ack>("/ping", &Empty)
+            .await
+            .unwrap();
+        assert_eq!(resp, Ack { ok: true });
 
         // Fire shutdown; the serve future must return Ok(()).
         shutdown_tx.send(()).unwrap();
@@ -2123,7 +2223,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn websocket_proxy_forwards_raw_messages() {
-        let upstream_router = Router::new().with_json("/echo", Ok);
+        let upstream_router = Router::new().with_typed("/echo", |v: Ack| Ok(v));
         let upstream_listener = crate::async_server::AsyncServer::listen(("127.0.0.1", 0))
             .await
             .unwrap();
@@ -2150,11 +2250,11 @@ mod tests {
         let client = WebSocketClient::connect(&format!("ws://{proxy_addr}/repe"))
             .await
             .unwrap();
-        let out = client
-            .call_json("/echo", &json!({ "ok": true }))
+        let out: Ack = client
+            .call_typed_json("/echo", &Ack { ok: true })
             .await
             .unwrap();
-        assert_eq!(out, json!({ "ok": true }));
+        assert_eq!(out, Ack { ok: true });
 
         drop(client);
         proxy_task.await.unwrap();
@@ -2189,7 +2289,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn registry_receives_broadcast() {
-        let router = Router::new().with_json("/ping", |_| Ok(json!({ "ok": true })));
+        let router = Router::new().with_typed("/ping", |_: Empty| Ok(Ack { ok: true }));
         let peers = PeerRegistry::new();
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -2204,12 +2304,18 @@ mod tests {
 
         // Round-trip a request so we know the peer is registered by
         // the time the broadcast runs.
-        let _ = client.call_json("/ping", &json!({})).await.unwrap();
+        let _ = client
+            .call_typed_json::<_, _, Ack>("/ping", &Empty)
+            .await
+            .unwrap();
 
         assert_eq!(peers.len(), 1);
-        let results = peers
-            .broadcast_notify_json("/announce", &json!({ "hello": "world" }))
-            .unwrap();
+        let results = peers.broadcast_notify_json(
+            "/announce",
+            &Greeting {
+                hello: "world".into(),
+            },
+        );
         assert_eq!(results.len(), 1);
         for r in results.values() {
             r.as_ref().expect("broadcast send");
@@ -2221,8 +2327,8 @@ mod tests {
             .expect("subscriber channel closed");
         assert!(pushed.header.notify != 0);
         assert_eq!(pushed.query_str().unwrap(), "/announce");
-        let body: serde_json::Value = pushed.json_body().unwrap();
-        assert_eq!(body, json!({ "hello": "world" }));
+        let body: Greeting = pushed.json_body().unwrap();
+        assert_eq!(body.hello, "world");
 
         drop(client);
         // Wait for disconnect to propagate.
@@ -2238,7 +2344,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn broadcast_reaches_multiple_peers() {
-        let router = Router::new().with_json("/ping", |_| Ok(json!({ "ok": true })));
+        let router = Router::new().with_typed("/ping", |_: Empty| Ok(Ack { ok: true }));
         let peers = PeerRegistry::new();
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -2254,15 +2360,15 @@ mod tests {
                 .unwrap();
             let rx = c.subscribe_notifies().expect("subscribe");
             // Synchronize so the peer is registered.
-            c.call_json("/ping", &json!({})).await.unwrap();
+            c.call_typed_json::<_, _, Ack>("/ping", &Empty)
+                .await
+                .unwrap();
             clients.push(c);
             receivers.push(rx);
         }
 
         assert_eq!(peers.len(), 3);
-        let results = peers
-            .broadcast_notify_json("/event", &json!({ "n": 1 }))
-            .unwrap();
+        let results = peers.broadcast_notify_json("/event", &Count { n: 1 });
         assert_eq!(results.len(), 3);
         for r in results.values() {
             r.as_ref().expect("broadcast send");
@@ -2284,7 +2390,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn connect_hook_queued_notify_arrives_before_response() {
-        let router = Router::new().with_json("/sync", |_| Ok(json!({ "ok": true })));
+        let router = Router::new().with_typed("/sync", |_: Empty| Ok(Ack { ok: true }));
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2293,7 +2399,9 @@ mod tests {
             // drains this before any response can be produced.
             let _ = peer.send_notify(
                 "/welcome",
-                NotifyBody::Json(serde_json::to_vec(&json!({ "id": peer.peer_id().0 })).unwrap()),
+                NotifyBody::Json(structio::json::to_vec(&PeerIdBody {
+                    id: peer.peer_id().0,
+                })),
             );
         });
         let server_task = serve_one(listener, "/repe", server).await;
@@ -2310,8 +2418,11 @@ mod tests {
             .expect("channel closed");
         assert_eq!(pushed.query_str().unwrap(), "/welcome");
 
-        let resp = client.call_json("/sync", &json!({})).await.unwrap();
-        assert_eq!(resp, json!({ "ok": true }));
+        let resp = client
+            .call_typed_json::<_, _, Ack>("/sync", &Empty)
+            .await
+            .unwrap();
+        assert_eq!(resp, Ack { ok: true });
 
         drop(client);
         server_task.abort();
@@ -2319,7 +2430,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn disconnect_hook_fires_on_drop() {
-        let router = Router::new().with_json("/ping", |_| Ok(json!({ "ok": true })));
+        let router = Router::new().with_typed("/ping", |_: Empty| Ok(Ack { ok: true }));
         let disconnected = Arc::new(Mutex::new(Vec::<PeerId>::new()));
         let disconnected_clone = Arc::clone(&disconnected);
 
@@ -2333,7 +2444,10 @@ mod tests {
             .await
             .unwrap();
         // Synchronize so the connection is fully accepted.
-        client.call_json("/ping", &json!({})).await.unwrap();
+        client
+            .call_typed_json::<_, _, Ack>("/ping", &Empty)
+            .await
+            .unwrap();
         drop(client);
 
         for _ in 0..50 {
@@ -2350,7 +2464,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn slow_consumer_surfaces_backpressure() {
         // Capacity 1: the second outbound send saturates the channel.
-        let router = Router::new().with_json("/ping", |_| Ok(json!({ "ok": true })));
+        let router = Router::new().with_typed("/ping", |_: Empty| Ok(Ack { ok: true }));
         let peers = PeerRegistry::new();
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -2369,7 +2483,10 @@ mod tests {
         // just need to push enough that try_send eventually returns
         // Full.
         let _notifies = client.subscribe_notifies().expect("subscribe");
-        client.call_json("/ping", &json!({})).await.unwrap();
+        client
+            .call_typed_json::<_, _, Ack>("/ping", &Empty)
+            .await
+            .unwrap();
 
         assert_eq!(peers.len(), 1);
 
@@ -2377,9 +2494,7 @@ mod tests {
         // happens quickly; cap at a generous limit.
         let mut saw_full = false;
         for i in 0..1024 {
-            let results = peers
-                .broadcast_notify_json("/burst", &json!({ "i": i }))
-                .unwrap();
+            let results = peers.broadcast_notify_json("/burst", &Index { i });
             for (_, r) in results {
                 match r {
                     Err(PeerSendError::Full) => {
@@ -2402,7 +2517,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn broadcast_after_disconnect_surfaces_disconnected() {
-        let router = Router::new().with_json("/ping", |_| Ok(json!({ "ok": true })));
+        let router = Router::new().with_typed("/ping", |_: Empty| Ok(Ack { ok: true }));
         let peers = PeerRegistry::new();
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -2413,7 +2528,10 @@ mod tests {
         let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
             .await
             .unwrap();
-        client.call_json("/ping", &json!({})).await.unwrap();
+        client
+            .call_typed_json::<_, _, Ack>("/ping", &Empty)
+            .await
+            .unwrap();
         assert_eq!(peers.len(), 1);
 
         // Snapshot the peer handles so we can keep them after the
@@ -2441,7 +2559,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn hooks_compose_in_registration_order() {
-        let router = Router::new().with_json("/ping", |_| Ok(json!({ "ok": true })));
+        let router = Router::new().with_typed("/ping", |_: Empty| Ok(Ack { ok: true }));
         let order = Arc::new(Mutex::new(Vec::<u32>::new()));
         let order_a = Arc::clone(&order);
         let order_b = Arc::clone(&order);
@@ -2456,7 +2574,10 @@ mod tests {
         let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
             .await
             .unwrap();
-        client.call_json("/ping", &json!({})).await.unwrap();
+        client
+            .call_typed_json::<_, _, Ack>("/ping", &Empty)
+            .await
+            .unwrap();
 
         let snapshot = order.lock().unwrap().clone();
         assert_eq!(snapshot, vec![1, 2]);
@@ -2467,7 +2588,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn broadcast_utf8_and_raw() {
-        let router = Router::new().with_json("/ping", |_| Ok(json!({ "ok": true })));
+        let router = Router::new().with_typed("/ping", |_: Empty| Ok(Ack { ok: true }));
         let peers = PeerRegistry::new();
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -2479,7 +2600,10 @@ mod tests {
             .await
             .unwrap();
         let mut notifies = client.subscribe_notifies().expect("subscribe");
-        client.call_json("/ping", &json!({})).await.unwrap();
+        client
+            .call_typed_json::<_, _, Ack>("/ping", &Empty)
+            .await
+            .unwrap();
 
         let utf_results = peers.broadcast_notify_utf8("/msg", "hello");
         for (_, r) in utf_results {
@@ -2521,7 +2645,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn panicking_connect_hook_still_runs_disconnect_cleanup() {
-        let router = Router::new().with_json("/ping", |_| Ok(json!({ "ok": true })));
+        let router = Router::new().with_typed("/ping", |_: Empty| Ok(Ack { ok: true }));
         let peers = PeerRegistry::new();
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -2558,14 +2682,16 @@ mod tests {
         // A handler registered via with_json_ctx pushes a progress
         // notify back to the calling peer mid-request. Both the
         // notify and the response must arrive on the same connection.
-        let router = Router::new().with_json_ctx("/work", |ctx, _params| {
+        let router = Router::new().with_typed_ctx("/work", |ctx: &CallContext, _params: Empty| {
             if let Some(peer) = ctx.peer() {
                 let _ = peer.send_notify(
                     "/progress",
-                    NotifyBody::Json(serde_json::to_vec(&json!({ "stage": "running" })).unwrap()),
+                    NotifyBody::Json(structio::json::to_vec(&Stage {
+                        stage: "running".into(),
+                    })),
                 );
             }
-            Ok(json!({ "done": true }))
+            Ok(Done { done: true })
         });
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -2578,8 +2704,11 @@ mod tests {
             .unwrap();
         let mut notifies = client.subscribe_notifies().expect("subscribe");
 
-        let resp = client.call_json("/work", &json!({})).await.unwrap();
-        assert_eq!(resp, json!({ "done": true }));
+        let resp = client
+            .call_typed_json::<_, _, Done>("/work", &Empty)
+            .await
+            .unwrap();
+        assert_eq!(resp, Done { done: true });
 
         let pushed = tokio::time::timeout(Duration::from_secs(2), notifies.recv())
             .await
@@ -2587,8 +2716,8 @@ mod tests {
             .expect("channel closed");
         assert!(pushed.header.notify != 0);
         assert_eq!(pushed.query_str().unwrap(), "/progress");
-        let body: serde_json::Value = pushed.json_body().unwrap();
-        assert_eq!(body, json!({ "stage": "running" }));
+        let body: Stage = pushed.json_body().unwrap();
+        assert_eq!(body.stage, "running");
 
         drop(client);
         server_task.abort();
@@ -2601,8 +2730,10 @@ mod tests {
         // is None. This guards the TCP-transport / direct-dispatch
         // fallback shape so a ctx-aware handler does not panic when
         // there is no peer.
-        let router = Router::new().with_json_ctx("/probe", |ctx, _params| {
-            Ok(json!({ "has_peer": ctx.peer().is_some() }))
+        let router = Router::new().with_typed_ctx("/probe", |ctx: &CallContext, _params: Empty| {
+            Ok(HasPeer {
+                has_peer: ctx.peer().is_some(),
+            })
         });
         let handler = router.get("/probe").expect("handler exists");
 
@@ -2610,12 +2741,11 @@ mod tests {
             .id(1)
             .query_str("/probe")
             .query_format(QueryFormat::JsonPointer)
-            .body_json(&json!({}))
-            .unwrap()
+            .body_json(&Empty)
             .build();
         let resp = handler.handle(&req).unwrap();
-        let body: serde_json::Value = resp.json_body().unwrap();
-        assert_eq!(body, json!({ "has_peer": false }));
+        let body: HasPeer = resp.json_body().unwrap();
+        assert!(!body.has_peer);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2630,17 +2760,19 @@ mod tests {
         registry
             .register_function(
                 "/work",
-                WithContext(|ctx: &CallContext, _params| {
-                    if let Some(peer) = ctx.peer() {
-                        let _ = peer.send_notify(
-                            "/progress",
-                            NotifyBody::Json(
-                                serde_json::to_vec(&json!({ "stage": "registry" })).unwrap(),
-                            ),
-                        );
-                    }
-                    Ok(json!({ "done": true }))
-                }),
+                WithContext(
+                    |ctx: &CallContext, _params: Option<crate::structs::RequestBody<'_>>| {
+                        if let Some(peer) = ctx.peer() {
+                            let _ = peer.send_notify(
+                                "/progress",
+                                NotifyBody::Json(structio::json::to_vec(&Stage {
+                                    stage: "registry".into(),
+                                })),
+                            );
+                        }
+                        Ok(Done { done: true })
+                    },
+                ),
             )
             .unwrap();
 
@@ -2656,8 +2788,11 @@ mod tests {
             .unwrap();
         let mut notifies = client.subscribe_notifies().expect("subscribe");
 
-        let resp = client.call_json("/work", &json!({})).await.unwrap();
-        assert_eq!(resp, json!({ "done": true }));
+        let resp = client
+            .call_typed_json::<_, _, Done>("/work", &Empty)
+            .await
+            .unwrap();
+        assert_eq!(resp, Done { done: true });
 
         let pushed = tokio::time::timeout(Duration::from_secs(2), notifies.recv())
             .await
@@ -2678,8 +2813,10 @@ mod tests {
         use crate::server::Next;
         let router = Router::new()
             .with_middleware(|req: &Message, next: Next<'_>| next.run(req))
-            .with_json_ctx("/work", |ctx, _params| {
-                Ok(json!({ "has_peer": ctx.peer().is_some() }))
+            .with_typed_ctx("/work", |ctx: &CallContext, _params: Empty| {
+                Ok(HasPeer {
+                    has_peer: ctx.peer().is_some(),
+                })
             });
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -2690,8 +2827,11 @@ mod tests {
         let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
             .await
             .unwrap();
-        let resp = client.call_json("/work", &json!({})).await.unwrap();
-        assert_eq!(resp, json!({ "has_peer": true }));
+        let resp = client
+            .call_typed_json::<_, _, HasPeer>("/work", &Empty)
+            .await
+            .unwrap();
+        assert_eq!(resp, HasPeer { has_peer: true });
 
         drop(client);
         server_task.abort();
@@ -2721,7 +2861,7 @@ mod tests {
                 }
                 next.run(req)
             })
-            .with_json("/ping", |_| Ok(json!({ "ok": true })));
+            .with_typed("/ping", |_: Empty| Ok(Ack { ok: true }));
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2731,8 +2871,11 @@ mod tests {
         let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
             .await
             .unwrap();
-        let resp = client.call_json("/ping", &json!({})).await.unwrap();
-        assert_eq!(resp, json!({ "ok": true }));
+        let resp = client
+            .call_typed_json::<_, _, Ack>("/ping", &Empty)
+            .await
+            .unwrap();
+        assert_eq!(resp, Ack { ok: true });
         assert!(
             saw_peer.load(Ordering::SeqCst),
             "middleware did not observe the calling peer via next.ctx()/next.peer()"
@@ -2744,8 +2887,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn shared_registry_across_two_servers_mints_unique_ids() {
-        let router_a = Router::new().with_json("/ping", |_| Ok(json!({ "ok": true })));
-        let router_b = Router::new().with_json("/ping", |_| Ok(json!({ "ok": true })));
+        let router_a = Router::new().with_typed("/ping", |_: Empty| Ok(Ack { ok: true }));
+        let router_b = Router::new().with_typed("/ping", |_: Empty| Ok(Ack { ok: true }));
         let peers = PeerRegistry::new();
 
         let la = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -2765,8 +2908,12 @@ mod tests {
             .await
             .unwrap();
         // Round-trips so both peers are registered.
-        c1.call_json("/ping", &json!({})).await.unwrap();
-        c2.call_json("/ping", &json!({})).await.unwrap();
+        c1.call_typed_json::<_, _, Ack>("/ping", &Empty)
+            .await
+            .unwrap();
+        c2.call_typed_json::<_, _, Ack>("/ping", &Empty)
+            .await
+            .unwrap();
 
         // Both peers must be present with distinct ids.
         assert_eq!(peers.len(), 2);
@@ -2787,7 +2934,7 @@ mod tests {
         // embedder uses to share a TCP port with its own HTTP routes),
         // round-trip a request, and assert a PeerRegistry attached via
         // with_peer_registry observes the peer.
-        let router = Router::new().with_json("/ping", |_| Ok(json!({ "ok": true })));
+        let router = Router::new().with_typed("/ping", |_: Empty| Ok(Ack { ok: true }));
         let peers = PeerRegistry::new();
         let server = WebSocketServer::new(router).with_peer_registry(peers.clone());
         let shared = server.into_shared();
@@ -2805,8 +2952,11 @@ mod tests {
         let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
             .await
             .unwrap();
-        let resp = client.call_json("/ping", &json!({})).await.unwrap();
-        assert_eq!(resp, json!({ "ok": true }));
+        let resp = client
+            .call_typed_json::<_, _, Ack>("/ping", &Empty)
+            .await
+            .unwrap();
+        assert_eq!(resp, Ack { ok: true });
 
         // Connect hooks fire before traffic is processed, so by the time
         // the /ping response is in hand the peer is already registered.
@@ -2828,19 +2978,19 @@ mod tests {
         let gate_signal = Arc::clone(&gate);
 
         let router = Router::new()
-            .with_json_blocking("/wait", move |_| {
+            .with_typed_blocking("/wait", move |_: Empty| {
                 let (lock, cv) = &*gate_wait;
                 let mut ready = lock.lock().unwrap();
                 while !*ready {
                     ready = cv.wait(ready).unwrap();
                 }
-                Ok(json!({ "woke": true }))
+                Ok(Ack { ok: true })
             })
-            .with_json("/signal", move |_| {
+            .with_typed("/signal", move |_: Empty| {
                 let (lock, cv) = &*gate_signal;
                 *lock.lock().unwrap() = true;
                 cv.notify_all();
-                Ok(json!({ "signaled": true }))
+                Ok(Ack { ok: true })
             });
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -2852,7 +3002,8 @@ mod tests {
             .await
             .unwrap();
         let waiter = client.clone();
-        let wait_call = tokio::spawn(async move { waiter.call_json("/wait", &json!({})).await });
+        let wait_call =
+            tokio::spawn(async move { waiter.call_typed_json::<_, _, Ack>("/wait", &Empty).await });
 
         // Give `/wait` time to reach the server and park.
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2860,19 +3011,19 @@ mod tests {
         // If the reader were blocked inside `/wait`, this would time out.
         let signaled = tokio::time::timeout(
             Duration::from_secs(2),
-            client.call_json("/signal", &json!({})),
+            client.call_typed_json::<_, _, Ack>("/signal", &Empty),
         )
         .await
         .expect("/signal timed out: off-reader handler blocked the reader")
         .unwrap();
-        assert_eq!(signaled["signaled"], true);
+        assert!(signaled.ok);
 
         let woke = tokio::time::timeout(Duration::from_secs(2), wait_call)
             .await
             .expect("/wait timed out")
             .unwrap()
             .unwrap();
-        assert_eq!(woke["woke"], true);
+        assert!(woke.ok);
 
         drop(client);
         server_task.abort();
@@ -2884,13 +3035,10 @@ mod tests {
         // error response (not swallowed into a client hang), and it must
         // not take the connection down.
         let router = Router::new()
-            .with_json_blocking(
-                "/boom",
-                |_| -> Result<serde_json::Value, (ErrorCode, String)> {
-                    panic!("handler exploded");
-                },
-            )
-            .with_json("/ping", |_| Ok(json!({ "pong": true })));
+            .with_typed_blocking("/boom", |_: Empty| -> Result<Ack, (ErrorCode, String)> {
+                panic!("handler exploded");
+            })
+            .with_typed("/ping", |_: Empty| Ok(Ack { ok: true }));
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2903,7 +3051,7 @@ mod tests {
 
         let err = tokio::time::timeout(
             Duration::from_secs(2),
-            client.call_json("/boom", &json!({})),
+            client.call_typed_json::<_, _, Ack>("/boom", &Empty),
         )
         .await
         .expect("/boom timed out: panic produced no response")
@@ -2916,8 +3064,11 @@ mod tests {
         }
 
         // The connection is still alive afterward.
-        let pong = client.call_json("/ping", &json!({})).await.unwrap();
-        assert_eq!(pong["pong"], true);
+        let pong = client
+            .call_typed_json::<_, _, Ack>("/ping", &Empty)
+            .await
+            .unwrap();
+        assert!(pong.ok);
 
         drop(client);
         server_task.abort();
@@ -2932,13 +3083,13 @@ mod tests {
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let gate_hold = Arc::clone(&gate);
 
-        let router = Router::new().with_json_blocking("/hold", move |_| {
+        let router = Router::new().with_typed_blocking("/hold", move |_: Empty| {
             let (lock, cv) = &*gate_hold;
             let mut ready = lock.lock().unwrap();
             while !*ready {
                 ready = cv.wait(ready).unwrap();
             }
-            Ok(json!({ "released": true }))
+            Ok(Ack { ok: true })
         });
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -2950,14 +3101,15 @@ mod tests {
             .await
             .unwrap();
         let holder = client.clone();
-        let first = tokio::spawn(async move { holder.call_json("/hold", &json!({})).await });
+        let first =
+            tokio::spawn(async move { holder.call_typed_json::<_, _, Ack>("/hold", &Empty).await });
 
         // Let the first `/hold` take the slot and park.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let rejected = tokio::time::timeout(
             Duration::from_secs(2),
-            client.call_json("/hold", &json!({})),
+            client.call_typed_json::<_, _, Ack>("/hold", &Empty),
         )
         .await
         .expect("second /hold timed out instead of being rejected")
@@ -2980,7 +3132,7 @@ mod tests {
             .expect("first /hold timed out")
             .unwrap()
             .unwrap();
-        assert_eq!(released["released"], true);
+        assert!(released.ok);
 
         drop(client);
         server_task.abort();
@@ -3014,7 +3166,7 @@ mod tests {
         let registry_ack = Arc::clone(&registry);
 
         let router = Router::new()
-            .with_json_ctx_blocking("/begin", move |ctx, _params| {
+            .with_typed_ctx_blocking("/begin", move |ctx: &CallContext, _params: Empty| {
                 let peer = ctx.peer().expect("websocket peer present").clone();
                 let control = TransferControl::new(WINDOW);
                 control.set_peer(peer);
@@ -3028,8 +3180,7 @@ mod tests {
                         .wait_for_credit(CHUNK, deadline)
                         .map_err(|e| (ErrorCode::ApplicationErrorBase, e.to_string()))?;
                     let through = offset + CHUNK;
-                    let body =
-                        serde_json::to_vec(&json!({ "through": through, "last": last })).unwrap();
+                    let body = structio::json::to_vec(&Progress { through, last });
                     let peer = control.peer().expect("peer installed");
                     peer.send_notify("/chunk", NotifyBody::Json(body))
                         .map_err(|e| {
@@ -3039,15 +3190,16 @@ mod tests {
                     offset = through;
                 }
                 registry_begin.unregister(TransferId(1));
-                Ok(json!({ "sent": NUM_CHUNKS, "bytes": offset }))
+                Ok(Sent {
+                    sent: NUM_CHUNKS as u64,
+                    bytes: offset as u64,
+                })
             })
-            .with_json("/ack", move |params| {
-                let file_index = params["file_index"].as_u64().unwrap_or(0) as u32;
-                let through = params["through"].as_u64().unwrap_or(0);
+            .with_typed("/ack", move |params: AckRequest| {
                 if let Some(control) = registry_ack.get(TransferId(1)) {
-                    control.record_ack(file_index, through);
+                    control.record_ack(params.file_index as u32, params.through);
                 }
-                Ok(json!({ "ok": true }))
+                Ok(Ack { ok: true })
             });
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -3063,7 +3215,11 @@ mod tests {
         // /begin runs the whole transfer and only responds when done, so
         // drive it concurrently while we drain chunk notifies and ACK.
         let begin_client = client.clone();
-        let begin = tokio::spawn(async move { begin_client.call_json("/begin", &json!({})).await });
+        let begin = tokio::spawn(async move {
+            begin_client
+                .call_typed_json::<_, _, Sent>("/begin", &Empty)
+                .await
+        });
 
         let mut count: u64 = 0;
         let mut last_through: u64 = 0;
@@ -3073,9 +3229,8 @@ mod tests {
                 .expect("chunk notify did not arrive (producer likely starved for credit)")
                 .expect("notify channel closed");
             assert_eq!(chunk.query_str().unwrap(), "/chunk");
-            let body: serde_json::Value = chunk.json_body().unwrap();
-            let through = body["through"].as_u64().unwrap();
-            let last = body["last"].as_bool().unwrap();
+            let body: Progress = chunk.json_body().unwrap();
+            let (through, last) = (body.through, body.last);
             // Chunks arrive in order, each advancing by exactly CHUNK.
             assert_eq!(through, last_through + CHUNK);
             last_through = through;
@@ -3083,7 +3238,13 @@ mod tests {
             // ACK everything received so far; record_ack releases credit
             // so a producer parked in wait_for_credit resumes.
             client
-                .call_json("/ack", &json!({ "file_index": 0, "through": through }))
+                .call_typed_json::<_, _, Ack>(
+                    "/ack",
+                    &AckRequest {
+                        file_index: 0,
+                        through,
+                    },
+                )
                 .await
                 .unwrap();
             if last {
@@ -3098,8 +3259,8 @@ mod tests {
             .expect("/begin did not complete")
             .expect("/begin task panicked")
             .expect("/begin returned an error");
-        assert_eq!(begin_resp["sent"].as_u64(), Some(NUM_CHUNKS));
-        assert_eq!(begin_resp["bytes"].as_u64(), Some(NUM_CHUNKS * CHUNK));
+        assert_eq!(begin_resp.sent, NUM_CHUNKS);
+        assert_eq!(begin_resp.bytes, NUM_CHUNKS * CHUNK);
         assert!(
             registry.is_empty(),
             "transfer should be unregistered after completion"
@@ -3163,15 +3324,18 @@ mod tests {
         let observed = Arc::new(AtomicBool::new(false));
         let observed_h = Arc::clone(&observed);
 
-        let router = Router::new().with_json_ctx_blocking("/run", move |ctx, _params| {
-            loop {
-                if ctx.is_cancelled() {
-                    observed_h.store(true, Ordering::SeqCst);
-                    return Ok(json!({ "cancelled": true }));
+        let router = Router::new().with_typed_ctx_blocking(
+            "/run",
+            move |ctx: &CallContext, _params: Empty| {
+                loop {
+                    if ctx.is_cancelled() {
+                        observed_h.store(true, Ordering::SeqCst);
+                        return Ok(Ack { ok: true });
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
                 }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        });
+            },
+        );
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3185,7 +3349,7 @@ mod tests {
         // held response future (and thus no client clone) keeping the
         // connection open: dropping the sole client handle truly closes
         // it, which is what triggers the disconnect we want to observe.
-        client.notify_json("/run", &json!({})).await.unwrap();
+        client.notify_json("/run", &Empty).await.unwrap();
 
         // Let the handler reach its poll loop, then disconnect.
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -3218,15 +3382,18 @@ mod tests {
         let observed = Arc::new(AtomicBool::new(false));
         let observed_h = Arc::clone(&observed);
 
-        let router = Router::new().with_json_ctx_blocking("/run", move |ctx, _params| {
-            loop {
-                if ctx.is_cancelled() {
-                    observed_h.store(true, Ordering::SeqCst);
-                    return Ok(json!({ "done": true }));
+        let router = Router::new().with_typed_ctx_blocking(
+            "/run",
+            move |ctx: &CallContext, _params: Empty| {
+                loop {
+                    if ctx.is_cancelled() {
+                        observed_h.store(true, Ordering::SeqCst);
+                        return Ok(Done { done: true });
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
                 }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        });
+            },
+        );
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3250,7 +3417,7 @@ mod tests {
             .unwrap();
         // Fire the handler as a notify so it runs off-reader without a
         // held response future.
-        client.notify_json("/run", &json!({})).await.unwrap();
+        client.notify_json("/run", &Empty).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         shutdown_tx.send(()).unwrap();
@@ -3284,9 +3451,9 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let release_rx = Arc::new(Mutex::new(release_rx));
 
-        let router = Router::new().with_json_blocking("/stuck", move |_| {
+        let router = Router::new().with_typed_blocking("/stuck", move |_: Empty| {
             let _ = release_rx.lock().unwrap().recv();
-            Ok(json!({ "done": true }))
+            Ok(Done { done: true })
         });
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -3310,7 +3477,10 @@ mod tests {
             .await
             .unwrap();
         let runner = client.clone();
-        let _call = tokio::spawn(async move { runner.call_json("/stuck", &json!({})).await });
+        let _call =
+            tokio::spawn(
+                async move { runner.call_typed_json::<_, _, Ack>("/stuck", &Empty).await },
+            );
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         shutdown_tx.send(()).unwrap();
@@ -3335,15 +3505,18 @@ mod tests {
         let observed = Arc::new(AtomicBool::new(false));
         let observed_h = Arc::clone(&observed);
 
-        let router = Router::new().with_json_ctx_blocking("/run", move |ctx, _params| {
-            loop {
-                if ctx.is_cancelled() {
-                    observed_h.store(true, Ordering::SeqCst);
-                    return Ok(json!({ "done": true }));
+        let router = Router::new().with_typed_ctx_blocking(
+            "/run",
+            move |ctx: &CallContext, _params: Empty| {
+                loop {
+                    if ctx.is_cancelled() {
+                        observed_h.store(true, Ordering::SeqCst);
+                        return Ok(Done { done: true });
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
                 }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        });
+            },
+        );
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3364,7 +3537,7 @@ mod tests {
         let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
             .await
             .unwrap();
-        client.notify_json("/run", &json!({})).await.unwrap();
+        client.notify_json("/run", &Empty).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         token.cancel();
@@ -3485,13 +3658,10 @@ mod tests {
         let events_h = Arc::clone(&events);
 
         let router = Router::new()
-            .with_json_blocking(
-                "/boom",
-                |_| -> Result<serde_json::Value, (ErrorCode, String)> {
-                    panic!("kaboom");
-                },
-            )
-            .with_json("/ping", |_| Ok(json!({ "ok": true })));
+            .with_typed_blocking("/boom", |_: Empty| -> Result<Ack, (ErrorCode, String)> {
+                panic!("kaboom");
+            })
+            .with_typed("/ping", |_: Empty| Ok(Ack { ok: true }));
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3506,13 +3676,19 @@ mod tests {
             .await
             .unwrap();
         // The panic is caught and surfaces as an InternalError response.
-        let err = client.call_json("/boom", &json!({})).await.unwrap_err();
+        let err = client
+            .call_typed_json::<_, _, Ack>("/boom", &Empty)
+            .await
+            .unwrap_err();
         match err {
             RepeError::ServerError { code, .. } => assert_eq!(code, ErrorCode::InternalError),
             other => panic!("expected ServerError, got {other:?}"),
         }
         // Connection survives; round-trip to be sure the hook ran.
-        let _ = client.call_json("/ping", &json!({})).await.unwrap();
+        let _ = client
+            .call_typed_json::<_, _, Ack>("/ping", &Empty)
+            .await
+            .unwrap();
 
         let mut seen = false;
         for _ in 0..200 {
@@ -3535,13 +3711,13 @@ mod tests {
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let gate_hold = Arc::clone(&gate);
 
-        let router = Router::new().with_json_blocking("/hold", move |_| {
+        let router = Router::new().with_typed_blocking("/hold", move |_: Empty| {
             let (lock, cv) = &*gate_hold;
             let mut ready = lock.lock().unwrap();
             while !*ready {
                 ready = cv.wait(ready).unwrap();
             }
-            Ok(json!({ "released": true }))
+            Ok(Ack { ok: true })
         });
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -3559,10 +3735,14 @@ mod tests {
             .await
             .unwrap();
         let holder = client.clone();
-        let _first = tokio::spawn(async move { holder.call_json("/hold", &json!({})).await });
+        let _first =
+            tokio::spawn(async move { holder.call_typed_json::<_, _, Ack>("/hold", &Empty).await });
         tokio::time::sleep(Duration::from_millis(100)).await;
         // Second /hold saturates the cap-of-1 and is rejected.
-        let err = client.call_json("/hold", &json!({})).await.unwrap_err();
+        let err = client
+            .call_typed_json::<_, _, Ack>("/hold", &Empty)
+            .await
+            .unwrap_err();
         match err {
             RepeError::ServerError { code, .. } => assert_eq!(code, ErrorCode::ResourceExhausted),
             other => panic!("expected ServerError, got {other:?}"),
@@ -3593,7 +3773,7 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::<String>::new()));
         let events_h = Arc::clone(&events);
 
-        let router = Router::new().with_json("/ping", |_| Ok(json!({ "ok": true })));
+        let router = Router::new().with_typed("/ping", |_: Empty| Ok(Ack { ok: true }));
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -3755,7 +3935,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn handshake_query_param_drives_alias_for_targeted_push() {
-        let router = Router::new().with_json("/ping", |_| Ok(json!({ "ok": true })));
+        let router = Router::new().with_typed("/ping", |_: Empty| Ok(Ack { ok: true }));
         let peers = PeerRegistry::new();
 
         // Capture the context fields the hook saw, to assert the handshake
@@ -3786,7 +3966,10 @@ mod tests {
             .unwrap();
         let mut notifies = client.subscribe_notifies().expect("subscribe");
         // Round-trip so the connect hooks (registry insert, then alias) ran.
-        client.call_json("/ping", &json!({})).await.unwrap();
+        client
+            .call_typed_json::<_, _, Ack>("/ping", &Empty)
+            .await
+            .unwrap();
 
         // The hook observed the upgrade request context.
         let seen = captured.lock().unwrap().clone().expect("hook fired");
@@ -3833,7 +4016,7 @@ mod tests {
         let plain_h = Arc::clone(&plain);
         let ctx_h = Arc::clone(&ctx);
 
-        let router = Router::new().with_json("/ping", |_| Ok(json!({ "ok": true })));
+        let router = Router::new().with_typed("/ping", |_: Empty| Ok(Ack { ok: true }));
         let server = WebSocketServer::new(router)
             .on_peer_connect(move |_| {
                 plain_h.fetch_add(1, Ordering::SeqCst);
@@ -3850,7 +4033,10 @@ mod tests {
         let client = WebSocketClient::connect(&format!("ws://{addr}/repe"))
             .await
             .unwrap();
-        client.call_json("/ping", &json!({})).await.unwrap();
+        client
+            .call_typed_json::<_, _, Ack>("/ping", &Empty)
+            .await
+            .unwrap();
 
         assert_eq!(plain.load(Ordering::SeqCst), 1, "plain connect hook ran");
         assert_eq!(

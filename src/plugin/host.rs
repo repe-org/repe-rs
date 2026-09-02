@@ -1047,9 +1047,7 @@ mod tests {
         static RUNTIME: PluginRuntime = PluginRuntime::new(build);
 
         fn build() -> Router {
-            Router::new().with_json("/example/double", |v: serde_json::Value| {
-                Ok(serde_json::json!(v.as_i64().unwrap_or(0) * 2))
-            })
+            Router::new().with_typed("/example/double", |v: i64| Ok(v * 2))
         }
 
         pub unsafe extern "C" fn interface_version() -> u32 {
@@ -1095,14 +1093,13 @@ mod tests {
         unsafe { Plugin::from_abi(PathBuf::from("in-process"), abi, LoadOrigin::Mapped) }
     }
 
-    fn request(path: &str, body: &serde_json::Value, notify: bool) -> Vec<u8> {
+    fn request<T: structio::json::Write + ?Sized>(path: &str, body: &T, notify: bool) -> Vec<u8> {
         Message::builder()
             .id(7)
             .notify(notify)
             .query_str(path)
             .query_format(QueryFormat::JsonPointer)
             .body_json(body)
-            .unwrap()
             .build()
             .to_vec()
     }
@@ -1116,7 +1113,7 @@ mod tests {
         assert_eq!(plugin.interface_version(), REPE_PLUGIN_INTERFACE_VERSION);
 
         let response = plugin
-            .call(&request("/example/double", &serde_json::json!(21), false))
+            .call(&request("/example/double", &21i64, false))
             .expect("the call crosses the ABI")
             .expect("a non-notify request produces a response");
         let response = Message::from_slice(&response).unwrap();
@@ -1128,7 +1125,7 @@ mod tests {
     fn a_notify_produces_no_response() {
         let plugin = load(abi()).expect("a conforming plugin loads");
         let response = plugin
-            .call(&request("/example/double", &serde_json::json!(1), true))
+            .call(&request("/example/double", &1i64, true))
             .expect("the call crosses the ABI");
         assert!(
             response.is_none(),
@@ -1143,10 +1140,7 @@ mod tests {
 
         assert!(
             plugin
-                .call_into(
-                    &request("/example/double", &serde_json::json!(2), false),
-                    &mut buffer
-                )
+                .call_into(&request("/example/double", &2i64, false), &mut buffer)
                 .unwrap()
         );
         let after_first = buffer.capacity();
@@ -1156,10 +1150,7 @@ mod tests {
         // rather than leaving the previous response in it to be sent twice.
         assert!(
             !plugin
-                .call_into(
-                    &request("/example/double", &serde_json::json!(2), true),
-                    &mut buffer
-                )
+                .call_into(&request("/example/double", &2i64, true), &mut buffer)
                 .unwrap()
         );
         assert!(buffer.is_empty());
@@ -1187,7 +1178,7 @@ mod tests {
         // back as a REPE frame addressed to whoever sent the request.
         let plugin = load(abi()).expect("a conforming plugin loads");
         let response = plugin
-            .call(&request("/example/absent", &serde_json::json!(null), false))
+            .call(&request("/example/absent", &None::<i64>, false))
             .expect("an unknown method is not a host error")
             .expect("it is answered rather than dropped");
         let response = Message::from_slice(&response).unwrap();
@@ -1379,7 +1370,7 @@ mod tests {
         .expect("init and shutdown may be absent");
         assert!(
             plugin
-                .call(&request("/example/double", &serde_json::json!(3), false))
+                .call(&request("/example/double", &3i64, false))
                 .unwrap()
                 .is_some()
         );
@@ -1401,7 +1392,7 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(
-            plugin.call(&request("/example/double", &serde_json::json!(1), false)),
+            plugin.call(&request("/example/double", &1i64, false)),
             Err(HostError::NullResponse { size: 32 })
         ));
     }
@@ -1424,7 +1415,7 @@ mod tests {
         .unwrap();
         assert!(
             plugin
-                .call(&request("/example/double", &serde_json::json!(1), false))
+                .call(&request("/example/double", &1i64, false))
                 .unwrap()
                 .is_none()
         );
@@ -1446,7 +1437,7 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(
-            plugin.call(&request("/example/double", &serde_json::json!(1), false)),
+            plugin.call(&request("/example/double", &1i64, false)),
             Err(HostError::ResponseTooLarge { size: u64::MAX })
         ));
     }
@@ -1468,7 +1459,7 @@ mod tests {
     fn a_mounted_plugin_serves_what_it_claims() {
         let response = through_router(
             load(abi()).unwrap(),
-            &request("/example/double", &serde_json::json!(21), false),
+            &request("/example/double", &21i64, false),
         )
         .expect("a non-notify request is answered");
         assert_eq!(response.json_body::<i64>().unwrap(), 42);
@@ -1480,11 +1471,8 @@ mod tests {
         // The router has already missed everything else by the time a fallback
         // runs, so a path the plugin does not claim has nobody left to serve it.
         // Answering is the only thing that does not strand the caller.
-        let response = through_router(
-            load(abi()).unwrap(),
-            &request("/elsewhere", &serde_json::json!(1), false),
-        )
-        .expect("a declined path is still answered");
+        let response = through_router(load(abi()).unwrap(), &request("/elsewhere", &1i64, false))
+            .expect("a declined path is still answered");
         assert_eq!(response.error_code(), Some(ErrorCode::MethodNotFound));
         assert!(
             response
@@ -1512,13 +1500,7 @@ mod tests {
         })
         .unwrap();
         let before = SEEN.load(Ordering::SeqCst);
-        assert!(
-            through_router(
-                plugin,
-                &request("/example/double", &serde_json::json!(1), true),
-            )
-            .is_none()
-        );
+        assert!(through_router(plugin, &request("/example/double", &1i64, true),).is_none());
         assert_eq!(
             SEEN.load(Ordering::SeqCst),
             before + 1,
@@ -1543,11 +1525,8 @@ mod tests {
             ..abi()
         })
         .unwrap();
-        let response = through_router(
-            plugin,
-            &request("/example/double", &serde_json::json!(1), false),
-        )
-        .expect("the caller is told rather than left waiting");
+        let response = through_router(plugin, &request("/example/double", &1i64, false))
+            .expect("the caller is told rather than left waiting");
         assert_eq!(response.error_code(), Some(ErrorCode::InternalError));
     }
 
@@ -1566,11 +1545,8 @@ mod tests {
             ..abi()
         })
         .unwrap();
-        let response = through_router(
-            plugin,
-            &request("/example/double", &serde_json::json!(1), false),
-        )
-        .expect("answered");
+        let response =
+            through_router(plugin, &request("/example/double", &1i64, false)).expect("answered");
         assert_eq!(response.error_code(), Some(ErrorCode::InternalError));
     }
 
@@ -1601,7 +1577,7 @@ mod tests {
         // view; both have to produce the same answer, and only one of them is on
         // the path `Router::call` takes.
         let plugin = load(abi()).unwrap();
-        let frame = request("/example/double", &serde_json::json!(21), false);
+        let frame = request("/example/double", &21i64, false);
         let owned = Message::from_slice(&frame).unwrap();
         let view = MessageView::from_slice(&frame).unwrap();
 

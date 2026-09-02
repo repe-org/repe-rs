@@ -125,13 +125,23 @@ mod tests {
     use super::*;
     use crate::async_client::AsyncClient;
 
+    #[derive(Default)]
+    struct Operands {
+        a: i64,
+        b: i64,
+    }
+    structio::object!(Operands { a, b });
+
+    #[derive(Default)]
+    struct Product {
+        prod: i64,
+    }
+    structio::object!(Product { prod });
+
     #[tokio::test(flavor = "current_thread")]
     async fn async_server_with_async_client() {
-        let router = Router::new().with_json("/mul", |v: serde_json::Value| {
-            let a = v.get("a").and_then(|x| x.as_i64()).unwrap_or(0);
-            let b = v.get("b").and_then(|x| x.as_i64()).unwrap_or(0);
-            Ok(serde_json::json!({"prod": a * b}))
-        });
+        let router =
+            Router::new().with_typed("/mul", |v: Operands| Ok(Product { prod: v.a * v.b }));
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -144,11 +154,11 @@ mod tests {
         });
 
         let client = AsyncClient::connect(addr).await.unwrap();
-        let out = client
-            .call_json("/mul", &serde_json::json!({"a": 6, "b": 7}))
+        let out: Product = client
+            .call_typed_json("/mul", &Operands { a: 6, b: 7 })
             .await
             .unwrap();
-        assert_eq!(out["prod"], 42);
+        assert_eq!(out.prod, 42);
 
         // Drop client to close connection; handler future should finish
         drop(client);

@@ -683,7 +683,6 @@ impl Client {
             }
         })
     }
-
 }
 
 fn spawn_response_loop(mut reader: BufReader<TcpStream>, inner: std::sync::Weak<ClientInner>) {

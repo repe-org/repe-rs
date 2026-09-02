@@ -621,29 +621,23 @@ mod tests {
     use crate::message::Message;
     use std::sync::atomic::AtomicUsize;
 
-    fn request(path: &str, body: &serde_json::Value, notify: bool) -> Vec<u8> {
+    fn request<T: structio::json::Write + ?Sized>(path: &str, body: &T, notify: bool) -> Vec<u8> {
         Message::builder()
             .id(9)
             .notify(notify)
             .query_str(path)
             .query_format(QueryFormat::JsonPointer)
             .body_json(body)
-            .unwrap()
             .build()
             .to_vec()
     }
 
     fn router() -> Router {
         Router::new()
-            .with_json("/double", |v: serde_json::Value| {
-                Ok(serde_json::json!(v.as_i64().unwrap_or(0) * 2))
+            .with_typed("/double", |v: i64| Ok(v * 2))
+            .with_typed("/boom", |_: i64| -> Result<i64, (ErrorCode, String)> {
+                panic!("handler exploded")
             })
-            .with_json(
-                "/boom",
-                |_: serde_json::Value| -> Result<serde_json::Value, (ErrorCode, String)> {
-                    panic!("handler exploded")
-                },
-            )
     }
 
     /// SAFETY helper: every call in this module hands a live slice to
@@ -668,7 +662,7 @@ mod tests {
         let runtime = PluginRuntime::new(router);
         assert_eq!(runtime.init(), RepeResult::Ok);
 
-        let response = call(&runtime, &request("/double", &serde_json::json!(21), false));
+        let response = call(&runtime, &request("/double", &21i64, false));
         let message = Message::from_slice(&response).unwrap();
         assert_eq!(message.header.id, 9);
         assert_eq!(message.query_str().unwrap(), "/double");
@@ -678,7 +672,7 @@ mod tests {
     #[test]
     fn notify_answers_with_an_empty_non_null_buffer() {
         let runtime = PluginRuntime::new(router);
-        let frame = request("/double", &serde_json::json!(1), true);
+        let frame = request("/double", &1i64, true);
         let buffer = unsafe { runtime.call(frame.as_ptr().cast::<c_char>(), frame.len() as u64) };
         assert_eq!(buffer.size, 0);
         assert!(
@@ -694,7 +688,7 @@ mod tests {
         let runtime = PluginRuntime::new(router);
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
-        let response = call(&runtime, &request("/boom", &serde_json::json!(null), false));
+        let response = call(&runtime, &request("/boom", &None::<i64>, false));
         std::panic::set_hook(previous);
 
         let message = Message::from_slice(&response).unwrap();
@@ -711,7 +705,7 @@ mod tests {
         let runtime = PluginRuntime::new(router);
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
-        let response = call(&runtime, &request("/boom", &serde_json::json!(null), true));
+        let response = call(&runtime, &request("/boom", &None::<i64>, true));
         std::panic::set_hook(previous);
 
         assert!(
@@ -736,7 +730,7 @@ mod tests {
         let runtime = PluginRuntime::new(explode);
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
-        let frame = request("/double", &serde_json::json!(1), false);
+        let frame = request("/double", &1i64, false);
         for _ in 0..5 {
             let response = call(&runtime, &frame);
             let message = Message::from_slice(&response).unwrap();
@@ -784,7 +778,7 @@ mod tests {
     #[test]
     fn a_lazily_initialized_router_reports_already_initialized() {
         let runtime = PluginRuntime::new(router);
-        call(&runtime, &request("/double", &serde_json::json!(2), false));
+        call(&runtime, &request("/double", &2i64, false));
         assert_eq!(runtime.init(), RepeResult::AlreadyInitialized);
     }
 
@@ -797,7 +791,7 @@ mod tests {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let result = runtime.init();
-        let response = call(&runtime, &request("/double", &serde_json::json!(1), false));
+        let response = call(&runtime, &request("/double", &1i64, false));
         std::panic::set_hook(previous);
 
         assert_eq!(result, RepeResult::InitFailed);
@@ -811,7 +805,7 @@ mod tests {
         assert_eq!(runtime.init(), RepeResult::Ok);
         runtime.shutdown();
 
-        let response = call(&runtime, &request("/double", &serde_json::json!(1), false));
+        let response = call(&runtime, &request("/double", &1i64, false));
         let message = Message::from_slice(&response).unwrap();
         assert_eq!(message.error_code(), Some(ErrorCode::InternalError));
         assert!(message.error_message_utf8().unwrap().contains("shutdown"));
@@ -828,7 +822,7 @@ mod tests {
         static RUNTIME: OnceLock<PluginRuntime> = OnceLock::new();
         fn counted() -> Router {
             BUILDS.fetch_add(1, Ordering::Relaxed);
-            Router::new().with_json("/double", |v: serde_json::Value| Ok(v))
+            Router::new().with_typed("/double", |v: i64| Ok(v))
         }
         let _ = RUNTIME.set(PluginRuntime::new(counted));
         let runtime = RUNTIME.get().unwrap();
@@ -836,7 +830,7 @@ mod tests {
         std::thread::scope(|scope| {
             for _ in 0..8 {
                 scope.spawn(|| {
-                    call(runtime, &request("/double", &serde_json::json!(1), false));
+                    call(runtime, &request("/double", &1i64, false));
                 });
             }
         });
@@ -849,7 +843,7 @@ mod tests {
         // `from_raw_parts` above `isize::MAX` is undefined behavior. A host that
         // read a length field as `-1` lands here.
         let runtime = PluginRuntime::new(router);
-        let frame = request("/double", &serde_json::json!(1), false);
+        let frame = request("/double", &1i64, false);
         let buffer = unsafe { runtime.call(frame.as_ptr().cast::<c_char>(), u64::MAX) };
         let response = unsafe {
             std::slice::from_raw_parts(buffer.data.cast::<u8>(), buffer.size as usize).to_vec()
@@ -863,7 +857,7 @@ mod tests {
         // Feeding a response straight back in as the next request. `call_into`
         // would hold it as one argument while clearing the other.
         let runtime = PluginRuntime::new(router);
-        let frame = request("/double", &serde_json::json!(21), false);
+        let frame = request("/double", &21i64, false);
         let previous = unsafe { runtime.call(frame.as_ptr().cast::<c_char>(), frame.len() as u64) };
 
         let aliased = unsafe { runtime.call(previous.data, previous.size) };
@@ -894,7 +888,7 @@ mod tests {
         impl Drop for LastRites {
             fn drop(&mut self) {
                 let runtime = RUNTIME.get().unwrap();
-                let frame = request("/double", &serde_json::json!(1), false);
+                let frame = request("/double", &1i64, false);
                 let buffer =
                     unsafe { runtime.call(frame.as_ptr().cast::<c_char>(), frame.len() as u64) };
                 ANSWERED.store(buffer.size > 0 && !buffer.data.is_null(), Ordering::Release);
@@ -908,10 +902,7 @@ mod tests {
             // Register the teardown call's destructor first, so `RESPONSE` —
             // registered by the call below — is torn down before it.
             LAST_RITES.with(|_| {});
-            call(
-                RUNTIME.get().unwrap(),
-                &request("/double", &serde_json::json!(1), false),
-            );
+            call(RUNTIME.get().unwrap(), &request("/double", &1i64, false));
         })
         .join()
         .unwrap();
@@ -930,25 +921,22 @@ mod tests {
         // overwrite the buffer the outer call is about to return.
         static RUNTIME: OnceLock<PluginRuntime> = OnceLock::new();
         fn reentrant() -> Router {
-            Router::new().with_json("/reenter", |_: serde_json::Value| {
+            Router::new().with_typed("/reenter", |_: Option<i64>| {
                 let runtime = RUNTIME.get().expect("runtime is set before dispatch");
-                let inner = request("/reenter", &serde_json::json!(null), false);
+                let inner = request("/reenter", &None::<i64>, false);
                 let buffer =
                     unsafe { runtime.call(inner.as_ptr().cast::<c_char>(), inner.len() as u64) };
                 let bytes = unsafe {
                     std::slice::from_raw_parts(buffer.data.cast::<u8>(), buffer.size as usize)
                 };
                 let message = Message::from_slice(bytes).unwrap();
-                Ok(serde_json::json!(message.error_message_utf8()))
+                Ok(message.error_message_utf8())
             })
         }
         let _ = RUNTIME.set(PluginRuntime::new(reentrant));
         let runtime = RUNTIME.get().unwrap();
 
-        let response = call(
-            runtime,
-            &request("/reenter", &serde_json::json!(null), false),
-        );
+        let response = call(runtime, &request("/reenter", &None::<i64>, false));
         let message = Message::from_slice(&response).unwrap();
         assert!(
             !message.is_error(),

@@ -647,7 +647,6 @@ impl AsyncClient {
         Ok(resp)
     }
 
-
     async fn notify_with_body<P, F>(&self, path: P, body_fn: F) -> Result<(), RepeError>
     where
         P: AsRef<str>,
@@ -928,11 +927,22 @@ fn lock_pending_map(
 mod tests {
     use super::*;
     use crate::io::{read_message, write_message};
-    use serde_json::json;
     use std::io::{BufReader, BufWriter, Write};
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::thread;
+
+    #[derive(Default)]
+    struct Count {
+        n: i64,
+    }
+    structio::object!(Count { n });
+
+    #[derive(Default, Debug)]
+    struct Echo {
+        path: String,
+    }
+    structio::object!(Echo { path });
 
     fn json_response_for(req: &Message) -> Message {
         Message::builder()
@@ -941,8 +951,9 @@ mod tests {
             .query_format(
                 QueryFormat::try_from(req.header.query_format).unwrap_or(QueryFormat::RawBinary),
             )
-            .body_json(&json!({"path": req.query_utf8()}))
-            .expect("json body")
+            .body_json(&Echo {
+                path: req.query_utf8(),
+            })
             .build()
     }
 
@@ -973,7 +984,7 @@ mod tests {
         let cancelled_client = client.clone();
         let cancelled_call = tokio::spawn(async move {
             cancelled_client
-                .call_json("/cancelled", &json!({"n": 1}))
+                .call_typed_json::<_, _, Echo>("/cancelled", &Count { n: 1 })
                 .await
         });
 
@@ -998,11 +1009,11 @@ mod tests {
             "cancelled calls must not leak pending entries"
         );
 
-        let out = client
-            .call_json_with_timeout("/ok", &json!({"n": 2}), Duration::from_secs(1))
+        let out: Echo = client
+            .call_typed_json_with_timeout("/ok", &Count { n: 2 }, Duration::from_secs(1))
             .await
             .unwrap();
-        assert_eq!(out["path"], "/ok");
+        assert_eq!(out.path, "/ok");
 
         tokio::task::spawn_blocking(move || server.join().unwrap())
             .await

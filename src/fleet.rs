@@ -1,6 +1,6 @@
 use crate::client::Client;
-use crate::error::RepeError;
 use crate::constants::{BodyFormat, QueryFormat};
+use crate::error::RepeError;
 use crate::message::Message;
 use repe_core::structs::ServableOwned;
 use std::collections::{BTreeSet, HashMap, HashSet};

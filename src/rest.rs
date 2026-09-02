@@ -695,7 +695,9 @@ fn path_to_pointer(path: &str) -> Result<String, &'static str> {
     let mut pointer = String::with_capacity(path.len());
     for segment in path.split('/').skip(1) {
         pointer.push('/');
-        pointer.push_str(&crate::json_pointer::escape_token(&percent_decode(segment)?));
+        pointer.push_str(&crate::json_pointer::escape_token(&percent_decode(
+            segment,
+        )?));
     }
     Ok(pointer)
 }
