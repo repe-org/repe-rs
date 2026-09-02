@@ -14,18 +14,26 @@ publish = false
 # meaningless.
 [workspace]
 
-# The whole fixture. `repe-core` and `serde` — nothing else.
+# The whole fixture. `repe-core` and `structio` — nothing else.
 #
-# `serde` is a fair ask: the source below writes `#[derive(Serialize)]`.
-# `serde_json` is not, and is deliberately absent: nothing in the source names
-# it, so the generated code must reach it through `repe_core::__private` rather
-# than through an absolute `::serde_json` path. Every test elsewhere in this
-# repo has `serde_json` in scope already, so a regression to the absolute path
-# would compile everywhere except in a real consumer's crate.
+# `structio` is a fair ask: the source below writes `structio::object!`. What
+# this pins is that the *generated* code names nothing beyond it. The derive
+# emits calls to `repe_core`'s own surface — `ResponseBody::write`,
+# `RequestBody::read` — and never a codec path of its own, so a consumer's
+# manifest holds only what its source actually writes.
 #
-# `default-features = false` is implicit (repe-core has no default features);
-# this also therefore pins that `#[repe(typed)]` is the *only* thing behind the
-# `typed` feature, since everything below compiles without it.
+# That guarantee used to need machinery. The derive emitted absolute
+# `::serde_json::...` paths at 22 sites, then `repe::__private::serde_json` to
+# stop requiring a dependency nothing in the source mentioned. Neither is here
+# any more: the encoding is entirely in the user's own `object!` declaration,
+# so there is no codec for the generated code to name.
+#
+# Every crate in the repe workspace has `structio` in scope, so a regression
+# that reintroduced a hardcoded path would compile everywhere except in a real
+# consumer. That is what this standalone crate is for.
+#
+# `repe-core` has no features left to ask for: `typed` gated `beve` and its six
+# transitive packages, and structio has no dependencies to gate.
 [dependencies]
 repe-core = { path = "../../repe-core" }
-serde = { version = "1", features = ["derive"] }
+structio = "0.2.1"
