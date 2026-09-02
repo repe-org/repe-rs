@@ -15,10 +15,43 @@
 #![cfg(feature = "rest")]
 
 use repe::rest::{MEDIA_BEVE, MEDIA_JSON, MEDIA_PROBLEM, RestConfig, RestGateway};
+use repe::structs::RequestBody;
 use repe::{ErrorCode, Registry};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+#[derive(Default, Debug, PartialEq)]
+struct Operands {
+    a: i64,
+    b: i64,
+}
+structio::object!(Operands { a, b });
+
+#[derive(Default, Debug, PartialEq)]
+struct Sum {
+    result: i64,
+}
+structio::object!(Sum { result });
+
+#[derive(Default, Debug, PartialEq)]
+struct Config {
+    verbose: bool,
+    name: String,
+}
+structio::object!(Config { verbose, name });
+
+/// The one problem-details member this file asserts on. Read under
+/// [`SkipUnknown`](structio::SkipUnknown), because the gateway sends the full
+/// RFC 9457 object and a declaration that names one key would otherwise refuse
+/// the rest of it: `..` says the *type* has more fields, not that the document
+/// may.
+#[derive(Default, Debug, PartialEq)]
+struct Problem {
+    status: u16,
+}
+structio::object!(Problem { status, .. });
 
 struct HttpResponse {
     status: u16,
@@ -34,8 +67,14 @@ impl HttpResponse {
             .map(|(_, value)| value.as_str())
     }
 
-    fn json(&self) -> Value {
-        serde_json::from_slice(&self.body).expect("response body is JSON")
+    /// The body decoded as `T`.
+    fn json<T: repe::structs::ServableOwned>(&self) -> T {
+        structio::from_slice(&self.body).expect("response body is JSON")
+    }
+
+    /// The body as JSON text, for the cases where the shape is the assertion.
+    fn text(&self) -> &str {
+        std::str::from_utf8(&self.body).expect("response body is UTF-8 JSON")
     }
 }
 
@@ -122,30 +161,56 @@ async fn read_response(stream: &mut TcpStream, method: &str) -> HttpResponse {
     }
 }
 
-async fn start(config: RestConfig) -> (std::net::SocketAddr, Arc<Registry>) {
+/// Every registered path is a function now, so `/counter` is one too: the
+/// handler owns the state and decides what a body means. That is how a value
+/// endpoint is spelled with no document store behind the registry.
+async fn start(config: RestConfig) -> (std::net::SocketAddr, Arc<AtomicI64>) {
     let registry = Arc::new(Registry::new());
-    registry.register_value("/counter", json!(7)).unwrap();
+
+    let counter = Arc::new(AtomicI64::new(7));
+    let handle = Arc::clone(&counter);
     registry
-        .register_value("/config", json!({ "verbose": false, "name": "demo" }))
-        .unwrap();
-    registry
-        .register_function("/add", |params| {
-            let Some(Value::Object(map)) = params else {
-                return Err((ErrorCode::InvalidBody, "expected an object".into()));
-            };
-            let a = map.get("a").and_then(Value::as_i64).unwrap_or(0);
-            let b = map.get("b").and_then(Value::as_i64).unwrap_or(0);
-            Ok(json!({ "result": a + b }))
+        .register_function("/counter", move |params: Option<RequestBody<'_>>| {
+            if let Some(body) = params {
+                let next: i64 = body
+                    .read("/counter")
+                    .map_err(|err| (ErrorCode::InvalidBody, err.to_string()))?;
+                counter.store(next, Ordering::SeqCst);
+            }
+            Ok(counter.load(Ordering::SeqCst))
         })
         .unwrap();
 
-    let gateway = RestGateway::with_config("/api/v1", Arc::clone(&registry), config);
+    registry
+        .register_function("/config", |_: Option<RequestBody<'_>>| {
+            Ok(Config {
+                verbose: false,
+                name: "demo".into(),
+            })
+        })
+        .unwrap();
+
+    registry
+        .register_function("/add", |params: Option<RequestBody<'_>>| {
+            let Some(body) = params else {
+                return Err((ErrorCode::InvalidBody, "expected an object".into()));
+            };
+            let operands: Operands = body
+                .read("/add")
+                .map_err(|err| (ErrorCode::InvalidBody, err.to_string()))?;
+            Ok(Sum {
+                result: operands.a + operands.b,
+            })
+        })
+        .unwrap();
+
+    let gateway = RestGateway::with_config("/api/v1", registry, config);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let _ = gateway.serve(listener).await;
     });
-    (addr, registry)
+    (addr, handle)
 }
 
 async fn connect(addr: std::net::SocketAddr) -> TcpStream {
@@ -154,7 +219,7 @@ async fn connect(addr: std::net::SocketAddr) -> TcpStream {
 
 #[tokio::test]
 async fn a_read_carries_its_representation_and_its_cache_headers() {
-    let (addr, _registry) = start(RestConfig::default()).await;
+    let (addr, _counter) = start(RestConfig::default()).await;
     let mut stream = connect(addr).await;
 
     let response = send(&mut stream, "GET", "/api/v1/counter", &[], b"").await;
@@ -163,12 +228,12 @@ async fn a_read_carries_its_representation_and_its_cache_headers() {
     assert_eq!(response.header("cache-control"), Some("no-cache"));
     assert_eq!(response.header("vary"), Some("Accept"));
     assert!(response.header("etag").is_some());
-    assert_eq!(response.json(), json!(7));
+    assert_eq!(response.json::<i64>(), 7);
 }
 
 #[tokio::test]
 async fn a_conditional_read_is_answered_with_304_and_no_body() {
-    let (addr, _registry) = start(RestConfig::default()).await;
+    let (addr, _counter) = start(RestConfig::default()).await;
     let mut stream = connect(addr).await;
 
     let first = send(&mut stream, "GET", "/api/v1/config", &[], b"").await;
@@ -194,7 +259,7 @@ async fn a_conditional_read_is_answered_with_304_and_no_body() {
 
 #[tokio::test]
 async fn head_declares_the_length_it_does_not_send() {
-    let (addr, _registry) = start(RestConfig::default()).await;
+    let (addr, _counter) = start(RestConfig::default()).await;
     let mut stream = connect(addr).await;
 
     let get = send(&mut stream, "GET", "/api/v1/config", &[], b"").await;
@@ -212,7 +277,7 @@ async fn head_declares_the_length_it_does_not_send() {
 
 #[tokio::test]
 async fn a_write_is_visible_to_the_next_read_and_to_the_registry() {
-    let (addr, registry) = start(RestConfig::default()).await;
+    let (addr, counter) = start(RestConfig::default()).await;
     let mut stream = connect(addr).await;
 
     let written = send(
@@ -230,14 +295,14 @@ async fn a_write_is_visible_to_the_next_read_and_to_the_registry() {
     );
 
     let read = send(&mut stream, "GET", "/api/v1/counter", &[], b"").await;
-    assert_eq!(read.json(), json!(42));
-    // The same state the REPE leg would serve: one registry, two front doors.
-    assert_eq!(registry.read_value("/counter").unwrap(), json!(42));
+    assert_eq!(read.json::<i64>(), 42);
+    // The same state the REPE leg would serve: one handler, two front doors.
+    assert_eq!(counter.load(Ordering::SeqCst), 42);
 }
 
 #[tokio::test]
 async fn a_call_round_trips_through_the_function() {
-    let (addr, _registry) = start(RestConfig::default()).await;
+    let (addr, _counter) = start(RestConfig::default()).await;
     let mut stream = connect(addr).await;
 
     let response = send(
@@ -249,12 +314,12 @@ async fn a_call_round_trips_through_the_function() {
     )
     .await;
     assert_eq!(response.status, 200);
-    assert_eq!(response.json(), json!({ "result": 42 }));
+    assert_eq!(response.json::<Sum>(), Sum { result: 42 });
 }
 
 #[tokio::test]
 async fn beve_is_negotiated_on_both_legs() {
-    let (addr, _registry) = start(RestConfig::default()).await;
+    let (addr, _counter) = start(RestConfig::default()).await;
     let mut stream = connect(addr).await;
 
     let read = send(
@@ -266,10 +331,10 @@ async fn beve_is_negotiated_on_both_legs() {
     )
     .await;
     assert_eq!(read.header("content-type"), Some(MEDIA_BEVE));
-    let decoded: Value = structio::from_beve(&read.body).unwrap();
-    assert_eq!(decoded["name"], json!("demo"));
+    let decoded: Config = structio::from_beve(&read.body).unwrap();
+    assert_eq!(decoded.name, "demo");
 
-    let body = structio::to_beve(&json!({ "a": 1, "b": 2 })).unwrap();
+    let body = structio::to_beve(&Operands { a: 1, b: 2 });
     let call = send(
         &mut stream,
         "POST",
@@ -279,39 +344,49 @@ async fn beve_is_negotiated_on_both_legs() {
     )
     .await;
     assert_eq!(call.status, 200);
-    let decoded: Value = structio::from_beve(&call.body).unwrap();
-    assert_eq!(decoded["result"], json!(3));
+    let decoded: Sum = structio::from_beve(&call.body).unwrap();
+    assert_eq!(decoded, Sum { result: 3 });
 }
 
 #[tokio::test]
-async fn a_verb_the_target_does_not_support_is_405_with_allow() {
-    let (addr, registry) = start(RestConfig::default()).await;
+async fn put_and_post_both_call_and_a_third_verb_is_405() {
+    // The registry stores no values, so there is no assignment for `PUT` to
+    // mean instead of a call. The two verbs are documented aliases and every
+    // registered path admits both; anything else is 405 with the same `Allow`.
+    let (addr, counter) = start(RestConfig::default()).await;
     let mut stream = connect(addr).await;
 
-    let response = send(
-        &mut stream,
-        "POST",
-        "/api/v1/counter",
-        &[("Content-Type", MEDIA_JSON)],
-        b"1",
-    )
-    .await;
+    for (verb, value) in [("PUT", 1i64), ("POST", 2)] {
+        let response = send(
+            &mut stream,
+            verb,
+            "/api/v1/counter",
+            &[("Content-Type", MEDIA_JSON)],
+            value.to_string().as_bytes(),
+        )
+        .await;
+        assert_eq!(response.status, 200, "{verb}");
+        assert_eq!(counter.load(Ordering::SeqCst), value, "{verb}");
+    }
+
+    let response = send(&mut stream, "DELETE", "/api/v1/counter", &[], b"").await;
     assert_eq!(response.status, 405);
-    assert_eq!(response.header("allow"), Some("GET, HEAD, PUT, OPTIONS"));
     assert_eq!(
-        registry.read_value("/counter").unwrap(),
-        json!(7),
-        "the refused request must not have taken effect"
+        response.header("allow"),
+        Some("GET, HEAD, PUT, POST, OPTIONS")
     );
 
     let options = send(&mut stream, "OPTIONS", "/api/v1/add", &[], b"").await;
     assert_eq!(options.status, 204);
-    assert_eq!(options.header("allow"), Some("GET, HEAD, POST, OPTIONS"));
+    assert_eq!(
+        options.header("allow"),
+        Some("GET, HEAD, PUT, POST, OPTIONS")
+    );
 }
 
 #[tokio::test]
 async fn a_missing_resource_is_problem_details_carrying_the_repe_code() {
-    let (addr, _registry) = start(RestConfig::default()).await;
+    let (addr, _counter) = start(RestConfig::default()).await;
     let mut stream = connect(addr).await;
 
     let response = send(&mut stream, "GET", "/api/v1/absent", &[], b"").await;
@@ -321,12 +396,15 @@ async fn a_missing_resource_is_problem_details_carrying_the_repe_code() {
         response.header("x-repe-error-code"),
         Some((ErrorCode::MethodNotFound as u32).to_string().as_str())
     );
-    assert_eq!(response.json()["status"], json!(404));
+    let problem: Problem =
+        structio::json::from_slice_with::<structio::SkipUnknown, _>(&response.body)
+            .expect("the problem body is JSON");
+    assert_eq!(problem.status, 404);
 }
 
 #[tokio::test]
 async fn an_oversized_body_is_refused_before_it_is_buffered() {
-    let (addr, registry) = start(RestConfig {
+    let (addr, counter) = start(RestConfig {
         max_body_bytes: 32,
         ..RestConfig::default()
     })
@@ -343,7 +421,7 @@ async fn an_oversized_body_is_refused_before_it_is_buffered() {
     )
     .await;
     assert_eq!(response.status, 413);
-    assert_eq!(registry.read_value("/counter").unwrap(), json!(7));
+    assert_eq!(counter.load(Ordering::SeqCst), 7);
 
     // A body just under the limit still goes through, so the limit is a limit
     // and not an outage.
@@ -353,10 +431,11 @@ async fn an_oversized_body_is_refused_before_it_is_buffered() {
         "PUT",
         "/api/v1/counter",
         &[("Content-Type", MEDIA_JSON)],
-        b"\"small\"",
+        b"11",
     )
     .await;
     assert_eq!(accepted.status, 200);
+    assert_eq!(counter.load(Ordering::SeqCst), 11);
 }
 
 #[tokio::test]
@@ -364,7 +443,7 @@ async fn one_connection_serves_many_requests() {
     // Keep-alive is what makes the facade cheap enough to sit in front of a
     // binary protocol at all; a per-request connection would dominate everything
     // the mapping does.
-    let (addr, _registry) = start(RestConfig::default()).await;
+    let (addr, _counter) = start(RestConfig::default()).await;
     let mut stream = connect(addr).await;
 
     for expected in 0..5i64 {
@@ -377,7 +456,7 @@ async fn one_connection_serves_many_requests() {
         )
         .await;
         let read = send(&mut stream, "GET", "/api/v1/counter", &[], b"").await;
-        assert_eq!(read.json(), json!(expected));
+        assert_eq!(read.json::<i64>(), expected);
     }
 }
 
@@ -389,7 +468,7 @@ async fn one_connection_serves_many_requests() {
 /// timeout does not cover this: the head here is complete and well-formed.
 #[tokio::test]
 async fn a_promised_body_that_never_arrives_is_timed_out() {
-    let (addr, _registry) = start(RestConfig {
+    let (addr, _counter) = start(RestConfig {
         request_timeout: Some(std::time::Duration::from_millis(300)),
         ..RestConfig::default()
     })
@@ -424,7 +503,7 @@ async fn a_promised_body_that_never_arrives_is_timed_out() {
 /// would still be an outage even with the timeout in place.
 #[tokio::test]
 async fn a_timed_out_connection_releases_its_slot() {
-    let (addr, _registry) = start(RestConfig {
+    let (addr, _counter) = start(RestConfig {
         request_timeout: Some(std::time::Duration::from_millis(200)),
         max_connections: 2,
         ..RestConfig::default()
