@@ -122,11 +122,7 @@ struct AttributeStruct {
     #[repe(readonly)]
     name: String,
 }
-structio::object!(AttributeStruct {
-    value,
-    hidden,
-    name
-});
+structio::object!(AttributeStruct { value, name, .. });
 
 impl AttributeStruct {
     fn describe(&self) -> String {

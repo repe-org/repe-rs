@@ -44,7 +44,7 @@ structio::object!(Ordered {
     name,
     count,
     total,
-    ratio
+    ..
 });
 
 #[repe::methods]
@@ -81,7 +81,7 @@ structio::object!(Appended {
     name,
     count,
     total,
-    ratio
+    ..
 });
 
 #[repe::methods]

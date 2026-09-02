@@ -558,11 +558,7 @@ struct Outer {
     #[allow(dead_code)]
     hidden: u8,
 }
-structio::object!(Outer {
-    name,
-    inner,
-    hidden
-});
+structio::object!(Outer { name, inner, .. });
 
 fn outer() -> Outer {
     Outer {
