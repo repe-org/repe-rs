@@ -1187,7 +1187,7 @@ impl Router {
     ///         if let Some(rest) = path.strip_prefix("/dynamic/") {
     ///             return Ok(Message::builder()
     ///                 .id(req.header.id)
-    ///                 .body_json(&rest)?
+    ///                 .body_json(rest)
     ///                 .build());
     ///         }
     ///         // Not ours: the router no longer frames this for us.
@@ -1300,13 +1300,17 @@ impl Router {
     ///
     /// struct Root;
     /// impl RepeStruct for Root {
-    ///     fn repe_handle(
+    ///     fn repe_handle_into(
     ///         &mut self,
     ///         segments: &[&str],
-    ///         _body: Option<serde_json::Value>,
-    ///     ) -> StructResult<Option<serde_json::Value>> {
+    ///         _body: Option<repe::structs::RequestBody<'_>>,
+    ///         out: &mut repe::structs::ResponseBody<'_>,
+    ///     ) -> StructResult<()> {
     ///         match segments {
-    ///             ["voltages"] => Ok(Some(vec![1i64, 2, 3])),
+    ///             ["voltages"] => {
+    ///                 out.write(&vec![1i64, 2, 3]);
+    ///                 Ok(())
+    ///             }
     ///             _ => Err(StructError::InvalidPath {
     ///                 path: repe::structs::path_from_segments(segments),
     ///             }),
@@ -1319,7 +1323,7 @@ impl Router {
     ///     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
     ///         let path = req.query_str().unwrap_or("");
     ///         if path.starts_with("/plugins/") {
-    ///             return Ok(Message::builder().id(req.header.id).body_json(&path)?.build());
+    ///             return Ok(Message::builder().id(req.header.id).body_json(&path).build());
     ///         }
     ///         Ok(create_error_response_like(
     ///             req,
@@ -1770,16 +1774,13 @@ impl Router {
     /// ```
     /// use repe::{Message, QueryFormat, server::Router};
     ///
-    /// let router = Router::new().with_json("/double", |v: serde_json::Value| {
-    ///     Ok(serde_json::json!(v.as_i64().unwrap_or(0) * 2))
-    /// });
+    /// let router = Router::new().with_typed("/double", |v: i64| Ok(v * 2));
     ///
     /// let request = Message::builder()
     ///     .id(1)
     ///     .query_str("/double")
     ///     .query_format(QueryFormat::JsonPointer)
-    ///     .body_json(&21)
-    ///     .unwrap()
+    ///     .body_json(&21i64)
     ///     .build()
     ///     .to_vec();
     ///

@@ -103,12 +103,12 @@ fn main() {
 }
 
 /// Isolate where the value_stream pull time goes for a large flat array: bulk
-/// decode (`from_slice`) vs streaming decode (`from_reader_streaming`), no
+/// decode (`from_beve`) vs reading through a stream (`beve::from_reader`), no
 /// transport involved. A large gap means the end-to-end rows above are
 /// decode-bound, not transport-bound.
 fn decode_diagnostic(total: usize) {
     let payload = lcg_bytes(total);
-    let encoded = structio::to_beve(&payload).unwrap();
+    let encoded = structio::to_beve(&payload);
 
     let t = Instant::now();
     let bulk: Vec<u8> = structio::from_beve(&encoded).unwrap();
@@ -116,7 +116,7 @@ fn decode_diagnostic(total: usize) {
     assert_eq!(bulk.len(), total);
 
     let t = Instant::now();
-    let streamed: Vec<u8> = beve::from_reader_streaming(Cursor::new(&encoded)).unwrap();
+    let streamed: Vec<u8> = structio::beve::from_reader(Cursor::new(&encoded)).unwrap();
     let stream_ms = t.elapsed().as_secs_f64() * 1000.0;
     assert_eq!(streamed.len(), total);
 

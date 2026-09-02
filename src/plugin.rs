@@ -263,8 +263,12 @@ fn static_error_frame() -> &'static [u8] {
 /// use repe::plugin::{PluginRuntime, RepeBuffer};
 /// use repe::server::Router;
 ///
+/// #[derive(Default)]
+/// struct Echo { message: String }
+/// structio::object!(Echo { message });
+///
 /// fn build() -> Router {
-///     Router::new().with_json("/example/echo", Ok)
+///     Router::new().with_typed("/example/echo", |v: Echo| Ok(v))
 /// }
 ///
 /// static RUNTIME: PluginRuntime = PluginRuntime::new(build);

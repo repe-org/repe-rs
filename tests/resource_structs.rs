@@ -90,8 +90,16 @@ impl RepeStruct for Settings {
                 Ok(())
             }
             // The applying semantics: only the named keys move.
+            //
+            // Read under `Standard` rather than the wire policy, so a key this
+            // surface does not recognize is refused rather than skipped. That
+            // is a deliberate narrowing of what the protocol permits, and it is
+            // the right one here: a settings write naming a member that does
+            // not exist is a caller mistake, and silently applying nothing is
+            // the worst available answer.
             ([], Some(body)) => {
-                let patch: SettingsPatch = body.read("")?;
+                let mut patch = SettingsPatch::default();
+                body.read_into_with::<structio::Standard, _>("", &mut patch)?;
                 for (name, value) in [("retries", patch.retries), ("timeout", patch.timeout)] {
                     let Some(value) = value else { continue };
                     match name {
@@ -274,12 +282,17 @@ fn a_whole_child_write_reports_the_child_s_own_error() {
     //
     // *Which* refusal changed with the codec. The child used to walk the body
     // key by key and could name the offending one (`/settings/nope`); it now
-    // reads into a declared `SettingsPatch`, and an unknown key is refused by
-    // the reader before the handler sees it. So the error is `InvalidBody`
-    // rather than `MethodNotFound`, and it names the byte the parse stopped at
-    // rather than the key — a worse message, bought with a decode that does not
-    // walk a map. What the test is about is unchanged: the message is the
-    // child's, carried up under the field that owns it.
+    // reads into a declared `SettingsPatch` under `structio::Standard`, and the
+    // reader refuses the unknown key before the handler sees it. So the error
+    // is `InvalidBody` rather than `MethodNotFound`, and it names the byte the
+    // parse stopped at rather than the key — a worse message, bought with a
+    // decode that does not walk a map.
+    //
+    // Note the `Standard`: under repe's default wire policy the key would be
+    // *skipped*, because that is what REPE's schema-evolution guarantee asks
+    // for. This surface opts out, and that opt-out is what this test observes.
+    // What the test is about is unchanged: the message is the child's, carried
+    // up under the field that owns it.
     for (kind, router) in routers(service) {
         let message = answer(&router, &write("/service/settings", r##"{ "nope": 1 }"##));
         assert_eq!(

@@ -2,10 +2,20 @@
 //! `body_typed_slice` / `body_complex_slice` encoders, the `decode_typed_slice` /
 //! `decode_complex_slice` decoders, and the `write_message_typed_slice` /
 //! `write_message_complex_slice` framing convenience. The central guarantees are
-//! that the bulk path is byte-for-byte interchangeable with the serde
+//! that the bulk path is byte-for-byte interchangeable with the ordinary
 //! (`body_beve`) path and that it round-trips.
+//!
+//! # Half floats are not covered
+//!
+//! BEVE defines `float16` and `bfloat16` typed arrays, and repe's numeric body
+//! path used to carry them (`f16` / `bf16` from the `half` crate implemented
+//! `beve::BeveTypedSlice`). structio has no value-level codec for a two-byte
+//! float — `NumericBytes` covers `f32`, `f64` and the integer widths — so
+//! neither element type can cross the wire as a value here. Its header layer
+//! and its BEVE-to-JSON transcoder both know the widths, so this is a missing
+//! codec rather than a missing format; reinstate these cases when structio
+//! grows one.
 
-use half::{bf16, f16};
 use repe::constants::BodyFormat;
 use repe::message::Message;
 use repe::{
@@ -25,24 +35,26 @@ fn typed_slice_roundtrips_and_sets_beve_format() {
 #[test]
 fn typed_slice_bytes_identical_to_serde_body() {
     // The bulk encoder must produce the same wire bytes as `body_beve(&Vec<T>)`,
-    // so a bulk sender and a serde receiver (and vice versa) interoperate.
+    // so a bulk sender and an ordinary receiver (and vice versa) interoperate.
     macro_rules! check {
         ($t:ty, $vals:expr) => {{
             let data: Vec<$t> = $vals;
             let bulk = Message::builder().body_typed_slice(&data).build();
-            let serde = Message::builder().body_beve(&data).build();
+            let ordinary = Message::builder().body_beve(&data).build();
             assert_eq!(
                 bulk.body,
-                serde.body,
+                ordinary.body,
                 "body bytes differ for {}",
                 std::any::type_name::<$t>()
             );
-            // Cross-decode: bulk bytes via serde, serde bytes via the bulk reader.
-            let via_serde: Vec<$t> = serde.beve_body().unwrap();
-            assert_eq!(via_serde, data);
+            // Cross-decode: each body through the other's reader. There is one
+            // reader underneath both, which is why they agree; the two names
+            // exist so a call site says which shape it means.
+            let via_value: Vec<$t> = ordinary.beve_body().unwrap();
+            assert_eq!(via_value, data);
             let via_bulk: Vec<$t> = bulk.decode_typed_slice().unwrap();
             assert_eq!(via_bulk, data);
-            let cross: Vec<$t> = serde.decode_typed_slice().unwrap();
+            let cross: Vec<$t> = ordinary.decode_typed_slice().unwrap();
             assert_eq!(cross, data);
         }};
     }
@@ -55,21 +67,6 @@ fn typed_slice_bytes_identical_to_serde_body() {
     check!(i64, vec![i64::MIN, -1, 0, i64::MAX]);
     check!(f32, vec![1.0, -2.5, 3.25, -0.0]);
     check!(f64, vec![1.0, -2.5, 3.25, 1e9]);
-    // Half floats are part of the exposed surface (`T: BeveTypedSlice`); they are
-    // 2-byte and distinguished only by byte_code (bf16 = 0, f16 = 1), so exercise
-    // both through the repe layer.
-    check!(
-        f16,
-        vec![f16::from_f32(1.0), f16::from_f32(-2.5), f16::from_f32(3.25)]
-    );
-    check!(
-        bf16,
-        vec![
-            bf16::from_f32(1.0),
-            bf16::from_f32(-2.5),
-            bf16::from_f32(3.25)
-        ]
-    );
 }
 
 #[test]
@@ -181,11 +178,43 @@ fn decode_typed_slice_rejects_non_beve_body() {
 }
 
 #[test]
-fn decode_typed_slice_rejects_wrong_element_type() {
-    // Decoding an f64 array as f32 is a type mismatch (wrong width), surfaced as a
-    // BEVE error rather than a silent reinterpretation.
+fn a_numeric_array_is_read_at_the_width_the_caller_asked_for() {
+    // A stored width and a requested width need not match: the reader converts
+    // element by element where they differ, and takes the bulk path where they
+    // do not. Under `beve` a width mismatch was an error, so this is a change —
+    // and the better one, since which width a peer chose to store is not
+    // something a schema should have to agree on.
     let msg = Message::builder()
         .body_typed_slice(&[1.0f64, 2.0, 3.0])
+        .build();
+    assert_eq!(
+        msg.decode_typed_slice::<f32>().unwrap(),
+        vec![1.0, 2.0, 3.0]
+    );
+
+    let narrow = Message::builder().body_typed_slice(&[1.0f32, 2.0]).build();
+    assert_eq!(narrow.decode_typed_slice::<f64>().unwrap(), vec![1.0, 2.0]);
+
+    // Conversion, not reinterpretation: an integer that does not fit is
+    // refused rather than wrapped.
+    let big = Message::builder()
+        .body_typed_slice(&[1i64, 2, i64::MAX])
+        .build();
+    assert!(
+        matches!(
+            big.decode_typed_slice::<i32>(),
+            Err(repe::RepeError::Beve(_))
+        ),
+        "an integer outside the requested width is an error"
+    );
+}
+
+#[test]
+fn decode_typed_slice_rejects_a_non_numeric_element_type() {
+    // Width is negotiable; class is not. A string array read as numbers is an
+    // error, not a reinterpretation of its bytes.
+    let msg = Message::builder()
+        .body_beve(&vec!["a".to_string(), "b".to_string()])
         .build();
     let err = msg.decode_typed_slice::<f32>().unwrap_err();
     assert!(

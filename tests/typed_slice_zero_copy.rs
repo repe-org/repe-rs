@@ -100,29 +100,43 @@ async fn ref_route_accepts_serde_client() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn aligned_call_against_regular_route_is_an_error() {
-    // The aligned body is a distinct BEVE type; a plain `with_typed_slice` route
-    // does not understand it and rejects rather than misreading.
+async fn an_aligned_call_reaches_a_regular_route() {
+    // The aligned form is not a distinct BEVE type — it is the same typed array
+    // with padding in front of the payload — and one reader takes both forms.
+    // So a client that sends the aligned body reaches a plain
+    // `with_typed_slice` route, which simply does not get the borrow.
+    //
+    // Under `beve` these were two encodings with two readers, and this test
+    // asserted the refusal. What the aligned form buys now is the borrow on the
+    // routes that can take it, not admission to a route that cannot.
     let router = Router::new().with_typed_slice::<f64, f64, _>("/echo", Ok);
     let addr = spawn(router).await;
     let client = AsyncClient::connect(&addr).await.expect("connect");
 
     let xs: Vec<f64> = vec![1.0, 2.0, 3.0];
-    let res: Result<Vec<f64>, _> = client.call_typed_slice_aligned("/echo", &xs).await;
-    assert!(res.is_err(), "aligned body into a regular route must error");
+    let out: Vec<f64> = client
+        .call_typed_slice_aligned("/echo", &xs)
+        .await
+        .expect("an aligned body is a typed array like any other");
+    assert_eq!(out, xs);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn wrong_element_type_is_an_error() {
-    // Server expects f64; client sends an aligned f32 array. The element
-    // class/width disagree, so the borrowing decoder rejects.
+async fn a_narrower_element_type_is_widened_rather_than_refused() {
+    // Server expects f64; client sends an aligned f32 array. The widths
+    // disagree, and the reader converts element by element rather than
+    // refusing — which also means the borrow declines and the owned fallback
+    // serves it, since a converted payload is not the caller's memory.
     let router = Router::new().with_typed_slice_ref::<f64, f64, _>("/echo", |xs| Ok(xs.to_vec()));
     let addr = spawn(router).await;
     let client = AsyncClient::connect(&addr).await.expect("connect");
 
     let fs: Vec<f32> = vec![1.0, 2.0, 3.0];
-    let res: Result<Vec<f32>, _> = client.call_typed_slice_aligned("/echo", &fs).await;
-    assert!(res.is_err(), "aligned f32 into an f64 route must error");
+    let out: Vec<f32> = client
+        .call_typed_slice_aligned("/echo", &fs)
+        .await
+        .expect("a narrower element type is widened on the way in");
+    assert_eq!(out, fs);
 }
 
 #[test]

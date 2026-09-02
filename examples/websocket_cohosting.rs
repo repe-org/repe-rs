@@ -32,11 +32,30 @@ use repe::{WebSocketClient, WebSocketServer, is_websocket_upgrade};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+#[derive(Default, Debug)]
+struct Empty;
+structio::object!(Empty {});
+
+#[derive(Default, Debug)]
+struct Pong {
+    pong: bool,
+}
+structio::object!(Pong { pong });
+
+/// The plain-HTTP fork's `/config` body. Declared like any other, because the
+/// gateway is not what makes a body a type — the type is.
+#[derive(Default, Debug)]
+struct HttpConfig {
+    version: String,
+    transport: String,
+}
+structio::object!(HttpConfig { version, transport });
+
 const REPE_PATH: &str = "/repe";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let router = Router::new().with_typed("/ping", |_| Ok(json!({ "pong": true })));
+    let router = Router::new().with_typed("/ping", |_: Empty| Ok(Pong { pong: true }));
     let shared = WebSocketServer::new(router).into_shared();
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
@@ -74,9 +93,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Fork 1: the REPE WebSocket endpoint. ---
     let client = WebSocketClient::connect(&format!("ws://{addr}{REPE_PATH}")).await?;
-    let pong = client.call_typed_json("/ping", &json!({})).await?;
-    println!("[ws] /ping -> {pong}");
-    assert_eq!(pong["pong"], true);
+    let pong: Pong = client.call_typed_json("/ping", &Empty).await?;
+    println!("[ws] /ping -> pong={}", pong.pong);
+    assert!(pong.pong);
     drop(client);
 
     // --- Fork 2: a plain HTTP route on the same port. ---
@@ -122,8 +141,10 @@ async fn serve_http(mut stream: TcpStream) -> std::io::Result<()> {
     match (method, path) {
         ("GET", "/healthz") => write_response(&mut stream, 200, "OK", "text/plain", b"ok").await,
         ("GET", "/config") => {
-            let body = json!({ "version": env!("CARGO_PKG_VERSION"), "transport": "repe" });
-            let bytes = serde_json::to_vec(&body).expect("serialize config");
+            let bytes = structio::json::to_vec(&HttpConfig {
+                version: env!("CARGO_PKG_VERSION").into(),
+                transport: "repe".into(),
+            });
             write_response(&mut stream, 200, "OK", "application/json", &bytes).await
         }
         ("GET", _) => {

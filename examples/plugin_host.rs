@@ -65,7 +65,7 @@ fn read(query: &str, id: u64) -> Vec<u8> {
 
 /// A write, or a method call with an argument. Same frame either way: what
 /// distinguishes them is what the path names.
-fn write<T: serde::Serialize>(query: &str, id: u64, value: &T) -> Vec<u8> {
+fn write<T: structio::json::Write + ?Sized>(query: &str, id: u64, value: &T) -> Vec<u8> {
     Message::builder()
         .id(id)
         .query_str(query)
@@ -248,11 +248,11 @@ fn run(path: &str) -> Result<u32, HostError> {
         // build, for a time nothing here bounds, so on the WebSocket server it
         // belongs off the reader task. On the TCP servers the two are the same.
         let router = Router::new()
-            .with_typed("/host/ping", |_| Ok(serde_json::json!("pong")))
+            .with_typed("/host/ping", |_: Option<i64>| Ok("pong".to_string()))
             .with_fallback_blocking(std::sync::Arc::new(mounted));
 
         let frame = router
-            .call(&write("/host/ping", 8, &serde_json::Value::Null))
+            .call(&write("/host/ping", 8, &None::<i64>))
             .expect("the host route answers");
         let message = Message::from_slice(&frame).expect("the response is a REPE frame");
         checks.check(

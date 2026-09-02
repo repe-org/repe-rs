@@ -116,7 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let value = server_copy.clone();
                 move |w: &mut dyn Write| -> std::io::Result<()> {
                     let mut tee = HashTee::new(w);
-                    beve::to_writer_streaming(&mut tee, &value)
+                    structio::beve::to_writer(&value, &mut tee)
                         .map_err(|e| std::io::Error::other(e.to_string()))?;
                     let digest = tee.finish();
                     w.write_all(&digest.to_le_bytes())?;

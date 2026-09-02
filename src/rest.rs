@@ -27,12 +27,26 @@
 //! the error model in full: <https://repe-org.github.io/repe-rs/rest/>.
 //!
 //! ```no_run
+//! use repe::structs::RequestBody;
 //! use repe::{Registry, rest::RestGateway};
 //! use std::sync::Arc;
+//! use std::sync::atomic::{AtomicI64, Ordering};
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! let registry = Arc::new(Registry::new());
-//! registry.register_value("/counter", serde_json::json!(0))?;
+//!
+//! // Every registered path is a function, so a stateful endpoint is one that
+//! // owns its state: a body sets the counter, no body reads it.
+//! let counter = Arc::new(AtomicI64::new(0));
+//! registry.register_function("/counter", move |params: Option<RequestBody<'_>>| {
+//!     if let Some(body) = params {
+//!         let next: i64 = body
+//!             .read("/counter")
+//!             .map_err(|e| (repe::ErrorCode::InvalidBody, e.to_string()))?;
+//!         counter.store(next, Ordering::SeqCst);
+//!     }
+//!     Ok(counter.load(Ordering::SeqCst))
+//! })?;
 //!
 //! let gateway = RestGateway::new("/api/v1", Arc::clone(&registry));
 //! let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
@@ -45,7 +59,7 @@
 //! $ curl -s localhost:8080/api/v1/counter
 //! 0
 //! $ curl -s -X PUT -d 42 localhost:8080/api/v1/counter
-//! {"path":"/counter","status":"ok"}
+//! 42
 //! ```
 
 use crate::constants::{BodyFormat, ErrorCode};
