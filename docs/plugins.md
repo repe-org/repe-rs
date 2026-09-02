@@ -75,7 +75,7 @@ Whether the *work* runs concurrently depends on what the router holds. A router 
 ```rust
 use repe::server::Router;
 
-# #[derive(Default, serde::Serialize, serde::Deserialize, repe::RepeStruct)]
+# #[derive(Default, repe::RepeStruct)]
 # struct Instrument { gain: f64 }
 #[repe::plugin(root = "/instrument")]
 fn build() -> Router {
@@ -160,7 +160,7 @@ use std::sync::Arc;
 // SAFETY: loading a native library runs its initializers.
 let plugin = Arc::new(unsafe { Plugin::load("libinstrument.so") }?);
 let router = Router::new()
-    .with_json("/host/version", |_| Ok(serde_json::json!(env!("CARGO_PKG_VERSION"))))
+    .with_typed("/host/version", |_: Option<i64>| Ok(env!("CARGO_PKG_VERSION").to_string()))
     .with_fallback_blocking(plugin.clone());
 ```
 

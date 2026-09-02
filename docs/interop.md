@@ -44,7 +44,7 @@ The enforcement is deterministic and needs no C++ toolchain to run the tests.
 
 A note on JSON: REPE does not fix JSON whitespace, object key order, or number
 formatting, so the suite does **not** demand byte-identical JSON output from
-`serde_json`. JSON parity is covered semantically (decoded-value equality and
+a JSON writer. JSON parity is covered semantically (decoded-value equality and
 round-trip) rather than by from-scratch byte identity. BEVE numeric arrays, error
 frames, and header/query-only frames *are* byte-defined and are checked from
 scratch.
@@ -78,7 +78,7 @@ The guarantee above covers BEVE **objects** and **typed numeric arrays**, which 
 
 The BEVE specification has its own version line, independent of REPE's. BEVE **Version 2** deprecates the type-tag extension that Version 1 used to mark a variant, and writes one as ordinary self-describing data instead. Both implementations have made that move — the `beve` crate in its 5.0 release, Glaze in 8.0.0 — and both sides of this suite are now past it: repe depends on `beve 10`, and the fixtures are generated from Glaze v8.0.0. A peer older than either writes and expects the Version 1 form; decoding is backward compatible and encoding is not, so an older peer's variant is read correctly here while one this crate writes is not.
 
-Version 2 alone does not make the two sides agree, because it fixes the encoding but not the *shape*, and each language picks that per type. Rust's serde defaults to external tagging (`{"Name": payload}`); a plain C++ `std::variant` is written bare, which corresponds to `#[serde(untagged)]`; a Glaze variant with `tag`/`ids` is internally tagged, which corresponds to `#[serde(tag = "...")]`. Pair them deliberately — the encoding is only half the contract.
+Version 2 alone does not make the two sides agree, because it fixes the encoding but not the *shape*, and each language picks that per type. structio's `tagged_enum!` is externally tagged (`{"Name": payload}`); a plain C++ `std::variant` is written bare and deduced from the alternatives' shapes; a Glaze variant with `tag`/`ids` is internally tagged. Pair them deliberately — the encoding is only half the contract.
 
 None of this is pinned by the fixture suite, so nothing here fails loudly if it drifts. Until it is, either pair the shapes deliberately and test the pairing yourself, or sidestep it: model the case as an object with an explicit discriminant field, or send it over JSON. Structs, numbers, strings, containers, and typed numeric arrays are unaffected either way, and are what the fixtures cover.
 

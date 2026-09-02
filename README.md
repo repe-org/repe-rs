@@ -9,11 +9,11 @@ Rust implementation of the [REPE RPC protocol](https://github.com/repe-org/REPE)
 
 - REPE header and message types with correct little-endian wire encoding.
 - Streaming and zero-copy I/O (`MessageView`, `write_message_streaming`) for large bodies.
-- JSON bodies via `serde_json`; BEVE bodies via the [`beve`](https://crates.io/crates/beve) crate.
+- JSON and BEVE bodies via [`structio`](https://crates.io/crates/structio): one declaration serves both formats, and there is no document model, no derive, and no proc macro in the dependency graph.
 - Sync and async (tokio) clients and servers, with multiplexed in-flight requests, per-call timeouts, batching, and notify support.
-- Dynamic [`Registry`](https://repe-org.github.io/repe-rs/registry/) routing with JSON Pointer semantics.
+- Dynamic [`Registry`](https://repe-org.github.io/repe-rs/registry/) routing: a flat table of functions resolved by JSON Pointer.
 - [`Fleet`](https://repe-org.github.io/repe-rs/fleet/) APIs for multi-node TCP and UDP fanout.
-- Optional [REST gateway](https://repe-org.github.io/repe-rs/rest/) (`RestGateway`) fronting a `Registry` over HTTP/1.1 and HTTP/2, with verb-checked reads/writes/calls, `ETag` revalidation, and JSON/BEVE negotiation.
+- Optional [REST gateway](https://repe-org.github.io/repe-rs/rest/) (`RestGateway`) fronting a `Registry` over HTTP/1.1 and HTTP/2, with `ETag` revalidation and JSON/BEVE negotiation.
 - Optional [WebSocket transport](https://repe-org.github.io/repe-rs/websocket/), including a wasm browser client and server-pushed notify subscriptions.
 - Optional [`stream`](https://repe-org.github.io/repe-rs/streaming/) module for backpressure-controlled bulk transfers with reconnect-resume.
 - Optional [`repe` CLI](https://repe-org.github.io/repe-rs/cli/) for talking to any REPE server over TCP or WebSocket.
@@ -24,23 +24,27 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-repe = "12"
+repe = "13"
 ```
 
 Or run `cargo add repe`.
 
 ## Quick Start
 
-Build, serialize, and parse a JSON message:
+A body is a type you declare. One `structio::object!` gives it both formats:
 
 ```rust
 use repe::{BodyFormat, Message, QueryFormat};
+
+#[derive(Default, Debug)]
+struct Ping { ping: bool }
+structio::object!(Ping { ping });
 
 let msg = Message::builder()
     .id(42)
     .query_str("/status")
     .query_format(QueryFormat::JsonPointer)
-    .body_json(&serde_json::json!({"ping": true}))?
+    .body_json(&Ping { ping: true })
     .build();
 
 let bytes = msg.to_vec();
@@ -48,12 +52,13 @@ let parsed = repe::Message::from_slice(&bytes)?;
 
 assert_eq!(parsed.header.id, 42);
 assert_eq!(parsed.header.body_format, BodyFormat::Json as u16);
-let val: serde_json::Value = parsed.json_body()?;
-assert_eq!(val["ping"], true);
+assert!(parsed.json_body::<Ping>()?.ping);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Replace `body_json` with `body_beve` to encode the body with BEVE; everything else is identical.
+Replace `body_json` with `body_beve` to encode the same value as BEVE; the declaration is unchanged and everything else is identical.
+
+`object!` is a `macro_rules!` macro, so declaring a type costs no proc macro and no build-time dependency. It also works on a type you do not own.
 
 ## Server and Client
 
@@ -61,25 +66,36 @@ A minimal TCP server with one route, plus a client call:
 
 ```rust
 use repe::{Client, Router, Server};
-use serde_json::json;
 
-let router = Router::new().with("/ping", |_v| Ok(json!({"pong": true})));
+#[derive(Default, Debug)]
+struct Empty;
+structio::object!(Empty {});
+
+#[derive(Default, Debug)]
+struct Pong { pong: bool }
+structio::object!(Pong { pong });
+
+let router = Router::new().with_typed("/ping", |_: Empty| Ok(Pong { pong: true }));
 let server = Server::new(router);
 let listener = server.listen("127.0.0.1:0")?;
 let addr = listener.local_addr()?;
 std::thread::spawn(move || { let _ = server.serve(listener); });
 
 let client = Client::connect(addr)?;
-let pong = client.call_json("/ping", &json!({}))?;
-assert_eq!(pong["pong"], true);
+let pong: Pong = client.call_typed_json("/ping", &Empty)?;
+assert!(pong.pong);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+Every route names the type it takes and the type it returns. A request body is
+read straight into the handler's parameter and the return value is written
+straight into the response frame, with no intermediate document either way.
 
 The async (`tokio`) variant uses `AsyncServer` and `AsyncClient` and exposes the same shape. See the [Server guide](https://repe-org.github.io/repe-rs/server/) for routers, typed handlers, middleware, struct registration, and peer-aware handlers, and the [Client guide](https://repe-org.github.io/repe-rs/client/) for the full client surface (typed and BEVE helpers, multiplexing, timeouts, batches, notifies, error handling).
 
 ### Bulk numeric arrays
 
-When a request and response are whole contiguous numeric arrays (`f32`, `f64`, integer widths), `Router::with_typed_slice` and `Client::call_typed_slice` (also `AsyncClient::call_typed_slice`) carry them on BEVE's typed-slice fast path: one bulk copy each way, skipping serde's per-element walk. The wire bytes are identical to the serde path, so a `with_typed_slice` route and a `with_typed` / `call_typed_beve` peer interoperate freely.
+When a request and response are whole contiguous numeric arrays (`f32`, `f64`, integer widths), `Router::with_typed_slice` and `Client::call_typed_slice` (also `AsyncClient::call_typed_slice`) carry them on BEVE's typed-slice fast path: one bulk copy each way rather than a per-element walk. The wire bytes are identical to an ordinary `Vec<T>` body, so a `with_typed_slice` route and a `with_typed` / `call_typed_beve` peer interoperate freely.
 
 ```rust
 use repe::{Client, Router, Server};
@@ -115,7 +131,7 @@ assert_eq!(out, vec![6.0]);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-A `with_typed_slice_ref` route is a drop-in superset of `with_typed_slice`: it still accepts the regular `call_typed_slice` / serde clients (bulk-copying those), and falls back to a bulk copy whenever a borrow isn't possible, so correctness never depends on the alignment landing.
+A `with_typed_slice_ref` route is a drop-in superset of `with_typed_slice`: it still accepts the regular `call_typed_slice` clients (bulk-copying those), and falls back to a bulk copy whenever a borrow isn't possible, so correctness never depends on the alignment landing.
 
 ## Feature Flags
 

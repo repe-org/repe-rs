@@ -8,7 +8,7 @@ Rust implementation of the [REPE RPC protocol](https://github.com/repe-org/REPE)
 
 - REPE header and message types with correct little-endian wire encoding.
 - Streaming and zero-copy I/O (`MessageView`, `write_message_streaming`) for large bodies.
-- JSON bodies via `serde_json`; BEVE bodies via the [`beve`](https://crates.io/crates/beve) crate.
+- JSON and BEVE bodies via [`structio`](https://crates.io/crates/structio): one declaration serves both formats, with no document model, no derive, and no proc macro in the dependency graph.
 - A bulk fast path for [high-throughput numeric bodies](numeric-bodies.md) (typed numeric and complex arrays) that encodes, decodes, and frames a whole-body slice in a single copy.
 - Sync and async (tokio) clients and servers, with multiplexed in-flight requests, per-call timeouts, batching, and notify support.
 - Dynamic [`Registry`](registry.md) routing with JSON Pointer semantics.
@@ -37,7 +37,7 @@ let msg = Message::builder()
     .id(42)
     .query_str("/status")
     .query_format(QueryFormat::JsonPointer)
-    .body_json(&serde_json::json!({"ping": true}))?
+    .body_json(&Ping { ping: true })
     .build();
 
 let bytes = msg.to_vec();
@@ -45,8 +45,7 @@ let parsed = repe::Message::from_slice(&bytes)?;
 
 assert_eq!(parsed.header.id, 42);
 assert_eq!(parsed.header.body_format, BodyFormat::Json as u16);
-let val: serde_json::Value = parsed.json_body()?;
-assert_eq!(val["ping"], true);
+assert!(parsed.json_body::<Ping>()?.ping);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 

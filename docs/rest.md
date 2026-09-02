@@ -10,7 +10,7 @@ use repe::{Registry, Router};
 use std::sync::Arc;
 
 let registry = Arc::new(Registry::new());
-registry.register_value("/counter", serde_json::json!(0))?;
+registry.register_function("/counter", |_: Option<repe::structs::RequestBody<'_>>| Ok(0i64))?;
 
 // One registry, two carriers.
 let router = Router::new().with_registry("/api/v1", Arc::clone(&registry));

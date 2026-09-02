@@ -4,13 +4,16 @@
 
 ## Router
 
-Add JSON `Value` handlers with `.with(path, fn)` and typed handlers with `.with_typed(path, fn)`. Typed handlers auto-deserialize JSON, UTF-8, or BEVE bodies into `T` and default to JSON responses; wrap the return with `TypedResponse::beve(...)` / `TypedResponse::utf8(...)` to pick a different response `BodyFormat`. Bodies in unsupported formats are rejected with `Invalid body`.
+Add handlers with `.with_typed(path, fn)`. Every route names the type it takes and the type it returns: the request body is decoded straight into the parameter and the return value is written straight into the response frame, with no intermediate document either way. JSON, UTF-8, and BEVE bodies all reach the same handler — the frame header says which — and the response defaults to JSON; wrap the return with `TypedResponse::beve(...)` / `TypedResponse::utf8(...)` to pick a different response `BodyFormat`. Bodies in unsupported formats are rejected with `Invalid body`.
+
+There is no untyped handler. `with_json` took a `serde_json::Value` in and out; with no document model there is nothing for it to be, and a route that names its types turns a wrong body into a decode error at the boundary rather than a `None` found inside the handler.
+
+Declare a body type with `structio::object!`, which is a `macro_rules!` macro — no derive, no proc macro, and it works on a type you do not own.
 
 Pre-request middleware runs before the handler and can centralize auth, validation, or tracing.
 
 ```rust
 use repe::{Router, Server};
-use serde_json::json;
 use std::time::Duration;
 
 let router = Router::new()
@@ -20,9 +23,9 @@ let router = Router::new()
         }
         next.run(req)
     })
-    .with("/ping", |_v| Ok(json!({"pong": true})))
-    .with("/echo", |v| Ok(json!({"echo": v})))
-    .with("/status", |_v| Ok(json!({"status": "ok"})));
+    .with_typed("/ping", |_: Empty| Ok(Pong { pong: true }))
+    .with_typed("/echo", |v: Message| Ok(v))
+    .with_typed("/status", |_: Empty| Ok(Status { status: "ok".into() }));
 
 let server = Server::new(router)
     .read_timeout(Some(Duration::from_secs(120)))
@@ -40,7 +43,7 @@ Every registrar runs before `Server::serve`, so a path discovered at run time ha
 
 ```rust
 let router = Router::new()
-    .with("/ping", |_v| Ok(json!({"pong": true})))
+    .with_typed("/ping", |_: Empty| Ok(Pong { pong: true }))
     .with_fallback(Arc::new(dynamic_table));
 ```
 
@@ -71,7 +74,9 @@ A fallback takes an `Arc<dyn HandlerErased>`: it receives the raw request and re
 
 repe-rs ignores object keys it does not recognize when decoding a request body into a typed handler (`with_typed`) or a registered struct, across both JSON and BEVE. This is a deliberate, guaranteed forward-compatibility property, not an accident of the codec: a newer client can add an optional field to a request and an older server built against this crate decodes the rest and drops the unknown key rather than rejecting the call. See [Schema Evolution](protocol.md#schema-evolution) for the protocol stance.
 
-A handler that wants the opposite — reject a request carrying undeclared keys, for instance to catch a client typo — opts in per type with serde's `#[serde(deny_unknown_fields)]` on its request struct; the rejection then names the offending key. Strictness is a per-type decision the handler author makes, never the server default.
+It is written down as `repe::WirePolicy`, the read policy every body decode in this crate uses. structio's own default is the opposite — an unknown key is refused — which is the right default for a document you own and the wrong one for a frame that arrived from someone else's build.
+
+A handler that wants the opposite — reject a request carrying undeclared keys, to catch a client typo — reads the body itself with `RequestBody::read_into_with::<structio::Standard, _>(..)`. That is a deliberate narrowing of what the protocol permits, decided per endpoint rather than server-wide.
 
 ## Typed Handlers via `JsonTypedHandler`
 
@@ -79,12 +84,14 @@ Implement the `JsonTypedHandler` trait to attach a service type's methods to a r
 
 ```rust
 use repe::{Router, JsonTypedHandler, ErrorCode};
-use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize)]
+#[derive(Default)]
 struct Input { name: String }
-#[derive(Serialize)]
+structio::object!(Input { name });
+
+#[derive(Default)]
 struct Output { greeting: String }
+structio::object!(Output { greeting });
 
 struct Greeter;
 impl JsonTypedHandler for Greeter {
@@ -104,9 +111,12 @@ let router = Router::new().with_handler("/greet", Greeter);
 
 ```rust
 use repe::Router;
-use serde::{Deserialize, Serialize};
 
-#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+// `#[derive(RepeStruct)]` publishes the endpoints; `structio::object!` gives
+// the type its wire encoding. A served type needs both, and they are separate
+// on purpose: a type can have an encoding without being served, and the
+// declaration works on a type from a crate you do not own.
+#[derive(Default, repe::RepeStruct)]
 #[repe(methods)]
 struct Device {
     id: String,
@@ -114,8 +124,9 @@ struct Device {
     #[repe(nested)]
     metrics: Metrics,
 }
+structio::object!(Device { id, status, metrics });
 
-#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+#[derive(Default, repe::RepeStruct)]
 struct Metrics {
     temperature: f64,
     humidity: f64,
@@ -176,7 +187,7 @@ A method's arguments are deserialized from the request body:
 In the object form a missing key decodes as `null`, so a parameter typed `Option<T>` may be omitted and arrives as `None`. Omitting a parameter that is not optional is an `InvalidBody` error naming it — `deserialization error for /blend(right)` — rather than a silent default.
 
 ```rust
-#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+#[derive(Default, repe::RepeStruct)]
 #[repe(methods)]
 struct Mixer { gain: f64 }
 
@@ -206,7 +217,7 @@ Resolving either would need type information a macro does not have.
 Some values look like fields to a client and are not fields at all: a stored value in different units, a value derived from two others, a setting the backing resource holds rather than the struct. `#[repe(get = "...")]` and `#[repe(set = "...")]` publish one endpoint served by a getter/setter pair:
 
 ```rust
-#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+#[derive(Default, repe::RepeStruct)]
 #[repe(methods)]
 struct Budget {
     used_bytes: u64,
@@ -252,7 +263,7 @@ Worth stating plainly: Rust cannot reach Glaze's zero-annotation reflection. Gla
 The struct-level list form remains as the escape hatch for a block that cannot be annotated — a foreign type, or an impl generated by another macro:
 
 ```rust
-#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+#[derive(Default, repe::RepeStruct)]
 #[repe(methods(
     greet(&self) -> String,
     blend(&self, left: f64, right: f64) -> f64,
@@ -278,7 +289,6 @@ Declare the receiver accurately. A method listed as `&self` is served through th
 | `#[repe(skip)]` | keep the field off the wire entirely |
 | `#[repe(readonly)]` | reads succeed, every write *through* the field returns `InvalidBody` |
 | `#[repe(nested)]` | descend into a field that is itself a `RepeStruct` |
-| `#[repe(nested_serde)]` | descend into a field that implements only `Serialize` + `DeserializeOwned` |
 | `#[repe(typed)]` | encode a numeric slice as a BEVE typed array |
 
 For a field-shaped endpoint with no field behind it, see [Field-shaped endpoints](#field-shaped-endpoints).
@@ -292,13 +302,12 @@ For a field-shaped endpoint with no field behind it, see [Field-shaped endpoints
 | `#[repe(no_replace)]` | a write of the **whole object** is refused, and `Self: DeserializeOwned` is not required |
 | `#[repe(listing_order(..))]` | the key order of the whole-object listing, named in full |
 
-`#[repe(no_replace)]` refuses a write of the whole object and nothing more. It is spelled apart from `#[repe(readonly)]` because the two are different statements: `readonly` on a field says *this subtree is not writable*, recursively, while `no_replace` says *this type cannot be rebuilt from a body* and leaves every field writable. Writing `#[repe(readonly)]` on a struct is a compile error naming both, rather than silently meaning one of them. It also matters for more than the refusal. Without it the empty-segments arm emits `*self = serde_json::from_value(body)?`, so **every** derived struct has to be constructible from JSON — including one that holds an open socket, a file handle, or anything else no JSON describes. The attribute emits only the refusal, never the assignment followed by dead code, so `from_value::<Self>` is not generated and the bound is not required. Fields and children are unaffected: they still read and write as they always did.
+`#[repe(no_replace)]` refuses a write of the whole object and nothing more. It is spelled apart from `#[repe(readonly)]` because the two are different statements: `readonly` on a field says *this subtree is not writable*, recursively, while `no_replace` says *this type cannot be rebuilt from a body* and leaves every field writable. Writing `#[repe(readonly)]` on a struct is a compile error naming both, rather than silently meaning one of them. It also matters for more than the refusal. Without it the empty-segments arm reads the body into `*self`, so **every** derived struct has to have a structio declaration — including one that holds an open socket, a file handle, or anything else no document describes. The attribute emits only the refusal, never the assignment followed by dead code, so the read is not generated and the declaration is not required. Fields and children are unaffected: they still read and write as they always did.
 
 `#[repe(listing_order(..))]` names every key of the whole-object listing, in the order to emit them. Without it the listing appends fields in declaration order, then struct-listed methods, then the impl block's signatures, then its field-shaped accessors — so a `#[repe(get/set)]` endpoint is always last, wherever its logical place reads. That is wire-visible, and it is the one key order a `glz::object` with a `custom<setter, getter>` in the middle cannot be reproduced in.
 
 ```rust
-# use serde::{Deserialize, Serialize};
-#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+#[derive(Default, repe::RepeStruct)]
 #[repe(methods)]
 #[repe(listing_order("name", "count", "percent", "total", "identify"))]
 struct Report {
@@ -321,28 +330,24 @@ impl Report {
 
 Naming the sequence in full is what makes a typo or an omission a compile error. Half the check is at macro time, against the fields and the struct-level method list, with the offending key in the message; the other half is a `const` assertion against the impl block's two generated tables, which the derive cannot see. It reorders emission only — same keys, same values, no run-time cost, and nothing at all for a struct that does not use it.
 
-The order governs every frame that reaches a client, because the router encodes through `repe_handle_into`. It does *not* govern `RepeStruct::repe_handle`, the `serde_json::Value` form: a `serde_json::Map` is a `BTreeMap` unless something in the dependency graph enables `serde_json/preserve_order`, so that form sorts its keys and carries no order at all. The same is true of declaration order, and has been since before this attribute existed.
+The order governs every frame that reaches a client, because a listing is written member by member into the response buffer. It is assertable, too: previously the listing was assembled into a `serde_json::Map` — a `BTreeMap` unless something in the graph enabled `preserve_order` — which sorted the keys and could carry no order at all, so neither this attribute's order nor declaration order survived to the wire.
 
 ### Descending into a child
 
 `#[repe(nested)]` asks the field's own `RepeStruct` impl. Every path through the field goes there, including a write of the **whole child**: `/device/metrics` with body `{"temperature": 22.0}` is handed to `Metrics::repe_handle_into(&[], Some(body))` rather than assigned over the field.
 
-That matters for a child that owns something. A derived child's empty-segments arm is `*self = from_value(..)`, so a derived child is still replaced and nothing that worked before changes; a hand-written one can *apply* the fields it was given, which is what a live settings object means by a write. `#[repe(readonly)]` on the field refuses every write through it, whole-child and sub-path alike.
+That matters for a child that owns something. A derived child's empty-segments arm reads the body into `*self`, so a derived child is still replaced; a hand-written one can *apply* the fields it was given, which is what a live settings object means by a write. `#[repe(readonly)]` on the field refuses every write through it, whole-child and sub-path alike.
 
-`#[repe(nested_serde)]` is for a field whose type implements only the two serde traits. It descends by walking a `serde_json::Value` of the field, so sub-paths work without the field's type implementing `RepeStruct` — and so without the crate that *declares* that type depending on this one. Reach for it when that dependency edge is not available: a third-party type, or a pure-logic crate you would rather not hand an RPC layer. Where the type can implement the trait, [`repe-core`](#repe-core-declaring-a-served-type-without-the-server) is the better answer, because `#[repe(nested)]` descends without materializing anything.
+There used to be a second attribute here, `#[repe(nested_serde)]`, for a field whose type implemented only `Serialize` + `DeserializeOwned` — the case where the crate that *declares* the type cannot depend on this one. It descended by materializing the field as a `serde_json::Value` and walking it, which cost a round trip on every sub-path and could only address the serialized names.
 
-The cost is explicit and paid only on a sub-path: a read serializes the field and walks the result, a write serializes it, edits it, and deserializes it back. A whole-field read or write pays neither, and neither does a listing. Two consequences follow from that round trip, and both are the attribute's real limits:
-
-- **The field's type must round-trip losslessly through serde.** A sub-path write rebuilds the *whole* field from its serialized form, so anything serde drops on the way out is reset to its `Default` on the way back in — a `#[serde(skip)]` field is silently zeroed by a write to an unrelated sibling key. If the type does not round-trip, use `#[repe(nested)]` or mark the field `#[repe(readonly)]`.
-- **Sub-paths are the *serialized* names, not the Rust ones.** `#[serde(rename)]` renames a sub-path, `#[serde(flatten)]` lifts one, `#[serde(skip)]` removes it, and `#[serde(skip_serializing_if)]` removes it *conditionally* — a `None` field behind `skip_serializing_if` is `MethodNotFound` for both read and write until something else sets it.
+It is gone, and nothing replaced it because nothing needs to. `structio::object!` is a `macro_rules!` macro, so a declaration can be written for a type from a crate you do not own, in the crate that uses it; and [`repe-core`](#repe-core-declaring-a-served-type-without-the-server) carries `RepeStruct` without the server, the client, or the transport, so a pure-logic crate can implement it without acquiring an RPC layer. `#[repe(nested)]` then descends without materializing anything.
 
 A child that may not be there at all is an `Option<T>`. `RepeStruct` is implemented for it here, because a host cannot implement it itself — `Option` is foreign and the trait is not theirs. Present forwards everything to the inner value; absent reads as `null` at the child's own path and answers `MethodNotFound` to a write or any sub-path, because a silent no-op against a live resource is worse than an error. Presence itself is not settable through that path: a `null` write is refused whether the child is there or not, because removing one would otherwise be a door that only opens one way. A whole-object write at the parent still replaces the field.
 
 ```rust
-# use serde::{Deserialize, Serialize};
-# #[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+# #[derive(Default, repe::RepeStruct)]
 # struct Metrics { temperature: f64 }
-#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+#[derive(Default, repe::RepeStruct)]
 struct Device {
     id: String,
     #[repe(nested)]
@@ -350,16 +355,18 @@ struct Device {
 }
 ```
 
-`#[repe(typed)]` routes a numeric array or `Vec` field to the bulk encoder behind [`MessageBuilder::body_typed_slice`](numeric-bodies.md) — one `copy_nonoverlapping` rather than a per-element serde walk, and byte-identical to what Glaze emits for the same array. That response carries `BodyFormat::Beve`; decode it with `Message::decode_typed_slice`. Writes to the field are unaffected and still take JSON. Inside the whole-object read the frame is already committed to JSON, so the field appears there as an ordinary JSON array; the typed encoding is what you get by reading the field on its own, which is the case it exists for.
+`#[repe(typed)]` routes a numeric array or `Vec` field to the bulk encoder behind [`MessageBuilder::body_typed_slice`](numeric-bodies.md) — one `copy_nonoverlapping` rather than a per-element walk, and byte-identical to what Glaze emits for the same array. That response carries `BodyFormat::Beve`; decode it with `Message::decode_typed_slice`. Writes to the field are unaffected and still take JSON. Inside the whole-object read the frame is already committed to JSON, so the field appears there as an ordinary JSON array; the typed encoding is what you get by reading the field on its own, which is the case it exists for.
 
-### Reads do not build an intermediate `Value`
+### Nothing is materialized in either direction
 
-A read serializes the live field straight into the outgoing frame buffer. `RepeStruct` carries two methods for this: `repe_handle`, which returns a `serde_json::Value` and is all a hand-written impl needs, and `repe_handle_into`, which encodes in place and is what the router calls. The derive generates both; the default `repe_handle_into` falls back to `repe_handle`, so an existing hand-written impl keeps working unchanged and can override the second method when it is worth it.
+`RepeStruct` has one dispatch method, `repe_handle_into`. It is handed the request body as the bytes that arrived plus the format the header declared, and an output buffer to write into. A body is parsed **once, directly into the live member it is destined for**, and a response is written straight into the outgoing frame. Nothing allocates until a reader does, and a request no endpoint claims never parses at all.
+
+There used to be a second method, `repe_handle`, which took an `Option<serde_json::Value>` and returned one. It is gone with the document model, and the shape it forced went with it: a request was parsed into a tree, walked, and re-parsed into the member; a response was built as a tree and then serialized.
 
 Two consequences worth knowing:
 
-- Reading a whole object no longer walks a `serde_json::Map`, so its keys come out in **declaration order** rather than sorted. Previously the order came from `serde_json::Map`, which is alphabetical unless something in the dependency graph enables `serde_json/preserve_order` — declaration order is both stable and what Glaze emits.
-- `#[repe(typed)]` only takes effect on the encoding path; `repe_handle` still yields a JSON array, since a `Value` cannot carry a BEVE typed body.
+- Reading a whole object writes its members in **declaration order**, and that order reaches the wire. Previously the listing was assembled into a `serde_json::Map`, which is alphabetical unless something in the dependency graph enables `preserve_order`.
+- `#[repe(typed)]` takes effect wherever the field owns its own frame. Inside a listing the frame is already committed to JSON, so the field appears there as an ordinary JSON array.
 
 `Router` accepts `Arc<L>` for any lock implementing `repe::Lockable<T>`, so you can swap in `tokio::sync::Mutex` / `RwLock` (via their `blocking_*` APIs) or enable the optional `parking-lot` feature to use `parking_lot::Mutex` / `RwLock` without extra wrapper types.
 
@@ -370,7 +377,7 @@ A read does not need exclusive access, and behind an `RwLock` it no longer takes
 ```rust
 use repe::server::Router;
 
-# #[derive(Default, serde::Serialize, serde::Deserialize, repe::RepeStruct)]
+# #[derive(Default, repe::RepeStruct)]
 # struct Instrument { gain: f64 }
 let (router, instrument) = Router::new().with_struct_rw("/instrument", Instrument::default());
 ```
@@ -379,7 +386,7 @@ let (router, instrument) = Router::new().with_struct_rw("/instrument", Instrumen
 
 Under that registration a `/instrument/gain` read runs concurrently with any other read, including one already inside a slow `&self` method. What is served this way is everything the derive can reach without `&mut self`:
 
-- every field read, at any depth through `#[repe(nested)]` or `#[repe(nested_serde)]`;
+- every field read, at any depth through `#[repe(nested)]`;
 - **every `#[repe::methods]` method taking `&self`, arguments included**;
 - the getter half of a field-shaped endpoint, when that getter takes `&self`;
 - a refusal that needs no state at all — a write to a `#[repe(readonly)]` endpoint;
@@ -428,35 +435,27 @@ A served type's endpoints are declared where the *type* is declared, and that is
 ```toml
 # the pure crate
 [dependencies]
-repe-core = "3"
-# Only what the source below actually names. The derive reaches `serde_json`
-# through `repe-core`, so it is not a dependency of yours.
-serde = { version = "1", features = ["derive"] }
+repe-core = "4"
+# The declaration macro. Zero dependencies, no proc macro, no build script.
+structio = "0.2"
 ```
 
 ```rust,ignore
 use repe_core::RepeStruct;
 
-#[derive(Serialize, Deserialize, RepeStruct)]
+#[derive(Default, RepeStruct)]
 pub struct Build {
     pub version: String,
     pub revision: u64,
 }
+structio::object!(Build { version, revision });
 ```
 
 `repe` re-exports every one of those at the paths they have always had — `repe::structs::*`, `repe::constants::*` — so a type derived against `repe-core` mounts on a `repe::Router` with nothing in between, and `#[derive(RepeStruct)]` resolves its generated paths against whichever of the two crates is in scope. The one spelling that follows the crate name is the attribute macro: `#[repe_core::methods]` where only the core is a dependency, `#[repe::methods]` where `repe` is. It is one macro either way.
 
-`#[repe(typed)]` is the one attribute that costs something here. The BEVE typed-numeric encoding lives behind `repe-core`'s `typed` feature, off by default, because `beve` and the six packages behind it are the whole weight of the crate — and a crate light enough to want this split usually has no typed field at all. Add the feature where you do:
+`repe-core` has no features. It used to gate the BEVE typed-numeric encoding behind a `typed` feature, because `beve` and the six packages behind it were the whole weight of the crate; `structio` has no dependencies, so there is nothing left to gate and `#[repe(typed)]` costs nothing to have available.
 
-```toml
-repe-core = { version = "2", features = ["typed"] }
-```
-
-A struct with no `#[repe(typed)]` field compiles identically either way, and one that has such a field fails to compile with the feature named rather than quietly serving a JSON array. Through `repe` the feature is always on, so none of this reaches a crate that depends on `repe`.
-
-One consequence to know about: Cargo features are additive across a whole graph, so in a workspace that also contains `repe`, a pure crate that uses `#[repe(typed)]` and *forgets* the feature still compiles — `repe` turned it on for everyone. It fails only when that crate is built on its own, which is where it will be built by whoever consumes it. Build the pure crate standalone in CI if its light dependency list is load-bearing; this repo does exactly that for `repe-core`.
-
-Where you cannot add even that dependency — a type from a crate you do not own — `#[repe(nested_serde)]` descends into it without one.
+Where the type is one you do not own, declare it where you use it: `structio::object!` is a `macro_rules!` macro, so it needs no access to the type's own crate.
 
 ## Async Server
 
@@ -464,10 +463,9 @@ Where you cannot add even that dependency — a type from a crate you do not own
 
 ```rust
 use repe::{AsyncServer, Router};
-use serde_json::json;
 
 # async fn run() -> std::io::Result<()> {
-let router = Router::new().with("/ping", |_v| Ok(json!({"pong": true})));
+let router = Router::new().with_typed("/ping", |_: Empty| Ok(Pong { pong: true }));
 let listener = AsyncServer::listen(("127.0.0.1", 0)).await?;
 tokio::spawn(async move { let _ = AsyncServer::new(router).serve(listener).await; });
 # Ok(()) }
@@ -475,17 +473,20 @@ tokio::spawn(async move { let _ = AsyncServer::new(router).serve(listener).await
 
 ## Peer-Aware Handlers
 
-Handlers that need to push more than one message back to the calling client (e.g. server-pushed file chunks after a single `/run_collection` call) need a typed handle to that connection. `PeerSink` / `PeerHandle` / `CallContext` provide that handle, and `Registry::dispatch_with_ctx` threads it through to the handler.
+Handlers that need to push more than one message back to the calling client (e.g. server-pushed file chunks after a single `/run_collection` call) need a typed handle to that connection. `PeerSink` / `PeerHandle` / `CallContext` provide that handle, and `Registry::call` threads it through to the handler.
 
-The built-in WebSocket server constructs a `PeerHandle` per connection and threads it into each request's `CallContext`, so over WebSocket you write only the context-aware handler and read `ctx.peer()` — no sink or dispatch wiring of your own. The TCP servers and direct in-process dispatch do not attach a peer; there `ctx.peer()` returns `None`, and you wire your own `PeerSink` (typically a bounded channel drained by a writer task) and call `Registry::dispatch_with_ctx` with a populated `CallContext`, as in the example below.
+The built-in WebSocket server constructs a `PeerHandle` per connection and threads it into each request's `CallContext`, so over WebSocket you write only the context-aware handler and read `ctx.peer()` — no sink or dispatch wiring of your own. The TCP servers and direct in-process dispatch do not attach a peer; there `ctx.peer()` returns `None`, and you wire your own `PeerSink` (typically a bounded channel drained by a writer task) and call `Registry::call` with a populated `CallContext`, as in the example below.
 
 ```rust
 use repe::{
     CallContext, NotifyBody, PeerHandle, PeerId, PeerSendError, PeerSink,
     Registry, WithContext,
 };
-use serde_json::{json, Value};
 use std::sync::Arc;
+
+#[derive(Default)]
+struct Status { status: String }
+structio::object!(Status { status });
 
 struct OutboundChannel(/* tx: mpsc::Sender<...> */);
 impl PeerSink for OutboundChannel {
@@ -500,12 +501,14 @@ registry.register_function("/run", WithContext(|ctx: &CallContext, _params| {
     if let Some(peer) = ctx.peer() {
         peer.send_notify("/progress", NotifyBody::Json(b"{\"step\":1}".to_vec())).ok();
     }
-    Ok::<_, (repe::ErrorCode, String)>(json!({"status": "ok"}))
+    Ok::<_, (repe::ErrorCode, String)>(Status { status: "ok".into() })
 })).unwrap();
 
 let peer = PeerHandle::new(PeerId(1), Arc::new(OutboundChannel(/* ... */)));
 let ctx = CallContext::new("/run", &peer);
-let _ = registry.dispatch_with_ctx("/run", Some(json!({})), &ctx);
+let mut buf = Vec::new();
+let mut out = repe::ResponseBody::new(&mut buf);
+let _ = registry.call("/run", None, &ctx, &mut out);
 ```
 
 `WithContext` is the marker that opts a closure into the `&CallContext` parameter. Plain `Fn(Option<Value>) -> Result<...>` handlers keep working unchanged: `Registry::dispatch` is a thin wrapper that supplies a `CallContext::detached` context.

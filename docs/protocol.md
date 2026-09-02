@@ -30,7 +30,8 @@ use repe::MessageView;
 
 let view = MessageView::from_slice(&frame_bytes)?;
 let path = view.query_str()?;
-// view.body is &[u8] pointing inside frame_bytes; pair with serde_bytes::Bytes<'a>
+// view.body is &[u8] pointing inside frame_bytes; a declared type whose fields
+// borrow (`&'de str`, `&'de [u8]`) reads out of it without copying
 // on a Deserialize struct to keep the chunk payload borrowed end-to-end.
 ```
 
@@ -43,7 +44,7 @@ Method paths follow [RFC 6901](https://datatracker.ietf.org/doc/html/rfc6901): e
 Helpers:
 
 - `parse_json_pointer` splits a pointer into unescaped tokens.
-- `eval_json_pointer` indexes into a `serde_json::Value` using array indices or object keys.
+- A pointer addresses an *endpoint*, and resolving one is the router's or the registry's job. There is no document to index into.
 
 ## Schema Evolution
 
