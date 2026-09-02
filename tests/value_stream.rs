@@ -8,19 +8,19 @@ use repe::{
     BodyFormat, Client, RepeError, Router, Server, pull_consume, pull_stream, pull_to_beve_file,
     pull_to_file, pull_to_file_trailer_verified, pull_to_vec, pull_value,
 };
-use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::thread;
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Default, Clone, Debug, PartialEq)]
 struct Payload {
     id: u64,
     label: String,
     samples: Vec<f64>,
     tags: Vec<String>,
 }
+structio::object!(Payload { id, label, samples, tags });
 
 fn sample_payload() -> Payload {
     // Large enough (~1.6 MiB of f64 plus strings) to span many chunks once the
@@ -90,7 +90,7 @@ fn beve_zst_file_decodes_back_to_the_value() {
     // The file is the raw compressed stream: decompress, then BEVE-decode.
     let compressed = std::fs::read(&path).expect("read file");
     let beve_bytes = zstd::decode_all(&compressed[..]).expect("zstd decode");
-    let decoded: Payload = beve::from_slice(&beve_bytes).expect("beve decode");
+    let decoded: Payload = structio::from_beve(&beve_bytes).expect("beve decode");
     assert_eq!(decoded, payload);
 
     std::fs::remove_dir_all(&dir).ok();
@@ -109,7 +109,7 @@ fn beve_file_is_decompressed_and_decodes_back_to_the_value() {
 
     // The file is already-decompressed BEVE: decode directly.
     let beve_bytes = std::fs::read(&path).expect("read file");
-    let decoded: Payload = beve::from_slice(&beve_bytes).expect("beve decode");
+    let decoded: Payload = structio::from_beve(&beve_bytes).expect("beve decode");
     assert_eq!(decoded, payload);
 
     std::fs::remove_dir_all(&dir).ok();
@@ -398,7 +398,7 @@ fn pull_split_and_verify(client: &Client, path: &Path) -> Payload {
         got_digest,
         "trailer digest must match the streamed payload (end-to-end integrity)"
     );
-    beve::from_slice(payload_bytes).expect("beve decode of payload prefix")
+    structio::from_beve(payload_bytes).expect("beve decode of payload prefix")
 }
 
 #[test]
@@ -504,7 +504,7 @@ fn trailer_verified_commits_payload_only_uncompressed() {
         streamed_payload_bytes(&payload),
         "committed file must be the payload with the 8-byte trailer stripped"
     );
-    let decoded: Payload = beve::from_slice(&bytes).expect("decode payload-only file");
+    let decoded: Payload = structio::from_beve(&bytes).expect("decode payload-only file");
     assert_eq!(decoded, payload);
 
     std::fs::remove_dir_all(&dir).ok();
@@ -526,7 +526,7 @@ fn trailer_verified_commits_payload_only_through_compression() {
 
     let bytes = std::fs::read(&path).expect("read committed file");
     assert_eq!(bytes, streamed_payload_bytes(&payload));
-    let decoded: Payload = beve::from_slice(&bytes).expect("decode payload-only file");
+    let decoded: Payload = structio::from_beve(&bytes).expect("decode payload-only file");
     assert_eq!(decoded, payload);
 
     std::fs::remove_dir_all(&dir).ok();

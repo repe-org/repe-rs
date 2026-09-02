@@ -18,13 +18,13 @@ use repe::constants::{ErrorCode, QueryFormat};
 use repe::plugin::{REPE_PLUGIN_INTERFACE_VERSION, RepeBuffer, RepePluginData, RepeResult};
 use repe::server::Router;
 use repe::{Message, RepeStruct};
-use serde::{Deserialize, Serialize};
 
-#[derive(Default, Serialize, Deserialize, RepeStruct)]
+#[derive(Default, RepeStruct)]
 #[repe(methods)]
 struct Counter {
     value: i64,
 }
+structio::object!(Counter { value });
 
 #[repe::methods]
 impl Counter {
@@ -37,7 +37,7 @@ impl Counter {
 #[repe::plugin(name = "counter", version = "2.5.0", root = "/counter")]
 fn build() -> Router {
     Router::new()
-        .with_json("/counter/echo", Ok)
+        .with_typed("/counter/echo", Ok)
         .with_struct("/counter", Counter::default())
         .0
 }
@@ -69,8 +69,7 @@ fn request(path: &str, body: &serde_json::Value, notify: bool) -> Vec<u8> {
         .query_str(path)
         .query_format(QueryFormat::JsonPointer)
         .body_json(body)
-        .unwrap()
-        .build()
+                .build()
         .to_vec()
 }
 

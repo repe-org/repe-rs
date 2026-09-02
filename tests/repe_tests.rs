@@ -24,8 +24,7 @@ fn message_roundtrip_json() {
         .query_str("/status")
         .query_format(QueryFormat::JsonPointer)
         .body_json(&serde_json::json!({"ping": true}))
-        .unwrap()
-        .build();
+                .build();
     let bytes = msg.to_vec();
     let parsed = Message::from_slice(&bytes).unwrap();
     assert_eq!(parsed.header.id, 42);

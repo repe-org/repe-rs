@@ -35,8 +35,6 @@ use std::time::Duration;
 use repe::constants::{ErrorCode, QueryFormat};
 use repe::structs::{StructError, StructResult, path_from_segments};
 use repe::{Message, RepeStruct, Router};
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -45,7 +43,7 @@ use serde_json::{Value, json};
 /// A child that owns live state. A whole-object write **applies** the fields it
 /// was handed rather than replacing the child, which is what a settings surface
 /// means by a write. Unreachable before a whole-child write descended.
-#[derive(Default, Serialize)]
+#[derive(Default)]
 struct Settings {
     retries: u32,
     timeout: u32,
@@ -53,6 +51,7 @@ struct Settings {
     /// distinguishable from a *replace* by more than its result.
     writes: u32,
 }
+structio::object!(Settings { retries, timeout, writes });
 
 impl RepeStruct for Settings {
     fn repe_handle(
@@ -114,15 +113,16 @@ impl RepeStruct for Settings {
 /// against one of these still replaces it, because that is what its own
 /// empty-segments arm does. Descending changed which impl decides, not what a
 /// derived one decides.
-#[derive(Default, Serialize, Deserialize, RepeStruct)]
+#[derive(Default, RepeStruct)]
 struct Counter {
     ticks: u64,
     source: String,
 }
+structio::object!(Counter { ticks, source });
 
 /// The root. No `Deserialize` impl anywhere on it — that this file compiles is
 /// half of what `#[repe(no_replace)]` is for.
-#[derive(Default, Serialize, RepeStruct)]
+#[derive(Default, RepeStruct)]
 #[repe(no_replace)]
 struct Service {
     version: u32,
@@ -140,6 +140,7 @@ struct Service {
     #[repe(readonly)]
     fixed: Counter,
 }
+structio::object!(Service { version, settings, counter, aux, fixed });
 
 fn service() -> Service {
     Service {
@@ -176,8 +177,7 @@ fn write<T: Serialize>(query: &str, value: &T) -> Vec<u8> {
         .query_str(query)
         .query_format(QueryFormat::JsonPointer)
         .body_json(value)
-        .expect("the fixtures serialize")
-        .build()
+                .build()
         .to_vec()
 }
 

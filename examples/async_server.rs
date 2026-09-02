@@ -1,30 +1,32 @@
 use repe::{AsyncServer, Router};
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use std::time::Instant;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let started = Instant::now();
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Default, Debug)]
     struct MulReq {
         x: i64,
         y: i64,
     }
-    #[derive(Debug, Serialize)]
+    structio::object!(MulReq { x, y });
+    #[derive(Default, Debug)]
     struct MulResp {
         product: i64,
     }
-    #[derive(Debug, Deserialize)]
+    structio::object!(MulResp { product });
+    #[derive(Default, Debug)]
     struct AddReq {
         a: i64,
         b: i64,
     }
-    #[derive(Debug, Serialize)]
+    structio::object!(AddReq { a, b });
+    #[derive(Default, Debug)]
     struct AddResp {
         sum: i64,
     }
+    structio::object!(AddResp { sum });
 
     let router = Router::new()
         .with("/ping", |_v: Value| Ok(json!({"pong": true})))

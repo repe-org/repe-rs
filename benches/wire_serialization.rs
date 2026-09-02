@@ -36,7 +36,7 @@
 //! should build a response frame straight from a serializable value instead of
 //! serializing into a `Message` body first:
 //!
-//! * `via_message`: today's path -- `beve::to_vec(value)` into a tight buffer,
+//! * `via_message`: today's path -- `structio::to_beve(value)` into a tight buffer,
 //!   wrap in a `Message`, then `into_wire_bytes`. The BEVE buffer is tight
 //!   (cap == len), so the prefix never fits and `into_wire_bytes` falls to its
 //!   slow path: a second allocation plus a body copy.
@@ -59,7 +59,6 @@
 
 use benchit::{Bench, GroupResult, Throughput};
 use repe::{BodyFormat, HEADER_SIZE, Header, Message, QueryFormat};
-use serde::{Deserialize, Serialize};
 
 const QUERY: &str = "/collect/file_chunk";
 const BODY_SIZES: &[usize] = &[64, 4 * 1024, 64 * 1024, 4 * 1024 * 1024];
@@ -120,17 +119,18 @@ fn bench_wire_serialization(bench: &mut Bench) {
 /// A handler-shaped response body: a small head plus a sized payload, encoded
 /// as BEVE (the case `into_wire_bytes` cannot fast-path, since `beve::to_vec`
 /// returns a tight buffer with no room for the wire prefix).
-#[derive(Serialize, Deserialize, PartialEq, Debug)]
+#[derive(Default, PartialEq, Debug)]
 struct Payload {
     id: u64,
     data: Vec<u8>,
 }
+structio::object!(Payload { id, data });
 
 /// Current outbound path: serialize the value to a tight BEVE `Vec`, wrap it in
 /// a [`Message`], then frame it. Two allocations (body + wire) and one body
 /// copy, because the tight body buffer has no room for the header+query prefix.
 fn frame_via_message(value: &Payload) -> Vec<u8> {
-    let body = beve::to_vec(value).unwrap();
+    let body = structio::to_beve(value).unwrap();
     Message::builder()
         .id(value.id)
         .query_str(QUERY)

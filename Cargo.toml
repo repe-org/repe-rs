@@ -248,7 +248,7 @@ web-sys = { version = "0.3", optional = true, features = [
 rand = "0.8"
 benchit = "0.1"
 # Only for tests: construct f16/bf16 values to exercise the half-float element
-# types of the typed-numeric body path (the runtime dep on half comes via beve).
+# types of the typed-numeric body path.
 half = "2.4"
 # Only for the `value-stream` integration tests: independently decompress a
 # pulled `.beve.zst` file to assert its contents. Deliberately the reference C

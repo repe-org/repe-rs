@@ -16,7 +16,6 @@
 
 use repe::rest::{MEDIA_BEVE, MEDIA_JSON, MEDIA_PROBLEM, RestConfig, RestGateway};
 use repe::{ErrorCode, Registry};
-use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -267,10 +266,10 @@ async fn beve_is_negotiated_on_both_legs() {
     )
     .await;
     assert_eq!(read.header("content-type"), Some(MEDIA_BEVE));
-    let decoded: Value = beve::from_slice(&read.body).unwrap();
+    let decoded: Value = structio::from_beve(&read.body).unwrap();
     assert_eq!(decoded["name"], json!("demo"));
 
-    let body = beve::to_vec(&json!({ "a": 1, "b": 2 })).unwrap();
+    let body = structio::to_beve(&json!({ "a": 1, "b": 2 })).unwrap();
     let call = send(
         &mut stream,
         "POST",
@@ -280,7 +279,7 @@ async fn beve_is_negotiated_on_both_legs() {
     )
     .await;
     assert_eq!(call.status, 200);
-    let decoded: Value = beve::from_slice(&call.body).unwrap();
+    let decoded: Value = structio::from_beve(&call.body).unwrap();
     assert_eq!(decoded["result"], json!(3));
 }
 

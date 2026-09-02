@@ -27,7 +27,6 @@ use std::time::Duration;
 
 use repe::server::Router;
 use repe::{ConnectionError, WebSocketClient, WebSocketServer};
-use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
@@ -39,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (or a client disconnect) winds it down at the next loop boundary.
     let wound_down = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&wound_down);
-    let router = Router::new().with_json_ctx_blocking("/work", move |ctx, _params| {
+    let router = Router::new().with_typed_ctx_blocking("/work", move |ctx, _params| {
         let mut step = 0u64;
         loop {
             if ctx.is_cancelled() {

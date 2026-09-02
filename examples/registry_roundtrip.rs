@@ -1,5 +1,4 @@
 use repe::{BodyFormat, ErrorCode, Message, QueryFormat, Registry, Router};
-use serde_json::{Value, json};
 use std::sync::Arc;
 
 fn request_read(path: &str) -> Message {
@@ -16,8 +15,7 @@ fn request_json(path: &str, body: &Value) -> Message {
         .query_str(path)
         .query_format(QueryFormat::JsonPointer)
         .body_json(body)
-        .expect("json body")
-        .build()
+                .build()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -27,7 +27,6 @@
 
 use repe::rest::RestGateway;
 use repe::{AsyncServer, ErrorCode, Registry, Router};
-use serde_json::{Value, json};
 use std::sync::Arc;
 
 #[tokio::main]

@@ -19,14 +19,14 @@
 //! Run with: `cargo run --example beve_streaming_body`
 
 use repe::{BodyFormat, Header, QueryFormat, write_message_streaming};
-use serde::{Deserialize, Serialize};
 use std::io::Write;
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Default, Debug, PartialEq)]
 struct SensorFrame {
     id: u64,
     samples: Vec<f64>,
 }
+structio::object!(SensorFrame { id, samples });
 
 fn header_for(frame: &SensorFrame) -> Header {
     let mut header = Header::new();

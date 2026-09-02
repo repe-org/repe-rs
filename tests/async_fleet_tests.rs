@@ -6,7 +6,6 @@ use common::{
     TestServer, TransportFlakyServer, error_response_for, json_response_for, unused_port,
 };
 use repe::{AsyncFleet, ErrorCode, FleetError, FleetOptions, NodeConfig, RepeError, RetryPolicy};
-use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -82,13 +81,13 @@ async fn async_fleet_end_to_end() {
     assert!(!fleet.is_connected("server-3").await.unwrap());
 
     let single = fleet
-        .call_json("server-1", "/compute", Some(&json!({"value": 10})))
+        .call_typed_json("server-1", "/compute", Some(&json!({"value": 10})))
         .await
         .unwrap();
     assert!(single.succeeded());
     assert_eq!(single.value.as_ref().unwrap()["result"], 20);
 
-    let missing = fleet.call_json("missing", "/status", None).await;
+    let missing = fleet.call_typed_json("missing", "/status", None).await;
     assert!(matches!(missing, Err(FleetError::NodeNotFound(_))));
 
     let all_status = fleet.broadcast_json("/status", None, &[] as &[&str]).await;
@@ -185,7 +184,7 @@ async fn async_fleet_retry_policy_recovers_from_transport_errors() {
     assert_eq!(connected.connected, vec!["flaky".to_string()]);
 
     let result = fleet
-        .call_json("flaky", "/flaky", Some(&json!({})))
+        .call_typed_json("flaky", "/flaky", Some(&json!({})))
         .await
         .unwrap();
     assert!(result.succeeded());
@@ -230,7 +229,7 @@ async fn async_fleet_retry_policy_does_not_retry_application_errors() {
     assert_eq!(connected.connected, vec!["flaky".to_string()]);
 
     let result = fleet
-        .call_json("flaky", "/flaky", Some(&json!({})))
+        .call_typed_json("flaky", "/flaky", Some(&json!({})))
         .await
         .unwrap();
     assert!(result.failed());

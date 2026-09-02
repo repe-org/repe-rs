@@ -20,16 +20,16 @@
 
 use repe::value_stream::{RouterValueStreamExt, StreamOpts};
 use repe::{BodyFormat, Client, RepeError, Router, Server, pull_to_file_trailer_verified};
-use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 use std::net::TcpListener;
 use std::thread;
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Default, Clone, Debug, PartialEq)]
 struct Dataset {
     name: String,
     samples: Vec<f64>,
 }
+structio::object!(Dataset { name, samples });
 
 // A tiny non-cryptographic digest (FNV-1a, 64-bit) so the example pulls in no
 // hashing dependency. Swap in BLAKE3 / SHA-256 for real use — the seam is the
@@ -161,7 +161,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     // Reaching here means the trailer verified and the payload-only file committed.
-    let decoded: Dataset = beve::from_slice(&std::fs::read(&path)?)?;
+    let decoded: Dataset = structio::from_beve(&std::fs::read(&path)?)?;
     std::fs::remove_file(&path).ok();
 
     println!(

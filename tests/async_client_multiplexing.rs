@@ -1,7 +1,6 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use repe::{AsyncClient, Message, QueryFormat, RepeError, read_message, write_message};
-use serde_json::{Value, json};
 use std::io::{BufReader, BufWriter, Write};
 use std::net::TcpListener;
 use std::thread;
@@ -15,8 +14,7 @@ fn json_response_for(req: &Message, body: &Value) -> Message {
             QueryFormat::try_from(req.header.query_format).unwrap_or(QueryFormat::RawBinary),
         )
         .body_json(body)
-        .expect("json body")
-        .build()
+                .build()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -51,7 +49,7 @@ async fn async_client_multiplexes_out_of_order_responses() {
 
     let c1 = client.clone();
     let call_a = tokio::spawn(async move {
-        let out = c1.call_json("/first", &json!({"v": 1})).await?;
+        let out = c1.call_typed_json("/first", &json!({"v": 1})).await?;
         if out["path"] != "/first" {
             return Err(RepeError::Io(std::io::Error::other(
                 "unexpected response for /first",
@@ -62,7 +60,7 @@ async fn async_client_multiplexes_out_of_order_responses() {
 
     let c2 = client.clone();
     let call_b = tokio::spawn(async move {
-        let out = c2.call_json("/second", &json!({"v": 2})).await?;
+        let out = c2.call_typed_json("/second", &json!({"v": 2})).await?;
         if out["path"] != "/second" {
             return Err(RepeError::Io(std::io::Error::other(
                 "unexpected response for /second",
@@ -93,7 +91,7 @@ async fn async_client_per_request_timeout() {
 
     let client = AsyncClient::connect(addr).await.unwrap();
     let err = client
-        .call_json_with_timeout("/slow", &json!({}), Duration::from_millis(50))
+        .call_typed_json_with_timeout("/slow", &json!({}), Duration::from_millis(50))
         .await
         .unwrap_err();
 
@@ -184,14 +182,14 @@ async fn async_client_ignores_late_response_for_timed_out_request() {
     let timed_client = client.clone();
     let timed_call = tokio::spawn(async move {
         timed_client
-            .call_json_with_timeout("/timed_out", &json!({"n": 1}), Duration::from_millis(50))
+            .call_typed_json_with_timeout("/timed_out", &json!({"n": 1}), Duration::from_millis(50))
             .await
     });
 
     let pending_client = client.clone();
     let pending_call = tokio::spawn(async move {
         pending_client
-            .call_json_with_timeout(
+            .call_typed_json_with_timeout(
                 "/still_pending",
                 &json!({"n": 2}),
                 Duration::from_millis(500),
@@ -233,7 +231,7 @@ async fn async_client_unrecognized_response_id_is_discarded() {
 
     let client = AsyncClient::connect(addr).await.unwrap();
     let result = tokio::time::timeout(Duration::from_millis(2000), async {
-        client.call_json("/x", &json!({"a": 1})).await
+        client.call_typed_json("/x", &json!({"a": 1})).await
     })
     .await
     .expect("call_json should fail when server closes connection");
@@ -263,8 +261,7 @@ async fn async_client_preserves_structured_fatal_response_loop_error() {
             .query_format(QueryFormat::try_from(req.header.query_format).unwrap())
             .error_code(repe::ErrorCode::Ok)
             .body_json(&json!({"ok": true}))
-            .unwrap()
-            .build();
+                        .build();
         resp.header.spec = 0;
 
         let mut writer = BufWriter::new(stream);
@@ -274,7 +271,7 @@ async fn async_client_preserves_structured_fatal_response_loop_error() {
 
     let client = AsyncClient::connect(addr).await.unwrap();
     let err = client
-        .call_json("/fatal", &json!({"a": 1}))
+        .call_typed_json("/fatal", &json!({"a": 1}))
         .await
         .unwrap_err();
     match err {

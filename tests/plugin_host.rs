@@ -100,8 +100,7 @@ fn write<T: serde::Serialize>(query: &str, id: u64, value: &T) -> Vec<u8> {
         .query_str(query)
         .query_format(QueryFormat::JsonPointer)
         .body_json(value)
-        .unwrap()
-        .build()
+                .build()
         .to_vec()
 }
 
@@ -254,7 +253,7 @@ fn a_real_shared_library_loads_and_serves() {
         let mounted = unsafe { Plugin::load(&path) }.expect("already resident");
         assert_eq!(mounted.load_origin(), LoadOrigin::AlreadyResident);
         let router = Router::new()
-            .with_json("/local", |_| Ok(serde_json::json!("served by the host")))
+            .with_typed("/local", |_| Ok(serde_json::json!("served by the host")))
             .with_fallback(Arc::new(mounted));
 
         // A route the host owns is untouched by the fallback.

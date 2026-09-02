@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use repe::server::Router;
 use repe::{RepeError, WebSocketClient, WebSocketLimits, WebSocketServer};
-use serde_json::{Value, json};
 
 /// Spawn a detached server for `router` on an ephemeral port and connect a
 /// client, both with the given limits.
@@ -36,7 +35,7 @@ async fn pair(
 
 /// A router whose one route returns a body of `len` bytes.
 fn echo_sized_router() -> Router {
-    Router::new().with_json("/blob", |payload: Value| {
+    Router::new().with_typed("/blob", |payload: Value| {
         let len = payload.get("len").and_then(Value::as_u64).unwrap_or(0) as usize;
         Ok(json!({ "data": "x".repeat(len) }))
     })

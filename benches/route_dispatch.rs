@@ -17,7 +17,6 @@ use benchit::Bench;
 use repe::registry::{Registry, RegistryCallable};
 use repe::server::{Middleware, Next, Router};
 use repe::{BodyFormat, Message, QueryFormat};
-use serde_json::{Value, json};
 use std::hint::black_box;
 use std::sync::{Arc, Mutex};
 
@@ -58,7 +57,7 @@ impl RegistryCallable for BenchCallable {
 }
 
 fn build_plain_router(with_middleware: bool) -> Router {
-    let router = Router::new().with_json("/sum", |_v: Value| Ok(json!({"sum": 0})));
+    let router = Router::new().with_typed("/sum", |_v: Value| Ok(json!({"sum": 0})));
     if with_middleware {
         router.with_middleware(PassThrough)
     } else {
@@ -114,8 +113,7 @@ fn build_request(path: &str) -> Message {
         .query_str(path)
         .query_format(QueryFormat::JsonPointer)
         .body_json(&json!({}))
-        .unwrap()
-        .body_format(BodyFormat::Json)
+                .body_format(BodyFormat::Json)
         .build()
 }
 

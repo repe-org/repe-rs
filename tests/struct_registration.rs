@@ -3,15 +3,13 @@
 
 use repe::constants::{ErrorCode, QueryFormat};
 use repe::{Message, Router};
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
 
 #[cfg(feature = "parking-lot")]
 use parking_lot::RwLock as ParkingRwLock;
 
-#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+#[derive(Default, repe::RepeStruct)]
 #[repe(methods(
     hello(&self) -> String,
     world(&self) -> String,
@@ -22,6 +20,7 @@ use parking_lot::RwLock as ParkingRwLock;
 struct MyFunctions {
     i: i32,
 }
+structio::object!(MyFunctions { i });
 
 impl MyFunctions {
     fn hello(&self) -> String {
@@ -65,7 +64,7 @@ impl MetaFunctions {
     }
 }
 
-#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+#[derive(Default, repe::RepeStruct)]
 #[repe(methods(
     append_awesome(&self, input: String) -> String
 ))]
@@ -76,6 +75,7 @@ struct MyNestedFunctions {
     meta_functions: MetaFunctions,
     my_string: String,
 }
+structio::object!(MyNestedFunctions { my_functions, meta_functions, my_string });
 
 impl MyNestedFunctions {
     fn append_awesome(&self, input: String) -> String {
@@ -83,7 +83,7 @@ impl MyNestedFunctions {
     }
 }
 
-#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+#[derive(Default, repe::RepeStruct)]
 #[repe(methods(
     get_name(&self) -> String,
     set_name(&mut self, new_name: String) -> (),
@@ -92,6 +92,7 @@ impl MyNestedFunctions {
 struct ExampleFunctions {
     name: String,
 }
+structio::object!(ExampleFunctions { name });
 
 impl ExampleFunctions {
     fn get_name(&self) -> String {
@@ -104,7 +105,7 @@ impl ExampleFunctions {
 }
 
 #[allow(unreachable_code)]
-#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+#[derive(Default, repe::RepeStruct)]
 #[repe(methods(
     alias = describe(&self) -> String
 ))]
@@ -116,6 +117,7 @@ struct AttributeStruct {
     #[repe(readonly)]
     name: String,
 }
+structio::object!(AttributeStruct { value, hidden, name });
 
 impl AttributeStruct {
     fn describe(&self) -> String {
@@ -123,11 +125,12 @@ impl AttributeStruct {
     }
 }
 
-#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+#[derive(Default, repe::RepeStruct)]
 struct RootStruct {
     foo: i32,
     bar: String,
 }
+structio::object!(RootStruct { foo, bar });
 
 fn request_empty(path: &str) -> Message {
     Message::builder()
@@ -141,8 +144,7 @@ fn request_json(path: &str, body: &Value) -> Message {
         .query_str(path)
         .query_format(QueryFormat::JsonPointer)
         .body_json(body)
-        .unwrap()
-        .build()
+                .build()
 }
 
 fn parse_body(resp: &Message) -> Value {
@@ -562,8 +564,7 @@ fn root_write_replaces_struct() {
         .query_str("")
         .query_format(QueryFormat::JsonPointer)
         .body_json(&json!({"foo": 5, "bar": "five"}))
-        .unwrap()
-        .build();
+                .build();
     let resp = router.get("").unwrap().handle(&replace).unwrap();
     assert_eq!(parse_body(&resp), Value::Null);
 

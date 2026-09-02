@@ -1,5 +1,4 @@
 use repe::{ErrorCode, Registry, Router, Server};
-use serde_json::{Value, json};
 use std::sync::Arc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

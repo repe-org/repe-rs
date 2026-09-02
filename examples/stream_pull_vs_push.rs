@@ -108,10 +108,10 @@ fn main() {
 /// decode-bound, not transport-bound.
 fn decode_diagnostic(total: usize) {
     let payload = lcg_bytes(total);
-    let encoded = beve::to_vec(&payload).unwrap();
+    let encoded = structio::to_beve(&payload).unwrap();
 
     let t = Instant::now();
-    let bulk: Vec<u8> = beve::from_slice(&encoded).unwrap();
+    let bulk: Vec<u8> = structio::from_beve(&encoded).unwrap();
     let bulk_ms = t.elapsed().as_secs_f64() * 1000.0;
     assert_eq!(bulk.len(), total);
 

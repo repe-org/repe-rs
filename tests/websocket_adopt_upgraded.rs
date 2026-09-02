@@ -24,12 +24,11 @@ use repe::{
     HandshakeContext, Message, PeerRegistry, QueryFormat, SharedWebSocketServer, ShutdownToken,
     WebSocketClient, WebSocketLimits, WebSocketServer, derive_accept_key,
 };
-use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 fn echo_router() -> Router {
-    Router::new().with_json("/echo", |payload: Value| Ok(json!({ "saw": payload })))
+    Router::new().with_typed("/echo", |payload: Value| Ok(json!({ "saw": payload })))
 }
 
 /// Read the upgrade request off `stream` and answer `101`, the way an HTTP
@@ -338,7 +337,7 @@ async fn adopt_upgraded_fixes_the_servers_configured_inbound_thresholds() {
 /// substituted rather than sent.
 #[tokio::test]
 async fn an_adopted_connection_enforces_the_outbound_guard() {
-    let router = Router::new().with_json("/blob", |payload: Value| {
+    let router = Router::new().with_typed("/blob", |payload: Value| {
         let len = payload.get("len").and_then(Value::as_u64).unwrap_or(0) as usize;
         Ok(json!({ "data": "x".repeat(len) }))
     });
@@ -472,8 +471,7 @@ fn request_bytes(n: u64) -> Vec<u8> {
         .query_format(QueryFormat::JsonPointer)
         .query_str("/echo")
         .body_json(&json!({ "n": n }))
-        .expect("body")
-        .build()
+                .build()
         .into_wire_bytes()
 }
 

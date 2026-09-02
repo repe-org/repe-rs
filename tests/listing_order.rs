@@ -23,7 +23,6 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use repe::constants::QueryFormat;
 use repe::{Message, RepeStruct, Router};
-use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -31,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 /// The shape that motivates the attribute: a field-shaped endpoint whose
 /// logical place is in the middle of the fields, not after them.
-#[derive(Clone, Default, Serialize, Deserialize, RepeStruct)]
+#[derive(Clone, Default, RepeStruct)]
 #[repe(methods)]
 #[repe(listing_order("name", "count", "percent", "total", "identify", "reset"))]
 struct Ordered {
@@ -41,6 +40,7 @@ struct Ordered {
     #[repe(skip)]
     ratio: f64,
 }
+structio::object!(Ordered { name, count, total, ratio });
 
 #[repe::methods]
 impl Ordered {
@@ -63,7 +63,7 @@ impl Ordered {
 
 /// The same surface with no `listing_order`, so the default is pinned beside the
 /// override rather than only implied by it.
-#[derive(Clone, Default, Serialize, Deserialize, RepeStruct)]
+#[derive(Clone, Default, RepeStruct)]
 #[repe(methods)]
 struct Appended {
     name: String,
@@ -72,6 +72,7 @@ struct Appended {
     #[repe(skip)]
     ratio: f64,
 }
+structio::object!(Appended { name, count, total, ratio });
 
 #[repe::methods]
 impl Appended {
@@ -97,13 +98,14 @@ impl Appended {
 /// assertion also stood down here, `#[repe(listing_order("a", "typo"))]` would
 /// compile and then fail *every* whole-object read with `InvalidPath` while each
 /// endpoint still answered on its own path.
-#[derive(Clone, Default, Serialize, Deserialize, RepeStruct)]
+#[derive(Clone, Default, RepeStruct)]
 #[repe(methods)]
 #[repe(listing_order("beta", "alpha"))]
 struct Quiet {
     alpha: u32,
     beta: u32,
 }
+structio::object!(Quiet { alpha, beta });
 
 #[repe::methods]
 impl Quiet {
@@ -115,13 +117,14 @@ impl Quiet {
 
 /// A struct with no `#[repe::methods]` block: everything the order names is
 /// visible to the derive, so the whole check happens at macro time.
-#[derive(Clone, Default, Serialize, Deserialize, RepeStruct)]
+#[derive(Clone, Default, RepeStruct)]
 #[repe(methods(probe(&self) -> u32))]
 #[repe(listing_order("beta", "probe", "alpha"))]
 struct Reversed {
     alpha: u32,
     beta: u32,
 }
+structio::object!(Reversed { alpha, beta });
 
 impl Reversed {
     fn probe(&self) -> u32 {

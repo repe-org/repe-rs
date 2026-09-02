@@ -5,8 +5,6 @@
 
 use repe::constants::{BodyFormat, ErrorCode, QueryFormat};
 use repe::{Message, Router};
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 
 #[derive(Debug)]
 struct DeviceError(&'static str);
@@ -17,7 +15,7 @@ impl std::fmt::Display for DeviceError {
     }
 }
 
-#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+#[derive(Default, repe::RepeStruct)]
 #[repe(methods)]
 struct Device {
     id: String,
@@ -27,6 +25,7 @@ struct Device {
     #[repe(typed)]
     trace: Vec<f64>,
 }
+structio::object!(Device { id, armed, samples, trace });
 
 #[repe::methods]
 impl Device {
@@ -94,8 +93,7 @@ fn request_json(path: &str, body: &Value) -> Message {
         .query_str(path)
         .query_format(QueryFormat::JsonPointer)
         .body_json(body)
-        .unwrap()
-        .build()
+                .build()
 }
 
 fn call(router: &Router, path: &str, request: &Message) -> Message {
@@ -323,11 +321,12 @@ fn a_typed_field_still_accepts_a_json_write() {
 
 #[test]
 fn a_nested_struct_reaches_its_own_impl_block_methods() {
-    #[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+    #[derive(Default, repe::RepeStruct)]
     #[repe(methods)]
     struct Channel {
         gain: f64,
     }
+    structio::object!(Channel { gain });
 
     #[repe::methods]
     impl Channel {
@@ -340,11 +339,12 @@ fn a_nested_struct_reaches_its_own_impl_block_methods() {
         }
     }
 
-    #[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+    #[derive(Default, repe::RepeStruct)]
     struct Rack {
         #[repe(nested)]
         channel: Channel,
     }
+    structio::object!(Rack { channel });
 
     let (router, handle) = Router::new().with_struct("", Rack::default());
     handle.lock().unwrap().channel.gain = 2.0;
@@ -426,11 +426,12 @@ fn the_whole_struct_listing_is_in_declaration_order() {
 /// The struct-level list is the escape hatch for an impl block that cannot be
 /// annotated. It carries the same multi-argument support, and the two forms
 /// coexist on one struct.
-#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+#[derive(Default, repe::RepeStruct)]
 #[repe(methods, methods(listed = combine(&self, left: i32, right: i32) -> i32))]
 struct MixedSurface {
     base: i32,
 }
+structio::object!(MixedSurface { base });
 
 impl MixedSurface {
     fn combine(&self, left: i32, right: i32) -> i32 {
@@ -493,15 +494,14 @@ fn a_beve_request_body_reaches_a_multi_argument_method() {
         .query_str("/scale")
         .query_format(QueryFormat::JsonPointer)
         .body_beve(&(3.0f64, 1.5f64))
-        .unwrap()
-        .build();
+                .build();
     let resp = call(&router, "/scale", &request);
     assert_eq!(parse_body(&resp), json!(7.5));
 }
 
 // --- The invariant the whole `Sink` factoring exists to hold ------------------
 
-#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+#[derive(Default, repe::RepeStruct)]
 #[repe(methods)]
 struct Inner {
     scale: f64,
@@ -510,6 +510,7 @@ struct Inner {
     #[repe(readonly)]
     serial: String,
 }
+structio::object!(Inner { scale, window, serial });
 
 #[repe::methods]
 impl Inner {
@@ -518,7 +519,7 @@ impl Inner {
     }
 }
 
-#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+#[derive(Default, repe::RepeStruct)]
 struct Outer {
     name: String,
     #[repe(nested)]
@@ -527,6 +528,7 @@ struct Outer {
     #[allow(dead_code)]
     hidden: u8,
 }
+structio::object!(Outer { name, inner, hidden });
 
 fn outer() -> Outer {
     Outer {
@@ -642,11 +644,12 @@ fn a_typed_field_is_the_one_sanctioned_divergence() {
 fn a_result_alias_not_named_result_is_serialized_as_data() {
     type DeviceResult<T> = std::result::Result<T, String>;
 
-    #[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+    #[derive(Default, repe::RepeStruct)]
     #[repe(methods)]
     struct Aliased {
         v: i32,
     }
+    structio::object!(Aliased { v });
 
     #[repe::methods]
     impl Aliased {

@@ -29,7 +29,6 @@
 
 use repe::server::Router;
 use repe::{WebSocketClient, WebSocketServer, is_websocket_upgrade};
-use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -37,7 +36,7 @@ const REPE_PATH: &str = "/repe";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let router = Router::new().with_json("/ping", |_| Ok(json!({ "pong": true })));
+    let router = Router::new().with_typed("/ping", |_| Ok(json!({ "pong": true })));
     let shared = WebSocketServer::new(router).into_shared();
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
@@ -75,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Fork 1: the REPE WebSocket endpoint. ---
     let client = WebSocketClient::connect(&format!("ws://{addr}{REPE_PATH}")).await?;
-    let pong = client.call_json("/ping", &json!({})).await?;
+    let pong = client.call_typed_json("/ping", &json!({})).await?;
     println!("[ws] /ping -> {pong}");
     assert_eq!(pong["pong"], true);
     drop(client);

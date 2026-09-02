@@ -28,7 +28,6 @@ use repe::{
     read_message_into, write_message, write_message_complex_slice, write_message_streaming,
     write_message_typed_slice,
 };
-use serde_json::json;
 
 thread_local! {
     static ALLOCS: Cell<usize> = const { Cell::new(0) };
@@ -74,8 +73,7 @@ fn request(path: &str, body: serde_json::Value) -> Vec<u8> {
         .query_str(path)
         .query_format(QueryFormat::JsonPointer)
         .body_json(&body)
-        .unwrap()
-        .build()
+                .build()
         .to_vec()
 }
 
@@ -187,7 +185,7 @@ fn json_dispatch_allocation_budget() {
     // this fails after a serde_json update, re-baseline EXPECTED; if it fails
     // after a repe change, investigate the new (or removed) allocation.
     const EXPECTED: usize = 5;
-    let router = Router::new().with_json("/echo", |v: serde_json::Value| Ok(v));
+    let router = Router::new().with_typed("/echo", |v: serde_json::Value| Ok(v));
     let wire = request("/echo", json!({"x": 1}));
     let mut out = Vec::new();
 
@@ -224,7 +222,7 @@ fn json_dispatch_view_allocation_budget() {
     // `handle_view` default (`MessageView::to_message`) and keep the owned
     // path's 2 read allocations until they too are overridden.
     const EXPECTED: usize = 3;
-    let router = Router::new().with_json("/echo", |v: serde_json::Value| Ok(v));
+    let router = Router::new().with_typed("/echo", |v: serde_json::Value| Ok(v));
     let wire = request("/echo", json!({"x": 1}));
     let mut buf = Vec::new();
     let mut out = Vec::new();
@@ -342,7 +340,7 @@ fn websocket_inline_dispatch_allocation_budget() {
     // As with the TCP path, this applies to with_json/with_typed routes; other
     // handlers use the owning handle_view fallback.
     const EXPECTED: usize = 4;
-    let router = Router::new().with_json("/echo", |v: serde_json::Value| Ok(v));
+    let router = Router::new().with_typed("/echo", |v: serde_json::Value| Ok(v));
     let wire = request("/echo", json!({"x": 1}));
 
     // Warm up (router.get + handler internals touch no per-call statics here,

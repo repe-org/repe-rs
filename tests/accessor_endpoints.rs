@@ -11,8 +11,6 @@
 use repe::constants::{BodyFormat, ErrorCode, QueryFormat};
 use repe::structs::{RepeStruct, ResponseBody};
 use repe::{Message, Router};
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 
 #[derive(Debug)]
 struct RangeError(&'static str);
@@ -25,7 +23,7 @@ impl std::fmt::Display for RangeError {
 
 /// The backing store. `used` is what the object holds; `used_percent` is what a
 /// client wants to talk about, and there is no field for it.
-#[derive(Debug, Default, Serialize, Deserialize, repe::RepeStruct)]
+#[derive(Debug, Default, repe::RepeStruct)]
 #[repe(methods)]
 struct Budget {
     used: u32,
@@ -35,6 +33,7 @@ struct Budget {
     /// to differ, and the derive refuses them if they do not.
     read_count: u32,
 }
+structio::object!(Budget { used, total, tier, read_count });
 
 #[repe::methods]
 impl Budget {
@@ -118,8 +117,7 @@ fn request_json(path: &str, body: &Value) -> Message {
         .query_str(path)
         .query_format(QueryFormat::JsonPointer)
         .body_json(body)
-        .unwrap()
-        .build()
+                .build()
 }
 
 fn call(router: &Router, path: &str, request: &Message) -> Message {
@@ -302,12 +300,13 @@ fn a_failing_getter_fails_the_whole_object_read() {
 mod nested {
     use super::*;
 
-    #[derive(Debug, Default, Serialize, Deserialize, repe::RepeStruct)]
+    #[derive(Debug, Default, repe::RepeStruct)]
     struct Plan {
         label: String,
         #[repe(nested)]
         budget: Budget,
     }
+    structio::object!(Plan { label, budget });
 
     fn plan() -> Plan {
         Plan {

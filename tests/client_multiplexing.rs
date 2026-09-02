@@ -1,7 +1,6 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use repe::{Client, Message, QueryFormat, RepeError, read_message, write_message};
-use serde_json::{Value, json};
 use std::io::{BufReader, BufWriter, Write};
 use std::net::TcpListener;
 use std::thread;
@@ -15,8 +14,7 @@ fn json_response_for(req: &Message, body: &Value) -> Message {
             QueryFormat::try_from(req.header.query_format).unwrap_or(QueryFormat::RawBinary),
         )
         .body_json(body)
-        .expect("json body")
-        .build()
+                .build()
 }
 
 #[test]
@@ -51,7 +49,7 @@ fn sync_client_multiplexes_out_of_order_responses() {
 
     let c1 = client.clone();
     let call_a = thread::spawn(move || {
-        let out = c1.call_json("/first", &json!({"v": 1}))?;
+        let out = c1.call_typed_json("/first", &json!({"v": 1}))?;
         if out["path"] != "/first" {
             return Err(RepeError::Io(std::io::Error::other(
                 "unexpected response for /first",
@@ -62,7 +60,7 @@ fn sync_client_multiplexes_out_of_order_responses() {
 
     let c2 = client.clone();
     let call_b = thread::spawn(move || {
-        let out = c2.call_json("/second", &json!({"v": 2}))?;
+        let out = c2.call_typed_json("/second", &json!({"v": 2}))?;
         if out["path"] != "/second" {
             return Err(RepeError::Io(std::io::Error::other(
                 "unexpected response for /second",
@@ -90,7 +88,7 @@ fn sync_client_per_request_timeout() {
 
     let client = Client::connect(addr).unwrap();
     let err = client
-        .call_json_with_timeout("/slow", &json!({}), Duration::from_millis(50))
+        .call_typed_json_with_timeout("/slow", &json!({}), Duration::from_millis(50))
         .unwrap_err();
 
     match err {
@@ -173,7 +171,7 @@ fn sync_client_ignores_late_response_for_timed_out_request() {
 
     let timed_client = client.clone();
     let timed_call = thread::spawn(move || {
-        timed_client.call_json_with_timeout(
+        timed_client.call_typed_json_with_timeout(
             "/timed_out",
             &json!({"n": 1}),
             Duration::from_millis(50),
@@ -182,7 +180,7 @@ fn sync_client_ignores_late_response_for_timed_out_request() {
 
     let pending_client = client.clone();
     let pending_call = thread::spawn(move || {
-        pending_client.call_json_with_timeout(
+        pending_client.call_typed_json_with_timeout(
             "/still_pending",
             &json!({"n": 2}),
             Duration::from_millis(500),

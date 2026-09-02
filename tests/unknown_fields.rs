@@ -11,26 +11,28 @@
 
 use repe::server::Router;
 use repe::{AsyncClient, AsyncServer, ErrorCode};
-use serde::{Deserialize, Serialize};
 
 /// The server was built against v1 of the request schema: it only knows `name`.
-#[derive(Deserialize)]
+#[derive(Default)]
 struct RequestV1 {
     name: String,
 }
+structio::object!(RequestV1 { name });
 
 /// A newer client adds an optional field the older server has never heard of.
-#[derive(Serialize)]
+#[derive(Default)]
 struct RequestV2 {
     name: String,
     /// Forward-looking optional field, absent from `RequestV1`.
     locale: String,
 }
+structio::object!(RequestV2 { name, locale });
 
-#[derive(Serialize, Deserialize, PartialEq, Debug)]
+#[derive(Default, PartialEq, Debug)]
 struct Reply {
     greeting: String,
 }
+structio::object!(Reply { greeting });
 
 async fn spawn(router: Router) -> String {
     let listener = AsyncServer::listen("127.0.0.1:0").await.expect("bind");

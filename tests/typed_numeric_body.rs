@@ -30,7 +30,7 @@ fn typed_slice_bytes_identical_to_serde_body() {
         ($t:ty, $vals:expr) => {{
             let data: Vec<$t> = $vals;
             let bulk = Message::builder().body_typed_slice(&data).build();
-            let serde = Message::builder().body_beve(&data).unwrap().build();
+            let serde = Message::builder().body_beve(&data).build();
             assert_eq!(
                 bulk.body,
                 serde.body,
@@ -91,7 +91,7 @@ fn complex_slice_roundtrips_and_matches_serde() {
         Complex { re: -0.0, im: 1e9 },
     ];
     let bulk = Message::builder().body_complex_slice(&data).build();
-    let serde = Message::builder().body_beve(&data).unwrap().build();
+    let serde = Message::builder().body_beve(&data).build();
 
     assert_eq!(bulk.header.body_format, BodyFormat::Beve as u16);
     assert_eq!(bulk.body, serde.body, "complex body bytes differ");
@@ -168,8 +168,7 @@ fn decode_typed_slice_rejects_non_beve_body() {
     // mismatch as `UnexpectedBodyFormat`, not attempt a bulk read.
     let msg = Message::builder()
         .body_json(&vec![1.0f64, 2.0])
-        .unwrap()
-        .build();
+                .build();
     let err = msg.decode_typed_slice::<f64>().unwrap_err();
     assert!(
         matches!(

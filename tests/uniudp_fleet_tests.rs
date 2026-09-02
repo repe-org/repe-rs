@@ -1,7 +1,6 @@
 #![cfg(all(not(target_arch = "wasm32"), feature = "fleet-udp"))]
 
 use repe::{FleetError, Message, UniUdpFleet, UniUdpNodeConfig};
-use serde_json::json;
 use std::net::UdpSocket;
 use std::time::Duration;
 use uniudp::message::SourcePolicy;

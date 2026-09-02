@@ -1,7 +1,6 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use repe::*;
-use serde::{Deserialize, Serialize};
 use std::io::{BufReader, BufWriter, Write};
 use std::net::TcpListener;
 use std::sync::mpsc;
@@ -23,8 +22,7 @@ fn client_unrecognized_response_id_is_discarded() {
             .query_format(QueryFormat::try_from(req.header.query_format).unwrap())
             .error_code(ErrorCode::Ok)
             .body_json(&serde_json::json!({"ok": true}))
-            .unwrap()
-            .build();
+                        .build();
         // Fix length field
         resp.header.length =
             (HEADER_SIZE as u64 + resp.header.query_length + resp.header.body_length) as u64;
@@ -38,7 +36,7 @@ fn client_unrecognized_response_id_is_discarded() {
     let client = client::Client::connect(addr).unwrap();
     let (done_tx, done_rx) = mpsc::channel();
     let worker = thread::spawn(move || {
-        let result = client.call_json("/x", &serde_json::json!({"a": 1}));
+        let result = client.call_typed_json("/x", &serde_json::json!({"a": 1}));
         let _ = done_tx.send(result);
     });
 
@@ -67,8 +65,7 @@ fn client_preserves_structured_fatal_response_loop_error() {
             .query_format(QueryFormat::try_from(req.header.query_format).unwrap())
             .error_code(ErrorCode::Ok)
             .body_json(&serde_json::json!({"ok": true}))
-            .unwrap()
-            .build();
+                        .build();
         resp.header.spec = 0;
 
         let mut writer = BufWriter::new(stream);
@@ -78,7 +75,7 @@ fn client_preserves_structured_fatal_response_loop_error() {
 
     let client = client::Client::connect(addr).unwrap();
     let err = client
-        .call_json("/fatal", &serde_json::json!({"a": 1}))
+        .call_typed_json("/fatal", &serde_json::json!({"a": 1}))
         .unwrap_err();
     match err {
         RepeError::InvalidSpec(0) => {}
@@ -90,15 +87,17 @@ fn client_preserves_structured_fatal_response_loop_error() {
 
 #[test]
 fn client_notify_sets_flag_and_does_not_wait_for_response() {
-    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    #[derive(Default, Debug, PartialEq)]
     struct NotifyPayload {
         ok: bool,
     }
+    structio::object!(NotifyPayload { ok });
 
-    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    #[derive(Default, Debug, PartialEq)]
     struct BevePayload {
         value: i32,
     }
+    structio::object!(BevePayload { value });
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -131,11 +130,11 @@ fn client_notify_sets_flag_and_does_not_wait_for_response() {
         .unwrap();
 
     client
-        .notify_typed_json("/notify_typed_json", &NotifyPayload { ok: true })
+        .notify_json("/notify_typed_json", &NotifyPayload { ok: true })
         .unwrap();
 
     client
-        .notify_typed_beve("/notify_beve", &BevePayload { value: 42 })
+        .notify_beve("/notify_beve", &BevePayload { value: 42 })
         .unwrap();
 
     drop(client);

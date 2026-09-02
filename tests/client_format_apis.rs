@@ -1,18 +1,17 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use repe::{BodyFormat, Client, Message, QueryFormat, read_message, write_message};
-use serde::Deserialize;
-use serde_json::{Value, json};
 use std::io::{BufReader, BufWriter, Write};
 use std::net::TcpListener;
 use std::thread;
 use std::time::Duration;
 
-#[derive(Debug, Deserialize)]
+#[derive(Default, Debug)]
 struct ReadPayload {
     kind: String,
     n: i64,
 }
+structio::object!(ReadPayload { kind, n });
 
 fn json_response_for(req: &Message, body: &Value) -> Message {
     Message::builder()
@@ -22,8 +21,7 @@ fn json_response_for(req: &Message, body: &Value) -> Message {
             QueryFormat::try_from(req.header.query_format).unwrap_or(QueryFormat::RawBinary),
         )
         .body_json(body)
-        .expect("json body")
-        .build()
+                .build()
 }
 
 #[test]
@@ -76,7 +74,7 @@ fn sync_call_message_and_registry_read_send_empty_body() {
     let decoded = message.json_body::<Value>().expect("decode JSON");
     assert_eq!(decoded["kind"], "message");
 
-    let read_value = client.registry_read("/second").expect("registry_read");
+    let read_value = client.registry_read_typed("/second").expect("registry_read");
     assert_eq!(read_value["kind"], "read");
     assert_eq!(read_value["n"], 5);
 

@@ -20,21 +20,21 @@ use repe::{
     CallContext, HEADER_SIZE, Message, MessageView, QueryFormat, read_message, read_message_into,
     write_message, write_message_streaming,
 };
-use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::hint::black_box;
 use std::io::{Cursor, Write};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default)]
 struct SumIn {
     a: i64,
     b: i64,
 }
+structio::object!(SumIn { a, b });
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default)]
 struct SumOut {
     sum: i64,
 }
+structio::object!(SumOut { sum });
 
 fn frame(path: &str, body: &serde_json::Value) -> Vec<u8> {
     Message::builder()
@@ -42,8 +42,7 @@ fn frame(path: &str, body: &serde_json::Value) -> Vec<u8> {
         .query_str(path)
         .query_format(QueryFormat::JsonPointer)
         .body_json(body)
-        .unwrap()
-        .build()
+                .build()
         .to_vec()
 }
 
@@ -81,7 +80,7 @@ fn run_cycle_view(router: &Router, wire: &[u8], path: &str, buf: &mut Vec<u8>, o
 fn main() {
     let mut bench = Bench::from_args();
 
-    let json_router = Router::new().with_json("/echo", |v: serde_json::Value| Ok(v));
+    let json_router = Router::new().with_typed("/echo", |v: serde_json::Value| Ok(v));
     let typed_router = Router::new()
         .with_typed::<SumIn, SumOut, _>("/sum", |i: SumIn| Ok(SumOut { sum: i.a + i.b }));
 

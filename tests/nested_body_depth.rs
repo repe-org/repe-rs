@@ -41,7 +41,7 @@ fn beve_request(path: &str, body: Vec<u8>) -> Vec<u8> {
 }
 
 fn router() -> Router {
-    Router::new().with_json("/echo", Ok)
+    Router::new().with_typed("/echo", Ok)
 }
 
 fn call(depth: usize) -> Message {

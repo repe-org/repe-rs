@@ -23,10 +23,9 @@
 use repe::constants::{BodyFormat, ErrorCode, QueryFormat};
 use repe::message::Message;
 use repe::{REPE_SPEC, REPE_VERSION};
-use serde::Deserialize;
 use std::path::PathBuf;
 
-#[derive(Debug, Deserialize)]
+#[derive(Default, Debug)]
 struct Manifest {
     repe_version: String,
     #[allow(dead_code)]
@@ -35,8 +34,9 @@ struct Manifest {
     note: String,
     fixtures: Vec<Fixture>,
 }
+structio::object!(Manifest { repe_version, glaze_version, note, fixtures });
 
-#[derive(Debug, Deserialize)]
+#[derive(Default, Debug)]
 struct Fixture {
     name: String,
     #[allow(dead_code)]
@@ -59,6 +59,7 @@ struct Fixture {
     /// Whether tier 4 (from-scratch byte identity) should be asserted.
     encoder_parity: bool,
 }
+structio::object!(Fixture { name, description, id, notify, ec, query_format, body_format, query_length, body_length, length, query, body_kind, body_json, body_text, encoder_parity });
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("interop/fixtures")
@@ -230,7 +231,7 @@ fn build_equivalent(f: &Fixture) -> Message {
 /// A server built against an older version of a request schema: it declares
 /// only the fields it knew about. The Glaze-authored `*_unknown_key` fixtures
 /// carry these fields plus keys this struct never declared.
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Default, Debug, PartialEq)]
 struct DemoBodyV1 {
     name: String,
     count: i32,
@@ -238,6 +239,7 @@ struct DemoBodyV1 {
     active: bool,
     values: Vec<i32>,
 }
+structio::object!(DemoBodyV1 { name, count, ratio, active, values });
 
 /// The version-skew guarantee, pinned against bytes repe did not author: a
 /// request body a newer client produced with object keys an older server never

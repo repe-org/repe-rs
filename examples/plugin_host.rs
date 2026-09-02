@@ -71,8 +71,7 @@ fn write<T: serde::Serialize>(query: &str, id: u64, value: &T) -> Vec<u8> {
         .query_str(query)
         .query_format(QueryFormat::JsonPointer)
         .body_json(value)
-        .expect("the values in this example serialize")
-        .build()
+                .build()
         .to_vec()
 }
 
@@ -249,7 +248,7 @@ fn run(path: &str) -> Result<u32, HostError> {
         // build, for a time nothing here bounds, so on the WebSocket server it
         // belongs off the reader task. On the TCP servers the two are the same.
         let router = Router::new()
-            .with_json("/host/ping", |_| Ok(serde_json::json!("pong")))
+            .with_typed("/host/ping", |_| Ok(serde_json::json!("pong")))
             .with_fallback_blocking(std::sync::Arc::new(mounted));
 
         let frame = router

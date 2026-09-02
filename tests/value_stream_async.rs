@@ -11,18 +11,18 @@ use repe::{
     pull_consume_async, pull_to_file_async, pull_to_file_trailer_verified_async,
     pull_to_file_verified_async, pull_to_vec_async, pull_typed_slice_async, pull_value_async,
 };
-use serde::{Deserialize, Serialize};
 use std::io::{self, Cursor, Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::thread;
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Default, Clone, Debug, PartialEq)]
 struct Payload {
     id: u64,
     label: String,
     samples: Vec<f64>,
     tags: Vec<String>,
 }
+structio::object!(Payload { id, label, samples, tags });
 
 fn sample_payload() -> Payload {
     // ~1.6 MiB, spans many 16 KiB chunks so the pull loop / lookahead / blocking
@@ -394,7 +394,7 @@ async fn trailer_verified_async_commits_payload_only() {
         streamed_payload_bytes(&payload),
         "committed file must be the payload with the 8-byte trailer stripped"
     );
-    let decoded: Payload = beve::from_slice(&bytes).unwrap();
+    let decoded: Payload = structio::from_beve(&bytes).unwrap();
     assert_eq!(decoded, payload);
 
     std::fs::remove_dir_all(&dir).ok();

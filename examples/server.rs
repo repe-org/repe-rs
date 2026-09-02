@@ -1,19 +1,19 @@
 use repe::{Router, Server};
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
 fn main() -> std::io::Result<()> {
     let started = Instant::now();
-    #[derive(Debug, Deserialize)]
+    #[derive(Default, Debug)]
     struct AddReq {
         a: i64,
         b: i64,
     }
-    #[derive(Debug, Serialize)]
+    structio::object!(AddReq { a, b });
+    #[derive(Default, Debug)]
     struct AddResp {
         sum: i64,
     }
+    structio::object!(AddResp { sum });
 
     let router = Router::new()
         .with("/ping", |_v: Value| Ok(json!({"pong": true})))

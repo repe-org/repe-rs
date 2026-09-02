@@ -13,7 +13,6 @@ use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 
 use repe::{AsyncServer, ErrorCode, Registry, Router, TypedResponse, WebSocketServer};
-use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
 /// Path to the freshly-built `repe` binary. Cargo populates this for
