@@ -75,7 +75,7 @@ With no stored values there is no assignment for `PUT` to mean instead of a call
 - Errors: `RepeError::Json` and `RepeError::Beve` carry a `structio::Error` (a `Copy` code-and-offset pair). `RepeError::decode_stream(format, err)` replaces the `From<StreamError>` impl, which had to guess a format and guessed BEVE.
 - Encoding is infallible. `MessageBuilder::body_json` / `body_beve` return `Self`, not `Result<Self, _>`; the `?` at those call sites goes away.
 - The CLI never builds a document: it validates the `--body` text and ships it verbatim, prettifies a JSON response as text, and transcodes a BEVE response with `structio::beve_to_json`.
-- `pull_value` buffers the encoded body before decoding it, where `beve` decoded incrementally. `pull_typed_slice` still reads a numeric array straight into the vector's memory; `pull_complex_slice` buffers, because structio's streaming bulk read does not accept a complex array's header.
+- `pull_value` buffers the encoded body before decoding it, where `beve` decoded incrementally. `pull_typed_slice` and `pull_complex_slice` still read straight into the vector's memory.
 - Per-request allocations went **down** across every measured path (see `tests/allocations.rs`): a `with_typed` dispatch from 5 to 4, its borrowing form from 3 to 2, the WebSocket inline path from 4 to 3. Framing a typed-slice body gained structio's one fixed 8 KiB sink buffer, and is otherwise unchanged — the payload still bypasses it in a single `write_all`.
 - **`repe-core` 4.0.0** and **`repe-derive` 0.7.0**, both for the same reason. Bump all three or none.
 

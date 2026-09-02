@@ -24,7 +24,7 @@ include = ["/Cargo.toml", "/README.md", "/LICENSE", "/src/**", "/tests/**"]
 # that only *declares* a served type should not link an encoder to say so.
 # structio has no dependencies at all, so the encoder costs nothing to carry and
 # `ResponseBody::write_typed_slice` is unconditional.
-structio = "0.2.1"
+structio = "0.2.2"
 thiserror = "1"
 # Re-exported, so a crate implementing `RepeStruct` needs one dependency rather
 # than two. The derive resolves its generated paths against whichever of `repe`

@@ -988,7 +988,7 @@ where
 /// moves the payload from the reader into the vector's own memory, while
 /// [`pull_value`] buffers the whole encoded body first and then parses it. For
 /// a multi-gigabyte array that is the difference between one copy of the data
-/// and two.
+/// and two. [`pull_complex_slice`] has the same property.
 ///
 /// Pair with a server registered via
 /// [`RouterValueStreamExt::with_typed_value_stream`], which emits the BEVE
@@ -1019,19 +1019,13 @@ pub fn pull_typed_slice<T: structio::beve::NumericBytes>(
 }
 
 /// Complex twin of [`pull_typed_slice`]: pull `resource` as a bulk
-/// `Vec<Complex<T>>`. Pair with a server registered via
-/// [`RouterValueStreamExt::with_complex_value_stream`]. For large IQ buffers.
-///
-/// **This one buffers**, unlike [`pull_typed_slice`].
-/// [`structio::beve::read_array_into`] reads a *typed* array's header and
-/// refuses a complex array's, so there is no reader that moves an interleaved
-/// `(re, im)` payload from a stream into the vector's own memory. The whole
-/// encoded body is held while it is decoded, so peak memory is roughly twice
-/// the result. Everything else — the wire form, the element type, the
-/// compression — is the same as the typed path's.
+/// `Vec<Complex<T>>`, with the same memory property. Pair with a server
+/// registered via [`RouterValueStreamExt::with_complex_value_stream`]. For
+/// large IQ buffers, which is where holding the payload once rather than twice
+/// is worth the most.
 pub fn pull_complex_slice<T>(client: &Client, resource: &str) -> Result<Vec<Complex<T>>, RepeError>
 where
-    Vec<Complex<T>>: ServableOwned,
+    Complex<T>: structio::beve::NumericBytes,
 {
     let open = open_stream(client, resource)?;
     if let Err(e) = require_beve(&open) {
@@ -1044,10 +1038,8 @@ where
     }
     let reader = ChunkReader::new(client, open.stream_id);
     let result = match open.compression {
-        Compression::None => read_one_value::<Vec<Complex<T>>, _>(reader),
-        Compression::Zstd => {
-            read_one_value::<Vec<Complex<T>>, _>(zstandard::io::Reader::new(reader))
-        }
+        Compression::None => read_array::<Complex<T>, _>(reader),
+        Compression::Zstd => read_array::<Complex<T>, _>(zstandard::io::Reader::new(reader)),
     };
     let _ = cancel_stream(client, open.stream_id, "bulk complex slice complete");
     result
@@ -1064,7 +1056,8 @@ where
 /// rather than the value alone.
 ///
 /// [`read_array`] is the way out for the case where that actually costs
-/// something, and [`pull_typed_slice`] is the call that takes it.
+/// something, and [`pull_typed_slice`] / [`pull_complex_slice`] are the calls
+/// that take it.
 fn read_one_value<T, R>(reader: R) -> Result<T, RepeError>
 where
     T: ServableOwned,
@@ -1684,9 +1677,9 @@ pub async fn pull_complex_slice_async<T: Send + 'static, C: AsyncSvsClient>(
     resource: &str,
 ) -> Result<Vec<Complex<T>>, RepeError>
 where
-    Vec<Complex<T>>: ServableOwned,
+    Complex<T>: structio::beve::NumericBytes,
 {
-    pull_beve_async(client, resource, read_one_value::<Vec<Complex<T>>, _>).await
+    pull_beve_async(client, resource, read_array::<Complex<T>, _>).await
 }
 
 /// Async, format-agnostic escape hatch: pull `resource` and hand its logical
