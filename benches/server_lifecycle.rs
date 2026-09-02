@@ -10,9 +10,15 @@
 //! public `Message`/`Header` fields so the measured work matches a real server.
 //!
 //! Pairs with `tests/allocations.rs`, which pins the allocation count of the
-//! same cycle. Two handler shapes are covered: a `serde_json::Value` echo
-//! (`with_json`, the Value round-trip path) and a typed handler (`with_typed`,
-//! which deserializes straight into a struct and skips the Value round-trip).
+//! same cycle.
+//!
+//! Two body shapes are covered, both through `with_typed`: an echo of a
+//! two-member object and a call that reads two numbers and returns one. This
+//! used to compare a `serde_json::Value` round trip against a typed handler,
+//! which is no longer a comparison anyone can make — there is no document
+//! model, so every route reads straight into its declared parameter. What is
+//! left to measure is the framing and dispatch cost itself, and how it moves
+//! with the body.
 
 use benchit::Bench;
 use repe::server::Router;
@@ -36,7 +42,16 @@ struct SumOut {
 }
 structio::object!(SumOut { sum });
 
-fn frame(path: &str, body: &serde_json::Value) -> Vec<u8> {
+/// The echo route's body: one number and one string, so the measurement covers
+/// both a scalar and an allocating member.
+#[derive(Default)]
+struct EchoBody {
+    x: i64,
+    y: String,
+}
+structio::object!(EchoBody { x, y });
+
+fn frame<T: structio::json::Write + ?Sized>(path: &str, body: &T) -> Vec<u8> {
     Message::builder()
         .id(1)
         .query_str(path)
@@ -80,28 +95,34 @@ fn run_cycle_view(router: &Router, wire: &[u8], path: &str, buf: &mut Vec<u8>, o
 fn main() {
     let mut bench = Bench::from_args();
 
-    let json_router = Router::new().with_typed("/echo", |v: serde_json::Value| Ok(v));
+    let echo_router = Router::new().with_typed("/echo", |v: EchoBody| Ok(v));
     let typed_router = Router::new()
         .with_typed::<SumIn, SumOut, _>("/sum", |i: SumIn| Ok(SumOut { sum: i.a + i.b }));
 
-    let json_wire = frame("/echo", &json!({"x": 1, "y": "hello"}));
-    let typed_wire = frame("/sum", &json!({"a": 2, "b": 3}));
+    let echo_wire = frame(
+        "/echo",
+        &EchoBody {
+            x: 1,
+            y: "hello".into(),
+        },
+    );
+    let typed_wire = frame("/sum", &SumIn { a: 2, b: 3 });
 
     // Every case in a group is live at once, so a single shared response buffer
     // would be two simultaneous `&mut` borrows. One buffer per case instead:
     // each is still reused across that case's own iterations, which is the
     // property the benchmark is measuring.
-    let mut json_out = Vec::with_capacity(256);
+    let mut echo_out = Vec::with_capacity(256);
     let mut typed_out = Vec::with_capacity(256);
 
     let mut group = bench.group("server_lifecycle");
     group.bench("json_echo", |b| {
         b.iter(|| {
             run_cycle(
-                black_box(&json_router),
-                black_box(&json_wire),
+                black_box(&echo_router),
+                black_box(&echo_wire),
                 "/echo",
-                &mut json_out,
+                &mut echo_out,
             )
         })
     });
@@ -125,11 +146,11 @@ fn main() {
     view_group.bench("json_echo", |b| {
         b.iter(|| {
             run_cycle_view(
-                black_box(&json_router),
-                black_box(&json_wire),
+                black_box(&echo_router),
+                black_box(&echo_wire),
                 "/echo",
                 &mut json_buf,
-                &mut json_out,
+                &mut echo_out,
             )
         })
     });

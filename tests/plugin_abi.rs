@@ -180,16 +180,12 @@ fn the_plugin_abi_behaves_as_a_host_expects() {
                 scope.spawn(move || {
                     for _ in 0..64 {
                         let response =
-                            host_call(&request("/counter/echo", &Count { n: n as i64 }, false))
-                                .unwrap();
+                            host_call(&request("/counter/echo", &Count { n }, false)).unwrap();
                         let echoed = Message::from_slice(&response)
                             .unwrap()
                             .json_body::<Count>()
                             .unwrap();
-                        assert_eq!(
-                            echoed.n, n as i64,
-                            "thread {n} read another thread's buffer"
-                        );
+                        assert_eq!(echoed.n, n, "thread {n} read another thread's buffer");
                     }
                 })
             })

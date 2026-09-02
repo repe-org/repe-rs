@@ -130,7 +130,7 @@ structio::object!(Payload { id, data });
 /// a [`Message`], then frame it. Two allocations (body + wire) and one body
 /// copy, because the tight body buffer has no room for the header+query prefix.
 fn frame_via_message(value: &Payload) -> Vec<u8> {
-    let body = structio::to_beve(value).unwrap();
+    let body = structio::to_beve(value);
     Message::builder()
         .id(value.id)
         .query_str(QUERY)
@@ -142,14 +142,14 @@ fn frame_via_message(value: &Payload) -> Vec<u8> {
 }
 
 /// Direct-frame: reserve the header+query prefix in one buffer, stream the body
-/// in behind it with `beve::to_writer_streaming`, then back-patch the header
+/// in behind it with `structio::beve::to_writer`, then back-patch the header
 /// with the now-known body length. One allocation, one encode pass, no separate
 /// body `Vec` and no body copy.
 fn frame_direct(value: &Payload) -> Vec<u8> {
     let prefix_len = HEADER_SIZE + QUERY.len();
     let mut buf = Vec::with_capacity(prefix_len + 64);
     buf.resize(prefix_len, 0);
-    beve::to_writer_streaming(&mut buf, value).unwrap();
+    structio::beve::to_writer(value, &mut buf).expect("a Vec sink cannot fail");
     let body_len = (buf.len() - prefix_len) as u64;
 
     let mut header = Header::new();
@@ -206,9 +206,9 @@ fn bench_typed_numeric_framing(bench: &mut Bench) {
         let mut header = Header::new();
         header.query_format = QueryFormat::JsonPointer as u16;
         header.body_format = BodyFormat::Beve as u16;
-        let body_len = beve::serialized_size(&data).unwrap();
+        let body_len = structio::beve_size(&data) as u64;
         repe::write_message_streaming(sink, header, QUERY.as_bytes(), body_len, |w| {
-            beve::to_writer_streaming(w, &data)
+            structio::beve::to_writer(&data, w)
         })
         .unwrap();
     }
