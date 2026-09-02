@@ -1110,132 +1110,184 @@ fn to_hyper(response: RestResponse) -> Response<Full<Bytes>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicI64, Ordering};
 
-    fn gateway() -> RestGateway {
-        gateway_with(RestConfig::default())
+    // ---- fixtures ----------------------------------------------------------
+
+    #[derive(Default, Debug, PartialEq)]
+    struct Operands {
+        a: i64,
+        b: i64,
     }
+    structio::object!(Operands { a, b });
 
+    #[derive(Default, Debug, PartialEq)]
+    struct Sum {
+        result: i64,
+    }
+    structio::object!(Sum { result });
+
+    #[derive(Default, Debug, PartialEq)]
+    struct Counter {
+        counter: i64,
+    }
+    structio::object!(Counter { counter });
+
+    #[derive(Default, Debug, PartialEq)]
+    struct Config {
+        verbose: bool,
+    }
+    structio::object!(Config { verbose });
+
+    #[derive(Default, Debug, PartialEq)]
+    struct Label {
+        label: String,
+    }
+    structio::object!(Label { label });
+
+    /// The problem-details body, read back. `Problem` itself borrows, and a
+    /// decoded response outlives the buffer it came from, so the test reads
+    /// into an owned mirror rather than the type the gateway writes.
+    #[derive(Default, Debug, PartialEq)]
+    struct ProblemBody {
+        kind: String,
+        title: String,
+        status: u16,
+        detail: String,
+        repe_code: Option<u32>,
+    }
+    structio::object!(ProblemBody {
+        "type" => kind,
+        title,
+        status,
+        detail,
+        repe_code
+    });
+
+    /// Every registered path is a function, so the fixture registry is a set of
+    /// functions. `/counter` holds state behind one, which is how a value
+    /// endpoint is spelled now: the handler owns the state and decides what a
+    /// body means, rather than the registry storing a tree the gateway writes
+    /// into blind.
     fn gateway_with(config: RestConfig) -> RestGateway {
         let registry = Arc::new(Registry::new());
-        registry.register_value("/counter", json!(7)).unwrap();
+
+        let counter = Arc::new(AtomicI64::new(7));
+        let read_counter = Arc::clone(&counter);
         registry
-            .register_value("/config", json!({ "verbose": false }))
+            .register_function("/counter", move |params: Option<RequestBody<'_>>| {
+                // A body sets the counter; no body reads it. The handler makes
+                // that rule, and it is the handler's to make.
+                if let Some(body) = params {
+                    let next: i64 = body
+                        .read("/counter")
+                        .map_err(|err| (ErrorCode::InvalidBody, err.to_string()))?;
+                    read_counter.store(next, Ordering::SeqCst);
+                }
+                Ok(read_counter.load(Ordering::SeqCst))
+            })
+            .unwrap();
+
+        registry
+            .register_function("/config", |_: Option<RequestBody<'_>>| {
+                Ok(Config { verbose: false })
+            })
             .unwrap();
         // A key with a literal `/` in it, reachable only through `~1`. This is
         // what the percent-decode-then-escape order exists to keep addressable.
         registry
-            .register_value("/items/a~1b", json!("slashed"))
-            .unwrap();
-        registry
-            .register_value("/tilde/a~0b", json!("tilded"))
-            .unwrap();
-        registry
-            .register_function("/add", |params| {
-                let Some(Value::Object(map)) = params else {
-                    return Err((ErrorCode::InvalidBody, "expected an object".into()));
-                };
-                let a = map.get("a").and_then(Value::as_i64).unwrap_or(0);
-                let b = map.get("b").and_then(Value::as_i64).unwrap_or(0);
-                Ok(json!({ "result": a + b }))
+            .register_function("/items/a~1b", |_: Option<RequestBody<'_>>| {
+                Ok("slashed".to_string())
             })
             .unwrap();
         registry
-            .register_function("/boom", |_| {
-                Err((ErrorCode::ApplicationErrorBase, "handler said no".into()))
+            .register_function("/tilde/a~0b", |_: Option<RequestBody<'_>>| {
+                Ok("tilded".to_string())
+            })
+            .unwrap();
+        registry
+            .register_function("/add", |params: Option<RequestBody<'_>>| {
+                let Some(body) = params else {
+                    return Err((ErrorCode::InvalidBody, "expected an object".into()));
+                };
+                let operands: Operands = body
+                    .read("/add")
+                    .map_err(|err| (ErrorCode::InvalidBody, err.to_string()))?;
+                Ok(Sum {
+                    result: operands.a + operands.b,
+                })
+            })
+            .unwrap();
+        registry
+            .register_function("/boom", |_: Option<RequestBody<'_>>| {
+                Err::<(), _>((ErrorCode::ApplicationErrorBase, "handler said no".into()))
             })
             .unwrap();
         RestGateway::with_config("/api/v1", registry, config)
     }
 
-    fn json_body(response: &RestResponse) -> Value {
-        serde_json::from_slice(&response.body).expect("response body is JSON")
+    fn gateway() -> RestGateway {
+        gateway_with(RestConfig::default())
+    }
+
+    fn body_as<T: crate::structs::ServableOwned>(response: &RestResponse) -> T {
+        structio::from_slice(&response.body).expect("response body is JSON")
+    }
+
+    fn counter_of(gateway: &RestGateway) -> i64 {
+        body_as(&gateway.respond(RestRequest::new("GET", "/api/v1/counter")))
     }
 
     // -- the verb mapping ---------------------------------------------------
 
     #[test]
-    fn get_reads_a_value() {
+    fn get_calls_a_function_with_no_arguments() {
         let response = gateway().respond(RestRequest::new("GET", "/api/v1/counter"));
         assert_eq!(response.status, 200);
         assert_eq!(response.content_type, Some(MEDIA_JSON));
-        assert_eq!(json_body(&response), json!(7));
+        assert_eq!(body_as::<i64>(&response), 7);
     }
 
     #[test]
-    fn get_at_the_mount_itself_reads_the_whole_tree() {
-        // The mount maps to the empty pointer, i.e. the registry root, so the
-        // tree is browsable from one URL rather than only leaf by leaf.
-        for target in ["/api/v1", "/api/v1/"] {
-            let response = gateway().respond(RestRequest::new("GET", target));
-            assert_eq!(response.status, 200, "{target}");
-            assert_eq!(json_body(&response)["counter"], json!(7), "{target}");
-        }
-    }
-
-    #[test]
-    fn put_writes_a_value() {
-        let gateway = gateway();
-        let response = gateway
-            .respond(RestRequest::new("PUT", "/api/v1/counter").with_body(MEDIA_JSON, b"42"));
-        assert_eq!(response.status, 200);
-        assert_eq!(
-            gateway.registry().read_value("/counter").unwrap(),
-            json!(42)
-        );
-    }
-
-    #[test]
-    fn post_calls_a_function() {
+    fn post_calls_a_function_with_the_body_as_arguments() {
         let response = gateway().respond(
             RestRequest::new("POST", "/api/v1/add").with_body(MEDIA_JSON, br#"{"a":2,"b":3}"#),
         );
         assert_eq!(response.status, 200);
-        assert_eq!(json_body(&response), json!({ "result": 5 }));
+        assert_eq!(body_as::<Sum>(&response), Sum { result: 5 });
     }
 
     #[test]
-    fn put_at_a_function_is_refused_rather_than_silently_calling_it() {
-        // The guarantee being protected: a caller retried a PUT because PUT is
-        // idempotent. Routing it into a function call would run the side effect
-        // twice, so the verb mismatch has to be an error, not a coercion.
-        let response =
-            gateway().respond(RestRequest::new("PUT", "/api/v1/add").with_body(MEDIA_JSON, b"{}"));
-        assert_eq!(response.status, 405);
-        assert_eq!(response.allow, Some(ALLOW_FUNCTION));
-        assert_eq!(response.content_type, Some(MEDIA_PROBLEM));
-    }
-
-    #[test]
-    fn post_at_a_value_is_refused_rather_than_silently_writing_it() {
-        // The mirror image: a value is idempotently writable, and answering a
-        // POST would tell callers otherwise — which is how an API ends up with
-        // POST on every route and REST's guarantees on none.
+    fn put_and_post_are_the_same_call() {
+        // The registry stores no values, so there is no assignment for PUT to
+        // mean instead of a call, and nothing to tell the two verbs apart by.
+        // They are documented aliases; this pins that they stay aliases rather
+        // than drifting into a distinction the registry cannot honor.
         let gateway = gateway();
-        let response = gateway
-            .respond(RestRequest::new("POST", "/api/v1/counter").with_body(MEDIA_JSON, b"1"));
-        assert_eq!(response.status, 405);
-        assert_eq!(response.allow, Some(ALLOW_VALUE));
-        assert_eq!(
-            gateway.registry().read_value("/counter").unwrap(),
-            json!(7),
-            "the refused POST must not have written"
+        let via_put = gateway.respond(
+            RestRequest::new("PUT", "/api/v1/add").with_body(MEDIA_JSON, br#"{"a":2,"b":3}"#),
         );
+        let via_post = gateway.respond(
+            RestRequest::new("POST", "/api/v1/add").with_body(MEDIA_JSON, br#"{"a":2,"b":3}"#),
+        );
+        assert_eq!(via_put.status, 200);
+        assert_eq!(via_post.status, 200);
+        assert_eq!(via_put.body, via_post.body);
+        assert_eq!(via_put.content_type, via_post.content_type);
     }
 
     #[test]
-    fn a_write_with_no_body_is_refused_rather_than_read() {
-        // An empty body is how the registry spells READ, so letting one through
-        // would answer a PUT with `200` and the *old* value, having written
-        // nothing. That is the single most confusing outcome available here.
-        // Each against the target kind its verb is legal for, so the empty-body
-        // check is what answers rather than the verb guard.
-        for (method, target) in [("PUT", "/api/v1/counter"), ("POST", "/api/v1/add")] {
-            let response = gateway().respond(RestRequest::new(method, target));
-            assert_eq!(response.status, 400, "{method} {target}");
+    fn a_call_with_no_body_is_refused_rather_than_read() {
+        // An empty body is how REPE spells "no arguments", which is what GET
+        // already sends. Letting one through would make PUT and GET the same
+        // request under a verb that says otherwise.
+        for method in ["PUT", "POST"] {
+            let response = gateway().respond(RestRequest::new(method, "/api/v1/add"));
+            assert_eq!(response.status, 400, "{method}");
             assert_eq!(
                 response.repe_error_code,
                 Some(ErrorCode::InvalidBody as u32),
-                "{method} {target}"
+                "{method}"
             );
         }
     }
@@ -1244,32 +1296,27 @@ mod tests {
     fn a_no_argument_call_is_spelled_with_a_null_body() {
         let registry = Arc::new(Registry::new());
         registry
-            .register_function("/ping", |_| Ok(json!("pong")))
+            .register_function("/ping", |_: Option<RequestBody<'_>>| Ok("pong".to_string()))
             .unwrap();
         let gateway = RestGateway::new("/api/v1", registry);
         let response = gateway
             .respond(RestRequest::new("POST", "/api/v1/ping").with_body(MEDIA_JSON, b"null"));
         assert_eq!(response.status, 200);
-        assert_eq!(json_body(&response), json!("pong"));
+        assert_eq!(body_as::<String>(&response), "pong");
     }
 
     #[test]
-    fn options_advertises_the_verbs_the_target_actually_supports() {
-        let gateway = gateway();
-        let value = gateway.respond(RestRequest::new("OPTIONS", "/api/v1/counter"));
-        assert_eq!(value.status, 204);
-        assert_eq!(value.allow, Some(ALLOW_VALUE));
-
-        let function = gateway.respond(RestRequest::new("OPTIONS", "/api/v1/add"));
-        assert_eq!(function.status, 204);
-        assert_eq!(function.allow, Some(ALLOW_FUNCTION));
+    fn options_advertises_the_verbs_the_gateway_supports() {
+        let response = gateway().respond(RestRequest::new("OPTIONS", "/api/v1/counter"));
+        assert_eq!(response.status, 204);
+        assert_eq!(response.allow, Some(ALLOW_CALL));
     }
 
     #[test]
     fn an_unsupported_method_is_405_with_allow() {
         let response = gateway().respond(RestRequest::new("DELETE", "/api/v1/counter"));
         assert_eq!(response.status, 405);
-        assert_eq!(response.allow, Some(ALLOW_VALUE));
+        assert_eq!(response.allow, Some(ALLOW_CALL));
     }
 
     #[test]
@@ -1294,9 +1341,10 @@ mod tests {
     }
 
     #[test]
-    fn a_write_carries_neither() {
-        let response = gateway()
-            .respond(RestRequest::new("PUT", "/api/v1/counter").with_body(MEDIA_JSON, b"1"));
+    fn a_call_carries_neither() {
+        let response = gateway().respond(
+            RestRequest::new("POST", "/api/v1/add").with_body(MEDIA_JSON, br#"{"a":1,"b":1}"#),
+        );
         assert_eq!(response.etag, None);
         assert_eq!(response.cache_control, None);
     }
@@ -1315,17 +1363,48 @@ mod tests {
     }
 
     #[test]
+    fn the_handler_runs_even_when_the_answer_is_304() {
+        // The ETag is a hash of the response bytes, so producing it requires
+        // producing them. A conditional request saves the transfer, not the
+        // work — which is a real change from a value store, and the reason
+        // `read`'s docs say so.
+        let calls = Arc::new(AtomicI64::new(0));
+        let counted = Arc::clone(&calls);
+        let registry = Arc::new(Registry::new());
+        registry
+            .register_function("/probe", move |_: Option<RequestBody<'_>>| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(1i64)
+            })
+            .unwrap();
+        let gateway = RestGateway::new("/api/v1", registry);
+
+        let first = gateway.respond(RestRequest::new("GET", "/api/v1/probe"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let tag = first.etag.unwrap();
+        let second =
+            gateway.respond(RestRequest::new("GET", "/api/v1/probe").with_if_none_match(&tag));
+        assert_eq!(second.status, 304);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the 304 was decided from the handler's own output"
+        );
+    }
+
+    #[test]
     fn a_stale_validator_answers_the_full_body() {
         let gateway = gateway();
         let response = gateway.respond(
             RestRequest::new("GET", "/api/v1/counter").with_if_none_match("\"0000000000000000\""),
         );
         assert_eq!(response.status, 200);
-        assert_eq!(json_body(&response), json!(7));
+        assert_eq!(body_as::<i64>(&response), 7);
     }
 
     #[test]
-    fn the_validator_changes_when_the_value_does() {
+    fn the_validator_changes_when_the_answer_does() {
         let gateway = gateway();
         let before = gateway.respond(RestRequest::new("GET", "/api/v1/counter"));
         gateway.respond(RestRequest::new("PUT", "/api/v1/counter").with_body(MEDIA_JSON, b"8"));
@@ -1371,20 +1450,49 @@ mod tests {
 
     #[test]
     fn beve_is_served_on_request_and_decodes_to_the_same_value() {
+        // The handler writes into the response buffer in the negotiated format,
+        // so there is no transcode step between it and the socket.
         let response =
             gateway().respond(RestRequest::new("GET", "/api/v1/config").with_accept(MEDIA_BEVE));
         assert_eq!(response.content_type, Some(MEDIA_BEVE));
-        let decoded: Value = beve::from_slice(&response.body).unwrap();
-        assert_eq!(decoded, json!({ "verbose": false }));
+        let decoded: Config = structio::from_beve(&response.body).unwrap();
+        assert_eq!(decoded, Config { verbose: false });
     }
 
     #[test]
     fn a_beve_request_body_is_accepted_by_default() {
-        let body = beve::to_vec(&json!({ "a": 20, "b": 22 })).unwrap();
+        let body = structio::to_beve(&Operands { a: 20, b: 22 });
         let response =
             gateway().respond(RestRequest::new("POST", "/api/v1/add").with_body(MEDIA_BEVE, &body));
         assert_eq!(response.status, 200);
-        assert_eq!(json_body(&response), json!({ "result": 42 }));
+        assert_eq!(body_as::<Sum>(&response), Sum { result: 42 });
+    }
+
+    #[test]
+    fn the_request_and_response_formats_are_independent() {
+        // A BEVE request answered in JSON, and a JSON request answered in BEVE.
+        // The header declares each leg separately, and the gateway honors both.
+        let gateway = gateway();
+
+        let beve_in = structio::to_beve(&Operands { a: 1, b: 2 });
+        let json_out = gateway.respond(
+            RestRequest::new("POST", "/api/v1/add")
+                .with_body(MEDIA_BEVE, &beve_in)
+                .with_accept(MEDIA_JSON),
+        );
+        assert_eq!(json_out.content_type, Some(MEDIA_JSON));
+        assert_eq!(body_as::<Sum>(&json_out), Sum { result: 3 });
+
+        let beve_out = gateway.respond(
+            RestRequest::new("POST", "/api/v1/add")
+                .with_body(MEDIA_JSON, br#"{"a":1,"b":2}"#)
+                .with_accept(MEDIA_BEVE),
+        );
+        assert_eq!(beve_out.content_type, Some(MEDIA_BEVE));
+        assert_eq!(
+            structio::from_beve::<Sum>(&beve_out.body).unwrap(),
+            Sum { result: 3 }
+        );
     }
 
     #[test]
@@ -1433,10 +1541,7 @@ mod tests {
         request.body = b"99";
         let gateway = gateway();
         assert_eq!(gateway.respond(request).status, 200);
-        assert_eq!(
-            gateway.registry().read_value("/counter").unwrap(),
-            json!(99)
-        );
+        assert_eq!(counter_of(&gateway), 99);
     }
 
     #[test]
@@ -1478,14 +1583,14 @@ mod tests {
         // key `a/b`.
         let response = gateway().respond(RestRequest::new("GET", "/api/v1/items/a%2Fb"));
         assert_eq!(response.status, 200);
-        assert_eq!(json_body(&response), json!("slashed"));
+        assert_eq!(body_as::<String>(&response), "slashed");
     }
 
     #[test]
     fn a_literal_tilde_in_a_segment_is_escaped_not_interpreted() {
         let response = gateway().respond(RestRequest::new("GET", "/api/v1/tilde/a~b"));
         assert_eq!(response.status, 200);
-        assert_eq!(json_body(&response), json!("tilded"));
+        assert_eq!(body_as::<String>(&response), "tilded");
     }
 
     #[test]
@@ -1528,7 +1633,9 @@ mod tests {
     #[test]
     fn a_root_mount_serves_every_path() {
         let registry = Arc::new(Registry::new());
-        registry.register_value("/counter", json!(1)).unwrap();
+        registry
+            .register_function("/counter", |_: Option<RequestBody<'_>>| Ok(1i64))
+            .unwrap();
         for mount in ["", "/"] {
             let gateway = RestGateway::new(mount, Arc::clone(&registry));
             assert_eq!(
@@ -1545,7 +1652,9 @@ mod tests {
         // the two mount-taking APIs in this crate cannot read one string two
         // different ways.
         let registry = Arc::new(Registry::new());
-        registry.register_value("/counter", json!(1)).unwrap();
+        registry
+            .register_function("/counter", |_: Option<RequestBody<'_>>| Ok(1i64))
+            .unwrap();
         for mount in ["/api/v1", "/api/v1/", "api/v1"] {
             let gateway = RestGateway::new(mount, Arc::clone(&registry));
             assert_eq!(
@@ -1556,6 +1665,14 @@ mod tests {
                 "mount {mount:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_doubled_slash_does_not_reach_the_root() {
+        // `//` is a pointer to the empty key beneath the mount, not the mount
+        // itself, so it must miss rather than dispatch to the root.
+        let response = gateway().respond(RestRequest::new("GET", "/api/v1//"));
+        assert_eq!(response.status, 404);
     }
 
     // -- errors -------------------------------------------------------------
@@ -1569,12 +1686,23 @@ mod tests {
             response.repe_error_code,
             Some(ErrorCode::MethodNotFound as u32)
         );
-        let problem = json_body(&response);
-        assert_eq!(problem["status"], json!(404));
-        assert_eq!(problem["title"], json!("Not Found"));
-        assert_eq!(
-            problem["repe_code"],
-            json!(ErrorCode::MethodNotFound as u32)
+        let problem: ProblemBody = body_as(&response);
+        assert_eq!(problem.status, 404);
+        assert_eq!(problem.title, "Not Found");
+        assert_eq!(problem.repe_code, Some(ErrorCode::MethodNotFound as u32));
+    }
+
+    #[test]
+    fn a_problem_with_no_repe_code_omits_the_member_rather_than_nulling_it() {
+        // RFC 9457 §3.2: an extension member that does not apply is absent.
+        // `SkipNull` is what makes that true of the encoding rather than of the
+        // struct.
+        let response = gateway().respond(RestRequest::new("GET", "/api/v1x/counter"));
+        assert_eq!(response.repe_error_code, None);
+        let text = std::str::from_utf8(&response.body).unwrap();
+        assert!(
+            !text.contains("repe_code"),
+            "an absent extension member must not appear at all: {text}"
         );
     }
 
@@ -1587,7 +1715,8 @@ mod tests {
             default.repe_error_code,
             Some(ErrorCode::ApplicationErrorBase as u32)
         );
-        assert_eq!(json_body(&default)["detail"], json!("handler said no"));
+        let problem: ProblemBody = body_as(&default);
+        assert!(problem.detail.contains("handler said no"));
 
         let remapped = gateway_with(RestConfig {
             application_error_status: 422,
@@ -1606,6 +1735,22 @@ mod tests {
         assert_eq!(response.status, 400);
     }
 
+    #[test]
+    fn an_error_response_is_never_cacheable() {
+        // RFC 9111 §4.2.2 makes 404 and 405 heuristically cacheable. A cached
+        // 405 keeps its stale `Allow` after the path is registered, leaving the
+        // resource unreachable through its only correct verb.
+        let gateway = gateway();
+        let cases = [
+            gateway.respond(RestRequest::new("GET", "/api/v1/absent")),
+            gateway.respond(RestRequest::new("DELETE", "/api/v1/counter")),
+        ];
+        for response in cases {
+            assert!(response.status >= 400);
+            assert_eq!(response.cache_control.as_deref(), Some("no-store"));
+        }
+    }
+
     // -- policy guards ------------------------------------------------------
 
     #[test]
@@ -1614,7 +1759,7 @@ mod tests {
             accept_beve_bodies: false,
             ..RestConfig::default()
         });
-        let body = beve::to_vec(&json!({ "a": 1, "b": 2 })).unwrap();
+        let body = structio::to_beve(&Operands { a: 1, b: 2 });
         let response =
             gateway.respond(RestRequest::new("POST", "/api/v1/add").with_body(MEDIA_BEVE, &body));
         assert_eq!(response.status, 415);
@@ -1629,11 +1774,11 @@ mod tests {
 
     #[test]
     fn a_deeply_nested_beve_body_is_answered_rather_than_aborting() {
-        // Why BEVE bodies are on by default again. Nesting is declared by the
-        // input, so before `beve` 9 this was a few KB of anonymous request that
-        // aborted the process — a stack overflow does not unwind, so no `catch`
-        // in the gateway or in hyper could contain it. It is now an ordinary
-        // malformed body: 400, connection intact, every other request served.
+        // Nesting is declared by the input, so an unbounded decoder turns a few
+        // KB of anonymous request into a stack overflow — which does not unwind,
+        // so no `catch` in the gateway or in hyper could contain it. It is an
+        // ordinary malformed body: 400, connection intact, everything else
+        // served.
         let mut body = Vec::new();
         for _ in 0..20_000 {
             body.extend_from_slice(&[0x05, 0x04]);
@@ -1650,251 +1795,13 @@ mod tests {
             read_only: true,
             ..RestConfig::default()
         });
-        for (method, target) in [("PUT", "/api/v1/counter"), ("POST", "/api/v1/add")] {
-            let response =
-                gateway.respond(RestRequest::new(method, target).with_body(MEDIA_JSON, b"1"));
-            assert_eq!(response.status, 405, "{method} {target}");
-            assert_eq!(response.allow, Some(ALLOW_READ_ONLY), "{method} {target}");
-        }
-        assert_eq!(gateway.registry().read_value("/counter").unwrap(), json!(7));
-
-        // Discovery reports the narrowed set rather than what the registry could
-        // in principle support.
-        let options = gateway.respond(RestRequest::new("OPTIONS", "/api/v1/counter"));
-        assert_eq!(options.allow, Some(ALLOW_READ_ONLY));
-        assert_eq!(
-            gateway
-                .respond(RestRequest::new("GET", "/api/v1/counter"))
-                .status,
-            200
-        );
-    }
-
-    #[test]
-    fn a_write_at_the_mount_root_is_refused_unless_enabled() {
-        // The registry treats the empty pointer as a merge of the request object
-        // into the tree, so this writes keys the *caller* chose and can grow the
-        // registry without bound — a different hazard from writing a named leaf.
-        let gateway = gateway();
-        let response = gateway.respond(
-            RestRequest::new("PUT", "/api/v1").with_body(MEDIA_JSON, br#"{"injected":1}"#),
-        );
-        assert_eq!(response.status, 405);
-        assert!(gateway.registry().read_value("/injected").is_err());
-
-        let permissive = gateway_with(RestConfig {
-            allow_root_write: true,
-            ..RestConfig::default()
-        });
-        let response = permissive.respond(
-            RestRequest::new("PUT", "/api/v1").with_body(MEDIA_JSON, br#"{"injected":1}"#),
-        );
-        assert_eq!(response.status, 200);
-        assert_eq!(
-            permissive.registry().read_value("/injected").unwrap(),
-            json!(1)
-        );
-    }
-
-    #[test]
-    fn if_match_gates_the_write() {
-        let gateway = gateway();
-        let tag = gateway
-            .respond(RestRequest::new("GET", "/api/v1/counter"))
-            .etag
-            .unwrap();
-
-        // A stale validator must not write: this is the lost update a client
-        // doing optimistic concurrency is relying on us to prevent.
-        let stale = gateway.respond(
-            RestRequest::new("PUT", "/api/v1/counter")
-                .with_body(MEDIA_JSON, b"1")
-                .with_if_match("\"0000000000000000\""),
-        );
-        assert_eq!(stale.status, 412);
-        assert_eq!(gateway.registry().read_value("/counter").unwrap(), json!(7));
-
-        // A current one proceeds.
-        let fresh = gateway.respond(
-            RestRequest::new("PUT", "/api/v1/counter")
-                .with_body(MEDIA_JSON, b"1")
-                .with_if_match(&tag),
-        );
-        assert_eq!(fresh.status, 200);
-        assert_eq!(gateway.registry().read_value("/counter").unwrap(), json!(1));
-
-        // And the tag that just succeeded is now stale, so a replay is refused.
-        let replay = gateway.respond(
-            RestRequest::new("PUT", "/api/v1/counter")
-                .with_body(MEDIA_JSON, b"2")
-                .with_if_match(&tag),
-        );
-        assert_eq!(replay.status, 412);
-    }
-
-    #[test]
-    fn if_match_star_requires_the_resource_to_exist() {
-        let gateway = gateway();
-        let existing = gateway.respond(
-            RestRequest::new("PUT", "/api/v1/counter")
-                .with_body(MEDIA_JSON, b"1")
-                .with_if_match("*"),
-        );
-        assert_eq!(existing.status, 200);
-
-        let absent = gateway.respond(
-            RestRequest::new("PUT", "/api/v1/absent")
-                .with_body(MEDIA_JSON, b"1")
-                .with_if_match("*"),
-        );
-        assert_eq!(absent.status, 412);
-    }
-
-    #[test]
-    fn if_match_uses_strong_comparison() {
-        // RFC 9110 §13.1.1: unlike If-None-Match, a weak validator never
-        // satisfies If-Match, because it does not promise byte equality.
-        let gateway = gateway();
-        let tag = gateway
-            .respond(RestRequest::new("GET", "/api/v1/counter"))
-            .etag
-            .unwrap();
-        let response = gateway.respond(
-            RestRequest::new("PUT", "/api/v1/counter")
-                .with_body(MEDIA_JSON, b"1")
-                .with_if_match(&format!("W/{tag}")),
-        );
-        assert_eq!(response.status, 412);
-    }
-
-    #[test]
-    fn a_doubled_slash_does_not_reach_the_root() {
-        // `//` maps to the pointer `"/"`, which is not the empty string but is
-        // the root as far as `parse_pointer` is concerned. Two definitions of
-        // "root" meant the policy check tested one and the write took the other.
-        let gateway = gateway();
-        for target in ["/api/v1", "/api/v1/", "/api/v1//"] {
+        for method in ["PUT", "POST"] {
             let response = gateway
-                .respond(RestRequest::new("PUT", target).with_body(MEDIA_JSON, br#"{"x":1}"#));
-            assert_eq!(response.status, 405, "{target}");
+                .respond(RestRequest::new(method, "/api/v1/counter").with_body(MEDIA_JSON, b"1"));
+            assert_eq!(response.status, 405, "{method}");
+            assert_eq!(response.allow, Some(ALLOW_READ_ONLY), "{method}");
         }
-        assert!(
-            gateway.registry().read_value("/x").is_err(),
-            "the root was written through one of the spellings above"
-        );
-    }
-
-    #[test]
-    fn a_permitted_root_write_still_works_through_every_spelling() {
-        for target in ["/api/v1", "/api/v1/", "/api/v1//"] {
-            let gateway = gateway_with(RestConfig {
-                allow_root_write: true,
-                ..RestConfig::default()
-            });
-            let response = gateway
-                .respond(RestRequest::new("PUT", target).with_body(MEDIA_JSON, br#"{"x":1}"#));
-            assert_eq!(response.status, 200, "{target}");
-            assert_eq!(gateway.registry().read_value("/x").unwrap(), json!(1));
-        }
-    }
-
-    #[test]
-    fn if_none_match_star_refuses_to_overwrite() {
-        // RFC 9110 §13.1.2: `If-None-Match: *` on a write means create-only.
-        // Ignoring it tells a client its create succeeded while it silently
-        // clobbered someone else's state.
-        let gateway = gateway();
-        let response = gateway.respond(
-            RestRequest {
-                if_none_match: Some("*"),
-                ..RestRequest::new("PUT", "/api/v1/counter")
-            }
-            .with_body(MEDIA_JSON, b"99"),
-        );
-        assert_eq!(response.status, 412);
-        assert_eq!(gateway.registry().read_value("/counter").unwrap(), json!(7));
-    }
-
-    #[test]
-    fn if_none_match_star_permits_a_create() {
-        let gateway = gateway();
-        let response = gateway.respond(
-            RestRequest {
-                if_none_match: Some("*"),
-                ..RestRequest::new("PUT", "/api/v1/fresh")
-            }
-            .with_body(MEDIA_JSON, b"1"),
-        );
-        assert_eq!(response.status, 200);
-        assert_eq!(gateway.registry().read_value("/fresh").unwrap(), json!(1));
-    }
-
-    #[test]
-    fn if_none_match_with_a_tag_refuses_a_matching_write() {
-        let gateway = gateway();
-        let tag = gateway
-            .respond(RestRequest::new("GET", "/api/v1/counter"))
-            .etag
-            .unwrap();
-        let response = gateway.respond(
-            RestRequest {
-                if_none_match: Some(&tag),
-                ..RestRequest::new("PUT", "/api/v1/counter")
-            }
-            .with_body(MEDIA_JSON, b"99"),
-        );
-        assert_eq!(response.status, 412);
-        assert_eq!(gateway.registry().read_value("/counter").unwrap(), json!(7));
-    }
-
-    #[test]
-    fn exactly_one_racing_conditional_write_wins() {
-        // The lost update `If-Match` exists to prevent. Evaluated before the
-        // write rather than within it, every thread here sees the tag it
-        // expected and several writes land.
-        let gateway = Arc::new(gateway());
-        let tag = gateway
-            .respond(RestRequest::new("GET", "/api/v1/counter"))
-            .etag
-            .unwrap();
-
-        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let barrier = Arc::new(std::sync::Barrier::new(16));
-        std::thread::scope(|scope| {
-            for worker in 0..16 {
-                let gateway = Arc::clone(&gateway);
-                let accepted = Arc::clone(&accepted);
-                let barrier = Arc::clone(&barrier);
-                let tag = tag.clone();
-                scope.spawn(move || {
-                    // Offset so that no worker writes the value already stored.
-                    // A worker that wrote it would leave the resource — and so
-                    // its validator — unchanged, and the next worker's
-                    // `If-Match` would legitimately match as well. That is
-                    // `write_if` behaving correctly on a resource nobody
-                    // changed, but it is indistinguishable here from the lost
-                    // update this test exists to catch.
-                    let body = (1000 + worker).to_string();
-                    barrier.wait();
-                    let response = gateway.respond(
-                        RestRequest {
-                            if_match: Some(&tag),
-                            ..RestRequest::new("PUT", "/api/v1/counter")
-                        }
-                        .with_body(MEDIA_JSON, body.as_bytes()),
-                    );
-                    if response.status == 200 {
-                        accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    }
-                });
-            }
-        });
-
-        assert_eq!(
-            accepted.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "more than one writer saw the same validator match"
-        );
+        assert_eq!(counter_of(&gateway), 7, "no refused call may have run");
     }
 
     #[test]
@@ -1909,75 +1816,11 @@ mod tests {
     }
 
     #[test]
-    fn a_write_never_becomes_a_call_and_a_call_never_becomes_a_write() {
-        // The verb is resolved against the target kind before dispatch, so
-        // dispatch must stay committed to it rather than re-deciding from the
-        // body — which is what leaves a window for the target to change kind.
-        let registry = Arc::new(Registry::new());
-        registry.register_value("/value", json!(1)).unwrap();
-        registry
-            .register_function("/function", |_| Ok(json!("called")))
-            .unwrap();
-
-        assert!(
-            registry.write_if("/function", json!(2), |_| true).is_err(),
-            "a write reached a function"
-        );
-        assert!(
-            registry
-                .call(
-                    "/value",
-                    Some(json!(2)),
-                    &crate::CallContext::detached("/value")
-                )
-                .is_err(),
-            "a call reached a value"
-        );
-        assert_eq!(registry.read_value("/value").unwrap(), json!(1));
-    }
-
-    #[test]
-    fn if_match_accepts_a_tag_from_either_representation() {
-        // The client's tag came from whichever representation it negotiated, and
-        // the gateway has no record of which. Matching either is safe: changing
-        // the value changes both encodings.
-        let gateway = gateway();
-        let beve_tag = gateway
-            .respond(RestRequest::new("GET", "/api/v1/counter").with_accept(MEDIA_BEVE))
-            .etag
-            .unwrap();
-        let response = gateway.respond(
-            RestRequest::new("PUT", "/api/v1/counter")
-                .with_body(MEDIA_JSON, b"1")
-                .with_if_match(&beve_tag),
-        );
-        assert_eq!(response.status, 200);
-    }
-
-    #[test]
-    fn an_error_response_is_never_cacheable() {
-        // RFC 9111 §4.2.2 makes 404 and 405 heuristically cacheable. A cached
-        // 405 keeps its stale `Allow` after the path becomes a function, leaving
-        // the resource unreachable through its only correct verb.
-        let gateway = gateway();
-        let cases = [
-            gateway.respond(RestRequest::new("GET", "/api/v1/absent")),
-            gateway.respond(RestRequest::new("DELETE", "/api/v1/counter")),
-            gateway
-                .respond(RestRequest::new("POST", "/api/v1/counter").with_body(MEDIA_JSON, b"1")),
-        ];
-        for response in cases {
-            assert!(response.status >= 400);
-            assert_eq!(response.cache_control.as_deref(), Some("no-store"));
-        }
-    }
-
-    #[test]
     fn options_star_asks_about_the_server_not_a_resource() {
         // RFC 9110 §9.3.7, and the one OPTIONS form a generic HTTP tool sends.
         let response = gateway().respond(RestRequest::new("OPTIONS", "*"));
         assert_eq!(response.status, 204);
-        assert_eq!(response.allow, Some(ALLOW_SERVER));
+        assert_eq!(response.allow, Some(ALLOW_CALL));
     }
 
     // -- units --------------------------------------------------------------

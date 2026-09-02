@@ -3191,8 +3191,8 @@ mod tests {
                 }
                 registry_begin.unregister(TransferId(1));
                 Ok(Sent {
-                    sent: NUM_CHUNKS as u64,
-                    bytes: offset as u64,
+                    sent: NUM_CHUNKS,
+                    bytes: offset,
                 })
             })
             .with_typed("/ack", move |params: AckRequest| {

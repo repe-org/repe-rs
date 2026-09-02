@@ -635,9 +635,10 @@ mod tests {
     fn router() -> Router {
         Router::new()
             .with_typed("/double", |v: i64| Ok(v * 2))
-            .with_typed("/boom", |_: i64| -> Result<i64, (ErrorCode, String)> {
-                panic!("handler exploded")
-            })
+            .with_typed(
+                "/boom",
+                |_: Option<i64>| -> Result<i64, (ErrorCode, String)> { panic!("handler exploded") },
+            )
     }
 
     /// SAFETY helper: every call in this module hands a live slice to
