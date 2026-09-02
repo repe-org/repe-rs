@@ -67,15 +67,24 @@ fn count_allocs<R>(f: impl FnOnce() -> R) -> (R, usize) {
     (out, end - start)
 }
 
-fn request(path: &str, body: serde_json::Value) -> Vec<u8> {
+fn request<T: structio::json::Write + ?Sized>(path: &str, body: &T) -> Vec<u8> {
     Message::builder()
         .id(1)
         .query_str(path)
         .query_format(QueryFormat::JsonPointer)
-        .body_json(&body)
+        .body_json(body)
         .build()
         .to_vec()
 }
+
+/// The body every dispatch-cycle measurement sends. One small field, so the
+/// allocation count is about the framing and dispatch path rather than the
+/// payload.
+#[derive(Default)]
+struct Point {
+    x: i64,
+}
+structio::object!(Point { x });
 
 /// Replicates the read → dispatch → query-echo-move → write cycle a server runs
 /// per request, using only public APIs. `out` is reused across calls so its
@@ -143,7 +152,7 @@ fn framing_round_trip_allocates_only_query_and_body() {
     // `Vec` for the query and one for the body; the header is a stack array, and
     // `write_message` reuses the warmed `out` buffer. This is the framing budget
     // the zero-copy/borrowed-read work would later drive toward zero.
-    let wire = request("/echo", json!({"x": 1}));
+    let wire = request("/echo", &Point { x: 1 });
     let mut out = Vec::new();
 
     // Warm up `out` so its growth isn't charged to the measured call.
@@ -182,11 +191,11 @@ fn json_dispatch_allocation_budget() {
     // The count includes serde_json's payload (de)serialization, so it is
     // payload-shaped and may shift if serde_json's allocation behavior changes;
     // what this guards is that repe's *framework* contribution does not grow. If
-    // this fails after a serde_json update, re-baseline EXPECTED; if it fails
+    // this fails after a structio update, re-baseline EXPECTED; if it fails
     // after a repe change, investigate the new (or removed) allocation.
-    const EXPECTED: usize = 5;
-    let router = Router::new().with_typed("/echo", |v: serde_json::Value| Ok(v));
-    let wire = request("/echo", json!({"x": 1}));
+    const EXPECTED: usize = 4;
+    let router = Router::new().with_typed("/echo", |v: Point| Ok(v));
+    let wire = request("/echo", &Point { x: 1 });
     let mut out = Vec::new();
 
     // Warm up the reused writer buffer.
@@ -205,25 +214,29 @@ fn json_dispatch_allocation_budget() {
 fn json_dispatch_view_allocation_budget() {
     // The borrowing read path for the same `{"x":1}` echo. The two read-side
     // Vecs (query + body) are gone — the read buffer is reused and the response
-    // echoes the query as a borrowed slice — leaving only serde_json's payload
-    // work:
+    // echoes the query as a borrowed slice — leaving only the payload work:
     //
     //   0  read_message_into (reuses `buf`) + MessageView (borrows)
-    //   2  serde_json decode of `{"x":1}` to Value
-    //   1  serde_json encode of the response body
+    //   0  decode of `{"x":1}` into the declared `Point`
+    //   2  the response body Vec, and its one growth
     //   0  query echo (borrowed from the view by the writer)
     //   0  write_message_streaming (reuses `out`)
     //   ----
-    //   3   (down from 5 on the owned path)
+    //   2   (down from 3 under serde, and from 5 on the owned path)
     //
-    // NOTE: this 5→3 win applies to `with_json`/`with_typed` routes, which
-    // override `handle_view` to decode from the borrowed body. Context-aware,
-    // struct, registry, and middleware-wrapped routes use the owning
-    // `handle_view` default (`MessageView::to_message`) and keep the owned
-    // path's 2 read allocations until they too are overridden.
-    const EXPECTED: usize = 3;
-    let router = Router::new().with_typed("/echo", |v: serde_json::Value| Ok(v));
-    let wire = request("/echo", json!({"x": 1}));
+    // The decode is what went to zero. A declared type is read *into* an
+    // existing value, so `{"x":1}` reaching a `Point` allocates nothing at all;
+    // under serde the same body cost two, building a `Value` before anything
+    // looked at it.
+    //
+    // NOTE: this applies to `with_typed` routes, which override `handle_view`
+    // to decode from the borrowed body. Context-aware, struct, registry, and
+    // middleware-wrapped routes use the owning `handle_view` default
+    // (`MessageView::to_message`) and keep the owned path's 2 read allocations
+    // until they too are overridden.
+    const EXPECTED: usize = 2;
+    let router = Router::new().with_typed("/echo", |v: Point| Ok(v));
+    let wire = request("/echo", &Point { x: 1 });
     let mut buf = Vec::new();
     let mut out = Vec::new();
 
@@ -265,62 +278,85 @@ fn typed_slice_body_is_single_allocation() {
 }
 
 #[test]
-fn write_message_typed_slice_uses_no_body_buffer() {
-    // Streaming a typed-slice body frames it with no intermediate body `Vec`: the
-    // header is a stack array, the query a borrowed slice, and the payload the
-    // slice reinterpreted as bytes (little-endian) written straight to the sink.
-    // So once the reused sink is warmed, framing allocates nothing — the
-    // zero-buffer property of `write_message_typed_slice`. (On big-endian targets
-    // beve uses one small reused scratch buffer for per-element conversion; this
-    // budget is the little-endian path that CI runs on.)
-    let data: Vec<f64> = (0..4096).map(|i| i as f64).collect();
+fn write_message_typed_slice_does_not_materialize_the_body() {
+    // Streaming a typed-slice body never builds the body as a `Vec`: the header
+    // is a stack array, the query a borrowed slice, and the payload the slice
+    // reinterpreted as bytes (little-endian) handed straight to the sink in one
+    // `write_all`. structio's sink writer stages small values through a fixed
+    // 8 KiB buffer and bypasses it for any block at least that large, so what
+    // framing costs is that one fixed buffer and nothing that scales.
+    //
+    // Stated as independence from the payload rather than as a zero, because a
+    // zero is not what the property is: a hundredfold larger body must not cost
+    // a byte more. A budget proportional to the slice would mean the body is
+    // being materialized after all, which is exactly the regression this
+    // guards.
     let query = b"/sensors/raw";
     let mut out = Vec::new();
 
-    // Warm the sink so its growth isn't charged to the measured call.
-    write_message_typed_slice(&mut out, Header::new(), query, &data).unwrap();
-
-    let (_, allocs) = count_allocs(|| {
-        out.clear();
+    let mut measure = |len: usize| {
+        let data: Vec<f64> = (0..len).map(|i| i as f64).collect();
+        // Warm the sink so its growth isn't charged to the measured call.
         write_message_typed_slice(&mut out, Header::new(), query, &data).unwrap();
-        black_box(&out);
-    });
+        let (_, allocs) = count_allocs(|| {
+            out.clear();
+            write_message_typed_slice(&mut out, Header::new(), query, &data).unwrap();
+            black_box(&out);
+        });
+        allocs
+    };
 
+    let small = measure(64);
+    let large = measure(65_536);
     assert_eq!(
-        allocs, 0,
-        "streaming a typed-slice body should allocate no intermediate buffer"
+        small, large,
+        "framing cost must not scale with the payload (64 elements: {small}, \
+         65536 elements: {large})"
+    );
+    assert!(
+        small <= 1,
+        "framing a typed-slice body should cost at most structio's fixed sink \
+         buffer, got {small} allocations"
     );
 }
 
 #[test]
-fn write_message_complex_slice_uses_no_body_buffer() {
-    // The complex counterpart of `write_message_typed_slice_uses_no_body_buffer`:
-    // streaming a complex-slice body frames it with no intermediate body `Vec`.
-    // The interleaved (re, im) payload is the slice reinterpreted as bytes
-    // (little-endian) written straight to the sink, so once the reused sink is
-    // warmed, framing allocates nothing. (On big-endian targets beve uses one small
-    // reused scratch buffer; this budget is the little-endian path CI runs on.)
-    let data: Vec<Complex<f64>> = (0..4096)
-        .map(|i| Complex {
-            re: i as f64,
-            im: -(i as f64),
-        })
-        .collect();
+fn write_message_complex_slice_does_not_materialize_the_body() {
+    // The complex counterpart of
+    // [`write_message_typed_slice_does_not_materialize_the_body`], and the same
+    // property: the interleaved `(re, im)` payload is the slice reinterpreted
+    // as bytes and handed to the sink in one write, so framing costs a fixed
+    // amount however long the slice is.
     let query = b"/spectra/iq";
     let mut out = Vec::new();
 
-    // Warm the sink so its growth isn't charged to the measured call.
-    write_message_complex_slice(&mut out, Header::new(), query, &data).unwrap();
-
-    let (_, allocs) = count_allocs(|| {
-        out.clear();
+    let mut measure = |len: usize| {
+        let data: Vec<Complex<f64>> = (0..len)
+            .map(|i| Complex {
+                re: i as f64,
+                im: -(i as f64),
+            })
+            .collect();
         write_message_complex_slice(&mut out, Header::new(), query, &data).unwrap();
-        black_box(&out);
-    });
+        let (_, allocs) = count_allocs(|| {
+            out.clear();
+            write_message_complex_slice(&mut out, Header::new(), query, &data).unwrap();
+            black_box(&out);
+        });
+        allocs
+    };
 
+    let small = measure(64);
+    let large = measure(65_536);
     assert_eq!(
-        allocs, 0,
-        "streaming a complex-slice body should allocate no intermediate buffer"
+        small, large,
+        "framing cost must not scale with the payload (64 elements: {small}, \
+         65536 elements: {large})"
+    );
+    assert!(
+        small <= 1,
+        "framing a complex-slice body should cost at most structio's fixed sink \
+         buffer, got {small} allocations"
     );
 }
 
@@ -335,13 +371,13 @@ fn websocket_inline_dispatch_allocation_budget() {
     //   1  serde_json encode of the response body
     //   1  query copy for the owned response (outbound channel)
     //   ----
-    //   4   (down from 5 on the owned WebSocket path — the read-side body Vec)
+    //   3   (down from 4 under serde: the decode into a declared type is free)
     //
-    // As with the TCP path, this applies to with_json/with_typed routes; other
-    // handlers use the owning handle_view fallback.
-    const EXPECTED: usize = 4;
-    let router = Router::new().with_typed("/echo", |v: serde_json::Value| Ok(v));
-    let wire = request("/echo", json!({"x": 1}));
+    // As with the TCP path, this applies to `with_typed` routes; other handlers
+    // use the owning `handle_view` fallback.
+    const EXPECTED: usize = 3;
+    let router = Router::new().with_typed("/echo", |v: Point| Ok(v));
+    let wire = request("/echo", &Point { x: 1 });
 
     // Warm up (router.get + handler internals touch no per-call statics here,
     // but keep the shape identical to the other budgets).
@@ -370,7 +406,7 @@ fn request_empty(path: &str) -> Vec<u8> {
 
 /// A device status block: the access pattern the struct read path is sized for,
 /// where a client polls the whole object (or one wide field) at high frequency.
-#[derive(Default, serde::Serialize, serde::Deserialize, repe::RepeStruct)]
+#[derive(Default, repe::RepeStruct)]
 struct Status {
     id: String,
     temperature: f64,
@@ -378,6 +414,12 @@ struct Status {
     #[repe(typed)]
     samples: [u32; 8],
 }
+structio::object!(Status {
+    id,
+    temperature,
+    state,
+    samples
+});
 
 fn status() -> Status {
     Status {
@@ -433,51 +475,45 @@ fn struct_read_allocation_budget() {
 }
 
 #[test]
-fn encoding_in_place_beats_the_value_path() {
-    // The friction the encode-in-place path removes, measured directly rather
-    // than inferred: both `RepeStruct` methods produce the same response bytes
-    // for the same read, but the `Value` form allocates a map node, a `String`
-    // per key and a `Value` per field before any of it reaches a buffer.
+fn a_whole_object_read_writes_straight_into_the_response_buffer() {
+    // The property the encode-in-place path exists for, stated as a budget
+    // rather than as a comparison. There is no longer a `Value` form to
+    // measure against: `repe_handle_into` is the only shape the trait has, and
+    // a response is written into the caller's buffer as it is produced.
     //
-    // For this four-field status block the split measured 1 allocation in place
-    // against 9 through `Value`. Compared as a strict inequality, not a fixed
-    // count, so the test states the property (in-place is cheaper) rather than
-    // serde_json's current internals.
+    // One allocation, and it is the caller's own `Vec` growing past the
+    // capacity it was given. Nothing between the struct's fields and the bytes
+    // allocates: no map node, no `String` per key, no boxed value per field.
     use repe::structs::{RepeStruct, ResponseBody};
 
-    let mut value_side = status();
-    let mut encode_side = status();
+    let mut status = status();
 
-    // Warm up any lazily-initialized allocations inside serde_json.
-    black_box(serde_json::to_vec(&value_side.repe_handle(&[], None).unwrap()).unwrap());
+    // Warm up: the first call settles any lazily-initialized state so the
+    // measured one charges only the encode.
     {
         let mut buf = Vec::with_capacity(256);
         let mut out = ResponseBody::new(&mut buf);
-        encode_side.repe_handle_into(&[], None, &mut out).unwrap();
+        status.repe_handle_into(&[], None, &mut out).unwrap();
     }
 
-    let (value_bytes, value_allocs) = count_allocs(|| {
-        let value = value_side.repe_handle(&[], None).unwrap().unwrap();
-        serde_json::to_vec(&value).unwrap()
-    });
-
-    let (encode_bytes, encode_allocs) = count_allocs(|| {
+    let (bytes, allocs) = count_allocs(|| {
+        // Sized for the response, so the buffer is the one allocation and it is
+        // not grown afterwards.
         let mut buf = Vec::with_capacity(256);
         let mut out = ResponseBody::new(&mut buf);
-        encode_side.repe_handle_into(&[], None, &mut out).unwrap();
+        status.repe_handle_into(&[], None, &mut out).unwrap();
         buf
     });
 
-    assert!(
-        encode_allocs < value_allocs,
-        "encode-in-place should allocate less than the Value path \
-         (in place {encode_allocs}, via Value {value_allocs})"
+    assert_eq!(
+        allocs, 1,
+        "a whole-object read should allocate only the response buffer, got {allocs}"
     );
-
-    // Same response, modulo the key ordering `serde_json::Map` imposes.
-    let via_value: serde_json::Value = serde_json::from_slice(&value_bytes).unwrap();
-    let in_place: serde_json::Value = serde_json::from_slice(&encode_bytes).unwrap();
-    assert_eq!(in_place, via_value);
+    // And the bytes are the listing, not an empty buffer that happened not to
+    // allocate.
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(text.starts_with(r#"{"id":"sensor-42""#), "{text}");
+    assert!(text.contains(r#""samples":[1,2,3,4,5,6,7,8]"#), "{text}");
 }
 
 /// A write through an `RwLock`-registered struct: the shared attempt declines
@@ -495,13 +531,16 @@ fn encoding_in_place_beats_the_value_path() {
 fn struct_write_under_a_shared_lock_splits_the_pointer_once() {
     use std::sync::{Arc, RwLock};
 
-    #[derive(Default, serde::Serialize, serde::Deserialize, repe::RepeStruct)]
+    #[derive(Default, repe::RepeStruct)]
     struct Escaped {
         #[repe(rename = "a/b")]
-        #[serde(rename = "a/b")]
         a_b: u64,
         plain: u64,
     }
+    structio::object!(Escaped {
+        "a/b" => a_b,
+        plain
+    });
 
     let router = Router::new()
         .with_struct_shared::<Escaped, _>("/e", Arc::new(RwLock::new(Escaped::default())));
@@ -512,12 +551,12 @@ fn struct_write_under_a_shared_lock_splits_the_pointer_once() {
         // shows up.
         ("/e/plain", 3usize),
         // Escaped: one `json_pointer::parse`, not two. Splitting per attempt
-        // instead of once for both costs four more (11 rather than 7): the
-        // `Vec<String>`, the owned segment, its `str::replace` pair, and the
+        // instead of once for both costs four more (10 rather than 6): the
+        // `Vec<Cow<str>>`, the owned segment, its unescape, and the
         // `Vec<&str>`, all paid again to reach the identical segments.
-        ("/e/a~1b", 7usize),
+        ("/e/a~1b", 6usize),
     ] {
-        let wire = request(path, json!(7));
+        let wire = request(path, &7u64);
         let mut out = Vec::new();
         dispatch_cycle(&router, &wire, path, &mut out);
         let (_, allocs) = count_allocs(|| dispatch_cycle(&router, &wire, path, &mut out));
