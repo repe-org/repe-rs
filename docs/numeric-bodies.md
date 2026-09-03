@@ -38,7 +38,7 @@ They error with `RepeError::UnexpectedBodyFormat` if the body is not `BodyFormat
 
 ## Streaming a large body with no body buffer
 
-For a body too large to hold a second copy of, `write_message_typed_slice` sizes the body in closed form (`beve::typed_slice_size`, no traversal) and writes the payload straight to the sink:
+For a body too large to hold a second copy of, `write_message_typed_slice` sizes the body in closed form (`structio::beve_size`, no traversal) and writes the payload straight to the sink:
 
 ```rust
 use repe::{Header, write_message_typed_slice};

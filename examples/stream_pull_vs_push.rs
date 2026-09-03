@@ -131,7 +131,7 @@ fn decode_diagnostic(total: usize) {
         mb / (bulk_ms / 1000.0)
     );
     println!(
-        "  beve::from_reader_streaming (element)  {:>8.2} ms   {:>7.0} MB/s   <- value_stream mode-3 path",
+        "  structio::beve::from_reader (element)  {:>8.2} ms   {:>7.0} MB/s   <- value_stream mode-3 path",
         stream_ms,
         mb / (stream_ms / 1000.0)
     );
@@ -364,9 +364,9 @@ fn print_caveats() {
          per chunk (request + response). 128 MiB = 128 chunks: at L=1ms that is ~256 ms of pure\n\
          round-trip stall that windowed push avoids (push pays ~one window-fill total); at\n\
          L=25us (LAN) ~6 ms; at loopback (~1us) negligible, as measured above.\n\n\
-         Friction (beve): `from_slice::<Vec<u8>>` / `from_reader_streaming::<Vec<u8>>` decode a\n\
-         flat byte array element-wise (~300 MB/s) rather than via a bulk u8 path (memcpy speed).\n\
-         A bulk fast-path for primitive arrays in the streaming decoder would lift value_stream\n\
-         mode-3 throughput for large numeric/byte payloads by an order of magnitude."
+         Where the element-wise `from_beve::<Vec<u8>>` / `from_reader::<Vec<u8>>` figures above\n\
+         fall well short of the bulk (memcpy) path, a bulk fast path for primitive arrays in the\n\
+         generic reader would lift value_stream mode-3 throughput for large numeric/byte\n\
+         payloads by the same margin; `pull_typed_slice` already takes the bulk path."
     );
 }

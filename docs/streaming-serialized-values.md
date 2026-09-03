@@ -7,7 +7,7 @@ Status: **implemented** behind the `value-stream` feature (`src/value_stream.rs`
 Behind the optional `value-stream` feature (pulls in [`zstandard`](https://crates.io/crates/zstandard), a pure-Rust codec for the same format — no C toolchain, no build script). Sections 2 and 7 below are the proposal as written, and name the `zstd` C bindings it originally reached for.
 
 - **Server producer** — `Router::with_value_stream(resolve, StreamOpts)` registers the `/_svs/{open,next,cancel}` routes backed by a bounded per-stream session (a `std::thread` running `structio::beve::to_writer` → optional zstd `write::Encoder` → a `sync_channel` of chunks). One registration serves one value type. The `next` handler reports `Execution::OffReader` so it is also correct on the WebSocket server; it blocks for backpressure on the synchronous `Server` (one thread per connection). It is **not** suitable on the inline `AsyncServer`, which does not honor `OffReader` (documented in the module). The same `RouterValueStreamExt` extension registers four more producer shapes on `Router`: `with_typed_value_stream` / `with_complex_value_stream` (a bulk numeric / complex array in BEVE typed-array form, for memcpy-speed decode), `with_reader_stream` (**opaque, already-serialized bytes** streamed verbatim from a producer-side `Read`, tagged `format = RawBinary`), and its write-side counterpart `with_writer_stream(format, resolve, StreamOpts)` (the producer closure **owns the `Write` sink** and emits the body in a single pass). The writer variant is the seam for **single-pass content integrity** — serialize through a hashing tee and append a trailing digest with no second encode pass (§11).
-- **Client puller** — `pull_value::<T>`, `pull_to_beve_file`, `pull_to_beve_zst_file`, `pull_to_file`, `pull_to_vec`, and the general `pull_stream` drive the pull over the synchronous `Client`, alongside the format-agnostic `pull_consume` reader hatch and `pull_to_file_trailer_verified` (strip + verify an in-stream `payload || digest` trailer and commit the payload alone). All three receiver modes (§3.2) work: raw `.beve.zst`, decompressed `.beve`, and streaming typed decode into `T` via `beve::from_reader_streaming`. File modes write a temp sibling and rename only after the terminating `last = 1` and an fsync, so a dropped connection never commits a truncated file. Async consumers mirror these as `pull_*_async`, including `pull_to_vec_async` and `pull_to_file_trailer_verified_async`.
+- **Client puller** — `pull_value::<T>`, `pull_to_beve_file`, `pull_to_beve_zst_file`, `pull_to_file`, `pull_to_vec`, and the general `pull_stream` drive the pull over the synchronous `Client`, alongside the format-agnostic `pull_consume` reader hatch and `pull_to_file_trailer_verified` (strip + verify an in-stream `payload || digest` trailer and commit the payload alone). All three receiver modes (§3.2) work: raw `.beve.zst`, decompressed `.beve`, and typed decode into `T` via `structio::beve::from_reader` (the body is buffered, then parsed; see the note under mode 3). File modes write a temp sibling and rename only after the terminating `last = 1` and an fsync, so a dropped connection never commits a truncated file. Async consumers mirror these as `pull_*_async`, including `pull_to_vec_async` and `pull_to_file_trailer_verified_async`.
 - **Tests** — unit tests for the chunker and the lookahead/`last` detection (including producer-failure vs clean-end), plus end-to-end TCP round-trips for every mode, tag/output-mismatch rejection, unknown-resource errors, sequential-stream release, and the atomic-file guarantee (`tests/value_stream.rs`). A runnable demo is in `examples/value_stream.rs`; the single-pass `payload || digest` integrity seam (the `with_writer_stream` producer) is demonstrated in `examples/writer_stream_digest.rs`.
 
 **Transports:** the puller drives the sync `Client`, the async `AsyncClient`, and (with the `websocket` feature) the `WebSocketClient` — the async pullers are generic over a sealed `AsyncSvsClient` implemented for both async clients. The server producer runs under both the synchronous and WebSocket servers (it reports `Execution::OffReader`), not the inline async server.
@@ -34,7 +34,7 @@ Neither existing transfer mechanism fits directly (§5).
 
 This proposal is mostly glue, because the hard parts are already public:
 
-- **`beve` streams both directions, including typed decode.** `beve::to_writer_streaming::<W: Write, T: Serialize>` + `beve::serialized_size` produce without materializing; `beve::from_reader_streaming::<R: Read, T: DeserializeOwned>` decodes **directly into `T`** token-by-token, with no intermediate generic tree (`streaming_de.rs`). This is a genuine advantage over the Julia binding, whose typed deserialize still materializes a generic tree first — Rust needs no `beve` change for any mode.
+- **structio streams the producer side and decodes with no tree.** `structio::beve::to_writer` + `structio::beve_size` produce without materializing. On the consumer side `structio::beve::from_reader` decodes **directly into `T`** with no intermediate generic tree, but it buffers the encoded bytes before parsing: the reader is slice-backed so a `&'de str` field can borrow from the input. `structio::beve::read_array_into` is the exception, and it is what the bulk numeric pulls use to decode straight from the stream.
 - **zstd streams.** The `zstd` crate's `stream::write::Encoder<W>` / `stream::write::Decoder<W>` (write-side filters) and `stream::read::Decoder<R>` (read-side filter) wrap any `Write`/`Read`. `zstd` is **not yet a dependency** — add it behind an optional feature (§7).
 - **Request/response works on both transports today.** The pull model below uses ordinary request/response, which the sync `Client`, async client, and `WebSocketClient` all already provide. It deliberately does **not** use `subscribe_notifies` (see the revision note).
 
@@ -45,13 +45,13 @@ So the only genuinely new code is a chunk-transport adapter (a producer session 
 ```
 SERVER (producer, holds value: T)              CLIENT (receiver, drives the pull)
   &value                                         loop: `next(stream_id)` request
-    │ beve::to_writer_streaming                    │  ← response body = next chunk (+ last flag)
+    │ structio::beve::to_writer                    │  ← response body = next chunk (+ last flag)
     ▼                                              ▼
   BEVE bytes                                     chunk bytes
     │ zstd write::Encoder                          ├─► write raw ──────────────► tmp → rename .beve.zst (mode 1)
     ▼                                              ├─► zstd write::Decoder ────► tmp → rename .beve     (mode 2)
   zstd bytes                                       └─► zstd read::Decoder
-    │ BoundedSink (blocks task when full)               │ beve::from_reader_streaming::<_, T>   (mode 3)
+    │ BoundedSink (blocks task when full)               │ structio::beve::from_reader::<T>      (mode 3)
     ▼                                                    ▼
   bounded session channel ──[ `next` request/response over TCP / WebSocket ]── pulled on demand
 ```
@@ -66,7 +66,7 @@ let (tx, rx) = sync_channel::<Msg>(SESSION_DEPTH);       // bounded: Chunk(bytes
 std::thread::spawn(move || {                             // or spawn_blocking in async
     let sink = ChunkSink::new(tx, 1 << 20);              // ~1 MiB Chunk(bytes) into the bounded channel
     let mut enc = zstd::stream::write::Encoder::new(sink, 3)?;
-    beve::to_writer_streaming(&mut enc, &value)?;        // value -> BEVE -> zstd -> bounded chunks
+    structio::beve::to_writer(&mut enc, &value)?;        // value -> BEVE -> zstd -> bounded chunks
     let sink = enc.finish()?;                            // flush zstd epilogue into sink
     sink.finish()                                        // push final partial chunk, then send an explicit End (Fail on error) before tx drops
 });
@@ -88,9 +88,9 @@ tmp.write_all(&chunk)?;                      // ... on last: tmp.sync_all()?; fs
 let mut dec = zstd::stream::write::Decoder::new(tmp)?;
 dec.write_all(&chunk)?;                      // ... on last: dec.flush()?; rename(tmp, final)?;
 
-// Mode 3: struct — pull reader -> zstd read::Decoder -> typed streaming decode.
+// Mode 3: struct — pull reader -> zstd read::Decoder -> typed decode.
 //   `ChunkReader: Read` issues `next` requests on demand (§3.3), bounded in-flight.
-let value: T = beve::from_reader_streaming(
+let value: T = structio::beve::from_reader(
     zstd::stream::read::Decoder::new(ChunkReader::new(client, stream_id))?
 )?;
 ```
@@ -99,15 +99,15 @@ let value: T = beve::from_reader_streaming(
 |---|---|---|---|
 | 1 | `.beve.zst` | no | no |
 | 2 | `.beve` | no | no |
-| 3 | `T` | yes (the result) | no — typed decode streams directly into `T` |
+| 3 | `T` | yes (the result) | holds the decompressed bytes while parsing |
 
-Mode 3 is strictly leaner than `beve::from_reader` over a whole decompressed buffer, and far leaner than read-file-then-decompress-then-decode (which holds compressed + decompressed + value at once). Because `from_reader_streaming` decodes straight into `T`, there is no intermediate generic tree (unlike the Julia path).
+Mode 3 holds the decompressed encoding plus the value at its peak, never the compressed bytes, and decodes straight into `T` with no intermediate generic tree (unlike the Julia path). The bulk numeric pulls (`pull_typed_slice`, `pull_complex_slice`) go further and decode from the stream with no buffer at all.
 
 **Atomic output (mandatory).** The wire commits no total length (the compressed size is unknown up front), so a dropped connection would otherwise leave a byte-truncated `.beve`/`.beve.zst` that looks complete. File modes write to a temp path and `rename` only **after** `last` and a flush. A stream that ends without `last` is discarded.
 
 ### 3.3 Pull reader for mode 3
 
-`from_reader_streaming` pulls bytes (`R: Read`), which fits the pull model directly: `ChunkReader::read` returns buffered bytes and, when empty, issues the next `next` request (and surfaces `last` as EOF). For throughput, the client may keep a small in-flight window of `next` requests and feed a **bounded** channel that the blocking `from_reader_streaming` (run under `spawn_blocking` in async code) drains — bounded, unlike the push design's unbounded notify channel. Modes 1 and 2 need no decoder; the pull loop writes bytes straight to the temp file/decoder.
+`structio::beve::from_reader` pulls bytes (`R: Read`), which fits the pull model directly: `ChunkReader::read` returns buffered bytes and, when empty, issues the next `next` request (and surfaces `last` as EOF). For throughput, the client may keep a small in-flight window of `next` requests and feed a **bounded** channel that the blocking decode (run under `spawn_blocking` in async code) drains — bounded, unlike the push design's unbounded notify channel. Modes 1 and 2 need no decoder; the pull loop writes bytes straight to the temp file/decoder.
 
 ## 4. Wire contract — defined in the shared SVS spec
 
@@ -179,7 +179,7 @@ Keep `chunk_bytes` small enough that a WebSocket binary frame stays modest — *
 | Full decompressed buffer | never | never | never (typed decode streams) |
 | Transient | `SESSION_DEPTH` chunks + zstd | 1 chunk + zstd + write buf | window chunks + zstd + decode |
 
-File modes are bounded regardless of payload size; struct mode is bounded to `T` + O(window). (Contrast the Julia companion plan, where typed mode 3 is bounded only after a new streaming typed deserializer lands; Rust's `from_reader_streaming` already streams typed decode.)
+File modes are bounded regardless of payload size; struct mode holds the decoded encoding plus `T` at its peak (see mode 3 above); the bulk numeric pulls are bounded to the output plus O(window).
 
 ## 11. Out of scope and deferred
 
@@ -197,6 +197,6 @@ File modes are bounded regardless of payload size; struct mode is bounded to `T`
 1. Add `zstd` optional dep + `beve-zstd-stream` feature.
 2. `ChunkSink: Write` + bounded session channel + `open`/`next`/`cancel` helpers over `Message`; test the producer session in isolation (bounded memory, clean shutdown), asserting byte-identity with `to_writer_streaming` + zstd over a `Vec`.
 3. `ChunkReader: Read` + `pull_stream` with file modes (atomic temp-then-rename) + round-trip over TCP.
-4. Mode 3: typed `from_reader_streaming` over the pull reader (`spawn_blocking` in async); round-trip a struct, asserting value-equality with the source.
+4. Mode 3: typed `structio::beve::from_reader` over the pull reader (`spawn_blocking` in async); round-trip a struct, asserting value-equality with the source.
 5. WebSocket parity — free, since pull is plain request/response; assert frame sizes stay ~`chunk_bytes`.
 6. Backpressure (slow client → bounded server memory), session-lifecycle (disconnect frees the session), atomic-output (mid-stream kill leaves no final-named file), cancel, and large-payload (generated) tests.

@@ -5,20 +5,20 @@
 //! notify, or sub-millisecond dispatch keep talking REPE to the same registry.
 //!
 //! The translation is mechanical rather than a redesign, because a REPE query is
-//! an RFC 6901 JSON Pointer into a value tree and a REST resource is a path into
-//! a value tree. [`Registry::dispatch`] already picks between three operations
-//! from the body alone, and they are the three HTTP verbs worth having, with the
-//! same safety and idempotency:
+//! an RFC 6901 JSON Pointer and a REST resource is a path: the same addressing
+//! scheme. Every registered path is a function, and the verbs map onto the two
+//! ways of calling one — with a body or without:
 //!
 //! | HTTP | Registry operation | Safe | Idempotent | Cacheable |
 //! | --- | --- | --- | --- | --- |
-//! | `GET` / `HEAD` | READ the value at the path | yes | yes | yes |
-//! | `PUT` | WRITE the value at the path | no | yes | no |
-//! | `POST` | CALL the function at the path | no | no | no |
+//! | `GET` / `HEAD` | call the function with no body | yes | yes | yes |
+//! | `PUT` / `POST` | call the function with the body as arguments | no | no | no |
 //!
-//! A verb aimed at the wrong kind of target is `405`, not a silent coercion:
-//! that refusal is what keeps the facade from becoming RPC in a costume, paying
-//! REST's costs while offering none of its guarantees.
+//! `PUT` and `POST` are aliases. The registry stores no values, so there is no
+//! assignment for `PUT` to mean instead of a call, and neither verb is
+//! idempotent because a call is not. A `GET` is treated as safe on the
+//! understanding that a bodiless call is a read; a handler that mutates on an
+//! empty body is breaking that contract, not the gateway.
 //!
 //! **This gateway does not authenticate anyone.** See [`RestConfig`] for what it
 //! can and cannot bound, and put identity in front of it as you would TLS.
@@ -137,8 +137,8 @@ pub struct RestConfig {
     /// Reject a request body larger than this with `413`. Defaults to 1 MiB.
     ///
     /// This bounds the *facade*, not the protocol. A REST body is buffered whole
-    /// before it can be decoded into a `serde_json::Value`, so an unbounded
-    /// limit here is an unbounded allocation driven by an anonymous caller.
+    /// before it can be decoded, so an unbounded limit here is an unbounded
+    /// allocation driven by an anonymous caller.
     /// Bulk payloads belong on the REPE side, which streams.
     pub max_body_bytes: usize,
     /// `Cache-Control` for successful reads. Defaults to `no-cache`:
@@ -164,25 +164,16 @@ pub struct RestConfig {
     /// because the mutation surface is otherwise reachable by anyone who can
     /// reach the port.
     pub read_only: bool,
-    /// Permit a `PUT` at the mount itself, which the registry treats as a merge
-    /// of the request object into the root. Defaults to `false`.
-    ///
-    /// Separate from [`read_only`](Self::read_only) because it is a different
-    /// hazard: a root merge writes *keys the caller chose* rather than a value
-    /// at a path the caller named, so it can introduce entirely new state and
-    /// grow the in-memory tree without bound. A gateway that legitimately
-    /// accepts writes to known leaves almost never wants that too.
-    pub allow_root_write: bool,
     /// Accept BEVE request *bodies*. Defaults to `true`.
     ///
-    /// This was off by default while `beve` 8's deserializer had no recursion
+    /// This was off by default while the previous BEVE decoder had no recursion
     /// limit: a few kilobytes of nested array tags overflowed the thread stack,
     /// and a Rust stack overflow aborts the process rather than unwinding into
     /// the per-connection catch, so one anonymous request took down every other
-    /// connection with it. `beve` 9 bounds nesting at `beve::MAX_RECURSION_DEPTH`
-    /// and reports the refusal as an ordinary error, which this gateway answers
-    /// with a `400` like any other malformed body. BEVE responses were never
-    /// affected — encoding is driven by the server's own data.
+    /// connection with it. structio bounds nesting depth (256 levels) and
+    /// reports the refusal as an ordinary error, which this gateway answers
+    /// with a `400` like any other malformed body. BEVE responses were never affected — encoding is driven by the
+    /// server's own data.
     ///
     /// Still a knob, because content negotiation is policy: a gateway that
     /// publishes a JSON-only contract can turn it off and refuse the media type
@@ -220,7 +211,6 @@ impl Default for RestConfig {
             cache_control: Some("no-cache".to_string()),
             application_error_status: 500,
             read_only: false,
-            allow_root_write: false,
             accept_beve_bodies: true,
             max_connections: 1024,
             request_timeout: Some(Duration::from_secs(30)),
@@ -246,8 +236,6 @@ pub struct RestRequest<'a> {
     pub accept: Option<&'a str>,
     /// `If-None-Match`, for conditional reads.
     pub if_none_match: Option<&'a str>,
-    /// `If-Match`, for conditional writes (optimistic concurrency).
-    pub if_match: Option<&'a str>,
     /// The raw request body.
     pub body: &'a [u8],
 }
@@ -261,7 +249,6 @@ impl<'a> RestRequest<'a> {
             content_type: None,
             accept: None,
             if_none_match: None,
-            if_match: None,
             body: &[],
         }
     }
@@ -282,12 +269,6 @@ impl<'a> RestRequest<'a> {
     /// Attach an `If-None-Match` header.
     pub fn with_if_none_match(mut self, tag: &'a str) -> Self {
         self.if_none_match = Some(tag);
-        self
-    }
-
-    /// Attach an `If-Match` header.
-    pub fn with_if_match(mut self, tag: &'a str) -> Self {
-        self.if_match = Some(tag);
         self
     }
 }
@@ -987,7 +968,6 @@ impl RestGateway {
         let content_type = header(hyper::header::CONTENT_TYPE);
         let accept = header(hyper::header::ACCEPT);
         let if_none_match = header(hyper::header::IF_NONE_MATCH);
-        let if_match = header(hyper::header::IF_MATCH);
 
         // `Limited` caps the body before it is buffered, so an oversized request
         // is refused rather than allocated. Checking `Content-Length` instead
@@ -1020,7 +1000,6 @@ impl RestGateway {
             content_type: content_type.as_deref(),
             accept: accept.as_deref(),
             if_none_match: if_none_match.as_deref(),
-            if_match: if_match.as_deref(),
             body: &body,
         }))
     }

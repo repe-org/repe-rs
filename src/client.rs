@@ -175,8 +175,8 @@ impl Client {
     /// The synchronous twin of
     /// [`AsyncClient::call_typed_slice_aligned`](crate::AsyncClient::call_typed_slice_aligned);
     /// see it for the full contract. Pairs specifically with a
-    /// [`Router::with_typed_slice_ref`] route (a plain `with_typed_slice` / serde
-    /// route does not understand the aligned form).
+    /// [`Router::with_typed_slice_ref`] route (a plain `with_typed_slice` /
+    /// `with_typed` route does not understand the aligned form).
     ///
     /// [`Router::with_typed_slice_ref`]: crate::server::Router::with_typed_slice_ref
     pub fn call_typed_slice_aligned<P, T, R>(

@@ -15,7 +15,7 @@
 //!
 //! #[repe::plugin(root = "/example")]
 //! fn build() -> Router {
-//!     Router::new().with_json("/example/echo", Ok)
+//!     Router::new().with_typed("/example/echo", |body: String| Ok(body))
 //! }
 //! ```
 //!

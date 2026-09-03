@@ -13,9 +13,7 @@
 //! curl -i -X PUT -d 42 localhost:8080/api/v1/counter
 //! curl -i -X POST -d '{"a":2,"b":3}' localhost:8080/api/v1/add
 //! curl -i -H 'If-None-Match: "..."' localhost:8080/api/v1/counter   # 304
-//! curl -i -X POST -d 1 localhost:8080/api/v1/counter                # 405
-//! curl -i -X PUT -d 1 -H 'If-Match: "deadbeefdeadbeef"' \
-//!      localhost:8080/api/v1/counter                                # 412
+//! curl -i -X PUT -d 1 localhost:8080/api/v1/counter                 # same as POST
 //! curl -i -X OPTIONS localhost:8080/api/v1/add                      # Allow
 //! ```
 //!

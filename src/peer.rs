@@ -22,7 +22,7 @@
 //! in-process dispatch do not attach a peer: there [`CallContext::peer`]
 //! returns `None`, and an embedder that needs peer routing wires its own
 //! [`PeerSink`] against its server's outbound channel and calls
-//! [`Registry::dispatch_with_ctx`](crate::registry::Registry::dispatch_with_ctx)
+//! [`Registry::call`](crate::registry::Registry::call)
 //! with a populated [`CallContext`].
 
 use crate::constants::BodyFormat;

@@ -424,7 +424,7 @@ A hand-written `RepeStruct` impl gets the exclusive behavior by default. To opt 
 
 - **answer a path identically** to `repe_handle_into`, or decline it;
 - **write nothing into the response body when declining.** `ObjectBody::entry_try_with` is there for this when the decline surfaces partway through an object — it rewinds the whole object, so propagating its `None` is all the caller has to do;
-- **leave the body alone when declining.** It arrives as `&mut Option<Value>` rather than by value precisely so the exclusive retry can re-dispatch the same request without a clone. Call `take` on it only once this borrow has committed to answering — an `Err` counts as an answer — and never on a path that goes on to return `None`.
+- **leave the body alone when declining.** It arrives as `Option<RequestBody<'_>>`, a `Copy` view of the request bytes, so the exclusive retry re-dispatches the very same request at no cost. Read from it only once this borrow has committed to answering — an `Err` counts as an answer — and never on a path that goes on to return `None`, because a read lands in a live member and the retry would then apply it twice.
 
 ### `repe-core`: declaring a served type without the server
 
@@ -511,4 +511,4 @@ let mut out = repe::ResponseBody::new(&mut buf);
 let _ = registry.call("/run", None, &ctx, &mut out);
 ```
 
-`WithContext` is the marker that opts a closure into the `&CallContext` parameter. Plain `Fn(Option<Value>) -> Result<...>` handlers keep working unchanged: `Registry::dispatch` is a thin wrapper that supplies a `CallContext::detached` context.
+`WithContext` is the marker that opts a closure into the `&CallContext` parameter. Plain `Fn(Option<RequestBody<'_>>) -> Result<...>` handlers keep working unchanged: `Registry::call_detached` is a thin wrapper that supplies a `CallContext::detached` context.

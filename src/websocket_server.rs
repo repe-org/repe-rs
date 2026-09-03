@@ -527,7 +527,7 @@ impl WebSocketServer {
     }
 
     /// Cap on concurrently-running off-reader handlers (those registered
-    /// via `Router::with_json_blocking` and friends) per connection.
+    /// via `Router::with_typed_blocking` and friends) per connection.
     /// Defaults to [`DEFAULT_OFFREADER_LIMIT`].
     ///
     /// When the cap is reached, a further off-reader request gets an
@@ -1410,8 +1410,8 @@ where
 
         // Bundle the per-connection dispatch state for the reader. `peer`
         // is threaded into each request's `CallContext` so handlers can
-        // push notifies back to the originator (via `Router::with_json_ctx`
-        // / `with_typed_ctx` or a registry-backed `RegistryCallable`), and
+        // push notifies back to the originator (via `Router::with_typed_ctx`
+        // or a registry-backed `RegistryCallable`), and
         // `conn_token` becomes each handler's cancellation signal.
         let conn = ConnDispatch {
             peer,
@@ -1517,8 +1517,8 @@ where
             } => match handler.execution() {
                 Execution::Inline => {
                     // Thread the calling peer and the connection's
-                    // cancellation signal to handlers so `with_json_ctx` /
-                    // `with_typed_ctx` (and registry-backed callables) can
+                    // cancellation signal to handlers so `with_typed_ctx`
+                    // (and registry-backed callables) can
                     // push notifies back through this connection during
                     // request handling and observe disconnect/shutdown.
                     let ctx = CallContext::with_cancel(path, &conn.peer, &inline_signal);

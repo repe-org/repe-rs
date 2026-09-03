@@ -1686,10 +1686,9 @@ fn build_accessor_arm(
 //
 // `repe_shared_into` and `repe_call_shared_into` serve a request through
 // `&self`, so a read does not queue behind a long-running call on the same
-// object. A decline is not a value any sink can encode, so this is not a third
-// `Sink`; it is a second `Raise`, and the arms themselves are the same
-// generators the exclusive path uses — `build_method_arm`, `build_accessor_arm`
-// — called with `Borrow::Shared`.
+// object. A decline is `None` where the exclusive path has only `Ok`/`Err`, and
+// the arms themselves are the same generators the exclusive path uses —
+// `build_method_arm`, `build_accessor_arm` — called with `Borrow::Shared`.
 //
 // That is why the two cannot disagree about how a value is serialized or how a
 // body is read: it is one generator, not two kept in step. They differ only in
@@ -1709,11 +1708,13 @@ fn build_accessor_arm(
 // served here whether or not it carries a body, a `&mut self` one never is, a
 // field write never is, and a nested child is asked the same question in turn.
 //
-// **The body.** It arrives as `&mut Option<Value>` and is taken only past the
-// last point an arm could still decline, because a decline owes the exclusive
-// retry the request it was handed. `decode_method_args` places the `take` for
-// that reason; a nested child is passed the borrow directly and holds the same
-// obligation.
+// **The body.** It arrives as `Option<RequestBody<'_>>`, a `Copy` view of the
+// request bytes, so a decline hands the exclusive retry the very same request
+// at no cost. What an arm must not do is *read from it* before the last point
+// it could still decline: a read lands in a live member, so a read followed by
+// a decline is a write the retry would then repeat. `decode_method_args` places
+// its reads for that reason; a nested child is passed the view directly and
+// holds the same obligation.
 //
 // **Listings settle first.** A listing is the one read that composes many
 // others, so a decline discovered partway through would leave the entries before

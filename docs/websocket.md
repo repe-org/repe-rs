@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The receiver yields raw `Message` values; decode the body using `Message::json_body::<T>()`, `beve::from_slice(&msg.body)`, or `MessageView::from_slice(&frame_bytes)` as appropriate for the wire `body_format`.
+The receiver yields raw `Message` values; decode the body using `Message::json_body::<T>()`, `Message::beve_body::<T>()`, or `MessageView::from_slice(&frame_bytes)` as appropriate for the wire `body_format`.
 
 ### Subscription rules
 

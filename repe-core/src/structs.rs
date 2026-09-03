@@ -217,6 +217,16 @@ impl<'a> RequestBody<'a> {
     /// An endpoint that wants some members to be mandatory marks them
     /// `#[required]` in its structio declaration, which is per field and unions
     /// with whatever policy is in force.
+    ///
+    /// **A failed read is not transactional.** structio parses straight into
+    /// `value`, so a body that is malformed partway through leaves the members
+    /// before the fault already updated and the rest as they were, and the
+    /// error goes back to the client. That is the price of the merge: there is
+    /// no scratch copy to discard, and building one would need `T: Clone` and
+    /// cost the allocation the live read exists to avoid. An endpoint that
+    /// must not expose a torn write reads into a fresh `T::default()` with
+    /// [`read`](Self::read) and assigns on success — replace semantics — or
+    /// validates the body against the schema before applying it.
     pub fn read_into<T>(&self, path: &str, value: &mut T) -> StructResult<()>
     where
         T: ServableRead<'a>,
@@ -766,9 +776,9 @@ pub fn prepend_path(mut err: StructError, prefix: &str) -> StructError {
 /// Exactly one top-level write is expected — a value, a null, or an
 /// [`object`](Self::object).
 ///
-/// A whole-object [`object`](Self::object) listing is JSON whatever the request
-/// asked for: a BEVE object carries its member count in its header, and a
-/// listing that lets entries decline does not know the count until it is done.
+/// A whole-object [`object`](Self::object) listing honours the requested format
+/// too: a BEVE object carries its member count in its header, so the listing
+/// declares its count up front and rewinds whole if an entry declines.
 ///
 /// Writing itself cannot fail: a [`structio::json::Write`] impl returns `()`.
 /// What can still fail is the *handler* around it — a nested child that
@@ -898,8 +908,10 @@ impl<'a> ResponseBody<'a> {
     /// emitting a short one, so the declared count is never wrong.
     ///
     /// Under JSON the count is unused. Under BEVE, writing a number of entries
-    /// other than `entries` produces a corrupt document; a debug build asserts
-    /// at [`finish`](ObjectBody::finish) rather than letting it reach a peer.
+    /// other than `entries` would produce a corrupt document, so
+    /// [`finish`](ObjectBody::finish) panics on a disagreement rather than
+    /// letting it reach a peer. The derive never miscounts; a hand-written
+    /// listing that does has a bug, and the panic names it.
     pub fn object(&mut self, entries: usize) -> ObjectBody<'_> {
         let start = self.buf.len();
         let format = if self.nested {
@@ -1050,8 +1062,15 @@ impl ObjectBody<'_> {
     }
 
     /// Close the object.
+    ///
+    /// # Panics
+    ///
+    /// If the number of entries written differs from the number declared to
+    /// [`ResponseBody::object`]. Under BEVE the count is already in the header,
+    /// so a disagreement is a corrupt document, and a panic in a handler is
+    /// caught and reported by the server where corrupt bytes would not be.
     pub fn finish(self) {
-        debug_assert_eq!(
+        assert_eq!(
             self.written, self.declared,
             "repe: a listing declared {} entries and wrote {}; under BEVE the \
              count is in the header and a disagreement corrupts the document",

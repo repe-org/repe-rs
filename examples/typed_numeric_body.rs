@@ -10,7 +10,7 @@
 //!   `body_complex_slice` encode the slice in one bulk write; the receiver pulls
 //!   it back with `Message::decode_typed_slice` / `decode_complex_slice`.
 //! * **Streaming, no body buffer** -- `write_message_typed_slice` sizes the body
-//!   in closed form (`beve::typed_slice_size`) and writes the payload straight to
+//!   in closed form (`structio::beve_size`) and writes the payload straight to
 //!   the sink, so framing a multi-MiB `&[f64]` is a header write plus one bulk
 //!   write.
 //!

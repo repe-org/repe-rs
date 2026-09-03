@@ -31,47 +31,43 @@ gateway.serve(listener).await
 
 TLS and identity are both out of scope. Put this behind a terminator that already handles certificate rotation, ALPN, and authentication — an ingress, an API gateway, a sidecar. `RestConfig` reduces blast radius; it is not an access-control system, and the defaults assume something in front is doing that job.
 
-Two defaults exist specifically to keep an unauthenticated deployment from being worse than it looks:
+One default exists specifically to keep an unauthenticated deployment from being worse than it looks: **`read_only`** (default `false`) answers every mutation with `405`. Reads are what this facade is for — the safe, cacheable, CDN-frontable half. A gateway that only publishes state should say so here rather than trust an upstream to filter methods.
 
-- **`read_only`** (default `false`) answers every mutation with `405`. Reads are what this facade is for — the safe, cacheable, CDN-frontable half. A gateway that only publishes state should say so here rather than trust an upstream to filter methods.
-- **`allow_root_write`** (default `false`) refuses a `PUT` at the mount itself. The registry treats the empty pointer as a *merge* of the request object into the root, so such a write introduces keys the caller chose rather than assigning a value at a path the caller named — it can inject arbitrary state and grow the in-memory tree without bound. That is a different hazard from writing a known leaf, so it is a separate decision.
-
-A third, **`accept_beve_bodies`**, defaults to `true` but is worth knowing about: see below.
+A second, **`accept_beve_bodies`**, defaults to `true` but is worth knowing about: see below.
 
 ### Why `accept_beve_bodies` exists
 
-It was off by default while `beve` 8's deserializer had no recursion limit. Nesting is declared by the input, so a few kilobytes of nested array tags overflowed the thread stack, and a Rust stack overflow **aborts the process** rather than unwinding into the per-connection catch — one unauthenticated request took down the gateway and anything co-hosted with it. `max_body_bytes` was three orders of magnitude too loose to help.
+It was off by default while the previous BEVE decoder had no recursion limit. Nesting is declared by the input, so a few kilobytes of nested array tags overflowed the thread stack, and a Rust stack overflow **aborts the process** rather than unwinding into the per-connection catch — one unauthenticated request took down the gateway and anything co-hosted with it. `max_body_bytes` was three orders of magnitude too loose to help.
 
-`beve` 9 bounds nesting at `beve::MAX_RECURSION_DEPTH` and reports the refusal as an ordinary error, which the gateway answers with `400` like any other malformed body, so the default is now `true`. It remains a knob because content negotiation is policy: a gateway that publishes a JSON-only contract can turn it off and refuse `application/x-beve` with `415` rather than accept a representation it does not document.
+structio bounds nesting depth (256 levels) and reports the refusal as an ordinary error, which the gateway answers with `400` like any other malformed body, so the default is now `true`. It remains a knob because content negotiation is policy: a gateway that publishes a JSON-only contract can turn it off and refuse `application/x-beve` with `415` rather than accept a representation it does not document.
 
 BEVE *responses* are unaffected either way and always available: encoding is driven by the server's own data, not by an anonymous caller.
 
 ## Why the translation is mechanical
 
-A REPE query is an RFC 6901 JSON Pointer into a value tree. A REST resource is a path into a value tree. They are the same addressing scheme, so the gateway is a mapping rather than a redesign.
+A REPE query is an RFC 6901 JSON Pointer. A REST resource is a path. They are the same addressing scheme, so the gateway is a mapping rather than a redesign.
 
-The verbs fall out the same way. `Registry::dispatch` already picks between three operations, from the body alone: an empty body READs, a non-empty body against a function CALLs, a non-empty body against anything else WRITEs. Those are exactly the three HTTP verbs worth having, with matching safety and idempotency:
+The verbs fall out the same way. Every registered path is a function, and `Registry::call` has two ways of calling one: with a body, or without. Those are the verbs:
 
 | HTTP | Registry operation | Safe | Idempotent | Cacheable |
 | --- | --- | --- | --- | --- |
-| `GET` / `HEAD` | READ the value at the path | yes | yes | yes |
-| `PUT` | WRITE the value at the path | no | yes | no |
-| `POST` | CALL the function at the path | no | no | no |
+| `GET` / `HEAD` | call the function with no body | yes | yes | yes |
+| `PUT` / `POST` | call the function with the body as arguments | no | no | no |
 
 ```
 $ curl -s localhost:8080/api/v1/counter
 0
 $ curl -s -X PUT -d 42 localhost:8080/api/v1/counter
-{"path":"/counter","status":"ok"}
+42
 $ curl -s -X POST -d '{"a":2,"b":3}' localhost:8080/api/v1/add
 {"result":5}
 ```
 
-## The verb mismatch is an error, not a coercion
+## `PUT` and `POST` are aliases
 
-A `PUT` at a function answers `405`, not a silent call. A `POST` at a value answers `405`, not a silent write. `Registry::is_function` is what makes the distinction available before a body exists.
+The registry stores no values, so there is no assignment for `PUT` to mean instead of a call. Both verbs call the function at the pointer, `Allow` reports `GET, HEAD, PUT, POST, OPTIONS`, and neither is idempotent, because a call is not. A caller that wants RFC 9110 §9.2.2 idempotence out of `PUT` is relying on a promise the registry never made; the honest reading is that this gateway exposes calls and nothing else.
 
-This is the part that keeps the facade from becoming RPC in a REST costume. An API where every route is `POST` pays all of REST's costs and collects none of its guarantees: nothing is cacheable, nothing is safely retryable, and no intermediary can act on the method. Refusing the mismatched verb is what preserves the promise a caller relies on when it retries a `PUT`.
+`GET` is safe on the understanding that a bodiless call is a read. A handler that mutates when called with no body breaks that contract on its own, and a cache in front of the gateway will then serve its stale output — which is the reason to keep reads and mutations on separate paths.
 
 `OPTIONS` answers `204` with the `Allow` set the target actually supports, so the value/function distinction is discoverable:
 
@@ -105,21 +101,11 @@ Reads also carry `Vary: Accept`, because the gateway content-negotiates JSON aga
 
 Mutations carry no validator and no freshness directive. Error responses carry `Cache-Control: no-store`, because RFC 9111 §4.2.2 makes 404 and 405 heuristically cacheable — a cached 405 would keep its stale `Allow` after the path became a function, leaving the resource unreachable through its only correct verb.
 
-## Conditional writes
+## No conditional writes
 
-`If-Match` is honored on `PUT`, so the validators handed out on reads are usable for optimistic concurrency rather than decorative. A stale tag is `412` and the write does not happen:
+`If-Match` and `If-None-Match` are not evaluated on `PUT` or `POST`. They compared a tag against a stored value, and there is no stored value to compare against: a call's effect is the handler's business, and a gateway that evaluated a validator against the *previous call's output* would be answering `412` on a question nobody asked. The headers are ignored on a mutation, not refused.
 
-```
-$ curl -s -o /dev/null -w '%{http_code}\n' -X PUT -d 1 \
-    -H 'If-Match: "0000000000000000"' localhost:8080/api/v1/counter
-412
-```
-
-Comparison is strong (RFC 9110 §13.1.1), so a `W/`-prefixed weak validator never satisfies it — unlike `If-None-Match`, which uses weak comparison. `If-Match: *` requires only that the resource exist. A tag from either representation is accepted, since the client's tag came from whichever one it negotiated and changing the value changes both encodings.
-
-`If-None-Match` works on `PUT` too, where `*` is the create-only idiom (RFC 9110 §13.1.2): the write happens only if nothing is there yet, and is `412` otherwise.
-
-Both are evaluated *inside* the registry's write lock, not before it. Comparing a validator with a separate read and then writing is check-then-act — two clients holding the same tag would each see it match and both write, so the lost update the precondition exists to prevent would happen anyway. This is the guarantee that makes the validators usable for real optimistic concurrency rather than as a courtesy check.
+A handler that needs compare-and-swap takes the expected state as an argument, where it is inside the handler's own lock rather than racing outside it. That is also the stronger guarantee: a validator compared outside the lock is check-then-act, and two clients holding the same tag would both write.
 
 ## Content negotiation
 

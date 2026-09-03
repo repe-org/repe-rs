@@ -1557,7 +1557,7 @@ mod tests {
         // frame belongs to whoever sent the request. The host forwards it
         // rather than replacing it with one of its own.
         //
-        // A bodiless request to a `with_json` route is the clearest case: the
+        // A bodiless request to a `with_typed` route is the clearest case: the
         // plugin answers `InvalidBody`, which the host has no way to produce —
         // it frames only `MethodNotFound` and `InternalError`.
         let bodiless = Message::builder()

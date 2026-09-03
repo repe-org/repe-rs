@@ -167,15 +167,6 @@ where
     }
 }
 
-/// Dynamic registry of callable entries, resolved by JSON pointer.
-///
-/// One flat map keyed on the whole pointer, so dispatch is a single hash lookup
-/// — the same shape as Glaze's registry, and the same shape the struct router
-/// already had.
-///
-/// Every registered path is a function. A frame with a body calls it with the
-/// body as parameters; a frame without one calls it with `None`. There is no
-/// third case, because there are no stored values left to read or write.
 /// Newtype wrapper for a handler that writes its own response body.
 ///
 /// The two closure impls above cover a handler that *returns* a value, which
@@ -211,6 +202,15 @@ where
     }
 }
 
+/// Dynamic registry of callable entries, resolved by JSON pointer.
+///
+/// One flat map keyed on the whole pointer, so dispatch is a single hash lookup
+/// — the same shape as Glaze's registry, and the same shape the struct router
+/// already had.
+///
+/// Every registered path is a function. A frame with a body calls it with the
+/// body as parameters; a frame without one calls it with `None`. There is no
+/// third case, because there are no stored values left to read or write.
 #[derive(Default)]
 pub struct Registry {
     /// Callables keyed by their canonical JSON Pointer string, computed once at
