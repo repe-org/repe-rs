@@ -2,6 +2,7 @@ use crate::constants::{BodyFormat, ErrorCode, HEADER_SIZE};
 use crate::error::RepeError;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::io::read_message_into;
+use crate::json_pointer::MalformedPointer;
 use crate::message::{
     Message, MessageView, create_body_response_unstamped, create_error_response_like,
     create_error_response_unstamped_view, create_response_unstamped,
@@ -103,8 +104,8 @@ pub trait HandlerErased: Send + Sync {
     /// The default implementation materializes an owned [`Message`] from the view
     /// (copying the query and body) and delegates to
     /// [`handle_with_ctx`](Self::handle_with_ctx), so existing handlers work
-    /// unchanged. The built-in JSON and typed handlers ([`Router::with_json`] /
-    /// [`Router::with_typed`]) override it to decode straight from the borrowed
+    /// unchanged. The built-in typed handlers ([`Router::with_typed`] and
+    /// friends) override it to decode straight from the borrowed
     /// body and skip those copies; the other built-ins (context-aware, struct,
     /// registry, and any middleware-wrapped route) use the owning default until
     /// they are likewise overridden.
@@ -439,8 +440,8 @@ where
 }
 
 /// Decode a BEVE typed-numeric-array request body into `Vec<T>` via the bulk
-/// `read_typed_slice` path (one `copy_nonoverlapping`, no serde walk). The
-/// typed-slice twin of [`decode_typed_param`].
+/// `read_typed_slice` path (one `copy_nonoverlapping`, no per-element walk).
+/// The typed-slice twin of `decode_typed_param`.
 ///
 /// The element type of a bulk numeric route: a scalar whose in-memory bytes
 /// *are* its BEVE payload, which is what makes the encode and decode one
@@ -517,8 +518,8 @@ where
 
 /// Bulk numeric handler registered by [`Router::with_typed_slice`]: decodes a
 /// contiguous `Vec<T>` request and frames a contiguous `Vec<R>` response, both
-/// through BEVE's typed-slice fast path, bypassing serde's per-element walk on
-/// the hot numeric path.
+/// through BEVE's typed-slice fast path, bypassing the per-element walk on the
+/// hot numeric path.
 struct TypedSliceHandler<T, R, F>(F, std::marker::PhantomData<(T, R)>)
 where
     T: SliceElement + Send + Sync + 'static,
@@ -1263,7 +1264,7 @@ impl Router {
     /// to the fallback instead. The rule is uniform — a mount's miss is still a
     /// miss, at the empty root or at any prefix — and it does not reorder
     /// anything: a mount that *does* serve the path still answers it, and a
-    /// fixed route registered with [`with_json`](Self::with_json) and friends
+    /// fixed route registered with [`with_typed`](Self::with_typed) and friends
     /// still wins over both.
     ///
     /// Registration order does not matter. The composition is rebuilt whenever
@@ -1454,11 +1455,11 @@ impl Router {
     ///
     /// This is the high-throughput counterpart to [`with_typed`](Self::with_typed)
     /// for whole-body numeric arrays. `with_typed` routes `Vec<f64>` through
-    /// serde, which visits every element on both decode and encode; `with_typed_slice`
+    /// the generic encoder, which visits every element on both decode and encode; `with_typed_slice`
     /// moves the whole contiguous block in a single bounds-checked
     /// `copy_nonoverlapping` each way (on little-endian targets), bypassing the
     /// per-element walk. The bytes on the wire are identical, so a `with_typed_slice`
-    /// route interoperates freely with a serde peer and with
+    /// route interoperates freely with a `with_typed` peer and with
     /// [`AsyncClient::call_typed_slice`](crate::AsyncClient::call_typed_slice) /
     /// [`Client::call_typed_slice`](crate::Client::call_typed_slice).
     ///
@@ -1498,7 +1499,7 @@ impl Router {
     /// little-endian targets), the handler receives a `&[T]` pointing straight
     /// into that buffer: no allocation and no element copy on the way in. When the
     /// buffer is not aligned, or the client used the regular
-    /// [`call_typed_slice`](crate::AsyncClient::call_typed_slice) / serde path, the
+    /// [`call_typed_slice`](crate::AsyncClient::call_typed_slice) / `call_typed` path, the
     /// body is bulk-copied into an owned buffer first and the handler sees a `&[T]`
     /// over that. Either way the closure is identical, so a `with_typed_slice_ref`
     /// route is a drop-in superset of `with_typed_slice`: it accepts every client
@@ -2033,7 +2034,7 @@ where
         // re-split, and for an escaped pointer that is `json_pointer::parse`
         // run twice — the `Vec<String>` and its `str::replace` per token, paid
         // again to reach the identical segments.
-        let response = with_segments(relative, |segments| {
+        let response = match with_segments(relative, |segments| {
             // The shared attempt, which is the whole point of registering the
             // struct behind an `RwLock`. A mutex answers `None` from a defaulted
             // method with no work in it, so it compiles out.
@@ -2067,7 +2068,20 @@ where
             };
 
             dispatch_struct_segments(&mut *guard, segments, body, body_format, buf, req)
-        });
+        }) {
+            Ok(response) => response,
+            // A pointer with a bad `~` escape names nothing. It is refused
+            // here, before any lock is taken, because the derived impls read an
+            // *empty* segment list as the struct root: letting it through would
+            // serve the whole listing to a bodiless request and overwrite the
+            // whole struct on a write. `MethodNotFound` matches what the derive
+            // answers for a well-formed path that names no member.
+            Err(MalformedPointer) => create_error_response_like(
+                req,
+                ErrorCode::MethodNotFound,
+                format!("malformed JSON Pointer: {path}"),
+            ),
+        };
         Ok(response)
     }
 }
@@ -2091,6 +2105,9 @@ fn lock_error_response(req: &Message, path: &str, err: LockError) -> Message {
 /// * `"/"` → one reference token, empty; calls `f(&[""])`. The derive-macro
 ///   impls treat this as `InvalidPath`, matching RFC 6901 semantics ("/" points
 ///   at a field named `""`).
+/// * a malformed `~` escape → `Err(MalformedPointer)` without calling `f`. An
+///   unparseable pointer has no segments, and an empty list would be read as
+///   the root, so the caller has to answer it rather than dispatch it.
 ///
 /// The escape-free fast path (`!relative.contains('~')`, the common case for
 /// JSON Pointers) avoids the `Vec<String>` from `json_pointer::parse` and drops
@@ -2098,30 +2115,26 @@ fn lock_error_response(req: &Message, path: &str, err: LockError) -> Message {
 /// only when the path is unusually deep. The escape path keeps the original
 /// `Vec<String>` + `Vec<&str>` shape because each escaped segment genuinely
 /// needs an owned `String`.
-fn with_segments<R, F>(relative: &str, f: F) -> R
+fn with_segments<R, F>(relative: &str, f: F) -> Result<R, MalformedPointer>
 where
     F: FnOnce(&[&str]) -> R,
 {
     const STACK_SEGS: usize = 16;
 
     if relative.contains('~') {
-        // A malformed escape has no segments to dispatch on. The derived
-        // impls answer `InvalidPath` for a segment list that names nothing,
-        // and an unparseable pointer names nothing, so the empty list reaches
-        // the same answer through the same door.
-        let owned = crate::json_pointer::parse(relative).unwrap_or_default();
+        let owned = crate::json_pointer::parse(relative)?;
         let seg_refs: Vec<&str> = owned.iter().map(AsRef::as_ref).collect();
-        return f(&seg_refs);
+        return Ok(f(&seg_refs));
     }
     if relative.is_empty() {
-        return f(&[]);
+        return Ok(f(&[]));
     }
     if relative == "/" {
         // RFC 6901: "/" decodes to a single empty reference token. The old
         // `json_pointer::parse("/")` path returned `vec![""]`; the fast path
         // must match so trailing-slash requests still surface as `InvalidPath`
         // rather than silently serving the whole struct.
-        return f(&[""]);
+        return Ok(f(&[""]));
     }
 
     let trimmed = relative.strip_prefix('/').unwrap_or(relative);
@@ -2141,10 +2154,10 @@ where
             overflow = Some(v);
         }
     }
-    match overflow.as_deref() {
+    Ok(match overflow.as_deref() {
         Some(v) => f(v),
         None => f(&stack[..count]),
-    }
+    })
 }
 
 /// A response buffer sized for one leaf read.
@@ -2164,8 +2177,8 @@ fn response_buffer(req: &Message) -> Vec<u8> {
 /// the result back to a `Message`.
 ///
 /// The handler encodes through [`RepeStruct::repe_handle_into`], writing the
-/// response body straight into the buffer rather than returning a
-/// [`serde_json::Value`] for this function to re-serialize. The buffer is then
+/// response body straight into the buffer rather than returning a value tree
+/// for this function to re-serialize. The buffer is then
 /// grown by the wire prefix so [`Message::into_wire_bytes`] reuses it instead of
 /// allocating a frame, making a leaf read one allocation end to end.
 fn dispatch_struct_segments<T>(
@@ -2235,8 +2248,9 @@ fn finish_struct_response(
     }
 }
 
-/// Pluggable trait for typed JSON handlers: auto-deserializes request JSON to `In`,
-/// returns `Out` which is serialized to JSON response.
+/// Pluggable trait for typed handlers: decodes the request body (JSON or BEVE,
+/// as the frame declares) into `In`, and encodes the returned `Out` in the
+/// format the request asked for.
 pub trait JsonTypedHandler: Send + Sync {
     type In: ServableOwned + Send + 'static;
     type Out: ServableWrite + Send + 'static;
@@ -3213,8 +3227,8 @@ mod tests {
     #[test]
     fn blocking_route_behaves_like_inline_over_tcp() {
         // The _blocking constructors are WebSocket-only: the TCP server
-        // never consults Execution, so a with_json_blocking route
-        // round-trips exactly like with_json. Both TCP servers share the
+        // never consults Execution, so a with_typed_blocking route
+        // round-trips exactly like with_typed. Both TCP servers share the
         // route_request -> resolve/dispatch path; this exercises the
         // sync Server end to end.
         let router = Router::new().with_typed_blocking("/echo", |v: Count| Ok(v));

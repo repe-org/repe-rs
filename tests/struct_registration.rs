@@ -618,6 +618,54 @@ fn struct_with_root_prefix_routes() {
     assert!(router.get("/i").is_none(), "prefix should scope visibility");
 }
 
+/// A pointer with a malformed `~` escape names nothing, and must be refused as
+/// such. The derived impls read an *empty* segment list as the struct root, so
+/// a dispatcher that parsed the bad pointer to no segments would serve the
+/// whole listing to a read and overwrite the whole struct on a write.
+#[test]
+fn a_malformed_pointer_escape_is_refused_not_dispatched_to_the_root() {
+    let shared = Arc::new(Mutex::new(RootStruct {
+        foo: 7,
+        bar: "ok".into(),
+    }));
+    let router = Router::new().with_struct_shared("/svc", shared.clone());
+
+    for query in ["/svc/foo~2", "/svc/foo~", "/svc/~"] {
+        let read = router
+            .get(query)
+            .unwrap()
+            .handle(&request_empty(query))
+            .unwrap();
+        assert!(
+            read.is_error(),
+            "{query}: a malformed pointer must not read"
+        );
+        assert_eq!(read.header.ec, ErrorCode::MethodNotFound as u32, "{query}");
+        assert!(
+            read.body_utf8().contains("malformed JSON Pointer"),
+            "{query}"
+        );
+
+        let write = router
+            .get(query)
+            .unwrap()
+            .handle(&request_json(query, r##"{"foo":99,"bar":"clobbered"}"##))
+            .unwrap();
+        assert!(
+            write.is_error(),
+            "{query}: a malformed pointer must not write"
+        );
+        assert_eq!(write.header.ec, ErrorCode::MethodNotFound as u32, "{query}");
+    }
+
+    let guard = shared.lock().unwrap();
+    assert_eq!(
+        (guard.foo, guard.bar.as_str()),
+        (7, "ok"),
+        "the struct is untouched"
+    );
+}
+
 /// Pins down the RFC 6901 split between `""` and `"/"` at the dispatch
 /// boundary so the routing fast path does not silently collapse them.
 ///
