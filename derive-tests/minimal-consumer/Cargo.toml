@@ -36,4 +36,4 @@ publish = false
 # transitive packages, and structio has no dependencies to gate.
 [dependencies]
 repe-core = { path = "../../repe-core" }
-structio = "0.2.2"
+structio = "0.3.0"

@@ -22,6 +22,8 @@ It is a `macro_rules!` macro — no proc macro, no build script — and it works
 
 `#[derive(RepeStruct)]` is unchanged and still publishes endpoints. A served type needs both: the derive says what is reachable, the declaration says how it crosses the wire.
 
+An enum body has a choice of shape. `structio::tagged_enum!` writes `{"Circle":{..}}` by default; a tag clause, `tagged_enum!(Shape as tag "kind" { .. })`, writes `{"kind":"Circle",..}` instead, which is what a Glaze `std::variant` with `tag`/`ids` reads. See [Interop](docs/interop.md#a-note-on-beve-variants).
+
 ### There is no `Value`
 
 Every place that took or returned a `serde_json::Value` now names a type.

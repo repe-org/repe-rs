@@ -145,7 +145,7 @@ required-features = ["value-stream"]
 # `Router::with_typed_slice_ref`; `read_beve_array_into` for the bulk decode;
 # and `minify` / `prettify` for the CLI, which reformats a body it has no type
 # for.
-structio = "0.2.2"
+structio = "0.3.0"
 thiserror = "1"
 # Moves in lockstep with this crate: the generated code names items that only
 # exist alongside a matching release. 0.6 -> 0.7 is what keeps a `repe = "12"`

@@ -925,9 +925,9 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "structio"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "328f42650cd2d455b3b12c50ebe234f4828998584b09de5ae451a2c2f3fd0c42"
+checksum = "c2e368b7accefc5173a3184f3a198941315f95ac6f6cfec62c6832715a5ae843"
 
 [[package]]
 name = "syn"

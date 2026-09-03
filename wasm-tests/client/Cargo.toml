@@ -17,7 +17,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # The wire types the browser suite sends and expects back. `repe` re-exports
 # nothing that would let a test declare one, so the declaration macro comes from
 # structio directly.
-structio = "0.2.2"
+structio = "0.3.0"
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"
