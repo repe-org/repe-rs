@@ -38,7 +38,7 @@ structio::object!(Seq { seq });
 struct UnknownRoute<'a> {
     unknown_route: &'a str,
 }
-structio::object!(['de] UnknownRoute<'de> { unknown_route });
+structio::object!(['a] UnknownRoute<'a> { unknown_route });
 
 const ACK: Ack = Ack { ok: true };
 const SEQ_1: Seq = Seq { seq: 1 };

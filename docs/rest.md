@@ -39,7 +39,7 @@ A second, **`accept_beve_bodies`**, defaults to `true` but is worth knowing abou
 
 It was off by default while the previous BEVE decoder had no recursion limit. Nesting is declared by the input, so a few kilobytes of nested array tags overflowed the thread stack, and a Rust stack overflow **aborts the process** rather than unwinding into the per-connection catch — one unauthenticated request took down the gateway and anything co-hosted with it. `max_body_bytes` was three orders of magnitude too loose to help.
 
-structio bounds nesting depth (256 levels) and reports the refusal as an ordinary error, which the gateway answers with `400` like any other malformed body, so the default is now `true`. It remains a knob because content negotiation is policy: a gateway that publishes a JSON-only contract can turn it off and refuse `application/x-beve` with `415` rather than accept a representation it does not document.
+structio bounds nesting at `structio::beve::MAX_DEPTH` and reports the refusal as an ordinary error, which the gateway answers with `400` like any other malformed body, so the default is now `true`. It remains a knob because content negotiation is policy: a gateway that publishes a JSON-only contract can turn it off and refuse `application/x-beve` with `415` rather than accept a representation it does not document.
 
 BEVE *responses* are unaffected either way and always available: encoding is driven by the server's own data, not by an anonymous caller.
 

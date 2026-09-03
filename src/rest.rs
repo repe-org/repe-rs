@@ -170,9 +170,10 @@ pub struct RestConfig {
     /// limit: a few kilobytes of nested array tags overflowed the thread stack,
     /// and a Rust stack overflow aborts the process rather than unwinding into
     /// the per-connection catch, so one anonymous request took down every other
-    /// connection with it. structio bounds nesting depth (256 levels) and
-    /// reports the refusal as an ordinary error, which this gateway answers
-    /// with a `400` like any other malformed body. BEVE responses were never affected — encoding is driven by the
+    /// connection with it. structio bounds nesting at
+    /// [`structio::beve::MAX_DEPTH`] and reports the refusal as an ordinary
+    /// error, which this gateway answers with a `400` like any other malformed
+    /// body. BEVE responses were never affected — encoding is driven by the
     /// server's own data.
     ///
     /// Still a knob, because content negotiation is policy: a gateway that

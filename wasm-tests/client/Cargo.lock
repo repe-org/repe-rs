@@ -383,9 +383,9 @@ dependencies = [
 
 [[package]]
 name = "structio"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2e368b7accefc5173a3184f3a198941315f95ac6f6cfec62c6832715a5ae843"
+checksum = "eb179952cc91a946507b28b886300d31891b5c0d6ab67594c2ae812aad3d0c2c"
 
 [[package]]
 name = "syn"
