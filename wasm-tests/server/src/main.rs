@@ -23,6 +23,26 @@ const DEFAULT_PORT: u16 = 8791;
 
 type Ws = WebSocketStream<TcpStream>;
 
+/// The fixture bodies, declared for the JSON writer. The browser suite reads
+/// them back with declarations of its own; the field names are the contract.
+struct Ack {
+    ok: bool,
+}
+structio::object!(Ack { ok });
+
+struct Seq {
+    seq: i64,
+}
+structio::object!(Seq { seq });
+
+struct UnknownRoute<'a> {
+    unknown_route: &'a str,
+}
+structio::object!(['de] UnknownRoute<'de> { unknown_route });
+
+const ACK: Ack = Ack { ok: true };
+const SEQ_1: Seq = Seq { seq: 1 };
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port: u16 = match std::env::var("REPE_WASM_TEST_PORT") {
@@ -79,14 +99,24 @@ async fn dispatch(ws: &mut Ws, request: &Message) -> Result<Flow, Box<dyn std::e
         // Baseline: proves the request/response correlation path works at all,
         // so a failure in any other test is about that test's subject.
         "/echo" => {
-            send(ws, response(id, "/echo", request.json_body()?)).await?;
+            // Forwarded verbatim, body and format code alike: the server has no
+            // declaration for whatever the client chose to send, and does not
+            // need one.
+            let echo = Message::builder()
+                .id(id)
+                .query_str("/echo")
+                .query_format(QueryFormat::JsonPointer)
+                .body_bytes(request.body.clone())
+                .body_format_code(request.header.body_format)
+                .build();
+            send(ws, echo).await?;
         }
 
         // The notify precedes the response on the wire, so by the time the
         // client's `call` resolves, the notify has already been routed.
         "/notify-then-respond" => {
-            send(ws, notify(0, "/pushed", serde_json::json!({ "seq": 1 }))).await?;
-            send(ws, response(id, "/ack", serde_json::json!({ "ok": true }))).await?;
+            send(ws, notify(0, "/pushed", &SEQ_1)).await?;
+            send(ws, response(id, "/ack", &ACK)).await?;
         }
 
         // The case the notify-before-correlation rule exists for: a notify
@@ -94,8 +124,8 @@ async fn dispatch(ws: &mut Ws, request: &Message) -> Result<Flow, Box<dyn std::e
         // its pending map first resolves the request with this notify and then
         // has no waiter left for the real response.
         "/collide" => {
-            send(ws, notify(id, "/collided", serde_json::json!({ "seq": 1 }))).await?;
-            send(ws, response(id, "/ack", serde_json::json!({ "ok": true }))).await?;
+            send(ws, notify(id, "/collided", &SEQ_1)).await?;
+            send(ws, response(id, "/ack", &ACK)).await?;
         }
 
         // Respond first so the client has no request in flight, then send a
@@ -103,19 +133,15 @@ async fn dispatch(ws: &mut Ws, request: &Message) -> Result<Flow, Box<dyn std::e
         // decode failure as connection death drops the subscription and never
         // delivers the notify -- on a socket that is still perfectly alive.
         "/undecodable-then-notify" => {
-            send(ws, response(id, "/ack", serde_json::json!({ "ok": true }))).await?;
+            send(ws, response(id, "/ack", &ACK)).await?;
             ws.send(WsMessage::Text("not a repe frame".into())).await?;
-            send(
-                ws,
-                notify(0, "/after-undecodable", serde_json::json!({ "seq": 1 })),
-            )
-            .await?;
+            send(ws, notify(0, "/after-undecodable", &SEQ_1)).await?;
         }
 
         // Server-initiated close with the client still alive, which is the only
         // way a push-only consumer can learn the connection is gone.
         "/close-after-response" => {
-            send(ws, response(id, "/ack", serde_json::json!({ "ok": true }))).await?;
+            send(ws, response(id, "/ack", &ACK)).await?;
             ws.close(None).await?;
             return Ok(Flow::Close);
         }
@@ -126,7 +152,9 @@ async fn dispatch(ws: &mut Ws, request: &Message) -> Result<Flow, Box<dyn std::e
                 response(
                     id,
                     "/error",
-                    serde_json::json!({ "unknown_route": unknown }),
+                    &UnknownRoute {
+                        unknown_route: unknown,
+                    },
                 ),
             )
             .await?;
@@ -141,21 +169,20 @@ async fn send(ws: &mut Ws, message: Message) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-fn response(id: u64, query: &str, body: serde_json::Value) -> Message {
+fn response<T: structio::json::Write>(id: u64, query: &str, body: &T) -> Message {
     build(id, query, body, false)
 }
 
-fn notify(id: u64, query: &str, body: serde_json::Value) -> Message {
+fn notify<T: structio::json::Write>(id: u64, query: &str, body: &T) -> Message {
     build(id, query, body, true)
 }
 
-fn build(id: u64, query: &str, body: serde_json::Value, notify: bool) -> Message {
+fn build<T: structio::json::Write>(id: u64, query: &str, body: &T, notify: bool) -> Message {
     Message::builder()
         .id(id)
         .notify(notify)
         .query_str(query)
         .query_format(QueryFormat::JsonPointer)
-        .body_json(&body)
-        .expect("fixture bodies are valid JSON")
+        .body_json(body)
         .build()
 }

@@ -16,4 +16,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 # tests frame identically.
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
-serde_json = "1"
+# The fixture bodies are declared with `structio::object!`, which `repe` does
+# not re-export.
+structio = "0.3.0"
