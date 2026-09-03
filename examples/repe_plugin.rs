@@ -22,12 +22,11 @@
 //! here so the repository builds and link-checks it on every CI run.
 
 use repe::server::Router;
-use serde::{Deserialize, Serialize};
 
 /// The object this plugin publishes. Every field becomes a readable and
 /// writable endpoint under the plugin's root; every method in the `impl` block
 /// below becomes a callable one.
-#[derive(Default, Serialize, Deserialize, repe::RepeStruct)]
+#[derive(Default, repe::RepeStruct)]
 #[repe(methods)]
 struct Instrument {
     /// Read-write: `/instrument/gain`.
@@ -43,6 +42,12 @@ struct Instrument {
     #[repe(typed)]
     samples: [f64; 8],
 }
+structio::object!(Instrument {
+    gain,
+    channel,
+    firmware,
+    samples
+});
 
 /// A command failed on the device. Any `Display` error works; the crate turns it
 /// into a REPE error response.

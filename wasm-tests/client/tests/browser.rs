@@ -17,6 +17,34 @@ use repe::{AlreadySubscribed, Message, WasmClient};
 use std::future::Future;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
+// ---- wire fixtures ----
+//
+// A body is a declared type now: there is no document model, so a call names
+// what it sends and what it expects back.
+
+/// An empty body: `{}` on the wire.
+#[derive(Default, Debug, PartialEq)]
+struct Empty;
+structio::object!(Empty {});
+
+#[derive(Default, Debug, PartialEq)]
+struct Ack {
+    ok: bool,
+}
+structio::object!(Ack { ok });
+
+#[derive(Default, Debug, PartialEq)]
+struct Greeting {
+    hello: String,
+}
+structio::object!(Greeting { hello });
+
+#[derive(Default, Debug, PartialEq)]
+struct Seq {
+    seq: i64,
+}
+structio::object!(Seq { seq });
+
 wasm_bindgen_test_configure!(run_in_browser);
 
 /// Kept in step with `DEFAULT_PORT` in `wasm-tests/server/src/main.rs`.
@@ -63,12 +91,17 @@ async fn a_json_call_round_trips() {
     // Baseline. If this fails, every other failure here is downstream of it.
     let client = connect().await;
 
-    let echoed = client
-        .call_json("/echo", &serde_json::json!({ "hello": "browser" }))
+    let echoed: Greeting = client
+        .call_typed_json::<_, _, Greeting>(
+            "/echo",
+            &Greeting {
+                hello: "browser".into(),
+            },
+        )
         .await
         .expect("call should succeed");
 
-    assert_eq!(echoed, serde_json::json!({ "hello": "browser" }));
+    assert_eq!(echoed.hello, "browser");
 }
 
 #[wasm_bindgen_test]
@@ -79,17 +112,14 @@ async fn a_pushed_notify_reaches_the_subscriber() {
     let mut notifies = client.subscribe_notifies().expect("subscribe");
 
     client
-        .call_json("/notify-then-respond", &serde_json::json!({}))
+        .call_typed_json::<_, _, Ack>("/notify-then-respond", &Empty)
         .await
         .expect("call should succeed");
 
     let pushed = expect_notify(&mut notifies).await;
     assert_eq!(pushed.query_utf8(), "/pushed");
     assert!(pushed.header.notify != 0);
-    assert_eq!(
-        pushed.json_body::<serde_json::Value>().unwrap(),
-        serde_json::json!({ "seq": 1 })
-    );
+    assert_eq!(pushed.json_body::<Seq>().unwrap(), Seq { seq: 1 });
 }
 
 #[wasm_bindgen_test]
@@ -101,12 +131,12 @@ async fn a_notify_sharing_a_request_id_does_not_steal_the_response() {
     let client = connect().await;
     let mut notifies = client.subscribe_notifies().expect("subscribe");
 
-    let response = client
-        .call_json("/collide", &serde_json::json!({}))
+    let response: Ack = client
+        .call_typed_json::<_, _, Ack>("/collide", &Empty)
         .await
         .expect("the real response should still arrive");
 
-    assert_eq!(response, serde_json::json!({ "ok": true }));
+    assert!(response.ok);
 
     let collided = expect_notify(&mut notifies).await;
     assert_eq!(collided.query_utf8(), "/collided");
@@ -121,7 +151,7 @@ async fn an_undecodable_frame_does_not_end_the_subscription() {
     let mut notifies = client.subscribe_notifies().expect("subscribe");
 
     client
-        .call_json("/undecodable-then-notify", &serde_json::json!({}))
+        .call_typed_json::<_, _, Ack>("/undecodable-then-notify", &Empty)
         .await
         .expect("call should succeed");
 
@@ -139,7 +169,7 @@ async fn the_stream_ends_when_the_server_closes() {
     let mut notifies = client.subscribe_notifies().expect("subscribe");
 
     client
-        .call_json("/close-after-response", &serde_json::json!({}))
+        .call_typed_json::<_, _, Ack>("/close-after-response", &Empty)
         .await
         .expect("call should succeed");
 
@@ -186,7 +216,7 @@ async fn notifies_sent_before_subscribing_are_dropped() {
     let client = connect().await;
 
     client
-        .call_json("/notify-then-respond", &serde_json::json!({}))
+        .call_typed_json::<_, _, Ack>("/notify-then-respond", &Empty)
         .await
         .expect("call should succeed");
 
@@ -195,7 +225,7 @@ async fn notifies_sent_before_subscribing_are_dropped() {
     // The second round-trip's notify is the first this subscriber can see; if
     // the earlier one had been queued it would arrive here instead.
     client
-        .call_json("/collide", &serde_json::json!({}))
+        .call_typed_json::<_, _, Ack>("/collide", &Empty)
         .await
         .expect("call should succeed");
 

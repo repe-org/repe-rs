@@ -7,47 +7,50 @@
 //! publish a couple of paths. Its choices without this crate were to derive
 //! nothing and concede the sub-paths, or to take the whole dependency.
 //!
-//! So this carries the four things a type needs to *be* served and nothing that
-//! serves it:
+//! So this carries what a type needs to *be* served and nothing that serves it:
 //!
 //! * [`RepeStruct`], the dispatch trait, and [`RepeMethods`], the method table
 //!   `#[repe::methods]` generates beside it;
+//! * [`RequestBody`] and [`ResponseBody`], what a write decodes from and a read
+//!   encodes into;
+//! * [`Servable`] and its halves, what a type must satisfy to cross a frame;
 //! * [`StructError`], what a handler reports;
-//! * [`ResponseBody`], what a read encodes into;
-//! * [`constants`], the protocol enums those two name.
+//! * [`constants`], the protocol enums those name.
 //!
 //! `repe` re-exports every one of them at the same paths, so a type derived
 //! against this crate mounts on a `repe::Router` with nothing in between, and
 //! `#[derive(RepeStruct)]` resolves its generated paths against whichever of the
 //! two crates it finds.
 //!
-//! # Features
+//! # Encoding
 //!
-//! **`typed`** — off by default — adds [`ResponseBody::write_typed_slice`], the
-//! BEVE typed-numeric array encoding a `#[repe(typed)]` field is read as, and
-//! with it the `beve` dependency and the six packages behind it.
+//! Bodies are read and written by [`structio`], which carries JSON and BEVE in
+//! one crate with no dependencies of its own and no intermediate `Value`. A
+//! request is parsed straight into the live field it is destined for and a
+//! response is written straight into the outgoing frame, so a read costs one
+//! pass rather than three.
 //!
-//! It is off because that encoder is the whole weight of this crate: without it
-//! the dependency list is `serde`, `serde_json` and `thiserror`, which is the
-//! point of depending here rather than on `repe`. A struct with no
-//! `#[repe(typed)]` field — the usual case for a crate that only declares a
-//! served type — compiles identically either way. One that has such a field
-//! gets a compile error naming the feature, from a bound with no implementors
-//! (`structs::TypedSliceElement`, which exists only in this configuration); it
-//! never falls back to a JSON array silently, since that would change the wire
-//! without saying so.
+//! There are no features. The `typed` feature this crate used to carry existed
+//! only because the BEVE encoder arrived with `beve` and six transitive packages
+//! behind it, and a crate that merely *declares* a served type should not link
+//! one to say so. That cost is gone, so
+//! [`ResponseBody::write_typed_slice`](structs::ResponseBody::write_typed_slice)
+//! is always there.
 //!
-//! `repe` enables it unconditionally, so nothing about `#[repe(typed)]` changes
-//! for a crate that depends on `repe`.
+//! A served field's own type is declared with structio's macros rather than with
+//! a derive; `#[derive(RepeStruct)]` publishes the *endpoints*, and structio
+//! describes the *encoding*.
 //!
 //! ```
 //! use repe_core::RepeStruct;
 //!
-//! #[derive(serde::Serialize, serde::Deserialize, RepeStruct)]
+//! #[derive(Default, RepeStruct)]
 //! struct Build {
 //!     version: String,
 //!     revision: u64,
 //! }
+//!
+//! structio::object!(Build { version, revision });
 //! ```
 //!
 //! [`repe`]: https://docs.rs/repe
@@ -61,7 +64,10 @@ pub mod constants;
 pub mod structs;
 
 pub use constants::{BodyFormat, ErrorCode, HEADER_SIZE, QueryFormat, REPE_SPEC, REPE_VERSION};
-pub use structs::{RepeStruct, ResponseBody, StructError};
+pub use structs::{
+    MethodArgs, RepeStruct, RequestBody, ResponseBody, Servable, ServableRead, ServableWrite,
+    StructError,
+};
 
 /// Derive macro generating a [`structs::RepeStruct`] implementation from a
 /// struct's fields.
@@ -73,23 +79,3 @@ pub use repe_derive::RepeStruct;
 /// Pair it with `#[repe(methods)]` on the `#[derive(RepeStruct)]` struct; each
 /// half asserts the other, so neither can be forgotten silently.
 pub use repe_derive::methods;
-
-/// Items named by `#[derive(RepeStruct)]`'s generated code. Not public API:
-/// nothing outside the derive should name anything here, and its contents may
-/// change in any release.
-///
-/// It exists so generated code reaches `serde_json` through the crate that
-/// *defines* the trait rather than through the deriving crate's own dependency
-/// list. That buys two things. A deriving crate no longer has to declare
-/// `serde_json` for paths nothing in its source mentions — which matters most
-/// to exactly the light-dependency crate `repe-core` was split out for. And
-/// `RepeStruct`'s signatures name `serde_json::Value`, so the emitted impl must
-/// use the *same* `serde_json` the trait was declared with; resolving through
-/// here makes that structural instead of a coincidence of everyone being on
-/// `serde_json` 1.x, and it keeps working for a crate that renames the
-/// dependency (`json = { package = "serde_json" }`), which the old absolute
-/// `::serde_json` path did not.
-#[doc(hidden)]
-pub mod __private {
-    pub use serde_json;
-}

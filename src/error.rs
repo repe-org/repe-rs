@@ -36,10 +36,19 @@ pub enum RepeError {
     ResponseIdMismatch { expected: u64, got: u64 },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// A JSON body did not parse.
+    ///
+    /// structio has one `Error` for both formats and deliberately does not
+    /// record which one produced it — the reasoning being that the caller knows,
+    /// because it chose the parser. repe does: every decode site here has
+    /// already read the frame header and so has the `BodyFormat` in hand. These
+    /// two variants are that knowledge written down, which is why neither
+    /// carries a `#[from]`: an impl could not tell them apart.
     #[error("json error: {0}")]
-    Json(#[from] serde_json::Error),
+    Json(#[source] structio::Error),
+    /// A BEVE body did not parse.
     #[error("beve error: {0}")]
-    Beve(#[from] beve::Error),
+    Beve(#[source] structio::Error),
     #[error("unknown value for enum conversion: {0}")]
     UnknownEnumValue(u64),
     #[error("unexpected body format: expected {expected:?}, got format code {got}")]
@@ -69,6 +78,41 @@ pub enum RepeError {
 }
 
 impl RepeError {
+    /// A parse failure attributed to the format the frame header declared.
+    ///
+    /// The one place the `Json` / `Beve` split is made, so a decode site names
+    /// its format once rather than choosing a variant by hand.
+    pub fn decode(format: crate::constants::BodyFormat, source: structio::Error) -> Self {
+        match format {
+            crate::constants::BodyFormat::Beve => RepeError::Beve(source),
+            _ => RepeError::Json(source),
+        }
+    }
+
+    /// [`decode`](Self::decode) for a streaming read, whose failure may be I/O
+    /// rather than content.
+    ///
+    /// An `io::Error` stays an `io::Error` all the way up rather than being
+    /// flattened into a parse error. There is deliberately no
+    /// `From<structio::StreamError>` beside this: `StreamError` is
+    /// format-independent — `json::Documents` and `json::Feed` raise the same
+    /// `Parse` variant that BEVE does — so a `From` impl would have to guess
+    /// which format failed, which is exactly what these two variants exist to
+    /// avoid.
+    pub fn decode_stream(format: crate::constants::BodyFormat, err: structio::StreamError) -> Self {
+        match err {
+            structio::StreamError::Io(err) => RepeError::Io(err),
+            structio::StreamError::Parse(err) => RepeError::decode(format, err),
+            // `StreamError` is non-exhaustive. A variant added later is content
+            // rather than I/O until it says otherwise, so it is attributed to
+            // the format like any other parse failure.
+            _ => RepeError::decode(
+                format,
+                structio::Error::new(structio::ErrorCode::InvalidUtf8, 0),
+            ),
+        }
+    }
+
     pub fn to_error_code(&self) -> ErrorCode {
         match self {
             RepeError::VersionMismatch(_) => ErrorCode::VersionMismatch,
@@ -153,11 +197,11 @@ mod tests {
                 ErrorCode::ParseError,
             ),
             (
-                RepeError::Json(serde_json::Error::io(std::io::Error::other("json"))),
+                RepeError::Json(structio::Error::new(structio::ErrorCode::ExpectedBrace, 0)),
                 ErrorCode::ParseError,
             ),
             (
-                RepeError::Beve(beve::Error::msg("beve")),
+                RepeError::Beve(structio::Error::new(structio::ErrorCode::ExpectedObject, 0)),
                 ErrorCode::ParseError,
             ),
             (RepeError::UnknownEnumValue(9), ErrorCode::ParseError),

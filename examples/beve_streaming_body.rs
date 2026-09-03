@@ -4,29 +4,29 @@
 //! writes the header/query/body straight to the sink (no separately-allocated
 //! wire frame):
 //!
-//! * **Reusable scratch buffer** -- serialize each body once into a single
-//!   `Vec<u8>` with `beve::to_vec_into`, which reuses the allocation and clears
-//!   it on every call. One encode per frame and, once the buffer has grown to
-//!   fit the largest body, no further allocation. The default for a writer
-//!   sending many frames whose bodies fit in memory.
+//! * **Reusable scratch buffer** -- encode each body into a single `Vec<u8>`
+//!   with `structio::beve::write_into`, which clears it and keeps the
+//!   allocation. One encode per frame and, once the buffer has grown to fit the
+//!   largest body, no further allocation. The default for a writer sending many
+//!   frames whose bodies fit in memory.
 //! * **Zero-buffer streaming** -- measure the encoded length with
-//!   `beve::serialized_size`, then stream the body to the sink with
-//!   `beve::to_writer_streaming`. The body is never materialized. This costs a
-//!   size pass over the value (O(1) for a `&[u8]`/`serde_bytes` blob or a
-//!   `beve::TypedSlice<T>`, O(payload) for a nested structure); reach for it
-//!   when the body is too large to hold in memory at once.
+//!   `structio::beve_size`, then stream the body to the sink with
+//!   `structio::beve::to_writer`. The body is never materialized. This costs a
+//!   size pass over the value (O(1) for a numeric slice, O(payload) for a
+//!   nested structure); reach for it when the body is too large to hold in
+//!   memory at once.
 //!
 //! Run with: `cargo run --example beve_streaming_body`
 
 use repe::{BodyFormat, Header, QueryFormat, write_message_streaming};
-use serde::{Deserialize, Serialize};
 use std::io::Write;
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Default, Debug, PartialEq)]
 struct SensorFrame {
     id: u64,
     samples: Vec<f64>,
 }
+structio::object!(SensorFrame { id, samples });
 
 fn header_for(frame: &SensorFrame) -> Header {
     let mut header = Header::new();
@@ -44,7 +44,7 @@ fn send_with_scratch(frames: &[SensorFrame]) -> Result<Vec<u8>, Box<dyn std::err
 
     for frame in frames {
         // Single encode into the reused buffer (clears + keeps capacity).
-        beve::to_vec_into(&mut body, frame)?;
+        structio::beve::write_into(frame, &mut body);
         write_message_streaming(
             &mut sink,
             header_for(frame),
@@ -68,15 +68,17 @@ fn send_zero_buffer(frames: &[SensorFrame]) -> Result<Vec<u8>, Box<dyn std::erro
     let mut sink: Vec<u8> = Vec::new();
 
     for frame in frames {
-        let body_len = beve::serialized_size(frame)?;
-        // body_writer returns beve::Result directly: its error type only needs
-        // to be Into<RepeError>, so a beve encode error stays a RepeError::Beve.
+        // Measured in closed form, without encoding anything.
+        let body_len = structio::beve_size(frame) as u64;
+        // The closure's only failure is the sink's: a structio encode is
+        // infallible, so what reaches `write_message_streaming` is an
+        // `io::Result` and nothing else.
         write_message_streaming(
             &mut sink,
             header_for(frame),
             b"/ingest/frame",
             body_len,
-            |w| beve::to_writer_streaming(w, frame),
+            |w| structio::beve::to_writer(frame, w),
         )?;
         println!(
             "  zero-buffer: sent frame {} ({body_len} body bytes)",

@@ -121,14 +121,40 @@ async fn serde_route_interops_with_typed_slice_client() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn wrong_element_type_is_an_error() {
-    // Server expects f64; client sends f32. The element class/width disagree, so
-    // the bulk decoder rejects rather than misreading.
+async fn a_narrower_element_type_is_widened_rather_than_refused() {
+    // Server expects f64; client sends f32. The widths disagree and the reader
+    // converts, element by element, rather than refusing — so this route is
+    // reachable from a client that stores its samples narrower.
+    //
+    // Under `beve` a width mismatch was an error, and this test asserted the
+    // refusal. The conversion is the better rule: which width a peer chose to
+    // store is not something the two sides should have to agree on, and the
+    // bulk path is still taken wherever they do agree.
     let router = Router::new().with_typed_slice::<f64, f64, _>("/echo", Ok);
     let addr = spawn(router).await;
     let client = AsyncClient::connect(&addr).await.expect("connect");
 
     let fs: Vec<f32> = vec![1.0, 2.0, 3.0];
-    let res: Result<Vec<f32>, _> = client.call_typed_slice("/echo", &fs).await;
-    assert!(res.is_err(), "f32 into an f64 route must error");
+    let out: Vec<f32> = client
+        .call_typed_slice("/echo", &fs)
+        .await
+        .expect("a narrower element type is widened on the way in");
+    assert_eq!(out, fs);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_non_numeric_body_is_an_error() {
+    // Width is negotiable; class is not. A JSON body against a bulk numeric
+    // route is refused rather than reinterpreted.
+    let router = Router::new().with_typed_slice::<f64, f64, _>("/echo", Ok);
+    let addr = spawn(router).await;
+    let client = AsyncClient::connect(&addr).await.expect("connect");
+
+    let res: Result<Vec<f64>, _> = client
+        .call_typed_json("/echo", &"not a numeric array".to_string())
+        .await;
+    assert!(
+        res.is_err(),
+        "a JSON body into a bulk numeric route must error"
+    );
 }

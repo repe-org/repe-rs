@@ -12,20 +12,46 @@
 //! a prefix check (or HashMap probe) plus a single `Arc::clone` of a handler
 //! `Arc` built at registration time. The `middleware` variants of these
 //! benches surface that hoisting directly.
+//!
+//! A fourth group used to measure a registry *value* read and write three
+//! levels deep, where resolving a pointer walked a tree and allocated a
+//! `String` per segment. The registry stores no values any more — every path is
+//! a function, resolved by one hash lookup on the whole pointer — so that walk
+//! does not exist and there is nothing there to measure.
 
 use benchit::Bench;
 use repe::registry::{Registry, RegistryCallable};
 use repe::server::{Middleware, Next, Router};
+use repe::structs::{RequestBody, ResponseBody};
 use repe::{BodyFormat, Message, QueryFormat};
-use serde_json::{Value, json};
 use std::hint::black_box;
 use std::sync::{Arc, Mutex};
 
-#[derive(Default, serde::Serialize, serde::Deserialize, repe::RepeStruct)]
+// ---- wire fixtures ----
+
+/// An empty body: `{}` on the wire.
+#[derive(Default, Debug, PartialEq)]
+struct Empty;
+structio::object!(Empty {});
+
+#[derive(Default, Debug, PartialEq)]
+struct Ack {
+    ok: bool,
+}
+structio::object!(Ack { ok });
+
+#[derive(Default, Debug, PartialEq)]
+struct Sum {
+    sum: i64,
+}
+structio::object!(Sum { sum });
+
+#[derive(Default, repe::RepeStruct)]
 #[repe(methods(get_number(&self) -> i32))]
 struct BenchStruct {
     counter: i32,
 }
+structio::object!(BenchStruct { counter });
 
 impl BenchStruct {
     fn get_number(&self) -> i32 {
@@ -51,14 +77,16 @@ impl RegistryCallable for BenchCallable {
     fn call(
         &self,
         _ctx: &repe::peer::CallContext,
-        _body: Option<Value>,
-    ) -> Result<Value, (repe::ErrorCode, String)> {
-        Ok(json!({"ok": true}))
+        _body: Option<RequestBody<'_>>,
+        out: &mut ResponseBody<'_>,
+    ) -> Result<(), (repe::ErrorCode, String)> {
+        out.write(&Ack { ok: true });
+        Ok(())
     }
 }
 
 fn build_plain_router(with_middleware: bool) -> Router {
-    let router = Router::new().with_json("/sum", |_v: Value| Ok(json!({"sum": 0})));
+    let router = Router::new().with_typed("/sum", |_: Empty| Ok(Sum { sum: 0 }));
     if with_middleware {
         router.with_middleware(PassThrough)
     } else {
@@ -77,27 +105,6 @@ fn build_registry_router(with_middleware: bool) -> Router {
     }
 }
 
-/// A registry holding a value three levels deep. Reads and writes against it
-/// exercise `parse_pointer` + `resolve_ref` / `set_pointer` — the value-tree
-/// walk that allocated a `String` per segment (the `walked`/`parent_path`
-/// clone plus the unconditional `unescape_token` allocation). The function
-/// route above never reaches that code: it resolves through `canonical_key`'s
-/// borrow fast path.
-fn build_registry_value_router() -> Router {
-    let registry = Arc::new(Registry::new());
-    registry.register_value("/a/b/c", json!({"v": 1})).unwrap();
-    Router::new().with_registry("/api", registry)
-}
-
-/// Empty body => READ (resolve_ref), not a function call.
-fn build_read_request(path: &str) -> Message {
-    Message::builder()
-        .id(1)
-        .query_str(path)
-        .query_format(QueryFormat::JsonPointer)
-        .build()
-}
-
 fn build_struct_router(with_middleware: bool) -> Router {
     let shared = Arc::new(Mutex::new(BenchStruct { counter: 7 }));
     let router = Router::new().with_struct_shared::<BenchStruct, _>("/svc", shared);
@@ -113,8 +120,7 @@ fn build_request(path: &str) -> Message {
         .id(1)
         .query_str(path)
         .query_format(QueryFormat::JsonPointer)
-        .body_json(&json!({}))
-        .unwrap()
+        .body_json(&Empty)
         .body_format(BodyFormat::Json)
         .build()
 }
@@ -199,30 +205,8 @@ fn bench_full_dispatch(bench: &mut Bench) {
     group.finish();
 }
 
-fn bench_registry_value(bench: &mut Bench) {
-    let router = build_registry_value_router();
-    let read_req = build_read_request("/api/a/b/c");
-    let write_req = build_request("/api/a/b/c"); // non-empty body => WRITE (set_pointer)
-
-    let mut group = bench.group("registry_value");
-    group.bench("read_depth3", |b| {
-        b.iter(|| {
-            let h = router.get(black_box("/api/a/b/c")).unwrap();
-            h.handle(&read_req).unwrap()
-        })
-    });
-    group.bench("write_depth3", |b| {
-        b.iter(|| {
-            let h = router.get(black_box("/api/a/b/c")).unwrap();
-            h.handle(&write_req).unwrap()
-        })
-    });
-    group.finish();
-}
-
 fn main() {
     let mut bench = Bench::from_args();
     bench_router_get(&mut bench);
     bench_full_dispatch(&mut bench);
-    bench_registry_value(&mut bench);
 }

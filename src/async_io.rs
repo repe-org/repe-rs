@@ -55,6 +55,12 @@ mod tests {
     use super::*;
     use crate::constants::{BodyFormat, QueryFormat};
 
+    #[derive(Default, Debug, PartialEq)]
+    struct Greeting {
+        hello: String,
+    }
+    structio::object!(Greeting { hello });
+
     #[tokio::test]
     async fn async_read_write_roundtrip() {
         let (mut a, b) = tokio::io::duplex(4096);
@@ -62,8 +68,9 @@ mod tests {
             .id(9)
             .query_str("/ping")
             .query_format(QueryFormat::JsonPointer)
-            .body_json(&serde_json::json!({"hello": "world"}))
-            .unwrap()
+            .body_json(&Greeting {
+                hello: "world".into(),
+            })
             .build();
 
         // Write on one end, read on the other

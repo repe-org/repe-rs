@@ -50,111 +50,72 @@ pub fn methods(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 // ---------------------------------------------------------------------------
-// Sink — the one place the two generated dispatch bodies differ
+// Response emitters — how a generated arm answers
 // ---------------------------------------------------------------------------
+//
+// These were methods on a `Sink` enum, because `RepeStruct` used to carry two
+// dispatch methods that had to agree: `repe_handle` returned an owned
+// `serde_json::Value` and `repe_handle_into` encoded straight into the response
+// body, and generating both from one `Sink`-parameterised builder is what kept
+// them in lockstep. There is one dispatch method now — the `Value` form went
+// with `serde_json::Value` — so the parameter, and the whole class of bug it
+// guarded against, is gone.
 
-/// Which response representation a generated arm produces.
-///
-/// `RepeStruct` carries two dispatch methods that must agree: `repe_handle`
-/// returns an owned `serde_json::Value`, `repe_handle_into` encodes straight
-/// into the response body. Rather than write two code generators, every builder
-/// below takes a `Sink` and emits the response through these four methods — so
-/// the pair stays in lockstep by construction, and a reader can check the whole
-/// difference between the two paths in one place.
-///
-/// They agree on *what* each path answers with, not on key order: a
-/// `serde_json::Map` sorts its keys unless the graph enables
-/// `serde_json/preserve_order`, so the `Value` form can carry neither
-/// declaration order nor `#[repe(listing_order(..))]`. The router calls
-/// `repe_handle_into`, so every frame a client sees carries the order; see
-/// `build_listing`.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Sink {
-    /// `RepeStruct::repe_handle` / `RepeMethods::repe_call`.
-    Value,
-    /// `RepeStruct::repe_handle_into` / `RepeMethods::repe_call_into`.
-    Encode,
+/// Respond with nothing: the acknowledgement for a write, or a method returning
+/// `()`.
+fn emit_null() -> TokenStream2 {
+    quote! {
+        {
+            out.write_null();
+            Ok(())
+        }
+    }
 }
 
-impl Sink {
-    /// Respond with nothing: the acknowledgement for a write, or a method
-    /// returning `()`.
-    fn emit_null(self) -> TokenStream2 {
-        match self {
-            Sink::Value => quote! { Ok(None) },
-            Sink::Encode => quote! {
-                {
-                    out.write_null();
-                    Ok(())
-                }
-            },
+/// Respond with `expr`, serialized as JSON.
+///
+/// Deliberately an expression of type `StructResult<()>` rather than
+/// `{ write(..)?; Ok(()) }`. That is what makes it usable where `?` is not,
+/// which is how the shared-borrow read path reuses these emitters verbatim
+/// under its `Option` return instead of keeping a second copy of them.
+///
+/// No error path and no endpoint literal: a `structio::json::Write` impl
+/// returns `()`, so writing a response cannot fail.
+fn emit_value(expr: TokenStream2) -> TokenStream2 {
+    emit_value_spanned(Span::call_site(), expr)
+}
+
+/// [`emit_value`] with the span a bound failure should point at.
+///
+/// structio's bounds are what a user trips here — a field whose type has no
+/// `object!` declaration — and the token worth underlining is the field, not the
+/// derive that happened to visit it. Same reasoning as the `quote_spanned!` on
+/// a method invocation below, with more force: a field's type is written down
+/// right there.
+fn emit_value_spanned(span: Span, expr: TokenStream2) -> TokenStream2 {
+    quote_spanned! {span=>
+        {
+            out.write(&#expr);
+            Ok(())
         }
     }
+}
 
-    /// Respond with `expr`, serialized. `path` is a string literal naming the
-    /// endpoint, read only if serialization fails.
-    ///
-    /// The encoding form is the write's own `StructResult` rather than
-    /// `{ write(..)?; Ok(()) }`, which is the same thing spelled longer. That
-    /// matters beyond brevity: it makes the expression usable where `?` is not,
-    /// which is how the shared-borrow read path reuses these emitters verbatim
-    /// under its `Option` return instead of keeping a second copy of them.
-    fn emit_value(self, repe: &TokenStream2, path: &LitStr, expr: TokenStream2) -> TokenStream2 {
-        match self {
-            Sink::Value => quote! {
-                {
-                    let value = #repe::__private::serde_json::to_value(&#expr)
-                        .map_err(|source| #repe::StructError::Serialize {
-                            path: String::from(#path),
-                            source,
-                        })?;
-                    Ok(Some(value))
-                }
-            },
-            Sink::Encode => quote! { out.write(#path, &#expr) },
-        }
-    }
+/// Respond with `expr` as a BEVE typed numeric array.
+///
+/// Inside an enclosing object the body falls back to a JSON array, which
+/// `ResponseBody` decides for itself — see its `nested` flag.
+fn emit_typed_slice(expr: TokenStream2) -> TokenStream2 {
+    emit_typed_slice_spanned(Span::call_site(), expr)
+}
 
-    /// Respond with `slice` as a BEVE typed numeric array.
-    ///
-    /// Only the encoding path can carry one; a `Value` has no representation for
-    /// a typed body, so it falls back to the JSON array. That divergence is the
-    /// documented cost of `#[repe(typed)]`.
-    fn emit_typed_slice(
-        self,
-        repe: &TokenStream2,
-        path: &LitStr,
-        expr: TokenStream2,
-    ) -> TokenStream2 {
-        match self {
-            Sink::Value => self.emit_value(repe, path, expr),
-            Sink::Encode => quote! { out.write_typed_slice(#path, &#expr[..]) },
-        }
-    }
-
-    /// The `RepeStruct` dispatch method this sink calls on a nested field.
-    fn struct_method(self) -> Ident {
-        match self {
-            Sink::Value => format_ident!("repe_handle"),
-            Sink::Encode => format_ident!("repe_handle_into"),
-        }
-    }
-
-    /// The `RepeMethods` dispatch method this sink calls for a path that
-    /// matched no field.
-    fn methods_method(self) -> Ident {
-        match self {
-            Sink::Value => format_ident!("repe_call"),
-            Sink::Encode => format_ident!("repe_call_into"),
-        }
-    }
-
-    /// Append the response body to an argument list, which only the encoding
-    /// path threads through.
-    fn with_out(self, args: TokenStream2) -> TokenStream2 {
-        match self {
-            Sink::Value => args,
-            Sink::Encode => quote! { #args, out },
+/// [`emit_typed_slice`] with the span a bound failure should point at. See
+/// [`emit_value_spanned`].
+fn emit_typed_slice_spanned(span: Span, expr: TokenStream2) -> TokenStream2 {
+    quote_spanned! {span=>
+        {
+            out.write_typed_slice(&#expr[..]);
+            Ok(())
         }
     }
 }
@@ -291,22 +252,15 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
     };
 
     let mut bodies = Vec::new();
-    for sink in [Sink::Value, Sink::Encode] {
-        let listing = build_listing(
-            &entries,
-            &repe,
-            match sink {
-                Sink::Value => ListingSink::Value,
-                Sink::Encode => ListingSink::Encode,
-            },
-        );
-        let field_arms = build_field_arms(&field_specs, &repe, sink);
-        let method_arms = build_method_arms(&struct_attrs.methods, &repe, sink, Raise::Result);
+    {
+        let listing = build_listing(&entries, &repe, Borrow::Exclusive);
+        let field_arms = build_field_arms(&field_specs, &repe, Borrow::Exclusive);
+        let method_arms = build_method_arms(&struct_attrs.methods, &repe, Borrow::Exclusive);
         let fallthrough = if from_impl_block {
-            let call = sink.methods_method();
-            let args = sink.with_out(quote! { self, segments, body });
             quote! {
-                _ => <Self as #repe::structs::RepeMethods>::#call(#args),
+                _ => <Self as #repe::structs::RepeMethods>::repe_call_into(
+                    self, segments, body, out,
+                ),
             }
         } else {
             quote! {
@@ -317,11 +271,9 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
         };
         // The whole-object write. `#[repe(readonly)]` on the struct emits *only*
         // the refusal — never the assignment followed by dead code — which is
-        // the point beyond the refusal itself: `from_value::<Self>` is then
-        // never generated, so the struct is not required to be
-        // `DeserializeOwned`. A type holding live handles has no JSON that
-        // produces one, and the alternative was a hand-written `Deserialize`
-        // that always errors on every such type.
+        // the point beyond the refusal itself: the read into `*self` is then
+        // never generated, so the struct is not required to be readable at all.
+        // A type holding live handles has no body that produces one.
         let root_write = if struct_attrs.no_replace {
             quote! {
                 if body.is_some() {
@@ -331,43 +283,22 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 }
             }
         } else {
-            let root_write_ack = sink.emit_null();
+            let root_write_ack = emit_null();
             quote! {
-                if let Some(value) = body {
-                    *self = #repe::__private::serde_json::from_value(value).map_err(|source| #repe::StructError::Deserialize {
-                        path: String::from(""),
-                        source,
-                    })?;
+                if let Some(__repe_body) = body {
+                    __repe_body.read_into("", self)?;
                     return #root_write_ack;
                 }
             }
         };
-        let (signature, ret) = match sink {
-            Sink::Value => (
-                quote! {
-                    fn repe_handle(
-                        &mut self,
-                        segments: &[&str],
-                        body: Option<#repe::__private::serde_json::Value>,
-                    )
-                },
-                quote! { #repe::structs::StructResult<Option<#repe::__private::serde_json::Value>> },
-            ),
-            Sink::Encode => (
-                quote! {
-                    fn repe_handle_into(
-                        &mut self,
-                        segments: &[&str],
-                        body: Option<#repe::__private::serde_json::Value>,
-                        out: &mut #repe::structs::ResponseBody<'_>,
-                    )
-                },
-                quote! { #repe::structs::StructResult<()> },
-            ),
-        };
 
         bodies.push(quote! {
-            #signature -> #ret {
+            fn repe_handle_into(
+                &mut self,
+                segments: &[&str],
+                body: Option<#repe::structs::RequestBody<'_>>,
+                out: &mut #repe::structs::ResponseBody<'_>,
+            ) -> #repe::structs::StructResult<()> {
                 if segments.is_empty() {
                     #root_write
                     return #listing;
@@ -390,7 +321,7 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
     // listing takes. Every term folds to a constant, and a struct with none gets
     // no guard emitted.
     let shared_listing = {
-        let listing = build_listing(&entries, &repe, ListingSink::Shared);
+        let listing = build_listing(&entries, &repe, Borrow::Shared);
         let guard = (!decline_terms.is_empty()).then(|| {
             quote! {
                 if <Self as #repe::RepeStruct>::repe_listing_declines(self) {
@@ -405,9 +336,8 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
             }
         }
     };
-    let shared_field_arms = build_shared_field_arms(&field_specs, &repe);
-    let shared_method_arms =
-        build_method_arms(&struct_attrs.methods, &repe, Sink::Encode, Raise::Shared);
+    let shared_field_arms = build_field_arms(&field_specs, &repe, Borrow::Shared);
+    let shared_method_arms = build_method_arms(&struct_attrs.methods, &repe, Borrow::Shared);
     let shared_fallthrough = if from_impl_block {
         quote! {
             _ => <Self as #repe::structs::RepeMethods>::repe_call_shared_into(
@@ -453,7 +383,7 @@ fn expand_repe_struct(input: &DeriveInput) -> syn::Result<TokenStream2> {
         fn repe_shared_into(
             &self,
             segments: &[&str],
-            body: &mut Option<#repe::__private::serde_json::Value>,
+            body: Option<#repe::structs::RequestBody<'_>>,
             out: &mut #repe::structs::ResponseBody<'_>,
         ) -> Option<#repe::structs::StructResult<()>> {
             if segments.is_empty() {
@@ -548,15 +478,6 @@ struct FieldAttrs {
     rename: Option<String>,
     skip: bool,
     nested: bool,
-    /// `#[repe(nested_serde)]`: descend into a field that implements only
-    /// `Serialize` + `DeserializeOwned`, by walking a `serde_json::Value` of it.
-    ///
-    /// The escape hatch for a type whose own crate cannot depend on this one —
-    /// a pure-logic crate with a no-I/O charter, or a third-party type there is
-    /// no way to annotate. `#[repe(nested)]` is the better answer wherever the
-    /// type *can* implement `RepeStruct`, since it descends without
-    /// materializing anything.
-    nested_serde: bool,
     readonly: bool,
     typed: bool,
 }
@@ -608,8 +529,13 @@ fn parse_field(field: &Field) -> syn::Result<FieldSpec> {
                 return Ok(());
             }
             if meta.path.is_ident("nested_serde") {
-                attrs.nested_serde = true;
-                return Ok(());
+                return Err(meta.error(
+                    "`#[repe(nested_serde)]` is gone: it descended into a field by walking a \
+                     `serde_json::Value` of it, and there is no tree to walk. Use \
+                     `#[repe(nested)]` where the child can implement `RepeStruct`, and a \
+                     structio adapter (`json::ReadAs` / `WriteAs`, named at the field as \
+                     `field as Adapter`) for a type whose crate cannot depend on this one.",
+                ));
             }
             if meta.path.is_ident("readonly") {
                 attrs.readonly = true;
@@ -623,19 +549,10 @@ fn parse_field(field: &Field) -> syn::Result<FieldSpec> {
         })?;
     }
 
-    if attrs.typed && (attrs.nested || attrs.nested_serde) {
+    if attrs.typed && attrs.nested {
         return Err(syn::Error::new(
             field.span(),
             "`#[repe(typed)]` encodes a numeric slice as a BEVE typed array, which a nested struct is not",
-        ));
-    }
-    if attrs.nested && attrs.nested_serde {
-        return Err(syn::Error::new(
-            field.span(),
-            "`#[repe(nested)]` and `#[repe(nested_serde)]` are two ways to descend into one \
-             field: the first asks the child's own `RepeStruct` impl, the second walks a \
-             `serde_json::Value` of it. Pick the first wherever the child can implement the \
-             trait.",
         ));
     }
 
@@ -691,12 +608,12 @@ struct StructAttrs {
     /// Struct-level `#[repe(readonly)]`: a write of the *whole* object is
     /// refused rather than deserialized into `Self`.
     ///
-    /// The point is not only the refusal — it is that the whole-object
-    /// assignment is then never emitted, so the struct is not required to be
-    /// `DeserializeOwned`. A type holding an open socket or a file handle has no
-    /// JSON that produces one, and hand-writing a `Deserialize` that
-    /// always errors trades a compile error for a runtime one and is boilerplate
-    /// on every such type. It emits only the rejection, and never the assignment
+    /// The point is not only the refusal — it is that the whole-object read is
+    /// then never emitted, so the struct is not required to be readable at all.
+    /// A type holding an open socket or a file handle has no body that produces
+    /// one, and declaring a reader that always errors trades a compile error for
+    /// a runtime one and is boilerplate on every such type. It emits only the
+    /// rejection, and never the assignment
     /// followed by dead code, because a crate under `#![deny(warnings)]` must
     /// not be broken by `unreachable_code` on generated code.
     ///
@@ -722,12 +639,10 @@ struct StructAttrs {
     /// Reorders emission only: it costs nothing at run time, and nothing at all
     /// for a struct that does not use it.
     ///
-    /// Governs the two listings that reach a client — `repe_handle_into` and
-    /// `repe_shared_into`, which the router calls. It cannot govern
-    /// `repe_handle`, whose `serde_json::Map` is a `BTreeMap` unless something
-    /// in the dependency graph enables `serde_json/preserve_order`; that form
-    /// sorts its keys and can carry no order at all, which is true of
-    /// declaration order too and is not something this attribute changed.
+    /// Governs both listings, which are the two that reach a client:
+    /// `repe_handle_into` and `repe_shared_into`. There is no third form to fall
+    /// out of step — the `serde_json::Map`-backed one, which sorted its keys and
+    /// so could carry no order at all, went with `serde_json::Value`.
     listing_order: Option<ListingOrder>,
 }
 
@@ -764,8 +679,8 @@ fn parse_struct_attrs(attrs: &[Attribute]) -> syn::Result<StructAttrs> {
                     "`#[repe(readonly)]` is a field attribute, and on a field it is recursive: \
                      it refuses every write through the field. A struct wanting that marks its \
                      fields. To refuse a write of the *whole* object while its fields stay \
-                     writable — which also drops the `Self: DeserializeOwned` requirement, for a \
-                     type no JSON describes — use `#[repe(no_replace)]`.",
+                     writable — which also drops the requirement that `Self` be readable at \
+                     all, for a type no body describes — use `#[repe(no_replace)]`.",
                 ));
             }
             if meta.path.is_ident("listing_order") {
@@ -957,10 +872,8 @@ fn normalize_type_string(ty: &Type) -> String {
 ///
 /// Resolved either from declaration order — fields, then struct-listed methods,
 /// then the impl block's two tables — or from `#[repe(listing_order(..))]`,
-/// which names the whole sequence. All three listings walk this one list, so
-/// they cannot disagree about what is emitted, or — for the two that can carry
-/// an order at all — about the order. See `build_listing` for the `Value` form's
-/// limitation.
+/// which names the whole sequence. Both listings walk this one list, so they
+/// cannot disagree about what is emitted or in what order.
 enum ListingEntry<'a> {
     /// A field, listed by its value.
     Field(&'a FieldSpec),
@@ -1093,197 +1006,48 @@ fn endpoint_path(endpoint: &str) -> LitStr {
     LitStr::new(&format!("/{endpoint}"), Span::call_site())
 }
 
-/// Which of the three whole-struct listings is being generated.
+/// Write one `"key": value` entry.
 ///
-/// The `Value` and `Encode` forms are the two `Sink`s; `Shared` is the same
-/// entries served through `&self`, which differs only in how a failure is
-/// reported (`Some(Err(..))` rather than `?`) and in which method it calls on a
-/// child. Carrying it as a third variant rather than a second generator is what
-/// makes "the listings agree" structural: there is one walk of one entry list,
-/// so a `#[repe(listing_order(..))]` cannot reach one listing and not another.
-///
-/// This is deliberately not a variant of [`Sink`]. `Sink` also drives the
-/// dispatch *arms*, where a decline is a control-flow shape no sink can encode —
-/// there the split into a separate shared builder is the right one. A listing
-/// entry cannot decline past the guard at its top, which is what lets these
-/// three share a generator.
-#[derive(Clone, Copy)]
-enum ListingSink {
-    Value,
-    Encode,
-    Shared,
-}
-
-impl ListingSink {
-    /// The `RepeStruct` method a `#[repe(nested)]` child is listed through.
-    fn child_call(self, repe: &TokenStream2, ty: &Type, ident: &Ident) -> TokenStream2 {
-        match self {
-            ListingSink::Value => {
-                quote! { <#ty as #repe::RepeStruct>::repe_handle(&mut self.#ident, &[], None) }
-            }
-            ListingSink::Encode => quote! {
-                <#ty as #repe::RepeStruct>::repe_handle_into(
-                    &mut self.#ident, &[], None, __repe_nested,
-                )
-            },
-            ListingSink::Shared => quote! {
-                <#ty as #repe::RepeStruct>::repe_shared_into(
-                    &self.#ident, &[], &mut None, __repe_nested,
-                )
-            },
-        }
-    }
-
-    /// Prefix a child's endpoint onto any error path it produced. The shared
-    /// form has an `Option` in the way, since a child may decline.
-    fn prepend(self, repe: &TokenStream2, call: TokenStream2, key: TokenStream2) -> TokenStream2 {
-        match self {
-            ListingSink::Value | ListingSink::Encode => quote! {
-                #call.map_err(|err| #repe::structs::prepend_path(err, #key))
-            },
-            ListingSink::Shared => quote! {
-                #call.map(|__repe_result| {
-                    __repe_result.map_err(|err| #repe::structs::prepend_path(err, #key))
-                })
-            },
-        }
-    }
-
-    /// The `RepeMethods` call that reads a field-shaped endpoint's value back.
-    fn accessor_call(self, repe: &TokenStream2, name: TokenStream2) -> TokenStream2 {
-        match self {
-            ListingSink::Value => quote! {
-                <Self as #repe::structs::RepeMethods>::repe_call(self, &[#name], None)
-            },
-            ListingSink::Encode => quote! {
-                <Self as #repe::structs::RepeMethods>::repe_call_into(
-                    self, &[#name], None, __repe_nested,
-                )
-            },
-            ListingSink::Shared => quote! {
-                <Self as #repe::structs::RepeMethods>::repe_call_shared_into(
-                    self, &[#name], &mut None, __repe_nested,
-                )
-            },
-        }
-    }
-
-    /// Write one `"key": <value>` entry whose value the callee produces.
-    ///
-    /// The shared form uses `entry_try_with`, which rewinds the whole object on
-    /// a decline and propagates the `None` out of `repe_shared_into` — the
-    /// safety net for a hand-written table whose `REPE_LISTING_NEEDS_EXCLUSIVE`
-    /// disagrees with its `repe_call_shared_into`, not a path a derived listing
-    /// takes.
-    fn entry_with(
-        self,
-        repe: &TokenStream2,
-        key: TokenStream2,
-        produce: TokenStream2,
-    ) -> TokenStream2 {
-        match self {
-            ListingSink::Value => quote! {
-                map.insert(
-                    String::from(#key),
-                    (#produce)?.unwrap_or(#repe::__private::serde_json::Value::Null),
-                );
-            },
-            ListingSink::Encode => quote! {
-                __repe_obj.entry_with(#key, |__repe_nested| { #produce })?;
-            },
-            ListingSink::Shared => quote! {
-                if let Err(__repe_err) = __repe_obj.entry_try_with(#key, |__repe_nested| {
-                    #produce
-                })? {
-                    return Some(Err(__repe_err));
-                }
-            },
-        }
-    }
-
-    /// Write one `"key": value` entry from a value that serializes.
-    fn entry(
-        self,
-        repe: &TokenStream2,
-        key: TokenStream2,
-        value: TokenStream2,
-        path: TokenStream2,
-    ) -> TokenStream2 {
-        match self {
-            ListingSink::Value => quote! {
-                {
-                    let __repe_value = #repe::__private::serde_json::to_value(&#value)
-                        .map_err(|source| #repe::StructError::Serialize {
-                            path: String::from(#path),
-                            source,
-                        })?;
-                    map.insert(String::from(#key), __repe_value);
-                }
-            },
-            ListingSink::Encode => quote! { __repe_obj.entry(#key, &#value)?; },
-            ListingSink::Shared => quote! {
-                if let Err(__repe_err) = __repe_obj.entry(#key, &#value) {
-                    return Some(Err(__repe_err));
-                }
-            },
-        }
-    }
-
-    /// Open the body, run `entries`, and close it.
-    fn wrap(self, repe: &TokenStream2, entries: &[TokenStream2]) -> TokenStream2 {
-        match self {
-            // The `Map` is a `BTreeMap` unless something in the dependency
-            // graph turns on `serde_json/preserve_order`, so this listing's key
-            // order is serde_json's and not the derive's — see `build_listing`.
-            ListingSink::Value => quote! {
-                {
-                    let mut map = #repe::__private::serde_json::Map::new();
-                    #(#entries)*
-                    Ok(Some(#repe::__private::serde_json::Value::Object(map)))
-                }
-            },
-            ListingSink::Encode => quote! {
-                {
-                    let mut __repe_obj = out.object();
-                    #(#entries)*
-                    __repe_obj.finish();
-                    Ok(())
-                }
-            },
-            ListingSink::Shared => quote! {
-                {
-                    let mut __repe_obj = out.object();
-                    #(#entries)*
-                    __repe_obj.finish();
-                    Some(Ok(()))
-                }
-            },
-        }
-    }
+/// One form for both borrows: writing cannot fail, so there is no failure to
+/// report differently.
+fn listing_entry(key: TokenStream2, value: TokenStream2) -> TokenStream2 {
+    quote! { __repe_obj.entry(#key, &#value); }
 }
 
 /// The response to a read of the whole struct: every field, plus every method
 /// published as its signature string.
 ///
-/// All three listings — the two `Sink` bodies and the shared one — are this one
-/// walk of one resolved entry list, so they cannot disagree about *what* is
-/// emitted or in what order.
+/// Both listings — the exclusive one and the shared one — are this one walk of
+/// one resolved entry list, so they cannot disagree about *what* is emitted or
+/// in what order.
 ///
-/// They can still disagree about **key order**, and one of them does: the
-/// `Value` form assembles a `serde_json::Map`, which is a `BTreeMap` unless
-/// something in the dependency graph enables `serde_json/preserve_order`, so it
-/// sorts its keys and can carry neither declaration order nor
-/// `#[repe(listing_order(..))]`. That is a property of `serde_json::Value` and
-/// not something this derive can fix; the router calls `repe_handle_into`, so
-/// the ordering governs every frame that reaches a client.
+/// Key order used to be the one thing they could disagree about, because a third
+/// form assembled a `serde_json::Map` and sorted its keys. That form is gone
+/// with `serde_json::Value`, so declaration order and
+/// `#[repe(listing_order(..))]` now reach every frame a client sees.
 fn build_listing(
     entries: &[ListingEntry<'_>],
     repe: &TokenStream2,
-    sink: ListingSink,
+    borrow: Borrow,
 ) -> TokenStream2 {
     let mut emitted = Vec::new();
+    // The object's member count, which BEVE needs in the header before any
+    // member. Not a literal: the two `Impl*` entries list a `const` slice whose
+    // length the deriving crate's own impl block settles. It is still a const
+    // expression, so this folds to a constant at the call site.
+    let mut fixed = 0usize;
+    let mut variable: Vec<TokenStream2> = Vec::new();
 
     for entry in entries {
+        match entry {
+            ListingEntry::ImplSignatures => variable.push(quote! {
+                <Self as #repe::structs::RepeMethods>::REPE_METHOD_SIGNATURES.len()
+            }),
+            ListingEntry::ImplAccessors => variable.push(quote! {
+                <Self as #repe::structs::RepeMethods>::REPE_ACCESSOR_ENDPOINTS.len()
+            }),
+            _ => fixed += 1,
+        }
         emitted.push(match entry {
             ListingEntry::Field(field) => {
                 let key = LitStr::new(&field.endpoint, Span::call_site());
@@ -1291,40 +1055,34 @@ fn build_listing(
                 if field.attrs.nested {
                     // The child writes into a *nested* body, so the frame stays
                     // JSON no matter what the child would emit on its own.
-                    let call = sink.child_call(repe, &field.ty, ident);
-                    sink.entry_with(
+                    let call = borrow.child_call(
                         repe,
+                        &field.ty,
+                        ident,
+                        quote! { &[], None },
+                        quote! { __repe_nested },
+                    );
+                    borrow.entry_with(
                         quote! { #key },
-                        sink.prepend(repe, call, quote! { #key }),
+                        borrow.prepend(repe, call, quote! { #key }),
                     )
                 } else {
-                    // A `#[repe(nested_serde)]` field lists exactly as a leaf
-                    // does: the descent it enables is a sub-path concern, and
-                    // the whole-object shape is what `Serialize` already
-                    // produces. A `#[repe(typed)]` field is a plain JSON array
-                    // here, because the enclosing object has already committed
-                    // the frame to JSON.
-                    let path = endpoint_path(&field.endpoint);
-                    sink.entry(repe, quote! { #key }, quote! { self.#ident }, quote! { #path })
+                    // A `#[repe(typed)]` field is a plain JSON array here,
+                    // because the enclosing object has already committed the
+                    // frame to JSON.
+                    listing_entry(quote! { #key }, quote! { self.#ident })
                 }
             }
             ListingEntry::Signature(method) => {
                 let key = LitStr::new(&method.endpoint, Span::call_site());
                 let signature = LitStr::new(&method.signature_display, Span::call_site());
-                let path = endpoint_path(&method.endpoint);
-                sink.entry(repe, quote! { #key }, quote! { #signature }, quote! { #path })
+                listing_entry(quote! { #key }, quote! { #signature })
             }
             ListingEntry::ImplNamed(name) => {
                 let resolved = impl_named_signature(name, repe);
                 let accessor =
-                    sink.entry_with(repe, quote! { #name }, sink.accessor_call(repe, quote! { #name }));
-                let path = endpoint_path(&name.value());
-                let signature = sink.entry(
-                    repe,
-                    quote! { #name },
-                    quote! { __repe_signature },
-                    quote! { #path },
-                );
+                    borrow.entry_with(quote! { #name }, borrow.accessor_call(repe, quote! { #name }));
+                let signature = listing_entry(quote! { #name }, quote! { __repe_signature });
                 quote! {
                     match #resolved {
                         ::core::option::Option::Some(__repe_signature) => { #signature }
@@ -1333,9 +1091,7 @@ fn build_listing(
                 }
             }
             ListingEntry::ImplSignatures => {
-                // The endpoint's own name is the error path here; a `&str` has
-                // no failing `Serialize`, so it is never read.
-                let entry = sink.entry(repe, quote! { name }, quote! { signature }, quote! { name });
+                let entry = listing_entry(quote! { name }, quote! { signature });
                 quote! {
                     for &(name, signature) in <Self as #repe::structs::RepeMethods>::REPE_METHOD_SIGNATURES {
                         #entry
@@ -1351,14 +1107,13 @@ fn build_listing(
             // accessors is quadratic in the endpoint count; the same read of an
             // all-field struct is not.
             //
-            // A getter that returns `Err` fails the whole listing, exactly as a
-            // field whose `Serialize` impl fails does. That is the field analogy
-            // held to consistently rather than an oversight, and it is why a
-            // getter meant to be listed should report a sentinel rather than an
-            // error.
+            // A getter that returns `Err` fails the whole listing. Writing a
+            // field cannot fail any more, so a getter is the only entry that can
+            // — which is why one meant to be listed should report a sentinel
+            // rather than an error.
             ListingEntry::ImplAccessors => {
                 let accessor =
-                    sink.entry_with(repe, quote! { name }, sink.accessor_call(repe, quote! { name }));
+                    borrow.entry_with(quote! { name }, borrow.accessor_call(repe, quote! { name }));
                 quote! {
                     for &name in <Self as #repe::structs::RepeMethods>::REPE_ACCESSOR_ENDPOINTS {
                         #accessor
@@ -1368,35 +1123,35 @@ fn build_listing(
         });
     }
 
-    sink.wrap(repe, &emitted)
+    let count = quote! { #fixed #( + #variable)* };
+    borrow.wrap(&emitted, count)
 }
 
 // ---------------------------------------------------------------------------
 // Field arms
 // ---------------------------------------------------------------------------
 
-/// A call into a `#[repe(nested)]` field's own `RepeStruct` impl, with this
-/// field's endpoint prefixed onto any error path it produces.
-fn nested_dispatch(
-    ty: &Type,
-    ident: &Ident,
-    key: LitStr,
-    args: TokenStream2,
+/// One dispatch arm per field, under either borrow.
+///
+/// A leaf serializes itself; a nested field forwards to its child with this
+/// field's endpoint prefixed onto any error path it produces; a write lands in
+/// the live field, is refused outright when the field is `#[repe(readonly)]`, or
+/// declines under a shared borrow because it needs `&mut self`.
+///
+/// One builder for both borrows. The three places they differ — how an outcome
+/// is shaped, which method a child is entered through, and what a write that
+/// needs exclusive access does — are exactly what [`Borrow`] carries, so there
+/// is nothing left for a second builder to hold. Field arms and *listing* arms
+/// are still built separately, because there the shapes genuinely diverge: a
+/// listing entry cannot decline past the guard at its top, and it rewinds.
+fn build_field_arms(
+    fields: &[FieldSpec],
     repe: &TokenStream2,
-    sink: Sink,
-) -> TokenStream2 {
-    let method = sink.struct_method();
-    let args = sink.with_out(quote! { &mut self.#ident, #args });
-    quote! {
-        <#ty as #repe::RepeStruct>::#method(#args)
-            .map_err(|err| #repe::structs::prepend_path(err, #key))
-    }
-}
-
-fn build_field_arms(fields: &[FieldSpec], repe: &TokenStream2, sink: Sink) -> Vec<TokenStream2> {
-    let refuse = refuse_write(repe, Raise::Result);
-    let subpath = refuse_subpath(repe, Raise::Result);
-    let ack = sink.emit_null();
+    borrow: Borrow,
+) -> Vec<TokenStream2> {
+    let refuse = refuse_write(repe, borrow);
+    let subpath = refuse_subpath(repe, borrow);
+    let ack = borrow.ok(emit_null());
     let mut arms = Vec::new();
     for field in fields {
         if field.attrs.skip {
@@ -1407,19 +1162,6 @@ fn build_field_arms(fields: &[FieldSpec], repe: &TokenStream2, sink: Sink) -> Ve
         let path = endpoint_path(&field.endpoint);
 
         if field.attrs.nested {
-            // Reading the child whole differs from writing it by one step in the
-            // `Value` sink: the child's `Option` has to be lifted into this
-            // struct's. The encoding sink has already written whatever there was.
-            let lift = |whole: TokenStream2| match sink {
-                Sink::Value => quote! {
-                    {
-                        let nested = #whole?;
-                        Ok(Some(nested.unwrap_or(#repe::__private::serde_json::Value::Null)))
-                    }
-                },
-                Sink::Encode => whole,
-            };
-
             // `readonly` on a nested field refuses every write *through* it,
             // subpaths included: the attribute says the field cannot be written,
             // and a write below it mutates the field just as surely as a write
@@ -1435,129 +1177,63 @@ fn build_field_arms(fields: &[FieldSpec], repe: &TokenStream2, sink: Sink) -> Ve
 
             // The whole-child write descends, exactly as the whole-child read
             // already did. Before this, a write with an empty tail replaced the
-            // child — `self.field = from_value(body)?` — and so was the one path
-            // on which a child's own `RepeStruct` impl was never consulted. That
-            // is precisely the path where a child backed by a resource has
-            // something to say: applying a partial object to live state is not
-            // the same operation as replacing a struct. A derived child's
-            // empty-segments arm is still `*self = from_value(..)`, so nothing
-            // that worked before changes; only a hand-written child gains a say.
-            let descend = nested_dispatch(
-                &field.ty,
-                ident,
-                key.clone(),
-                quote! { tail, body },
+            // child, and so was the one path on which a child's own
+            // `RepeStruct` impl was never consulted. That is precisely the path
+            // where a child backed by a resource has something to say: applying
+            // a partial object to live state is not the same operation as
+            // replacing a struct.
+            //
+            // A derived child's empty-segments arm reads the body into `*self`,
+            // which *merges* — a key the body omits keeps the value it had —
+            // where the replacement it succeeds blanked them. That difference is
+            // wire-visible on a whole-child write, and it is the behaviour a
+            // partial update wants.
+            //
+            // `tail` *is* the empty slice when it is empty, so there is one call
+            // here rather than a whole-child branch beside a descent.
+            let forward = borrow.prepend(
                 repe,
-                sink,
+                borrow.child_call(
+                    repe,
+                    &field.ty,
+                    ident,
+                    quote! { tail, body },
+                    quote! { out },
+                ),
+                quote! { #key },
             );
-            let body = match sink {
-                // `tail` *is* the empty slice when it is empty, and `lift` is
-                // the identity here, so the two branches the `Value` sink needs
-                // would be the same call twice.
-                Sink::Encode => quote! { return #descend; },
-                // Only here do they differ: a whole-child read has to lift the
-                // child's `Option` into this struct's.
-                Sink::Value => {
-                    let whole = lift(nested_dispatch(
-                        &field.ty,
-                        ident,
-                        key.clone(),
-                        quote! { &[], body },
-                        repe,
-                        sink,
-                    ));
-                    quote! {
-                        if tail.is_empty() {
-                            return #whole;
-                        }
-                        return #descend;
-                    }
-                }
-            };
-            arms.push(quote! { #key => { #guard #body } });
-        } else if field.attrs.nested_serde {
-            // Descend by walking a `serde_json::Value` of the field. The whole
-            // point is that the field's type implements only `Serialize` +
-            // `DeserializeOwned`, so there is no child impl to ask — which is
-            // also the cost: a subpath read materializes the field, and a
-            // subpath write materializes it, edits it, and deserializes it back.
-            // A whole-field read or write pays neither.
-            let read = nested_serde_read(field, repe, sink, Raise::Result);
-            let unresolved = refuse_unresolved(repe, Raise::Result);
-            let write = if field.attrs.readonly {
-                quote! { Some(_) => #refuse, }
-            } else {
-                quote! {
-                    Some(value) => {
-                        if tail.is_empty() {
-                            self.#ident = #repe::__private::serde_json::from_value(value)
-                                .map_err(|source| #repe::StructError::Deserialize {
-                                    path: String::from(#path),
-                                    source,
-                                })?;
-                            #ack
-                        } else {
-                            // The round trip a sub-path write costs, and the
-                            // reason the field's type has to survive one: the
-                            // whole child is materialized, edited, and decoded
-                            // back.
-                            let mut __repe_value = #repe::__private::serde_json::to_value(&self.#ident)
-                                .map_err(|source| #repe::StructError::Serialize {
-                                    path: String::from(#path),
-                                    source,
-                                })?;
-                            if #repe::structs::serde_pointer_set(&mut __repe_value, tail, value)
-                                .is_none()
-                            {
-                                return #unresolved;
-                            }
-                            self.#ident = #repe::__private::serde_json::from_value(__repe_value)
-                                .map_err(|source| #repe::StructError::Deserialize {
-                                    path: String::from(#path),
-                                    source,
-                                })?;
-                            #ack
-                        }
-                    }
-                }
-            };
-            arms.push(quote! {
-                #key => {
-                    return match body {
-                        None => { #read }
-                        #write
-                    };
-                }
-            });
+            arms.push(quote! { #key => { #guard #forward } });
         } else {
-            let read = if field.attrs.typed {
-                sink.emit_typed_slice(repe, &path, quote! { self.#ident })
+            let span = field.ty.span();
+            let read = borrow.ok(if field.attrs.typed {
+                emit_typed_slice_spanned(span, quote! { self.#ident })
             } else {
-                sink.emit_value(repe, &path, quote! { self.#ident })
-            };
-            let write = if field.attrs.readonly {
-                quote! { Some(_) => #refuse, }
-            } else {
-                quote! {
-                    Some(value) => {
-                        self.#ident = #repe::__private::serde_json::from_value(value)
-                            .map_err(|source| #repe::StructError::Deserialize {
-                                path: String::from(#path),
-                                source,
-                            })?;
+                emit_value_spanned(span, quote! { self.#ident })
+            });
+            let write = match (field.attrs.readonly, borrow) {
+                (true, _) => quote! { Some(_) => #refuse, },
+                (false, Borrow::Exclusive) => quote_spanned! {span=>
+                    Some(__repe_body) => {
+                        // Glaze's `read_params`: the bytes land in the live
+                        // field, so a `Vec` or `String` already there keeps its
+                        // allocation and a key the body omits keeps its value.
+                        __repe_body.read_into(#path, &mut self.#ident)?;
                         #ack
                     }
-                }
+                },
+                // A write needs `&mut self`, so the shared borrow declines and
+                // the caller retries under the exclusive one.
+                (false, Borrow::Shared) => quote! { Some(_) => None, },
             };
             arms.push(quote! {
                 #key => {
                     if !tail.is_empty() {
                         return #subpath;
                     }
-                    return match body {
+                    match body {
                         None => #read,
                         #write
-                    };
+                    }
                 }
             });
         }
@@ -1569,23 +1245,30 @@ fn build_field_arms(fields: &[FieldSpec], repe: &TokenStream2, sink: Sink) -> Ve
 // Method arms
 // ---------------------------------------------------------------------------
 
-/// How a generated arm reports a failure.
+/// Which borrow of `self` a generated body has, and so what it returns.
 ///
-/// The only difference between the two exclusive dispatch bodies, which return
-/// `StructResult<..>`, and the shared one, which returns
-/// `Option<StructResult<()>>` because it may decline. Everything else about
-/// decoding a method's arguments is identical, so this is what lets one
-/// generator serve both instead of two that can drift.
+/// One axis, and every generator in this file turns on it. Under `&mut self` a
+/// body returns `StructResult<..>`: a failure is `Err`, an answer is bare, and
+/// a `#[repe(nested)]` child is entered through `repe_handle_into`. Under
+/// `&self` it returns `Option<StructResult<()>>`, because it may decline a path
+/// that needs exclusive access, so every outcome is wrapped and a child is
+/// entered through `repe_shared_into`.
+///
+/// This used to be two enums — one for the return shape, one for the listing
+/// form — chosen together at every call site, which is what said they were the
+/// same distinction. Carrying it as one variant rather than one generator per
+/// borrow is what makes "the two agree" structural: there is one walk of one
+/// entry list, so a `#[repe(listing_order(..))]` cannot reach one and not the
+/// other.
 #[derive(Clone, Copy)]
-enum Raise {
-    /// `StructResult<..>`: a failure is `Err`, an answer is bare.
-    Result,
-    /// `Option<StructResult<()>>`: everything is wrapped, because `None` is
-    /// reserved for a decline.
+enum Borrow {
+    /// `&mut self`, returning `StructResult<..>`.
+    Exclusive,
+    /// `&self`, returning `Option<StructResult<()>>`, `None` being a decline.
     Shared,
 }
 
-impl Raise {
+impl Borrow {
     /// `err` as an early return.
     fn err(self, err: TokenStream2) -> TokenStream2 {
         let refusal = self.refuse(err);
@@ -1595,16 +1278,120 @@ impl Raise {
     /// `err` as an expression in this shape — an answer, not a decline.
     fn refuse(self, err: TokenStream2) -> TokenStream2 {
         match self {
-            Raise::Result => quote! { Err(#err) },
-            Raise::Shared => quote! { Some(Err(#err)) },
+            Borrow::Exclusive => quote! { Err(#err) },
+            Borrow::Shared => quote! { Some(Err(#err)) },
         }
     }
 
     /// A successful `expr` in this shape.
     fn ok(self, expr: TokenStream2) -> TokenStream2 {
         match self {
-            Raise::Result => expr,
-            Raise::Shared => quote! { Some(#expr) },
+            Borrow::Exclusive => expr,
+            Borrow::Shared => quote! { Some(#expr) },
+        }
+    }
+
+    /// The `RepeStruct` method a `#[repe(nested)]` child is entered through,
+    /// under this borrow.
+    ///
+    /// `args` is the request being forwarded and `out` the body it writes into:
+    /// `&[], None` and the enclosing object's nested body when the child is
+    /// being *listed*, `tail, body` and `out` when a request is being dispatched
+    /// *into* it.
+    fn child_call(
+        self,
+        repe: &TokenStream2,
+        ty: &Type,
+        ident: &Ident,
+        args: TokenStream2,
+        out: TokenStream2,
+    ) -> TokenStream2 {
+        match self {
+            Borrow::Exclusive => quote! {
+                <#ty as #repe::RepeStruct>::repe_handle_into(
+                    &mut self.#ident, #args, #out,
+                )
+            },
+            Borrow::Shared => quote! {
+                <#ty as #repe::RepeStruct>::repe_shared_into(
+                    &self.#ident, #args, #out,
+                )
+            },
+        }
+    }
+
+    /// Prefix a child's endpoint onto any error path it produced. The shared
+    /// form has an `Option` in the way, since a child may decline.
+    fn prepend(self, repe: &TokenStream2, call: TokenStream2, key: TokenStream2) -> TokenStream2 {
+        match self {
+            Borrow::Exclusive => quote! {
+                #call.map_err(|err| #repe::structs::prepend_path(err, #key))
+            },
+            Borrow::Shared => quote! {
+                #call.map(|__repe_result| {
+                    __repe_result.map_err(|err| #repe::structs::prepend_path(err, #key))
+                })
+            },
+        }
+    }
+
+    /// The `RepeMethods` call that reads a field-shaped endpoint's value back.
+    fn accessor_call(self, repe: &TokenStream2, name: TokenStream2) -> TokenStream2 {
+        match self {
+            Borrow::Exclusive => quote! {
+                <Self as #repe::structs::RepeMethods>::repe_call_into(
+                    self, &[#name], None, __repe_nested,
+                )
+            },
+            Borrow::Shared => quote! {
+                <Self as #repe::structs::RepeMethods>::repe_call_shared_into(
+                    self, &[#name], None, __repe_nested,
+                )
+            },
+        }
+    }
+
+    /// Write one `"key": <value>` entry whose value the callee produces.
+    ///
+    /// The shared form uses `entry_try_with`, which rewinds the whole object on
+    /// a decline and propagates the `None` out of `repe_shared_into` — the
+    /// safety net for a hand-written table whose `REPE_LISTING_NEEDS_EXCLUSIVE`
+    /// disagrees with its `repe_call_shared_into`, not a path a derived listing
+    /// takes.
+    fn entry_with(self, key: TokenStream2, produce: TokenStream2) -> TokenStream2 {
+        match self {
+            Borrow::Exclusive => quote! {
+                __repe_obj.entry_with(#key, |__repe_nested| { #produce })?;
+            },
+            Borrow::Shared => quote! {
+                if let Err(__repe_err) = __repe_obj.entry_try_with(#key, |__repe_nested| {
+                    #produce
+                })? {
+                    return Some(Err(__repe_err));
+                }
+            },
+        }
+    }
+
+    /// Open the body, run `entries`, and close it.
+    fn wrap(self, entries: &[TokenStream2], count: TokenStream2) -> TokenStream2 {
+        match self {
+            Borrow::Exclusive => quote! {
+                {
+                    let mut __repe_obj = out.object(#count);
+                    #(#entries)*
+                    __repe_obj.finish();
+                    Ok(())
+                }
+            },
+            Borrow::Shared => quote! {
+                {
+                    let mut __repe_obj = out.object(#count);
+                    #(#entries)*
+                    __repe_obj.finish();
+                    Some(Ok(()))
+                }
+            },
         }
     }
 }
@@ -1616,8 +1403,8 @@ impl Raise {
 /// code. Servable under a shared borrow as well as an exclusive one: refusing a
 /// write touches nothing, so there is no reason to take the write guard to say
 /// so.
-fn refuse_write(repe: &TokenStream2, raise: Raise) -> TokenStream2 {
-    raise.refuse(quote! {
+fn refuse_write(repe: &TokenStream2, borrow: Borrow) -> TokenStream2 {
+    borrow.refuse(quote! {
         #repe::StructError::BodyUnexpected {
             path: #repe::structs::path_from_segments(segments),
         }
@@ -1625,58 +1412,12 @@ fn refuse_write(repe: &TokenStream2, raise: Raise) -> TokenStream2 {
 }
 
 /// The refusal for a path segment below a leaf endpoint.
-fn refuse_subpath(repe: &TokenStream2, raise: Raise) -> TokenStream2 {
-    raise.refuse(quote! {
+fn refuse_subpath(repe: &TokenStream2, borrow: Borrow) -> TokenStream2 {
+    borrow.refuse(quote! {
         #repe::StructError::InvalidSubpath {
             path: #repe::structs::path_from_segments(segments),
         }
     })
-}
-
-/// The refusal for a path that does not resolve inside a
-/// `#[repe(nested_serde)]` field.
-fn refuse_unresolved(repe: &TokenStream2, raise: Raise) -> TokenStream2 {
-    raise.refuse(quote! {
-        #repe::StructError::InvalidPath {
-            path: #repe::structs::path_from_segments(segments),
-        }
-    })
-}
-
-/// The read below a `#[repe(nested_serde)]` field, which both borrow paths serve
-/// identically: serializing the field and walking the result mutates nothing.
-/// An expression, so it drops into the exclusive arm's `match body` and the
-/// shared arm's tail position unchanged.
-fn nested_serde_read(
-    field: &FieldSpec,
-    repe: &TokenStream2,
-    sink: Sink,
-    raise: Raise,
-) -> TokenStream2 {
-    let ident = &field.ident;
-    let path = endpoint_path(&field.endpoint);
-    let whole = raise.ok(sink.emit_value(repe, &path, quote! { self.#ident }));
-    let found = raise.ok(sink.emit_value(repe, &path, quote! { __repe_found }));
-    let unresolved = refuse_unresolved(repe, raise);
-    let unserializable = raise.refuse(quote! {
-        #repe::StructError::Serialize {
-            path: String::from(#path),
-            source,
-        }
-    });
-    quote! {
-        if tail.is_empty() {
-            #whole
-        } else {
-            match #repe::__private::serde_json::to_value(&self.#ident) {
-                Ok(__repe_value) => match #repe::structs::serde_pointer(&__repe_value, tail) {
-                    Some(__repe_found) => #found,
-                    None => #unresolved,
-                },
-                Err(source) => #unserializable,
-            }
-        }
-    }
 }
 
 /// Bind a published method's arguments out of the request body.
@@ -1689,48 +1430,36 @@ fn decode_method_args(
     method: &MethodSpec,
     bindings: &[Ident],
     repe: &TokenStream2,
-    raise: Raise,
+    borrow: Borrow,
 ) -> TokenStream2 {
     if method.args.is_empty() {
         return quote! { let _ = &body; };
     }
     let path = endpoint_path(&method.endpoint);
-    let missing = raise.err(quote! {
+    let missing = borrow.err(quote! {
         #repe::StructError::BodyExpected {
             path: #repe::structs::path_from_segments(segments),
         }
     });
-    let take_body = match raise {
-        Raise::Result => quote! {
-            let value = match body {
-                Some(value) => value,
-                None => { #missing }
-            };
-        },
-        // Taken here and nowhere earlier: past this point the arm answers, so
-        // the body can no longer be owed back to the exclusive retry.
-        Raise::Shared => quote! {
-            let value = match body.take() {
-                Some(value) => value,
-                None => { #missing }
-            };
-        },
+    // One shape for both borrows. `RequestBody` is `Copy` and borrows the frame,
+    // so the shared path no longer has to take the body out of an `&mut Option`
+    // and owe it back to the exclusive retry when it declines.
+    let take_body = quote! {
+        let __repe_body = match body {
+            Some(__repe_body) => __repe_body,
+            None => { #missing }
+        };
     };
+    let bad_args = borrow.err(quote! { __repe_err });
 
     if method.args.len() == 1 {
         let binding = &bindings[0];
         let ty = &method.args[0].1;
-        let undecodable = raise.err(quote! {
-            #repe::StructError::Deserialize {
-                path: String::from(#path),
-                source,
-            }
-        });
         return quote! {
             #take_body
-            let #binding: #ty = match #repe::__private::serde_json::from_value(value) {
+            let #binding: #ty = match __repe_body.read(#path) {
                 Ok(__repe_value) => __repe_value,
-                Err(source) => { #undecodable }
+                Err(__repe_err) => { #bad_args }
             };
         };
     }
@@ -1740,9 +1469,8 @@ fn decode_method_args(
         .iter()
         .map(|(ident, _)| LitStr::new(&ident.to_string(), Span::call_site()))
         .collect();
-    let bad_args = raise.err(quote! { __repe_err });
     let decls = method.args.iter().zip(bindings).map(|((_, ty), binding)| {
-        let bad_args = bad_args.clone();
+        let bad_args = &bad_args;
         quote! {
             let #binding: #ty = match __repe_args.next_arg() {
                 Ok(__repe_value) => __repe_value,
@@ -1752,7 +1480,9 @@ fn decode_method_args(
     });
     quote! {
         #take_body
-        let mut __repe_args = match #repe::structs::MethodArgs::new(#path, &[#(#names),*], value) {
+        let mut __repe_args = match #repe::structs::MethodArgs::new(
+            #path, &[#(#names),*], __repe_body,
+        ) {
             Ok(__repe_args) => __repe_args,
             Err(__repe_err) => { #bad_args }
         };
@@ -1763,42 +1493,36 @@ fn decode_method_args(
 fn build_method_arms(
     methods: &[MethodSpec],
     repe: &TokenStream2,
-    sink: Sink,
-    raise: Raise,
+    borrow: Borrow,
 ) -> Vec<TokenStream2> {
     methods
         .iter()
-        .map(|method| build_method_arm(method, repe, sink, raise))
+        .map(|method| build_method_arm(method, repe, borrow))
         .collect()
 }
 
-fn build_method_arm(
-    method: &MethodSpec,
-    repe: &TokenStream2,
-    sink: Sink,
-    raise: Raise,
-) -> TokenStream2 {
+fn build_method_arm(method: &MethodSpec, repe: &TokenStream2, borrow: Borrow) -> TokenStream2 {
     let key = LitStr::new(&method.endpoint, Span::call_site());
     // A `&mut self` method cannot run under a shared borrow however the frame is
     // shaped. Declining costs nothing: the exclusive path answers it exactly as
     // it always has.
-    if matches!(raise, Raise::Shared) && !matches!(method.receiver, ReceiverKind::Ref) {
+    if matches!(borrow, Borrow::Shared) && !matches!(method.receiver, ReceiverKind::Ref) {
         return quote! { #key => None, };
     }
     let path = endpoint_path(&method.endpoint);
-    let subpath = refuse_subpath(repe, raise);
+    let subpath = refuse_subpath(repe, borrow);
     let method_ident = &method.method_ident;
 
     let bindings: Vec<Ident> = (0..method.args.len())
         .map(|i| format_ident!("__repe_arg{}", i))
         .collect();
 
-    let decode_args = decode_method_args(method, &bindings, repe, raise);
+    let decode_args = decode_method_args(method, &bindings, repe, borrow);
 
     let emit_ok = if method.ret.ok_is_unit() {
-        sink.emit_null()
+        emit_null()
     } else {
-        sink.emit_value(repe, &path, quote! { __repe_ok })
+        emit_value(quote! { __repe_ok })
     };
     // Spanned at the method name, because this is the one call in the generated
     // code whose receiver comes from a *declaration* rather than from a
@@ -1808,7 +1532,7 @@ fn build_method_arm(
     let invocation = quote_spanned! { method_ident.span()=>
         Self::#method_ident(self #(, #bindings)*)
     };
-    let call = raise.ok(call_and_emit(invocation, &method.ret, emit_ok, repe, &path));
+    let call = borrow.ok(call_and_emit(invocation, &method.ret, emit_ok, repe, &path));
 
     quote! {
         #key => {
@@ -1885,34 +1609,34 @@ fn call_and_emit(
 fn build_accessor_arm(
     accessor: &AccessorSpec,
     repe: &TokenStream2,
-    sink: Sink,
-    raise: Raise,
+    borrow: Borrow,
 ) -> TokenStream2 {
     let key = LitStr::new(&accessor.endpoint, Span::call_site());
     let path = endpoint_path(&accessor.endpoint);
-    let subpath = refuse_subpath(repe, raise);
+    let subpath = refuse_subpath(repe, borrow);
 
     // No `ok_is_unit` branch: a getter that returns nothing is rejected at
     // `parse_impl_method`, since the listing would have no value to show for the
     // endpoint. A `&mut self` getter cannot run under a shared borrow.
-    let read =
-        if matches!(raise, Raise::Shared) && !matches!(accessor.get.receiver, ReceiverKind::Ref) {
-            quote! { None }
+    let read = if matches!(borrow, Borrow::Shared)
+        && !matches!(accessor.get.receiver, ReceiverKind::Ref)
+    {
+        quote! { None }
+    } else {
+        let getter = &accessor.get.method_ident;
+        let emit = if accessor.typed {
+            emit_typed_slice(quote! { __repe_ok })
         } else {
-            let getter = &accessor.get.method_ident;
-            let emit = if accessor.typed {
-                sink.emit_typed_slice(repe, &path, quote! { __repe_ok })
-            } else {
-                sink.emit_value(repe, &path, quote! { __repe_ok })
-            };
-            raise.ok(call_and_emit(
-                quote! { Self::#getter(self) },
-                &accessor.get.ret,
-                emit,
-                repe,
-                &path,
-            ))
+            emit_value(quote! { __repe_ok })
         };
+        borrow.ok(call_and_emit(
+            quote! { Self::#getter(self) },
+            &accessor.get.ret,
+            emit,
+            repe,
+            &path,
+        ))
+    };
 
     // A getter with no setter *is* a read-only endpoint, so the refusal is the
     // same one `#[repe(readonly)]` produces on a field. Emitting only the
@@ -1920,27 +1644,23 @@ fn build_accessor_arm(
     // clean under `#![deny(warnings)]`, as the field arms do. A setter mutates
     // by construction, so the shared borrow declines it; the refusal above
     // mutates nothing and is served either way.
-    let refuse = refuse_write(repe, raise);
-    let write = match (&accessor.set, raise) {
+    let refuse = refuse_write(repe, borrow);
+    let write = match (&accessor.set, borrow) {
         (None, _) => quote! { Some(_) => #refuse, },
-        (Some(_), Raise::Shared) => quote! { Some(_) => None, },
-        (Some(set), Raise::Result) => {
+        (Some(_), Borrow::Shared) => quote! { Some(_) => None, },
+        (Some(set), Borrow::Exclusive) => {
             let setter = &set.method_ident;
             let ty = &set.args[0].1;
             let call = call_and_emit(
                 quote! { Self::#setter(self, __repe_arg) },
                 &set.ret,
-                sink.emit_null(),
+                emit_null(),
                 repe,
                 &path,
             );
             quote! {
-                Some(value) => {
-                    let __repe_arg: #ty = #repe::__private::serde_json::from_value(value)
-                        .map_err(|source| #repe::StructError::Deserialize {
-                            path: String::from(#path),
-                            source,
-                        })?;
+                Some(__repe_body) => {
+                    let __repe_arg: #ty = __repe_body.read(#path)?;
                     #call
                 }
             }
@@ -1966,10 +1686,9 @@ fn build_accessor_arm(
 //
 // `repe_shared_into` and `repe_call_shared_into` serve a request through
 // `&self`, so a read does not queue behind a long-running call on the same
-// object. A decline is not a value any sink can encode, so this is not a third
-// `Sink`; it is a second `Raise`, and the arms themselves are the same
-// generators the exclusive path uses — `build_method_arm`, `build_accessor_arm`
-// — called with `Raise::Shared`.
+// object. A decline is `None` where the exclusive path has only `Ok`/`Err`, and
+// the arms themselves are the same generators the exclusive path uses —
+// `build_method_arm`, `build_accessor_arm` — called with `Borrow::Shared`.
 //
 // That is why the two cannot disagree about how a value is serialized or how a
 // body is read: it is one generator, not two kept in step. They differ only in
@@ -1989,11 +1708,13 @@ fn build_accessor_arm(
 // served here whether or not it carries a body, a `&mut self` one never is, a
 // field write never is, and a nested child is asked the same question in turn.
 //
-// **The body.** It arrives as `&mut Option<Value>` and is taken only past the
-// last point an arm could still decline, because a decline owes the exclusive
-// retry the request it was handed. `decode_method_args` places the `take` for
-// that reason; a nested child is passed the borrow directly and holds the same
-// obligation.
+// **The body.** It arrives as `Option<RequestBody<'_>>`, a `Copy` view of the
+// request bytes, so a decline hands the exclusive retry the very same request
+// at no cost. What an arm must not do is *read from it* before the last point
+// it could still decline: a read lands in a live member, so a read followed by
+// a decline is a write the retry would then repeat. `decode_method_args` places
+// its reads for that reason; a nested child is passed the view directly and
+// holds the same obligation.
 //
 // **Listings settle first.** A listing is the one read that composes many
 // others, so a decline discovered partway through would leave the entries before
@@ -2008,87 +1729,6 @@ fn build_accessor_arm(
 //
 // Reading one of those endpoints on its own is unaffected: that arm decides from
 // the receiver, before it calls anything.
-
-/// One shared arm per field: a leaf serializes itself, a nested field asks its
-/// child, which may decline in turn, and a write declines unless the field is
-/// read-only.
-fn build_shared_field_arms(fields: &[FieldSpec], repe: &TokenStream2) -> Vec<TokenStream2> {
-    let subpath = refuse_subpath(repe, Raise::Shared);
-    let refuse = refuse_write(repe, Raise::Shared);
-    let mut arms = Vec::new();
-    for field in fields {
-        if field.attrs.skip {
-            continue;
-        }
-        let key = LitStr::new(&field.endpoint, Span::call_site());
-        let ident = &field.ident;
-        let path = endpoint_path(&field.endpoint);
-        // A write needs `&mut self` unless it is refused outright, in which case
-        // it needs nothing at all.
-        let write = if field.attrs.readonly {
-            refuse.clone()
-        } else {
-            quote! { None }
-        };
-
-        if field.attrs.nested {
-            // `tail` covers both cases the exclusive path splits: empty asks the
-            // child whole, non-empty descends. The child is handed the body
-            // borrow and the same obligation to leave it alone if it declines.
-            let ty = &field.ty;
-            let forward = quote! {
-                <#ty as #repe::RepeStruct>::repe_shared_into(&self.#ident, tail, body, out)
-                    .map(|__repe_result| {
-                        __repe_result.map_err(|err| #repe::structs::prepend_path(err, #key))
-                    })
-            };
-            if field.attrs.readonly {
-                arms.push(quote! {
-                    #key => {
-                        if body.is_some() {
-                            return #refuse;
-                        }
-                        #forward
-                    }
-                });
-            } else {
-                arms.push(quote! { #key => #forward, });
-            }
-        } else if field.attrs.nested_serde {
-            // Every read below the field is `&self`: serializing the field and
-            // walking the result mutates nothing, so the whole descent is
-            // servable here, through the same generator the exclusive arm uses.
-            // A write is a write.
-            let read = nested_serde_read(field, repe, Sink::Encode, Raise::Shared);
-            arms.push(quote! {
-                #key => {
-                    if body.is_some() {
-                        return #write;
-                    }
-                    #read
-                }
-            });
-        } else {
-            let read = if field.attrs.typed {
-                Sink::Encode.emit_typed_slice(repe, &path, quote! { self.#ident })
-            } else {
-                Sink::Encode.emit_value(repe, &path, quote! { self.#ident })
-            };
-            arms.push(quote! {
-                #key => {
-                    if !tail.is_empty() {
-                        return #subpath;
-                    }
-                    if body.is_some() {
-                        return #write;
-                    }
-                    Some(#read)
-                }
-            });
-        }
-    }
-    arms
-}
 
 /// The terms of "a shared whole-object listing of this struct declines",
 /// OR'd together by both places that need the answer: the guard at the top of
@@ -2109,8 +1749,8 @@ fn build_shared_field_arms(fields: &[FieldSpec], repe: &TokenStream2) -> Vec<Tok
 /// the guard's promise ("nothing after this point can decline") true rather than
 /// true by accident of declaration order.
 ///
-/// A `#[repe(nested_serde)]` field contributes no term: it is listed by
-/// `Serialize`, exactly as a leaf is, and has no impl of its own to ask.
+/// A leaf field contributes no term: it is written straight into the response
+/// and has no impl of its own to ask.
 ///
 /// An empty result means the constant `false`: a struct of plain fields, or one
 /// whose nesting and accessors all read shared. The caller emits no guard at all
@@ -2138,8 +1778,8 @@ fn build_shared_field_arms(fields: &[FieldSpec], repe: &TokenStream2) -> Vec<Tok
 /// cannot see them; `#[repe::methods]` computes
 /// `RepeMethods::REPE_SHARED_SERVES_BODIES` and this ORs it in.
 ///
-/// A `#[repe(nested_serde)]` field contributes no term unless it is read-only:
-/// it is walked through `serde`, and a write through it needs `&mut self`.
+/// A leaf field contributes no term unless it is read-only: a write to one is a
+/// write, and needs `&mut self`.
 ///
 /// An empty result means the constant `false` — a struct of plain fields whose
 /// every write needs the exclusive borrow, which is the shape the skip is for.
@@ -2445,47 +2085,27 @@ fn methods_impl(
         });
 
     let mut bodies = Vec::new();
-    for sink in [Sink::Value, Sink::Encode] {
-        let arms = build_method_arms(&published.methods, repe, sink, Raise::Result)
+    {
+        let arms = build_method_arms(&published.methods, repe, Borrow::Exclusive)
             .into_iter()
             .chain(
                 published
                     .accessors
                     .iter()
-                    .map(|accessor| build_accessor_arm(accessor, repe, sink, Raise::Result)),
+                    .map(|accessor| build_accessor_arm(accessor, repe, Borrow::Exclusive)),
             )
             .collect::<Vec<_>>();
-        let (signature, ret, unused) = match sink {
-            Sink::Value => (
-                quote! {
-                    fn repe_call(
-                        &mut self,
-                        segments: &[&str],
-                        body: Option<#repe::__private::serde_json::Value>,
-                    )
-                },
-                quote! { #repe::structs::StructResult<Option<#repe::__private::serde_json::Value>> },
-                quote! { let _ = &body; },
-            ),
-            Sink::Encode => (
-                quote! {
-                    fn repe_call_into(
-                        &mut self,
-                        segments: &[&str],
-                        body: Option<#repe::__private::serde_json::Value>,
-                        out: &mut #repe::structs::ResponseBody<'_>,
-                    )
-                },
-                quote! { #repe::structs::StructResult<()> },
-                quote! { let _ = &body; let _ = &out; },
-            ),
-        };
         bodies.push(quote! {
-            #signature -> #ret {
+            fn repe_call_into(
+                &mut self,
+                segments: &[&str],
+                body: Option<#repe::structs::RequestBody<'_>>,
+                out: &mut #repe::structs::ResponseBody<'_>,
+            ) -> #repe::structs::StructResult<()> {
                 let Some((head, tail)) = segments.split_first() else {
                     return Err(#repe::StructError::InvalidPath { path: String::from("") });
                 };
-                #unused
+                let _ = (&out, tail, &body);
                 match *head {
                     #(#arms)*
                     _ => Err(#repe::StructError::InvalidPath {
@@ -2496,13 +2116,13 @@ fn methods_impl(
         });
     }
 
-    let shared_arms = build_method_arms(&published.methods, repe, Sink::Encode, Raise::Shared)
+    let shared_arms = build_method_arms(&published.methods, repe, Borrow::Shared)
         .into_iter()
         .chain(
             published
                 .accessors
                 .iter()
-                .map(|accessor| build_accessor_arm(accessor, repe, Sink::Encode, Raise::Shared)),
+                .map(|accessor| build_accessor_arm(accessor, repe, Borrow::Shared)),
         )
         .collect::<Vec<_>>();
     let shared_invalid_root = quote! {
@@ -2517,7 +2137,7 @@ fn methods_impl(
         fn repe_call_shared_into(
             &self,
             segments: &[&str],
-            body: &mut Option<#repe::__private::serde_json::Value>,
+            body: Option<#repe::structs::RequestBody<'_>>,
             out: &mut #repe::structs::ResponseBody<'_>,
         ) -> Option<#repe::structs::StructResult<()>> {
             let Some((head, tail)) = segments.split_first() else {
@@ -3132,24 +2752,21 @@ mod tests {
     }
 
     #[test]
-    fn typed_and_nested_serde_are_rejected_together() {
-        let msg = field_error(parse_quote! {
-            #[repe(typed, nested_serde)]
-            child: Child
-        });
-        assert!(msg.contains("BEVE typed array"), "got: {msg}");
-    }
-
-    #[test]
-    fn nested_and_nested_serde_are_rejected_together() {
-        let msg = field_error(parse_quote! {
-            #[repe(nested, nested_serde)]
-            child: Child
-        });
-        assert!(
-            msg.contains("two ways to descend into one field"),
-            "the message should name the choice between them, got: {msg}"
-        );
+    fn nested_serde_is_rejected_with_a_migration_note() {
+        // It is rejected during attribute parsing, so it is rejected in every
+        // combination and there is nothing left for the `typed`/`nested`
+        // conflict checks to see.
+        for field in [
+            parse_quote! { #[repe(nested_serde)] child: Child },
+            parse_quote! { #[repe(typed, nested_serde)] child: Child },
+            parse_quote! { #[repe(nested, nested_serde)] child: Child },
+        ] {
+            let msg = field_error(field);
+            assert!(
+                msg.contains("nested_serde") && msg.contains("structio"),
+                "the message should name what replaced it, got: {msg}"
+            );
+        }
     }
 
     #[test]
@@ -3204,7 +2821,6 @@ mod tests {
         for field in [
             parse_quote! { #[repe(typed)] values: Vec<f64> },
             parse_quote! { #[repe(nested)] child: Child },
-            parse_quote! { #[repe(nested_serde)] child: Child },
             parse_quote! { #[repe(nested, readonly)] child: Child },
             parse_quote! { #[repe(rename = "other")] a: u64 },
             parse_quote! { #[repe(skip)] a: u64 },

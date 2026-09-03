@@ -3,6 +3,18 @@
 use repe::message::{create_error_message, create_error_response_like, create_response};
 use repe::*;
 
+#[derive(Default, Debug, PartialEq)]
+struct Ping {
+    ping: bool,
+}
+structio::object!(Ping { ping });
+
+#[derive(Default, Debug, PartialEq)]
+struct Ack {
+    ok: bool,
+}
+structio::object!(Ack { ok });
+
 #[test]
 fn header_roundtrip_and_validation() {
     let mut h = Header::new();
@@ -23,14 +35,12 @@ fn message_roundtrip_json() {
         .id(42)
         .query_str("/status")
         .query_format(QueryFormat::JsonPointer)
-        .body_json(&serde_json::json!({"ping": true}))
-        .unwrap()
+        .body_json(&Ping { ping: true })
         .build();
     let bytes = msg.to_vec();
     let parsed = Message::from_slice(&bytes).unwrap();
     assert_eq!(parsed.header.id, 42);
-    let v: serde_json::Value = parsed.json_body().unwrap();
-    assert_eq!(v["ping"], true);
+    assert!(parsed.json_body::<Ping>().unwrap().ping);
 }
 
 #[test]
@@ -99,13 +109,13 @@ fn create_response_raw_binary_serializes_json() {
         .body_utf8("{}")
         .build();
 
-    let payload = serde_json::json!({"ok": true});
-    let resp = create_response(&request, &payload, BodyFormat::RawBinary).unwrap();
+    let payload = Ack { ok: true };
+    let resp = create_response(&request, &payload, BodyFormat::RawBinary);
 
     assert_eq!(resp.header.body_format, BodyFormat::RawBinary as u16);
     assert_eq!(resp.header.id, request.header.id);
     assert_eq!(resp.query, request.query);
-    assert_eq!(resp.body, serde_json::to_vec(&payload).unwrap());
+    assert_eq!(resp.body, structio::json::to_vec(&payload));
 }
 
 #[test]

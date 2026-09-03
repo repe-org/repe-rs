@@ -14,7 +14,6 @@ use std::time::Duration;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use repe::{AsyncClient, BodyFormat, Message, QueryFormat, RepeError, WebSocketClient};
-use serde_json::Value;
 
 const DEFAULT_PORT: u16 = 5099;
 const DEFAULT_HOST: &str = "localhost";
@@ -404,8 +403,22 @@ fn resolve_body(
     }
 }
 
+/// Reject a `--body` that is not one well-formed JSON document, before it is
+/// put on the wire.
+///
+/// The check is a structural walk, not a parse into a value: there is no
+/// document model here and the CLI does not need one, so the bytes the user
+/// typed are the bytes that get sent. `prettify` is the walk — it has to
+/// understand the structure to lay it out, so an unbalanced brace, a missing
+/// value, an unterminated string, a trailing comma, or a second document after
+/// the first all stop it. The output is discarded; only the verdict is wanted.
+///
+/// What it does not check is the spelling of a *token*: `01` and `1.2.3` pass
+/// here and are rejected by the server's reader instead. That is a worse error
+/// message for a rarer mistake, and closing it would mean parsing the body into
+/// something, which is the thing this design exists to avoid.
 fn validate_json(text: &str) -> Result<(), CliError> {
-    serde_json::from_str::<Value>(text)
+    structio::json::prettify(text)
         .map(|_| ())
         .map_err(|err| CliError::Usage(format!("invalid JSON body: {err}")))
 }
@@ -432,17 +445,18 @@ fn print_response(msg: &Message, raw: bool) -> Result<(), CliError> {
         return Ok(());
     };
     match decoded {
-        DecodedBody::Json(value) => {
+        DecodedBody::Json(text) => {
+            // `--raw` prints what came off the wire; the default reformats it.
+            // Both are text-to-text: the CLI has no type for the response and
+            // does not need one, so nothing is parsed into a value and back.
             let rendered = if raw {
-                serde_json::to_string(&value)
+                text
             } else {
-                serde_json::to_string_pretty(&value)
+                structio::json::prettify(&text).map_err(|e| {
+                    CliError::Rpc(format!("server returned malformed JSON body: {e}"))
+                })?
             };
-            // serde_json::to_string is infallible for `Value`: every variant
-            // has a defined serialization and no I/O is involved. If this
-            // ever does fail we want a panic, not a silently-zero exit code.
-            let s = rendered.expect("serde_json cannot fail to render a Value");
-            println!("{s}");
+            println!("{rendered}");
         }
         DecodedBody::Utf8Raw(text) => {
             // `--raw` on a UTF-8 body emits the bytes verbatim, so
@@ -453,12 +467,16 @@ fn print_response(msg: &Message, raw: bool) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Decoded response body, after dispatching on the wire body format. UTF-8
-/// stays separate from `Json(Value::String(..))` so callers can opt out of
-/// JSON quoting (e.g. `--raw` printing a plain `/motd` body).
+/// A response body reduced to text for printing, after dispatching on the wire
+/// body format.
+///
+/// `Json` holds the JSON *text*, not a parsed value: a BEVE body is transcoded
+/// to JSON on the way in, and a JSON body is already what it needs to be. UTF-8
+/// stays separate so `--raw` can print a plain `/motd` body without JSON
+/// quoting around it.
 #[derive(Debug)]
 enum DecodedBody {
-    Json(Value),
+    Json(String),
     Utf8Raw(String),
 }
 
@@ -469,12 +487,24 @@ fn decode_response(msg: &Message) -> Result<Option<DecodedBody>, CliError> {
         return Ok(None);
     }
     match BodyFormat::try_from(msg.header.body_format) {
-        Ok(BodyFormat::Json) => Ok(Some(DecodedBody::Json(msg.json_body::<Value>().map_err(
-            |e| CliError::Rpc(format!("server returned malformed JSON body: {e}")),
-        )?))),
-        Ok(BodyFormat::Beve) => Ok(Some(DecodedBody::Json(msg.beve_body::<Value>().map_err(
-            |e| CliError::Rpc(format!("server returned malformed BEVE body: {e}")),
-        )?))),
+        Ok(BodyFormat::Json) => {
+            let text = std::str::from_utf8(&msg.body).map_err(|e| {
+                CliError::Rpc(format!("server returned a non-UTF-8 JSON body: {e}"))
+            })?;
+            // Checked here rather than left to the printer, so `--raw` reports a
+            // malformed body instead of passing it through to the terminal.
+            structio::json::prettify(text)
+                .map_err(|e| CliError::Rpc(format!("server returned malformed JSON body: {e}")))?;
+            Ok(Some(DecodedBody::Json(text.to_string())))
+        }
+        // Transcoded straight from the bytes. This is the one place repe wanted
+        // a `json_to_beve`-style converter and does not need it: the direction
+        // that matters here is the one BEVE can do without buffering, since a
+        // BEVE container declares its count up front.
+        Ok(BodyFormat::Beve) => Ok(Some(DecodedBody::Json(
+            structio::beve_to_json(&msg.body)
+                .map_err(|e| CliError::Rpc(format!("server returned malformed BEVE body: {e}")))?,
+        ))),
         Ok(BodyFormat::Utf8) => Ok(Some(DecodedBody::Utf8Raw(msg.body_utf8()))),
         Ok(BodyFormat::RawBinary) | Ok(_) | Err(_) => Err(CliError::Rpc(format!(
             "server returned {} raw-binary bytes (cannot render as JSON)",
@@ -771,38 +801,55 @@ mod tests {
         assert!(decode_response(&msg).unwrap().is_none());
     }
 
+    #[derive(Default)]
+    struct Keyed {
+        k: i64,
+    }
+    structio::object!(Keyed { k });
+
     #[test]
     fn decode_response_handles_json() {
-        let msg = repe::Message::builder()
-            .body_json(&serde_json::json!({"k": 1}))
-            .unwrap()
-            .build();
+        let msg = repe::Message::builder().body_json(&Keyed { k: 1 }).build();
         match decode_response(&msg).unwrap().unwrap() {
-            DecodedBody::Json(value) => assert_eq!(value["k"], 1),
+            DecodedBody::Json(text) => assert_eq!(text, r#"{"k":1}"#),
             DecodedBody::Utf8Raw(text) => panic!("expected Json variant, got Utf8Raw({text:?})"),
         }
     }
 
     #[test]
-    fn decode_response_handles_beve() {
-        let msg = repe::Message::builder()
-            .body_beve(&serde_json::json!({"k": 2}))
-            .unwrap()
-            .build();
+    fn decode_response_transcodes_beve_to_json() {
+        // The CLI has no type for a response, so a BEVE body is turned into
+        // JSON text rather than into a value. What arrives is the same document
+        // either way.
+        let msg = repe::Message::builder().body_beve(&Keyed { k: 2 }).build();
         match decode_response(&msg).unwrap().unwrap() {
-            DecodedBody::Json(value) => assert_eq!(value["k"], 2),
+            DecodedBody::Json(text) => {
+                assert_eq!(structio::json::minify(&text).unwrap(), r#"{"k":2}"#);
+            }
             DecodedBody::Utf8Raw(text) => panic!("expected Json variant, got Utf8Raw({text:?})"),
         }
+    }
+
+    #[test]
+    fn decode_response_rejects_a_malformed_json_body() {
+        // `--raw` prints the body through, so a truncated document has to be
+        // caught by the decoder rather than passed to the terminal.
+        let msg = repe::Message::builder()
+            .body_bytes(br#"{"k":"#.to_vec())
+            .body_format(repe::BodyFormat::Json)
+            .build();
+        assert!(matches!(decode_response(&msg), Err(CliError::Rpc(_))));
     }
 
     #[test]
     fn decode_response_keeps_utf8_separate_from_json() {
         // The CLI prints UTF-8 bodies verbatim under `--raw`, so the decoder
-        // must surface them distinctly from `Json(Value::String(..))`.
+        // must surface them distinctly from a JSON string body, which would
+        // otherwise print with its quotes.
         let msg = repe::Message::builder().body_utf8("hello").build();
         match decode_response(&msg).unwrap().unwrap() {
             DecodedBody::Utf8Raw(text) => assert_eq!(text, "hello"),
-            DecodedBody::Json(value) => panic!("expected Utf8Raw, got Json({value})"),
+            DecodedBody::Json(text) => panic!("expected Utf8Raw, got Json({text})"),
         }
     }
 

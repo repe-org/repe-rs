@@ -1,76 +1,47 @@
+//! The public JSON Pointer surface: [`repe::parse_json_pointer`].
+//!
+//! `eval_json_pointer` used to sit beside it, walking a `serde_json::Value` to
+//! the token a pointer named. There is no document model to walk any more, so
+//! it is gone: a pointer addresses an *endpoint* on this side of the wire, and
+//! resolving one is the router's or the registry's job rather than a tree
+//! walk's.
+//!
+//! The parser's own edge cases live in `src/json_pointer.rs`; what this file
+//! pins is that the re-export exists and behaves per RFC 6901.
+
 #![cfg(not(target_arch = "wasm32"))]
 
-use repe::{eval_json_pointer, parse_json_pointer};
-use serde_json::json;
+use repe::parse_json_pointer;
 
 #[test]
-fn parse_json_pointer_basic() {
-    let toks = parse_json_pointer("/a/b~1c/~0~0");
+fn tokens_are_unescaped() {
+    let toks = parse_json_pointer("/a/b~1c/~0~0").expect("a well-formed pointer");
     assert_eq!(toks, vec!["a", "b/c", "~~"]);
 }
 
 #[test]
-fn eval_json_pointer_object_array() {
-    let v = json!({
-        "a": { "b": [10, 20, 30] }
-    });
-    assert_eq!(eval_json_pointer(&v, "/a/b/1").unwrap(), &json!(20));
+fn the_root_pointer_has_no_tokens() {
+    assert!(parse_json_pointer("").expect("the root pointer").is_empty());
 }
 
 #[test]
-fn parse_json_pointer_root_and_escape() {
-    // Empty pointer returns whole document (evaluate test in repo covers behavior);
-    // here we ensure parser returns empty token list.
-    let toks = parse_json_pointer("");
-    assert!(toks.is_empty());
-
-    // Escaping: ~1 => '/', ~0 => '~'
-    let toks2 = parse_json_pointer("/a~1b/~0");
-    assert_eq!(toks2, vec!["a/b", "~"]);
-}
-
-#[test]
-fn parse_json_pointer_without_leading_slash() {
-    let toks = parse_json_pointer("foo/bar~1baz");
-    assert_eq!(toks, vec!["foo", "bar/baz"]);
-}
-
-#[test]
-fn parse_json_pointer_with_empty_tokens() {
-    let toks = parse_json_pointer("/accounts//email");
+fn an_empty_token_is_a_key_named_empty_string() {
+    let toks = parse_json_pointer("/accounts//email").expect("a well-formed pointer");
     assert_eq!(toks, vec!["accounts", "", "email"]);
 }
 
 #[test]
-fn eval_json_pointer_root_returns_document() {
-    let v = json!({
-        "data": [1, 2, 3]
-    });
-    assert_eq!(eval_json_pointer(&v, "").unwrap(), &v);
+fn a_pointer_without_a_leading_slash_is_malformed() {
+    // RFC 6901 §3: a non-empty pointer begins with `/`. This used to be
+    // accepted and silently split as though the slash were there, which made
+    // `foo/bar` and `/foo/bar` name the same endpoint through one door and not
+    // the other.
+    assert!(parse_json_pointer("foo/bar").is_err());
 }
 
 #[test]
-fn eval_json_pointer_missing_path_returns_none() {
-    let v = json!({
-        "present": true
-    });
-    assert_eq!(eval_json_pointer(&v, "/missing"), None);
-}
-
-#[test]
-fn eval_json_pointer_array_invalid_index_returns_none() {
-    let v = json!({
-        "arr": ["zero", "one"]
-    });
-    assert_eq!(eval_json_pointer(&v, "/arr/not-a-number"), None);
-}
-
-#[test]
-fn eval_json_pointer_handles_escaped_keys() {
-    let v = json!({
-        "a/b": {
-            "~": "tilde"
-        }
-    });
-    assert_eq!(eval_json_pointer(&v, "/a~1b/~0").unwrap(), &json!("tilde"));
+fn an_unknown_escape_is_malformed() {
+    // `~` introduces an escape and only `~0` and `~1` are defined, so `~2` is
+    // not a literal tilde-two — it is a pointer that does not parse.
+    assert!(parse_json_pointer("/a~2b").is_err());
 }

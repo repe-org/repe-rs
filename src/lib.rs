@@ -72,33 +72,6 @@ pub mod derive {
     pub use repe_derive::{RepeStruct, methods};
 }
 
-/// Items named by `#[derive(RepeStruct)]`'s generated code. Not public API:
-/// nothing outside the derive should name anything here, and its contents may
-/// change in any release.
-///
-/// It exists so generated code reaches `serde_json` through the crate that
-/// *defines* the trait rather than through the deriving crate's own dependency
-/// list. That buys two things. A deriving crate no longer has to declare
-/// `serde_json` for paths nothing in its source mentions — which matters most
-/// to exactly the light-dependency crate `repe-core` was split out for. And
-/// `RepeStruct`'s signatures name `serde_json::Value`, so the emitted impl must
-/// use the *same* `serde_json` the trait was declared with; resolving through
-/// here makes that structural instead of a coincidence of everyone being on
-/// `serde_json` 1.x, and it keeps working for a crate that renames the
-/// dependency (`json = { package = "serde_json" }`), which the old absolute
-/// `::serde_json` path did not.
-#[doc(hidden)]
-pub mod __private {
-    // Forwarded from `repe-core` rather than re-exported from this crate's own
-    // `serde_json`. `RepeStruct`'s signatures name `repe_core`'s
-    // `serde_json::Value`, so generated code has to name that one — and `repe`
-    // re-exporting its own would be the same crate only because both manifests
-    // say `"1"` and Cargo unifies them. That is a coincidence, narrower than the
-    // one this module removed but the same kind. This makes it structural: there
-    // is only ever one `serde_json` in play, and it is the trait's.
-    pub use repe_core::__private::serde_json;
-}
-
 /// Derive macro to generate [`structs::RepeStruct`] implementations.
 pub use repe_derive::RepeStruct;
 
@@ -140,21 +113,25 @@ pub use io::{
     read_message, read_message_into, write_message, write_message_complex_slice,
     write_message_streaming, write_message_typed_slice,
 };
-pub use json_pointer::{evaluate as eval_json_pointer, parse as parse_json_pointer};
+pub use json_pointer::parse as parse_json_pointer;
 
-/// Re-exported from `beve` for the typed-numeric body fast path: the element
-/// trait bound for [`MessageBuilder::body_typed_slice`] /
-/// [`Message::decode_typed_slice`] and the complex element type. Lets callers
-/// use the numeric body API without naming `beve` directly.
+/// The element bound for the typed-numeric body fast path, re-exported from
+/// `structio` so callers can use that API without naming `structio` directly.
+///
+/// `NumericBytes` is what `beve::BeveTypedSlice` was: the marker for an element
+/// whose in-memory bytes *are* its BEVE payload, which is what makes the bulk
+/// encode one `copy_nonoverlapping`. It bounds
+/// [`MessageBuilder::body_typed_slice`] and [`Message::decode_typed_slice`].
 ///
 /// [`MessageBuilder::body_typed_slice`]: crate::message::MessageBuilder::body_typed_slice
 /// [`Message::decode_typed_slice`]: crate::message::Message::decode_typed_slice
-pub use beve::{BeveTypedSlice, Complex};
+pub use structio::beve::NumericBytes;
+
 pub use message::{Message, MessageView};
 pub use peer::{
     CallContext, NotifyBody, PeerHandle, PeerId, PeerRegistry, PeerSendError, PeerSink,
 };
-pub use registry::{Registry, RegistryCallable, RegistryError, WithContext};
+pub use registry::{Registry, RegistryCallable, RegistryError, WithBody, WithContext};
 #[cfg(not(target_arch = "wasm32"))]
 pub use server::Server;
 pub use server::{
@@ -167,7 +144,10 @@ pub use stream::{
     DEFAULT_REPLAY_RING_BYTES, DEFAULT_WINDOW_BYTES, PendingResume, ReconnectOutcome,
     ResumeRejection, RingChunk, TransferControl, TransferRegistry, spawn_watchdog,
 };
-pub use structs::{RepeStruct, ResponseBody, StructError};
+/// The complex element type for the complex-array body path, re-exported from
+/// `structio` for the same reason as [`NumericBytes`].
+pub use structio::Complex;
+pub use structs::{RepeStruct, ResponseBody, StructError, WirePolicy};
 #[cfg(all(feature = "fleet-udp", not(target_arch = "wasm32")))]
 pub use udp_client::UniUdpClient;
 #[cfg(all(feature = "fleet-udp", not(target_arch = "wasm32")))]

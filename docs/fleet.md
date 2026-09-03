@@ -16,10 +16,27 @@
 
 ## Sync Fleet (`Fleet`)
 
+Every call names the type it sends and the type it expects back, the same as the single-node client.
+
 ```rust
 use repe::{Fleet, FleetOptions, NodeConfig, RetryPolicy};
-use serde_json::json;
 use std::time::Duration;
+
+#[derive(Default)]
+struct Empty;
+structio::object!(Empty {});
+
+#[derive(Default)]
+struct Input { value: i64 }
+structio::object!(Input { value });
+
+#[derive(Default)]
+struct Computed { result: i64 }
+structio::object!(Computed { result });
+
+#[derive(Default)]
+struct Status { status: String }
+structio::object!(Status { status });
 
 let fleet = Fleet::with_options(
     vec![
@@ -33,14 +50,15 @@ let fleet = Fleet::with_options(
 )?;
 
 let _ = fleet.connect_all();
-let single = fleet.call_json("node-1", "/compute", Some(&json!({"value": 10})))?;
-let many = fleet.broadcast_json("/status", None, &[] as &[&str]);
-let primary = fleet.broadcast_json("/status", None, &["primary"]);
+let single: repe::RemoteResult<Computed> =
+    fleet.call_json("node-1", "/compute", Some(&Input { value: 10 }))?;
+let many = fleet.broadcast_json::<_, Empty, Status>("/status", None, &[] as &[&str]);
+let primary = fleet.broadcast_json::<_, Empty, Status>("/status", None, &["primary"]);
 let health = fleet.health_check("/status");
-let total = fleet.map_reduce_json("/compute", Some(&json!({"value": 10})), &["compute"], |results| {
+let total = fleet.map_reduce_json("/compute", Some(&Input { value: 10 }), &["compute"], |results| {
     results
         .into_iter()
-        .filter_map(|r| r.value.and_then(|v| v["result"].as_i64()))
+        .filter_map(|r: repe::RemoteResult<Computed>| r.value.map(|v| v.result))
         .sum::<i64>()
 });
 let _ = fleet.disconnect_all();
@@ -60,7 +78,7 @@ let _ = fleet.disconnect_all();
   - `connect_all`, `disconnect_all`, `reconnect_disconnected`
   - `is_connected_all`, `is_connected(name)`
 - Invocation:
-  - `call_json(name, method, params)`
+  - `call_json::<T, R>(name, method, params)` — `params: None` sends an empty body
   - `call_message(name, method)`
   - `broadcast_json(method, params, tags)`
   - `map_reduce_json(method, params, tags, reduce_fn)`
@@ -73,7 +91,6 @@ let _ = fleet.disconnect_all();
 
 ```rust
 use repe::{AsyncFleet, FleetOptions, NodeConfig, RetryPolicy};
-use serde_json::json;
 use std::time::Duration;
 
 let fleet = AsyncFleet::with_options(
@@ -85,7 +102,8 @@ let fleet = AsyncFleet::with_options(
 )?;
 
 let _ = fleet.connect_all().await;
-let result = fleet.call_json("node-1", "/status", Some(&json!({}))).await?;
+let result: repe::RemoteResult<Status> =
+    fleet.call_json("node-1", "/status", Some(&Empty)).await?;
 assert!(result.succeeded());
 ```
 
@@ -107,7 +125,7 @@ assert!(result.succeeded());
   - `len`, `is_empty`, `keys`, `node`, `nodes`, `filter_nodes`
 - Node management:
   - `add_node`, `remove_node`, `close`
-- Sends:
+- Sends (`params: Option<&T>` where `T` is a declared body type; `None` sends an empty body):
   - `send_notify(method, params, tags)`
   - `send_request(method, params, tags)`
   - `notify_all(method, params)`
@@ -115,14 +133,17 @@ assert!(result.succeeded());
 
 ```rust
 use repe::{UniUdpFleet, UniUdpNodeConfig};
-use serde_json::json;
+
+#[derive(Default)]
+struct Source { source: String }
+structio::object!(Source { source });
 
 let fleet = UniUdpFleet::new(vec![
     UniUdpNodeConfig::new("127.0.0.1", 5001)?.with_name("edge-a")?.with_tags(["edge"]),
     UniUdpNodeConfig::new("127.0.0.1", 5002)?.with_name("edge-b")?.with_tags(["edge"]),
 ])?;
 
-let results = fleet.send_notify("/heartbeat", Some(&json!({"source": "controller"})), &["edge"]);
+let results = fleet.send_notify("/heartbeat", Some(&Source { source: "controller".into() }), &["edge"]);
 for (name, result) in results {
     println!("{name}: sent={} msg_id={}", result.succeeded(), result.message_id);
 }

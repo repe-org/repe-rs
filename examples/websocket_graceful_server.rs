@@ -27,9 +27,18 @@ use std::time::Duration;
 
 use repe::server::Router;
 use repe::{ConnectionError, WebSocketClient, WebSocketServer};
-use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+
+#[derive(Default, Debug)]
+struct Empty;
+structio::object!(Empty {});
+
+#[derive(Default, Debug)]
+struct Progress {
+    cancelled_at: u64,
+}
+structio::object!(Progress { cancelled_at });
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -39,20 +48,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (or a client disconnect) winds it down at the next loop boundary.
     let wound_down = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&wound_down);
-    let router = Router::new().with_json_ctx_blocking("/work", move |ctx, _params| {
-        let mut step = 0u64;
-        loop {
-            if ctx.is_cancelled() {
-                println!("[handler] cancelled at step {step}; freeing the thread");
-                flag.store(true, Ordering::SeqCst);
-                return Ok(json!({ "cancelled_at": step }));
+    let router =
+        Router::new().with_typed_ctx_blocking("/work", move |ctx: &repe::CallContext, _: Empty| {
+            let mut step = 0u64;
+            loop {
+                if ctx.is_cancelled() {
+                    println!("[handler] cancelled at step {step}; freeing the thread");
+                    flag.store(true, Ordering::SeqCst);
+                    return Ok(Progress { cancelled_at: step });
+                }
+                // A real handler would produce a chunk here and push it to the
+                // caller via `ctx.peer()`.
+                step += 1;
+                std::thread::sleep(Duration::from_millis(50));
             }
-            // A real handler would produce a chunk here and push it to the
-            // caller via `ctx.peer()`.
-            step += 1;
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    });
+        });
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let addr = listener.local_addr()?;
@@ -82,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // waiting for a response (which only arrives once the handler is
     // cancelled).
     let client = WebSocketClient::connect(&format!("ws://{addr}/repe")).await?;
-    client.notify_json("/work", &json!({})).await?;
+    client.notify_json("/work", &Empty).await?;
     println!("[client] started /work; letting it run briefly...");
     tokio::time::sleep(Duration::from_millis(200)).await;
 

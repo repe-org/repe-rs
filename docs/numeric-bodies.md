@@ -1,8 +1,8 @@
 # High-Throughput Numeric Bodies
 
-When a whole REPE message body is a contiguous numeric slice -- `&[f64]`, `&[i32]`, a `&[Complex<f64>]`, a matrix of samples -- repe can encode and decode it as a BEVE typed array in a single bulk copy, bypassing serde's element-by-element walk. On little-endian targets the encode, decode, and framing are O(1) in the element count (a header plus one `memcpy`), versus the per-element traversal a serde body pays.
+When a whole REPE message body is a contiguous numeric slice -- `&[f64]`, `&[i32]`, a `&[Complex<f64>]`, a matrix of samples -- repe can encode and decode it as a BEVE typed array in a single bulk copy, in a single bulk copy rather than an element-by-element walk. On little-endian targets the encode, decode, and framing are O(1) in the element count (a header plus one `memcpy`).
 
-This is opt-in and applies to a **whole-body** numeric slice. A numeric `Vec<T>` nested as a field inside a larger struct still goes through serde (serde never exposes the field's backing slice), so reach for it when the entire body is the array.
+This is opt-in and applies to a **whole-body** numeric slice. A numeric `Vec<T>` nested as a field inside a larger struct is written by the same writer and takes the same bulk path for its own payload; what these APIs add is measuring the length in closed form so the frame's buffer is allocated once.
 
 ## Encoding
 
@@ -23,7 +23,7 @@ let cmsg = Message::builder()
     .build();
 ```
 
-The bytes are **identical** to `body_beve(&samples)` (the serde path), so a bulk sender and a serde receiver -- or the reverse -- interoperate freely. The difference is only the cost of producing them.
+The bytes are **identical** to `body_beve(&samples)` -- structio has one writer, and it already takes the bulk path for a numeric vector -- so a bulk sender and an ordinary receiver, or the reverse, interoperate freely. What these APIs add is the closed-form size, so the buffer is allocated once rather than grown.
 
 ## Decoding
 
@@ -34,11 +34,11 @@ let back: Vec<f64> = msg.decode_typed_slice()?;
 let cback: Vec<Complex<f64>> = cmsg.decode_complex_slice()?;
 ```
 
-They error with `RepeError::UnexpectedBodyFormat` if the body is not `BodyFormat::Beve`, and `RepeError::Beve` if the bytes are not a typed array of the requested element type (wrong class/width, or a truncated payload) -- never a silent reinterpretation. Because the bytes match the serde encoding, `decode_typed_slice` also reads a body that was produced by `body_beve(&Vec<T>)`, and conversely `beve_body::<Vec<T>>()` reads a `body_typed_slice` body.
+They error with `RepeError::UnexpectedBodyFormat` if the body is not `BodyFormat::Beve`, and `RepeError::Beve` if the bytes are not a numeric array at all, or hold an integer that does not fit the requested width -- never a silent reinterpretation. A *width* mismatch is not an error: a stored `f64` array read as `f32` is converted element by element, and the bulk path is taken wherever the widths agree. `decode_typed_slice` and `beve_body::<Vec<T>>()` read each other's bodies, because there is one reader underneath both.
 
 ## Streaming a large body with no body buffer
 
-For a body too large to hold a second copy of, `write_message_typed_slice` sizes the body in closed form (`beve::typed_slice_size`, no traversal) and writes the payload straight to the sink:
+For a body too large to hold a second copy of, `write_message_typed_slice` sizes the body in closed form (`structio::beve_size`, no traversal) and writes the payload straight to the sink:
 
 ```rust
 use repe::{Header, write_message_typed_slice};
@@ -51,9 +51,9 @@ The wire frame is byte-for-byte identical to building a `body_typed_slice` messa
 
 ## Performance
 
-Framing a whole-body numeric `Vec<f64>`, serde streaming (`serialized_size` + `to_writer_streaming`, two O(payload) element walks) vs the typed-slice fast path (O(1) size + one bulk write), from `benches/wire_serialization.rs`:
+Framing a whole-body numeric `Vec<f64>`, a size pass plus a stream write vs the typed-slice fast path (O(1) size + one bulk write), from `benches/wire_serialization.rs`:
 
-| elements | serde stream | typed slice | speedup |
+| elements | size + stream | typed slice | speedup |
 |---:|---:|---:|---:|
 | 64 | 268 ns | 19 ns | ~14x |
 | 4 096 | 17.6 us | 535 ns | ~33x |

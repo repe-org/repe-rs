@@ -1,13 +1,41 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use repe::{Client, Message, QueryFormat, RepeError, read_message, write_message};
-use serde_json::{Value, json};
 use std::io::{BufReader, BufWriter, Write};
 use std::net::TcpListener;
 use std::thread;
 use std::time::Duration;
 
-fn json_response_for(req: &Message, body: &Value) -> Message {
+// ---- wire fixtures ----
+
+#[derive(Default, Debug, PartialEq)]
+struct Count {
+    n: i64,
+}
+structio::object!(Count { n });
+
+/// A response echoing the request's own query back.
+#[derive(Default, Debug, PartialEq)]
+struct Echo {
+    path: String,
+}
+structio::object!(Echo { path });
+
+/// [`Echo`] plus the request id, for tests where pairing a response to its
+/// request is the thing under test.
+#[derive(Default, Debug, PartialEq)]
+struct EchoId {
+    path: String,
+    id: u64,
+}
+structio::object!(EchoId { path, id });
+
+/// An empty body: `{}` on the wire.
+#[derive(Default, Debug, PartialEq)]
+struct Empty;
+structio::object!(Empty {});
+
+fn json_response_for<T: structio::json::Write + ?Sized>(req: &Message, body: &T) -> Message {
     Message::builder()
         .id(req.header.id)
         .query_bytes(req.query.clone())
@@ -15,7 +43,6 @@ fn json_response_for(req: &Message, body: &Value) -> Message {
             QueryFormat::try_from(req.header.query_format).unwrap_or(QueryFormat::RawBinary),
         )
         .body_json(body)
-        .expect("json body")
         .build()
 }
 
@@ -34,11 +61,17 @@ fn sync_client_multiplexes_out_of_order_responses() {
 
         let resp_b = json_response_for(
             &req_b,
-            &json!({"path": req_b.query_utf8(), "id": req_b.header.id}),
+            &EchoId {
+                path: req_b.query_utf8(),
+                id: req_b.header.id,
+            },
         );
         let resp_a = json_response_for(
             &req_a,
-            &json!({"path": req_a.query_utf8(), "id": req_a.header.id}),
+            &EchoId {
+                path: req_a.query_utf8(),
+                id: req_a.header.id,
+            },
         );
 
         write_message(&mut writer, &resp_b).unwrap();
@@ -51,8 +84,8 @@ fn sync_client_multiplexes_out_of_order_responses() {
 
     let c1 = client.clone();
     let call_a = thread::spawn(move || {
-        let out = c1.call_json("/first", &json!({"v": 1}))?;
-        if out["path"] != "/first" {
+        let out: EchoId = c1.call_typed_json("/first", &Count { n: 1 })?;
+        if out.path != "/first" {
             return Err(RepeError::Io(std::io::Error::other(
                 "unexpected response for /first",
             )));
@@ -62,8 +95,8 @@ fn sync_client_multiplexes_out_of_order_responses() {
 
     let c2 = client.clone();
     let call_b = thread::spawn(move || {
-        let out = c2.call_json("/second", &json!({"v": 2}))?;
-        if out["path"] != "/second" {
+        let out: EchoId = c2.call_typed_json("/second", &Count { n: 2 })?;
+        if out.path != "/second" {
             return Err(RepeError::Io(std::io::Error::other(
                 "unexpected response for /second",
             )));
@@ -90,7 +123,7 @@ fn sync_client_per_request_timeout() {
 
     let client = Client::connect(addr).unwrap();
     let err = client
-        .call_json_with_timeout("/slow", &json!({}), Duration::from_millis(50))
+        .call_typed_json_with_timeout::<_, _, Echo>("/slow", &Empty, Duration::from_millis(50))
         .unwrap_err();
 
     match err {
@@ -117,23 +150,28 @@ fn sync_client_batch_json_preserves_order() {
         }
 
         for req in requests.into_iter().rev() {
-            let response = json_response_for(&req, &json!({"path": req.query_utf8()}));
+            let response = json_response_for(
+                &req,
+                &Echo {
+                    path: req.query_utf8(),
+                },
+            );
             write_message(&mut writer, &response).unwrap();
             writer.flush().unwrap();
         }
     });
 
     let client = Client::connect(addr).unwrap();
-    let results = client.batch_json(vec![
-        ("/a".to_string(), json!({"n": 1})),
-        ("/b".to_string(), json!({"n": 2})),
-        ("/c".to_string(), json!({"n": 3})),
+    let results: Vec<Result<Echo, _>> = client.batch_json(vec![
+        ("/a".to_string(), Count { n: 1 }),
+        ("/b".to_string(), Count { n: 2 }),
+        ("/c".to_string(), Count { n: 3 }),
     ]);
 
     assert_eq!(results.len(), 3);
-    assert_eq!(results[0].as_ref().unwrap()["path"], "/a");
-    assert_eq!(results[1].as_ref().unwrap()["path"], "/b");
-    assert_eq!(results[2].as_ref().unwrap()["path"], "/c");
+    assert_eq!(results[0].as_ref().unwrap().path, "/a");
+    assert_eq!(results[1].as_ref().unwrap().path, "/b");
+    assert_eq!(results[2].as_ref().unwrap().path, "/c");
 
     server.join().unwrap();
 }
@@ -158,13 +196,21 @@ fn sync_client_ignores_late_response_for_timed_out_request() {
 
         thread::sleep(Duration::from_millis(120));
 
-        let late_response =
-            json_response_for(&timed_out_req, &json!({"path": timed_out_req.query_utf8()}));
+        let late_response = json_response_for(
+            &timed_out_req,
+            &Echo {
+                path: timed_out_req.query_utf8(),
+            },
+        );
         write_message(&mut writer, &late_response).unwrap();
         writer.flush().unwrap();
 
-        let pending_response =
-            json_response_for(&pending_req, &json!({"path": pending_req.query_utf8()}));
+        let pending_response = json_response_for(
+            &pending_req,
+            &Echo {
+                path: pending_req.query_utf8(),
+            },
+        );
         write_message(&mut writer, &pending_response).unwrap();
         writer.flush().unwrap();
     });
@@ -173,18 +219,18 @@ fn sync_client_ignores_late_response_for_timed_out_request() {
 
     let timed_client = client.clone();
     let timed_call = thread::spawn(move || {
-        timed_client.call_json_with_timeout(
+        timed_client.call_typed_json_with_timeout::<_, _, Echo>(
             "/timed_out",
-            &json!({"n": 1}),
+            &Count { n: 1 },
             Duration::from_millis(50),
         )
     });
 
     let pending_client = client.clone();
     let pending_call = thread::spawn(move || {
-        pending_client.call_json_with_timeout(
+        pending_client.call_typed_json_with_timeout::<_, _, Echo>(
             "/still_pending",
-            &json!({"n": 2}),
+            &Count { n: 2 },
             Duration::from_millis(500),
         )
     });
@@ -196,7 +242,7 @@ fn sync_client_ignores_late_response_for_timed_out_request() {
     }
 
     let pending_out = pending_call.join().unwrap().unwrap();
-    assert_eq!(pending_out["path"], "/still_pending");
+    assert_eq!(pending_out.path, "/still_pending");
 
     server.join().unwrap();
 }

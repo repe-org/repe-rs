@@ -171,16 +171,20 @@ mod tests {
     use crate::constants::{HEADER_SIZE, QueryFormat};
     use crate::io::write_message_streaming;
     use crate::server::Router;
-    use serde_json::json;
     use std::io::Write;
 
-    fn request_bytes(path: &str, body: serde_json::Value) -> Vec<u8> {
+    #[derive(Default, Debug, PartialEq)]
+    struct Point {
+        x: i64,
+    }
+    structio::object!(Point { x });
+
+    fn request_bytes<T: structio::json::Write + ?Sized>(path: &str, body: &T) -> Vec<u8> {
         Message::builder()
             .id(7)
             .query_str(path)
             .query_format(QueryFormat::JsonPointer)
-            .body_json(&body)
-            .unwrap()
+            .body_json(body)
             .build()
             .to_vec()
     }
@@ -190,8 +194,8 @@ mod tests {
         // The borrowing path returns a query-less response; the server frames it
         // echoing the borrowed view query. The framed result must round-trip with
         // the request query intact — what the old owned (cloning) path produced.
-        let router = Router::new().with_json("/echo", |v: serde_json::Value| Ok(v));
-        let wire = request_bytes("/echo", json!({"x": 1}));
+        let router = Router::new().with_typed("/echo", |v: Point| Ok(v));
+        let wire = request_bytes("/echo", &Point { x: 1 });
         let view = MessageView::from_slice(&wire).unwrap();
 
         let resp = route_request_view(&router, &view).expect("response");
@@ -218,14 +222,14 @@ mod tests {
             framed.header.length,
             HEADER_SIZE as u64 + framed.header.query_length + framed.header.body_length
         );
-        let echoed: serde_json::Value = framed.json_body().unwrap();
-        assert_eq!(echoed, json!({"x": 1}));
+        let echoed: Point = framed.json_body().unwrap();
+        assert_eq!(echoed, Point { x: 1 });
     }
 
     #[test]
     fn view_dispatch_unknown_method_is_query_less_error() {
         let router = Router::new();
-        let wire = request_bytes("/missing", json!({}));
+        let wire = request_bytes("/missing", &Point { x: 0 });
         let view = MessageView::from_slice(&wire).unwrap();
 
         let resp = route_request_view(&router, &view).expect("error response");

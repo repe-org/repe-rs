@@ -11,10 +11,44 @@
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
+use repe::structs::RequestBody;
 use repe::{AsyncServer, ErrorCode, Registry, Router, TypedResponse, WebSocketServer};
-use serde_json::{Value, json};
 use tokio::net::TcpListener;
+
+#[derive(Default, Debug, PartialEq)]
+struct Config {
+    timeout: i64,
+    retries: i64,
+}
+structio::object!(Config { timeout, retries });
+
+#[derive(Default, Debug, PartialEq)]
+struct Operands {
+    a: i64,
+    b: i64,
+}
+structio::object!(Operands { a, b });
+
+#[derive(Default, Debug, PartialEq)]
+struct Sum {
+    result: i64,
+}
+structio::object!(Sum { result });
+
+#[derive(Default, Debug, PartialEq)]
+struct Count {
+    n: i64,
+}
+structio::object!(Count { n });
+
+#[derive(Default, Debug, PartialEq)]
+struct BeveEcho {
+    format: String,
+    echo: Count,
+}
+structio::object!(BeveEcho { format, echo });
 
 /// Path to the freshly-built `repe` binary. Cargo populates this for
 /// `[[bin]]` targets when the integration test compiles.
@@ -25,22 +59,45 @@ const REPE_BIN: &str = env!("CARGO_BIN_EXE_repe");
 /// surface area; any added endpoint becomes testable on both immediately.
 fn build_router() -> Router {
     let registry = Arc::new(Registry::new());
-    registry.register_value("/counter", json!(0)).unwrap();
+
+    // `/counter` holds state behind a function, which is how a value endpoint
+    // is spelled with no document store behind the registry: the handler owns
+    // the state and decides what a body means.
+    let counter = Arc::new(AtomicI64::new(0));
     registry
-        .register_value("/config", json!({"timeout": 30, "retries": 3}))
-        .unwrap();
-    registry
-        .register_function("/add", |params| {
-            let Some(Value::Object(map)) = params else {
-                return Err((ErrorCode::InvalidBody, "expected object body".into()));
-            };
-            let a = map.get("a").and_then(Value::as_i64).unwrap_or(0);
-            let b = map.get("b").and_then(Value::as_i64).unwrap_or(0);
-            Ok(json!({"result": a + b}))
+        .register_function("/counter", move |params: Option<RequestBody<'_>>| {
+            if let Some(body) = params {
+                let next: i64 = body
+                    .read("/counter")
+                    .map_err(|err| (ErrorCode::InvalidBody, err.to_string()))?;
+                counter.store(next, Ordering::SeqCst);
+            }
+            Ok(counter.load(Ordering::SeqCst))
         })
         .unwrap();
     registry
-        .register_function("/refresh", |_params| Ok(Value::Null))
+        .register_function("/config", |_: Option<RequestBody<'_>>| {
+            Ok(Config {
+                timeout: 30,
+                retries: 3,
+            })
+        })
+        .unwrap();
+    registry
+        .register_function("/add", |params: Option<RequestBody<'_>>| {
+            let Some(body) = params else {
+                return Err((ErrorCode::InvalidBody, "expected object body".into()));
+            };
+            let operands: Operands = body
+                .read("/add")
+                .map_err(|err| (ErrorCode::InvalidBody, err.to_string()))?;
+            Ok(Sum {
+                result: operands.a + operands.b,
+            })
+        })
+        .unwrap();
+    registry
+        .register_function("/refresh", |_: Option<RequestBody<'_>>| Ok(()))
         .unwrap();
     // Sleeps long enough that any reasonable `--timeout` setting will trip.
     // Uses std::thread::sleep because the registry's callable signature is
@@ -48,9 +105,9 @@ fn build_router() -> Router {
     // server's accept loop and CLI subprocess responsive while the handler
     // blocks.
     registry
-        .register_function("/slow_call", |_params| {
+        .register_function("/slow_call", |_: Option<RequestBody<'_>>| {
             std::thread::sleep(std::time::Duration::from_millis(500));
-            Ok(Value::Null)
+            Ok(())
         })
         .unwrap();
 
@@ -58,15 +115,15 @@ fn build_router() -> Router {
     // decoding: it accepts a JSON body and replies with the same payload
     // re-encoded as BEVE.
     Router::new()
-        // Turbofish on `with_typed` is required: `TypedResponse<Value>` matches
-        // both blanket `IntoTypedResponse` impls, so `R` cannot be inferred.
-        .with_typed::<Value, Value, _>(
+        // Turbofish on `with_typed` is required: `TypedResponse<T>` matches both
+        // blanket `IntoTypedResponse` impls, so `R` cannot be inferred.
+        .with_typed::<Count, BeveEcho, _>(
             "/beve_echo",
-            |params: Value| -> Result<TypedResponse<Value>, (ErrorCode, String)> {
-                Ok(TypedResponse::beve(json!({
-                    "format": "beve",
-                    "echo": params,
-                })))
+            |params: Count| -> Result<TypedResponse<BeveEcho>, (ErrorCode, String)> {
+                Ok(TypedResponse::beve(BeveEcho {
+                    format: "beve".into(),
+                    echo: params,
+                }))
             },
         )
         .with_registry("/api/v1", registry)
@@ -151,8 +208,8 @@ async fn call_with_json_body_returns_object() {
 
     let out = run_cli(&url, &["call", "/api/v1/add", r#"{"a":17,"b":25}"#]).await;
     assert!(out.status.success(), "stderr: {}", stderr_of(&out));
-    let value: Value = serde_json::from_str(stdout_of(&out).trim()).unwrap();
-    assert_eq!(value["result"], 42);
+    let value: Sum = structio::from_str(stdout_of(&out).trim()).unwrap();
+    assert_eq!(value.result, 42);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -167,9 +224,9 @@ async fn raw_flag_emits_compact_json() {
         !trimmed.contains('\n'),
         "expected single-line raw output, got: {stdout:?}"
     );
-    let value: Value = serde_json::from_str(trimmed).unwrap();
-    assert_eq!(value["timeout"], 30);
-    assert_eq!(value["retries"], 3);
+    let value: Config = structio::from_str(trimmed).unwrap();
+    assert_eq!(value.timeout, 30);
+    assert_eq!(value.retries, 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -234,8 +291,8 @@ async fn body_from_stdin_dash() {
     .expect("blocking task panicked");
 
     assert!(out.status.success(), "stderr: {}", stderr_of(&out));
-    let value: Value = serde_json::from_str(stdout_of(&out).trim()).unwrap();
-    assert_eq!(value["result"], 7);
+    let value: Sum = structio::from_str(stdout_of(&out).trim()).unwrap();
+    assert_eq!(value.result, 7);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -257,8 +314,8 @@ async fn body_from_file() {
     let _ = std::fs::remove_file(&path);
 
     assert!(out.status.success(), "stderr: {}", stderr_of(&out));
-    let value: Value = serde_json::from_str(stdout_of(&out).trim()).unwrap();
-    assert_eq!(value["result"], 42);
+    let value: Sum = structio::from_str(stdout_of(&out).trim()).unwrap();
+    assert_eq!(value.result, 42);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -267,9 +324,9 @@ async fn beve_response_is_decoded_to_json() {
 
     let out = run_cli(&url, &["call", "/beve_echo", r#"{"n":7}"#]).await;
     assert!(out.status.success(), "stderr: {}", stderr_of(&out));
-    let value: Value = serde_json::from_str(stdout_of(&out).trim()).unwrap();
-    assert_eq!(value["format"], "beve");
-    assert_eq!(value["echo"]["n"], 7);
+    let value: BeveEcho = structio::from_str(stdout_of(&out).trim()).unwrap();
+    assert_eq!(value.format, "beve");
+    assert_eq!(value.echo.n, 7);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -316,8 +373,8 @@ async fn websocket_get_set_call_roundtrip() {
 
     let out = run_cli(&url, &["call", "/api/v1/add", r#"{"a":40,"b":2}"#]).await;
     assert!(out.status.success(), "stderr: {}", stderr_of(&out));
-    let value: Value = serde_json::from_str(stdout_of(&out).trim()).unwrap();
-    assert_eq!(value["result"], 42);
+    let value: Sum = structio::from_str(stdout_of(&out).trim()).unwrap();
+    assert_eq!(value.result, 42);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

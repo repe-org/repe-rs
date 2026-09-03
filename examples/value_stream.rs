@@ -5,15 +5,15 @@
 
 use repe::value_stream::{RouterValueStreamExt, StreamOpts};
 use repe::{Client, Router, Server, pull_value};
-use serde::{Deserialize, Serialize};
 use std::net::TcpListener;
 use std::thread;
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Default, Clone, Debug, PartialEq)]
 struct Dataset {
     name: String,
     samples: Vec<f64>,
 }
+structio::object!(Dataset { name, samples });
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The value the server will stream. In a real service this might be loaded

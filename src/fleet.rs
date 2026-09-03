@@ -1,7 +1,8 @@
 use crate::client::Client;
+use crate::constants::{BodyFormat, QueryFormat};
 use crate::error::RepeError;
 use crate::message::Message;
-use serde_json::Value;
+use repe_core::structs::ServableOwned;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
@@ -450,14 +451,21 @@ impl Fleet {
         Ok(lock_node_client(&node.client).is_some())
     }
 
-    pub fn call_json(
+    /// Call one node with an optional JSON body and decode its response as `R`.
+    ///
+    /// `params: None` sends an empty body, which is a registry READ.
+    pub fn call_json<T, R>(
         &self,
         node_name: &str,
         method: &str,
-        params: Option<&Value>,
-    ) -> Result<RemoteResult<Value>, FleetError> {
+        params: Option<&T>,
+    ) -> Result<RemoteResult<R>, FleetError>
+    where
+        T: structio::json::Write + ?Sized,
+        R: ServableOwned,
+    {
         let node = self.node_state(node_name)?;
-        Ok(self.call_json_with_retry(node, method.to_string(), params.cloned()))
+        Ok(self.call_json_with_retry(node, method.to_string(), encode_params(params)))
     }
 
     pub fn call_message(
@@ -472,21 +480,30 @@ impl Fleet {
     /// Broadcasts to nodes matching all provided tags.
     ///
     /// Passing an empty `tags` slice matches all nodes.
-    pub fn broadcast_json<T: AsRef<str>>(
+    pub fn broadcast_json<Tag, T, R>(
         &self,
         method: &str,
-        params: Option<&Value>,
-        tags: &[T],
-    ) -> HashMap<String, RemoteResult<Value>> {
+        params: Option<&T>,
+        tags: &[Tag],
+    ) -> HashMap<String, RemoteResult<R>>
+    where
+        Tag: AsRef<str>,
+        T: structio::json::Write + ?Sized,
+        R: ServableOwned + Send + 'static,
+    {
         let target_nodes = self.snapshot_target_nodes(tags);
         let mut handles = Vec::with_capacity(target_nodes.len());
+        // Encoded once for the whole broadcast rather than per node. The body
+        // is byte-identical everywhere it goes, and cloning `Vec<u8>` is what
+        // the per-node `Value` clone was paying for anyway.
+        let body = encode_params(params);
 
         for node in target_nodes {
             let fleet = self.clone();
             let method = method.to_string();
-            let params = params.cloned();
+            let body = body.clone();
             handles.push(thread::spawn(move || {
-                let result = fleet.call_json_with_retry(node, method, params);
+                let result = fleet.call_json_with_retry(node, method, body);
                 (result.node.clone(), result)
             }));
         }
@@ -504,15 +521,18 @@ impl Fleet {
     /// Broadcasts and reduces over nodes matching all provided tags.
     ///
     /// Passing an empty `tags` slice matches all nodes.
-    pub fn map_reduce_json<T: AsRef<str>, R, F>(
+    pub fn map_reduce_json<Tag, T, V, R, F>(
         &self,
         method: &str,
-        params: Option<&Value>,
-        tags: &[T],
+        params: Option<&T>,
+        tags: &[Tag],
         reduce_fn: F,
     ) -> R
     where
-        F: FnOnce(Vec<RemoteResult<Value>>) -> R,
+        Tag: AsRef<str>,
+        T: structio::json::Write + ?Sized,
+        V: ServableOwned + Send + 'static,
+        F: FnOnce(Vec<RemoteResult<V>>) -> R,
     {
         let results = self.broadcast_json(method, params, tags);
         reduce_fn(results.into_values().collect())
@@ -583,12 +603,12 @@ impl Fleet {
             .ok_or_else(|| FleetError::NodeNotFound(name.to_string()))
     }
 
-    fn call_json_with_retry(
+    fn call_json_with_retry<R: ServableOwned>(
         &self,
         node: Arc<NodeState>,
         method: String,
-        params: Option<Value>,
-    ) -> RemoteResult<Value> {
+        body: Option<Vec<u8>>,
+    ) -> RemoteResult<R> {
         let started = Instant::now();
         let mut last_error = None;
 
@@ -596,12 +616,17 @@ impl Fleet {
             let timeout = node.config.timeout;
             let call = (|| {
                 let client = ensure_connected(&node)?;
-                if let Some(ref value) = params {
-                    client.call_json_with_timeout(&method, value, timeout)
-                } else {
-                    let message = client.call_message_with_timeout(&method, timeout)?;
-                    message.json_body::<Value>()
-                }
+                let message = match body {
+                    Some(ref bytes) => client.call_with_formats_and_timeout(
+                        &method,
+                        QueryFormat::JsonPointer as u16,
+                        Some(bytes),
+                        BodyFormat::Json as u16,
+                        timeout,
+                    )?,
+                    None => client.call_message_with_timeout(&method, timeout)?,
+                };
+                message.decode_body::<R>()
             })();
 
             match call {
@@ -791,4 +816,13 @@ fn write_nodes(
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     }
+}
+
+/// Encode an optional JSON body once, so a broadcast pays for one encode and
+/// then clones bytes rather than re-encoding per node.
+///
+/// `None` stays `None`: an absent body is an empty frame (a registry READ),
+/// which is not the same as a body encoding to `null`.
+fn encode_params<T: structio::json::Write + ?Sized>(params: Option<&T>) -> Option<Vec<u8>> {
+    params.map(structio::json::to_vec)
 }

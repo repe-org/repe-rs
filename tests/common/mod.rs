@@ -1,7 +1,6 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use repe::{ErrorCode, Message, RepeError, read_message, write_message};
-use serde_json::{Value, json};
 use std::io::{BufReader, BufWriter, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
@@ -10,6 +9,112 @@ use std::thread;
 use std::time::Duration;
 
 pub type Handler = Arc<dyn Fn(&Message) -> Message + Send + Sync>;
+
+// ---- shared wire fixtures -------------------------------------------------
+//
+// There is no document model, so a body needs a declared type. These are the
+// shapes the integration suite actually sends: markers, counters, operand
+// pairs. Declare a case-specific one locally where a test names its own field.
+
+/// An empty body: `{}` on the wire. The marker for "this frame carries a body
+/// but its contents do not matter".
+#[derive(Default, Debug, PartialEq)]
+pub struct Empty;
+structio::object!(Empty {});
+
+#[derive(Default, Debug, PartialEq)]
+pub struct Ack {
+    pub ok: bool,
+}
+structio::object!(Ack { ok });
+
+#[derive(Default, Debug, PartialEq)]
+pub struct Count {
+    pub n: i64,
+}
+structio::object!(Count { n });
+
+#[derive(Default, Debug, PartialEq)]
+pub struct Value_ {
+    pub value: i64,
+}
+structio::object!(Value_ { value });
+
+#[derive(Default, Debug, PartialEq)]
+pub struct Operands {
+    pub a: i64,
+    pub b: i64,
+}
+structio::object!(Operands { a, b });
+
+#[derive(Default, Debug, PartialEq)]
+pub struct Sum {
+    pub sum: i64,
+}
+structio::object!(Sum { sum });
+
+/// A response that echoes back the request's own query, for tests that only
+/// need to prove which request a response belongs to.
+#[derive(Default, Debug, PartialEq)]
+pub struct Echo {
+    pub path: String,
+}
+structio::object!(Echo { path });
+
+/// [`Echo`] plus the request id, for the multiplexing tests, where the pairing
+/// of response to request is the thing under test.
+#[derive(Default, Debug, PartialEq)]
+pub struct EchoId {
+    pub path: String,
+    pub id: u64,
+}
+structio::object!(EchoId { path, id });
+
+/// A tagged response, for tests that drive several routes through one server
+/// and need to tell the answers apart.
+#[derive(Default, Debug, PartialEq)]
+pub struct Kind {
+    pub kind: String,
+    pub n: i64,
+}
+structio::object!(Kind { kind, n });
+
+/// A node's `/status` answer.
+#[derive(Default, Debug, PartialEq)]
+pub struct Status {
+    pub status: String,
+    pub node: i64,
+}
+structio::object!(Status { status, node });
+
+/// A `/compute` request: one number to transform.
+#[derive(Default, Debug, PartialEq)]
+pub struct Input {
+    pub value: i64,
+}
+structio::object!(Input { value });
+
+/// A `/compute` answer, tagged with the node that produced it.
+#[derive(Default, Debug, PartialEq)]
+pub struct Computed {
+    pub result: i64,
+    pub node: i64,
+}
+structio::object!(Computed { result, node });
+
+/// An `/echo` body: a bare identifier, echoed back unchanged.
+#[derive(Default, Debug, PartialEq)]
+pub struct Id {
+    pub id: i64,
+}
+structio::object!(Id { id });
+
+#[derive(Default, Debug, PartialEq)]
+pub struct Attempt {
+    pub success: bool,
+    pub attempt: u64,
+}
+structio::object!(Attempt { success, attempt });
 
 pub struct TestServer {
     addr: std::net::SocketAddr,
@@ -85,7 +190,10 @@ impl TransportFlakyServer {
                             let resp = if req.query_utf8() == "/flaky" {
                                 json_response_for(
                                     &req,
-                                    &json!({"success": true, "attempt": current}),
+                                    &Attempt {
+                                        success: true,
+                                        attempt: current as u64,
+                                    },
                                 )
                             } else {
                                 error_response_for(&req, ErrorCode::MethodNotFound, "unknown route")
@@ -218,13 +326,12 @@ fn handle_connection(stream: TcpStream, stop: Arc<AtomicBool>, handler: Handler)
     }
 }
 
-pub fn json_response_for(req: &Message, body: &Value) -> Message {
+pub fn json_response_for<T: structio::json::Write + ?Sized>(req: &Message, body: &T) -> Message {
     Message::builder()
         .id(req.header.id)
         .query_bytes(req.query.clone())
         .query_format_code(req.header.query_format)
         .body_json(body)
-        .expect("json body")
         .build()
 }
 

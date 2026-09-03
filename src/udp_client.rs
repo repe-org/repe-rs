@@ -1,7 +1,7 @@
 use crate::constants::{BodyFormat, QueryFormat};
 use crate::error::RepeError;
 use crate::message::Message;
-use serde_json::Value;
+use repe_core::structs::ServableWrite;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -104,7 +104,11 @@ impl UniUdpClient {
         *socket = None;
     }
 
-    pub fn send_notify(&self, method: &str, params: Option<&Value>) -> Result<u64, RepeError> {
+    pub fn send_notify<T: ServableWrite + ?Sized>(
+        &self,
+        method: &str,
+        params: Option<&T>,
+    ) -> Result<u64, RepeError> {
         self.send_with_formats(
             method,
             params,
@@ -114,7 +118,11 @@ impl UniUdpClient {
         )
     }
 
-    pub fn send_request(&self, method: &str, params: Option<&Value>) -> Result<u64, RepeError> {
+    pub fn send_request<T: ServableWrite + ?Sized>(
+        &self,
+        method: &str,
+        params: Option<&T>,
+    ) -> Result<u64, RepeError> {
         self.send_with_formats(
             method,
             params,
@@ -124,10 +132,10 @@ impl UniUdpClient {
         )
     }
 
-    pub fn send_with_formats(
+    pub fn send_with_formats<T: ServableWrite + ?Sized>(
         &self,
         method: &str,
-        params: Option<&Value>,
+        params: Option<&T>,
         query_format: u16,
         body_format: u16,
         notify: bool,
@@ -142,7 +150,7 @@ impl UniUdpClient {
 
         let repe_id = self.next_repe_message_id();
         let message =
-            build_message_for_udp(repe_id, method, params, query_format, body_format, notify)?;
+            build_message_for_udp(repe_id, method, params, query_format, body_format, notify);
         let payload = message.into_wire_bytes();
         let request = SendRequest::new(self.inner.destination, &payload)
             .with_options(self.send_options())
@@ -183,37 +191,34 @@ impl UniUdpClient {
     }
 }
 
-fn build_message_for_udp(
+fn build_message_for_udp<T: ServableWrite + ?Sized>(
     id: u64,
     method: &str,
-    params: Option<&Value>,
+    params: Option<&T>,
     query_format: u16,
     body_format: u16,
     notify: bool,
-) -> Result<Message, RepeError> {
+) -> Message {
     let builder = Message::builder()
         .id(id)
         .notify(notify)
         .query_str(method)
         .query_format_code(query_format);
 
-    let builder = if let Some(value) = params {
-        match BodyFormat::try_from(body_format) {
-            Ok(BodyFormat::Json) => builder.body_json(value)?,
-            Ok(BodyFormat::Beve) => builder.body_beve(value)?,
-            Ok(BodyFormat::Utf8) => builder.body_utf8(&value.to_string()),
-            // Raw binary, an unrecognized code, and a `BodyFormat` this build
-            // does not know: send the bytes through under the code the caller
-            // asked for rather than guessing an encoding.
-            _ => builder
-                .body_bytes(serde_json::to_vec(value).map_err(RepeError::from)?)
-                .body_format_code(body_format),
-        }
-    } else {
-        builder.body_format_code(body_format)
+    let builder = match (params, BodyFormat::try_from(body_format)) {
+        (Some(value), Ok(BodyFormat::Json)) => builder.body_json(value),
+        (Some(value), Ok(BodyFormat::Beve)) => builder.body_beve(value),
+        // Utf8, raw binary, an unrecognized code, and a `BodyFormat` this build
+        // does not know. None of them names an encoding for a value, so the
+        // body goes out as JSON text under the code the caller asked for
+        // rather than under one guessed for it.
+        (Some(value), _) => builder
+            .body_bytes(structio::json::to_vec(value))
+            .body_format_code(body_format),
+        (None, _) => builder.body_format_code(body_format),
     };
 
-    Ok(builder.build())
+    builder.build()
 }
 
 fn resolve_destination<A: ToSocketAddrs>(target: A) -> Result<SocketAddr, RepeError> {

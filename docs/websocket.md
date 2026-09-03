@@ -8,12 +8,11 @@ Each REPE message maps to exactly one WebSocket binary message. WebSocket decodi
 
 ```rust
 use repe::WebSocketClient;
-use serde_json::json;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = WebSocketClient::connect("ws://127.0.0.1:8081/repe").await?;
-    let pong = client.call_json("/ping", &json!({})).await?;
+    let pong = client.call_typed_json::<_, _, Pong>("/ping", &Empty).await?;
     assert_eq!(pong["pong"], true);
     Ok(())
 }
@@ -25,7 +24,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```rust
 use repe::WebSocketClient;
-use serde_json::Value;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -34,16 +32,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         while let Some(msg) = notifies.recv().await {
             let path = msg.query_str().unwrap_or("");
-            let body: Value = msg.json_body().unwrap_or(Value::Null);
+            let body = msg.json_body::<Progress>().unwrap_or_default();
             println!("notify {path}: {body}");
         }
     });
-    let _ = client.call_json("/start", &serde_json::json!({})).await?;
+    let _ = client.call_typed_json::<_, _, Ack>("/start", &Empty).await?;
     Ok(())
 }
 ```
 
-The receiver yields raw `Message` values; decode the body using `Message::json_body::<T>()`, `beve::from_slice(&msg.body)`, or `MessageView::from_slice(&frame_bytes)` as appropriate for the wire `body_format`.
+The receiver yields raw `Message` values; decode the body using `Message::json_body::<T>()`, `Message::beve_body::<T>()`, or `MessageView::from_slice(&frame_bytes)` as appropriate for the wire `body_format`.
 
 ### Subscription rules
 
@@ -95,11 +93,10 @@ wasm_bindgen_futures::spawn_local(async move {
 use repe::PeerRegistry;
 use repe::server::Router;
 use repe::websocket_server::WebSocketServer;
-use serde_json::json;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let router = Router::new().with_json("/ping", |_| Ok(json!({ "ok": true })));
+    let router = Router::new().with_typed("/ping", |_: Empty| Ok(Ack { ok: true }));
 
     let peers = PeerRegistry::new();
     let server = WebSocketServer::new(router).with_peer_registry(peers.clone());
@@ -109,7 +106,7 @@ async fn main() -> std::io::Result<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            let _ = publisher.broadcast_notify_json("/heartbeat", &json!({ "t": 1 }));
+            let _ = publisher.broadcast_notify_json("/heartbeat", &Tick { t: 1 });
         }
     });
 
@@ -213,35 +210,34 @@ When the channel is full, `PeerHandle::send_notify` (and thus `broadcast_notify_
 
 ### In-Handler Notifies
 
-Request handlers can also push notifies back to the calling peer mid-request. Register a handler via `Router::with_json_ctx` (or `with_typed_ctx`) and the closure receives a `CallContext` carrying the `PeerHandle`:
+Request handlers can also push notifies back to the calling peer mid-request. Register a handler via `Router::with_typed_ctx` and the closure receives a `CallContext` carrying the `PeerHandle`:
 
 ```rust
 use repe::server::Router;
 use repe::websocket_server::WebSocketServer;
 use repe::NotifyBody;
-use serde_json::json;
 
-let router = Router::new().with_json_ctx("/run", |ctx, _params| {
+let router = Router::new().with_typed_ctx("/run", |ctx: &repe::CallContext, _: Empty| {
     if let Some(peer) = ctx.peer() {
         let _ = peer.send_notify(
             "/progress",
-            NotifyBody::Json(serde_json::to_vec(&json!({ "stage": "begin" })).unwrap()),
+            NotifyBody::Json(structio::json::to_vec(&Stage { stage: "begin".into() })),
         );
         // ... do work ...
         let _ = peer.send_notify(
             "/progress",
-            NotifyBody::Json(serde_json::to_vec(&json!({ "stage": "end" })).unwrap()),
+            NotifyBody::Json(structio::json::to_vec(&Stage { stage: "end".into() })),
         );
     }
-    Ok(json!({ "ok": true }))
+    Ok(Ack { ok: true })
 });
 
 let server = WebSocketServer::new(router);
 ```
 
-Registry-backed handlers reach the same `CallContext`: wrap a closure with `repe::registry::WithContext` before registering it. `WebSocketServer` automatically calls `Registry::dispatch_with_ctx` so the registered callable receives the peer.
+Registry-backed handlers reach the same `CallContext`: wrap a closure with `repe::registry::WithContext` before registering it. `WebSocketServer` automatically calls `Registry::call` with a populated context, so the registered callable receives the peer.
 
-Middleware does not need to be aware of `CallContext` to forward it. `Next::run(req)` threads whatever the upstream caller attached, so existing middleware composes transparently with new context-aware handlers. Handlers registered via `with_json` / `with_typed` (the legacy non-`_ctx` variants) keep working unchanged; they simply do not receive the context. A cross-cutting middleware that *does* want the calling peer can read it through `next.ctx()` (or the `next.peer()` shortcut); both return `None` on peer-less transports.
+Middleware does not need to be aware of `CallContext` to forward it. `Next::run(req)` threads whatever the upstream caller attached, so existing middleware composes transparently with new context-aware handlers. Handlers registered via `with_typed` (the non-`_ctx` variant) keep working unchanged; they simply do not receive the context. A cross-cutting middleware that *does* want the calling peer can read it through `next.ctx()` (or the `next.peer()` shortcut); both return `None` on peer-less transports.
 
 Calls dispatched through the TCP transports (`Client`, `AsyncClient`, `Server`, `AsyncServer`) do not carry a peer today; `ctx.peer()` returns `None` for those. Context-aware handlers should treat `None` as the no-push case rather than relying on the peer always being present.
 
@@ -263,9 +259,9 @@ The `_blocking` constructors opt a route out of inline dispatch:
 use repe::server::Router;
 
 let router = Router::new()
-    .with_json("/status", |_| Ok(serde_json::json!({ "ok": true })))  // inline, as usual
-    .with_json_blocking("/download/begin", |_params| { /* may block / park */ Ok(serde_json::json!({})) })
-    .with_json_ctx_blocking("/export", |ctx, _params| { /* ctx.peer() + may park */ Ok(serde_json::json!({})) })
+    .with_typed("/status", |_: Empty| Ok(Ack { ok: true }))  // inline, as usual
+    .with_typed_blocking("/download/begin", |_: Empty| { /* may block / park */ Ok(Ack { ok: true }) })
+    .with_typed_ctx_blocking("/export", |ctx: &repe::CallContext, _: Empty| { /* ctx.peer() + may park */ Ok(Ack { ok: true }) })
     .with_typed_blocking::<Req, Resp, _>("/report", |req| { /* ... */ })
     .with_typed_ctx_blocking::<Req, Resp, _>("/stream", |ctx, req| { /* ... */ });
 ```
@@ -299,14 +295,14 @@ The saturation rejection and the caught panic carry **distinct** wire codes so a
 An off-reader handler can observe that its work has become pointless through its `CallContext`. `ctx.is_cancelled()` (non-blocking) returns `true`, and `ctx.cancelled()` (a future) resolves, once the calling peer disconnects or the server begins a [graceful drain](#draining-in-flight-connections). A long poll-loop or compute handler should check `is_cancelled()` at loop boundaries and return early, freeing its `spawn_blocking` thread and off-reader permit instead of running to completion:
 
 ```rust
-let router = Router::new().with_json_ctx_blocking("/export", |ctx, _params| {
+let router = Router::new().with_typed_ctx_blocking("/export", |ctx: &repe::CallContext, _: Empty| {
     for chunk in chunks {
         if ctx.is_cancelled() {
-            return Ok(serde_json::json!({ "cancelled": true }));  // peer gone / shutting down
+            return Ok(Ack { ok: false });  // peer gone / shutting down
         }
         // ... produce and push the chunk via ctx.peer() ...
     }
-    Ok(serde_json::json!({ "done": true }))
+    Ok(Ack { ok: true })
 });
 ```
 

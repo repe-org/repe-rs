@@ -125,7 +125,7 @@ fn typed_producer_bytes_are_also_a_valid_beve_zst_file() {
 
     let compressed = std::fs::read(&path).unwrap();
     let beve_bytes = zstd::decode_all(&compressed[..]).unwrap();
-    let decoded = beve::read_typed_slice::<f64>(&beve_bytes).unwrap();
+    let decoded = structio::from_beve::<Vec<f64>>(&beve_bytes).unwrap();
     assert_eq!(decoded, v);
 
     std::fs::remove_dir_all(&dir).ok();

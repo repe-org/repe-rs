@@ -1,7 +1,45 @@
+//! Dynamic endpoints resolved by JSON Pointer at run time.
+//!
+//! # What this is, and what it stopped being
+//!
+//! This used to be two things: a table of callables **and** a schemaless
+//! document store — a `serde_json::Value` tree that
+//! `register_value("/counter", json!(0))` created data in, and that reads and
+//! writes navigated by pointer. The store is gone.
+//!
+//! It went with `serde_json::Value` itself, and the reason is not only that
+//! structio has no tree to put it in. Glaze, which serves the same protocol,
+//! has no analog: you own a struct and call `on(obj)`. A value registered here
+//! had no Rust type at all, so nothing could describe it, nothing could validate
+//! it, and every read of it cost a parse into a tree and a re-encode out of one.
+//! Owning the data is what [`RepeStruct`](crate::RepeStruct) is for, and a
+//! struct mounted on a [`Router`](crate::server::Router) serves the same paths
+//! with a type behind each of them.
+//!
+//! So what remains is the half that was always about *behaviour* rather than
+//! storage: a flat map from canonical pointer to a callable. That is Glaze's
+//! shape too — one hash lookup on the whole query string, then the handler.
+//!
+//! # Migrating a registered value
+//!
+//! Declare it as a field and mount the struct:
+//!
+//! ```ignore
+//! // Before: registry.register_value("/counter", json!(0))?;
+//! #[derive(Default, repe::RepeStruct)]
+//! struct State { counter: i64 }
+//! structio::object!(State { counter });
+//!
+//! let (router, state) = router.with_struct("", State::default());
+//! ```
+//!
+//! A value that genuinely has no type — a passthrough blob — is a function that
+//! returns it.
+
 use crate::constants::{BodyFormat, ErrorCode};
 use crate::message::Message;
 use crate::peer::CallContext;
-use serde_json::{Map, Value, json};
+use crate::structs::{RequestBody, ResponseBody};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -14,20 +52,8 @@ pub enum RegistryError {
     InvalidPointer { pointer: String },
     #[error("path not found `{path}`")]
     PathNotFound { path: String },
-    #[error("array index `{segment}` is invalid at `{path}`")]
-    InvalidArrayIndex { path: String, segment: String },
-    #[error("array index `{segment}` out of bounds at `{path}`")]
-    ArrayIndexOutOfBounds { path: String, segment: String },
-    #[error("root write requires a JSON object body")]
-    RootWriteRequiresObject,
     #[error("registry body format `{format}` is unsupported")]
     UnsupportedBodyFormat { format: u16 },
-    #[error("registry body is not valid UTF-8")]
-    InvalidUtf8(#[source] std::str::Utf8Error),
-    #[error("registry JSON parse error: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error("registry BEVE parse error: {0}")]
-    Beve(#[from] beve::Error),
     #[error("{message}")]
     Execution { code: ErrorCode, message: String },
 }
@@ -35,58 +61,86 @@ pub enum RegistryError {
 impl RegistryError {
     pub fn code(&self) -> ErrorCode {
         match self {
-            RegistryError::InvalidPointer { .. }
-            | RegistryError::PathNotFound { .. }
-            | RegistryError::InvalidArrayIndex { .. }
-            | RegistryError::ArrayIndexOutOfBounds { .. } => ErrorCode::MethodNotFound,
-            RegistryError::RootWriteRequiresObject => ErrorCode::InvalidBody,
-            RegistryError::UnsupportedBodyFormat { .. }
-            | RegistryError::InvalidUtf8(_)
-            | RegistryError::Json(_)
-            | RegistryError::Beve(_) => ErrorCode::InvalidBody,
+            RegistryError::InvalidPointer { .. } | RegistryError::PathNotFound { .. } => {
+                ErrorCode::MethodNotFound
+            }
+            RegistryError::UnsupportedBodyFormat { .. } => ErrorCode::InvalidBody,
             RegistryError::Execution { code, .. } => *code,
         }
     }
 }
 
-/// A function or object that the registry dispatches to.
+/// A callable the registry dispatches to.
 ///
-/// Handlers receive a [`CallContext`] alongside the request body so that
-/// peer-aware handlers can push notify messages back to the calling peer.
-/// Handlers that don't care about the context can register a plain
-/// `Fn(Option<Value>) -> Result<Value, ...>` closure: the blanket impl
-/// below ignores the context for them.
+/// The signature mirrors [`RepeStruct::repe_handle_into`](crate::RepeStruct::repe_handle_into),
+/// and deliberately: a handler reads its parameters straight out of the frame
+/// and writes its result straight into the outgoing one, with no value
+/// materialized in between. `params` is `None` for a bodiless frame.
+///
+/// Handlers receive a [`CallContext`] so that peer-aware ones can push notify
+/// messages back to the calling peer. A handler that does not care about the
+/// context can be a plain closure: the blanket impl below ignores it.
+///
+/// # Returning a value
+///
+/// The blanket impls accept the ergonomic form — a closure returning something
+/// writable — and do the `out.write(..)` for you:
+///
+/// ```ignore
+/// registry.register_function("/double", |params: Option<RequestBody<'_>>| {
+///     let n: i64 = params
+///         .ok_or((ErrorCode::InvalidBody, "body required".to_string()))?
+///         .read("/double")
+///         .map_err(|err| (ErrorCode::InvalidBody, err.to_string()))?;
+///     Ok(n * 2)
+/// })?;
+/// ```
+///
+/// Implement the trait directly when a handler wants the response buffer — to
+/// stream a large body, or to answer with a BEVE typed array through
+/// [`ResponseBody::write_typed_slice`].
 ///
 /// To register a closure that *does* want the context, wrap it with
 /// [`WithContext`]:
 ///
 /// ```ignore
-/// registry.register_function("/run", WithContext(|ctx, params| {
+/// registry.register_function("/run", WithContext(|ctx: &CallContext, _params| {
 ///     if let Some(peer) = ctx.peer() {
 ///         peer.send_notify("/progress", NotifyBody::Json(b"{}".to_vec())).ok();
 ///     }
-///     Ok(serde_json::json!({"status": "ok"}))
+///     Ok(Status { status: "ok" })
 /// }))?;
 /// ```
 pub trait RegistryCallable: Send + Sync {
-    fn call(&self, ctx: &CallContext, params: Option<Value>) -> Result<Value, (ErrorCode, String)>;
+    fn call(
+        &self,
+        ctx: &CallContext,
+        params: Option<RequestBody<'_>>,
+        out: &mut ResponseBody<'_>,
+    ) -> Result<(), (ErrorCode, String)>;
 }
 
-impl<F> RegistryCallable for F
+impl<F, R> RegistryCallable for F
 where
-    F: Fn(Option<Value>) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static,
+    F: for<'a> Fn(Option<RequestBody<'a>>) -> Result<R, (ErrorCode, String)>
+        + Send
+        + Sync
+        + 'static,
+    R: repe_core::structs::ServableWrite,
 {
     fn call(
         &self,
         _ctx: &CallContext,
-        params: Option<Value>,
-    ) -> Result<Value, (ErrorCode, String)> {
-        (self)(params)
+        params: Option<RequestBody<'_>>,
+        out: &mut ResponseBody<'_>,
+    ) -> Result<(), (ErrorCode, String)> {
+        out.write(&(self)(params)?);
+        Ok(())
     }
 }
 
-/// Newtype wrapper that adapts an `Fn(&CallContext, Option<Value>) -> ...`
-/// closure into a [`RegistryCallable`].
+/// Newtype wrapper that adapts a context-aware closure into a
+/// [`RegistryCallable`].
 ///
 /// Rust's coherence rules forbid two blanket impls on different `Fn`
 /// signatures for the same trait, so context-aware closures need a marker.
@@ -94,48 +148,76 @@ where
 /// [`Registry::register_function`] like any other handler.
 pub struct WithContext<F>(pub F);
 
-impl<F> RegistryCallable for WithContext<F>
+impl<F, R> RegistryCallable for WithContext<F>
 where
-    F: Fn(&CallContext, Option<Value>) -> Result<Value, (ErrorCode, String)>
+    F: for<'a> Fn(&CallContext, Option<RequestBody<'a>>) -> Result<R, (ErrorCode, String)>
+        + Send
+        + Sync
+        + 'static,
+    R: repe_core::structs::ServableWrite,
+{
+    fn call(
+        &self,
+        ctx: &CallContext,
+        params: Option<RequestBody<'_>>,
+        out: &mut ResponseBody<'_>,
+    ) -> Result<(), (ErrorCode, String)> {
+        out.write(&(self.0)(ctx, params)?);
+        Ok(())
+    }
+}
+
+/// Newtype wrapper for a handler that writes its own response body.
+///
+/// The two closure impls above cover a handler that *returns* a value, which
+/// the registry then encodes. A handler that needs the body itself — to stream
+/// a large result, or to answer with
+/// [`ResponseBody::write_typed_slice`](repe_core::structs::ResponseBody::write_typed_slice)
+/// — takes `out` instead, and this is how such a closure is spelled. Without it
+/// the only route is a hand-written `RegistryCallable` impl on a `Send + Sync`
+/// struct, which is a cliff for what is otherwise a closure.
+///
+/// Wraps a context-free handler; a context-aware one that also writes its own
+/// body implements [`RegistryCallable`] directly, which at three parameters is
+/// no longer the cliff it was at one.
+pub struct WithBody<F>(pub F);
+
+impl<F> RegistryCallable for WithBody<F>
+where
+    F: for<'a> Fn(
+            Option<RequestBody<'a>>,
+            &mut ResponseBody<'_>,
+        ) -> Result<(), (ErrorCode, String)>
         + Send
         + Sync
         + 'static,
 {
-    fn call(&self, ctx: &CallContext, params: Option<Value>) -> Result<Value, (ErrorCode, String)> {
-        (self.0)(ctx, params)
+    fn call(
+        &self,
+        _ctx: &CallContext,
+        params: Option<RequestBody<'_>>,
+        out: &mut ResponseBody<'_>,
+    ) -> Result<(), (ErrorCode, String)> {
+        (self.0)(params, out)
     }
 }
 
-struct RegistryState {
-    root: Value,
-    /// Callable entries keyed by their canonical JSON Pointer string (the
-    /// `canonical_pointer` form computed once at registration). Keying on the
-    /// canonical `String` rather than the parsed `Vec<String>` segments lets
-    /// dispatch probe the map with a borrowed `&str`: for the escape-free
-    /// common case the wire pointer already *is* its own canonical key, so a
-    /// function call resolves without allocating the per-segment `Vec<String>`
-    /// + `String`s that routing previously required on every request.
-    functions: HashMap<String, RegistryFunction>,
-}
-
-impl Default for RegistryState {
-    fn default() -> Self {
-        Self {
-            root: Value::Object(Map::new()),
-            functions: HashMap::new(),
-        }
-    }
-}
-
-/// Dynamic registry that serves values and callable entries by JSON pointer.
+/// Dynamic registry of callable entries, resolved by JSON pointer.
 ///
-/// Request semantics:
-/// - Empty body => READ value at pointer.
-/// - Non-empty body + function target => CALL function.
-/// - Non-empty body + non-function target => WRITE value.
+/// One flat map keyed on the whole pointer, so dispatch is a single hash lookup
+/// — the same shape as Glaze's registry, and the same shape the struct router
+/// already had.
+///
+/// Every registered path is a function. A frame with a body calls it with the
+/// body as parameters; a frame without one calls it with `None`. There is no
+/// third case, because there are no stored values left to read or write.
 #[derive(Default)]
 pub struct Registry {
-    state: RwLock<RegistryState>,
+    /// Callables keyed by their canonical JSON Pointer string, computed once at
+    /// registration. Keying on the `String` rather than on parsed segments lets
+    /// dispatch probe the map with a borrowed `&str`: a wire pointer already
+    /// *is* its own canonical key, so a call resolves without allocating.
+    state: RwLock<HashMap<String, RegistryFunction>>,
 }
 
 impl Registry {
@@ -143,61 +225,7 @@ impl Registry {
         Self::default()
     }
 
-    /// Replace the root JSON value stored by the registry.
-    pub fn set_root(&self, value: Value) {
-        let mut state = self.write_state();
-        state.root = value;
-    }
-
-    /// Register or replace a value at `path`, creating missing object parents.
-    pub fn register_value(&self, path: &str, value: Value) -> Result<(), RegistryError> {
-        let mut state = self.write_state();
-        let segments = parse_registration_path(path)?;
-        if segments.is_empty() {
-            state.root = value;
-            return Ok(());
-        }
-
-        let parent = ensure_object_parent(&mut state.root, &segments)?;
-        parent.insert(segments.last().unwrap().clone(), value);
-        Ok(())
-    }
-
-    /// Merge object fields into the root.
-    pub fn merge_root(&self, object: Map<String, Value>) -> Result<(), RegistryError> {
-        let mut state = self.write_state();
-        let root = ensure_object_root(&mut state.root)?;
-        for (key, value) in object {
-            root.insert(key, value);
-        }
-        Ok(())
-    }
-
-    /// Merge object fields into an object at `path`.
-    pub fn merge_at(&self, path: &str, object: Map<String, Value>) -> Result<(), RegistryError> {
-        let mut state = self.write_state();
-        let segments = parse_registration_path(path)?;
-        if segments.is_empty() {
-            let root = ensure_object_root(&mut state.root)?;
-            for (key, value) in object {
-                root.insert(key, value);
-            }
-            return Ok(());
-        }
-
-        let target = resolve_mut(&mut state.root, &segments)?;
-        let map = target
-            .as_object_mut()
-            .ok_or_else(|| RegistryError::PathNotFound {
-                path: canonical_pointer(&segments),
-            })?;
-        for (key, value) in object {
-            map.insert(key, value);
-        }
-        Ok(())
-    }
-
-    /// Register a callable at `path`, creating missing object parents for discoverability.
+    /// Register a callable at `path`.
     pub fn register_function(
         &self,
         path: &str,
@@ -211,127 +239,60 @@ impl Registry {
         path: &str,
         function: Arc<dyn RegistryCallable>,
     ) -> Result<(), RegistryError> {
-        let mut state = self.write_state();
-        let segments = parse_registration_path(path)?;
-        if segments.is_empty() {
-            return Err(RegistryError::InvalidPointer {
-                pointer: path.to_string(),
-            });
+        // A registration path may be given without its leading slash; every
+        // other spelling question is settled by `canonical_key`, which the
+        // lookup side also goes through, so the two cannot disagree.
+        let normalized: Cow<'_, str> = if path.starts_with('/') {
+            Cow::Borrowed(path)
+        } else {
+            Cow::Owned(format!("/{path}"))
+        };
+        if crate::json_pointer::addresses_root(&normalized) {
+            return Err(invalid(path));
         }
-        let _ = ensure_object_parent(&mut state.root, &segments)?;
-        state
-            .functions
-            .insert(canonical_pointer(&segments), function);
+        let key = canonical_key(&normalized)
+            .map_err(|_| invalid(path))?
+            .to_string();
+        self.write_state().insert(key, function);
         Ok(())
     }
 
-    /// Whether `pointer` names a registered function rather than a value.
+    /// Whether `pointer` names a registered function.
     ///
-    /// The registry decides read-vs-write-vs-call from the *body* alone, which
-    /// is the right rule for REPE, where a path is a path. A caller that has to
-    /// commit to a verb before it has a body — a REST facade choosing between
-    /// `PUT` (write a value) and `POST` (call a function), an introspection
-    /// endpoint, a generated client — needs the distinction up front, and
-    /// probing it with a read is not a substitute: a read of a function returns
-    /// a descriptor object that a stored value could equally well contain.
-    ///
-    /// A pointer that is malformed, or that names nothing at all, is not a
-    /// function, so this answers `false` rather than raising: callers use it to
-    /// pick a branch, and the branch they pick then reports the real error.
+    /// Every registered path is one, so this is "is anything mounted here" —
+    /// which is what a caller that has to commit to a verb before it has a body
+    /// actually needs. A pointer that is malformed, or that names nothing, is
+    /// not a function, so this answers `false` rather than raising: callers use
+    /// it to pick a branch, and the branch they pick reports the real error.
     pub fn is_function(&self, pointer: &str) -> bool {
         match canonical_key(pointer) {
-            Ok(key) => self.read_state().functions.contains_key(key.as_ref()),
+            Ok(key) => self.read_state().contains_key(key),
             Err(_) => false,
         }
     }
 
-    pub fn read_value(&self, pointer: &str) -> Result<Value, RegistryError> {
-        let state = self.read_state();
-        let segments = parse_pointer(pointer)?;
-        resolve_ref(&state.root, &segments).cloned()
+    /// Every registered pointer, in no particular order.
+    ///
+    /// The surface *is* the key set now that there is no tree to walk, which is
+    /// what the REST gateway used to reconstruct by descending the document.
+    pub fn endpoints(&self) -> Vec<String> {
+        self.read_state().keys().cloned().collect()
     }
 
-    /// Write `value` at `pointer`, but only into the value tree, and only if
-    /// `accept` approves what is there now.
+    /// Invoke the function at `pointer`, writing its result into `out`.
     ///
-    /// Returns `Ok(None)` when `accept` declined; the tree is untouched in that
-    /// case. `accept` receives `None` when nothing is registered at `pointer`.
-    ///
-    /// Two guarantees [`dispatch`](Self::dispatch) cannot give a caller that
-    /// needs them:
-    ///
-    /// * **The read and the write are one critical section.** Comparing a
-    ///   validator with [`read_value`](Self::read_value) and then writing is
-    ///   check-then-act: two callers can both observe the value they expected
-    ///   and both write, which is exactly the lost update an `If-Match`-style
-    ///   precondition exists to prevent.
-    /// * **A function is never called by it.** `dispatch` decides between a
-    ///   value write and a function call from the body alone, so a caller that
-    ///   already resolved "this is a value" races anyone registering a function
-    ///   at that pointer in between — and loses by handing its write payload to
-    ///   a function as arguments.
-    ///
-    /// Writing the root (`""` or `"/"`) merges an object, matching `dispatch`.
-    pub fn write_if(
-        &self,
-        pointer: &str,
-        value: Value,
-        accept: impl FnOnce(Option<&Value>) -> bool,
-    ) -> Result<Option<Value>, RegistryError> {
-        let segments = parse_pointer(pointer)?;
-        let key = canonical_key(pointer)?;
-        let mut state = self.write_state();
-
-        if state.functions.contains_key(key.as_ref()) {
-            return Err(RegistryError::PathNotFound {
-                path: pointer.to_string(),
-            });
-        }
-
-        {
-            let current = resolve_ref(&state.root, &segments).ok();
-            if !accept(current) {
-                return Ok(None);
-            }
-        }
-
-        if segments.is_empty() {
-            let Value::Object(object) = value else {
-                return Err(RegistryError::RootWriteRequiresObject);
-            };
-            let root = ensure_object_root(&mut state.root)?;
-            for (key, value) in object {
-                root.insert(key, value);
-            }
-            return Ok(Some(json!({
-                "status": "ok",
-                "path": "/",
-            })));
-        }
-
-        set_pointer(&mut state.root, &segments, value)?;
-        Ok(Some(json!({
-            "status": "ok",
-            "path": canonical_pointer(&segments),
-        })))
-    }
-
-    /// Call the function at `pointer`, and only a function.
-    ///
-    /// The counterpart of [`write_if`](Self::write_if) for a caller that has
-    /// already committed to "this is a call": a pointer that stops being a
-    /// function is a [`PathNotFound`](RegistryError::PathNotFound), never a
-    /// silent write of the arguments into the value tree.
+    /// A pointer naming nothing is [`PathNotFound`](RegistryError::PathNotFound).
     pub fn call(
         &self,
         pointer: &str,
-        body: Option<Value>,
+        params: Option<RequestBody<'_>>,
         ctx: &CallContext,
-    ) -> Result<Value, RegistryError> {
+        out: &mut ResponseBody<'_>,
+    ) -> Result<(), RegistryError> {
         let key = canonical_key(pointer)?;
         let function = {
             let state = self.read_state();
-            state.functions.get(key.as_ref()).cloned()
+            state.get(key).cloned()
         };
         let Some(function) = function else {
             return Err(RegistryError::PathNotFound {
@@ -339,121 +300,61 @@ impl Registry {
             });
         };
         function
-            .call(ctx, body)
+            .call(ctx, params, out)
             .map_err(|(code, message)| RegistryError::Execution { code, message })
     }
 
-    /// Dispatch a request to a registered value or function.
+    /// [`call`](Self::call) with a [`CallContext::detached`] context, for a
+    /// direct in-process dispatch where there is no calling peer.
     ///
-    /// Equivalent to [`Registry::dispatch_with_ctx`] with a
-    /// [`CallContext::detached`] context. Use this for direct in-process
-    /// dispatches where there's no calling peer (tests, batch fixups,
-    /// etc.). Servers that want to surface a [`PeerHandle`](crate::PeerHandle)
-    /// to handlers should call `dispatch_with_ctx` instead.
-    pub fn dispatch(&self, pointer: &str, body: Option<Value>) -> Result<Value, RegistryError> {
-        let ctx = CallContext::detached(pointer);
-        self.dispatch_with_ctx(pointer, body, &ctx)
-    }
-
-    /// Dispatch a request to a registered value or function, threading
-    /// `ctx` through to any registered [`RegistryCallable`].
-    ///
-    /// Reads (`body == None`) and writes (`body == Some(...)` against a
-    /// non-function target) ignore the context; only function calls use
-    /// it. The pointer used for routing is the `pointer` argument; the
-    /// context's `method()` is informational and may differ (e.g. a
-    /// router that strips a path prefix before dispatching).
-    pub fn dispatch_with_ctx(
+    /// This was `dispatch`, and it had three outcomes: read a value, write a
+    /// value, or call a function, chosen from the body. Two of those are gone
+    /// with the value tree, so it is a call either way and the name says so.
+    pub fn call_detached(
         &self,
         pointer: &str,
-        body: Option<Value>,
-        ctx: &CallContext,
-    ) -> Result<Value, RegistryError> {
-        // Resolve the function-lookup key up front. For the escape-free common
-        // case `key` borrows `pointer` directly (no allocation); only escaped
-        // pointers fall back to an owned canonical string. Crucially, the
-        // per-segment `Vec<String>` from `parse_pointer` is now allocated only
-        // on the value-tree fallback paths below, never on a function call.
-        let key = canonical_key(pointer)?;
-
-        if body.is_none() {
-            let state = self.read_state();
-            if state.functions.contains_key(key.as_ref()) {
-                return Ok(json!({
-                    "type": "function",
-                    "path": key.as_ref(),
-                }));
-            }
-            let segments = parse_pointer(pointer)?;
-            return resolve_ref(&state.root, &segments).cloned();
-        }
-
-        let payload = body.unwrap();
-
-        let function = {
-            let state = self.read_state();
-            state.functions.get(key.as_ref()).cloned()
-        };
-        if let Some(f) = function {
-            return f
-                .call(ctx, Some(payload))
-                .map_err(|(code, message)| RegistryError::Execution { code, message });
-        }
-
-        let segments = parse_pointer(pointer)?;
-        let mut state = self.write_state();
-        if segments.is_empty() {
-            let Value::Object(object) = payload else {
-                return Err(RegistryError::RootWriteRequiresObject);
-            };
-            let root = ensure_object_root(&mut state.root)?;
-            for (key, value) in object {
-                root.insert(key, value);
-            }
-            return Ok(json!({
-                "status": "ok",
-                "path": "/",
-            }));
-        }
-
-        set_pointer(&mut state.root, &segments, payload)?;
-        Ok(json!({
-            "status": "ok",
-            "path": canonical_pointer(&segments),
-        }))
+        params: Option<RequestBody<'_>>,
+        out: &mut ResponseBody<'_>,
+    ) -> Result<(), RegistryError> {
+        let ctx = CallContext::detached(pointer);
+        self.call(pointer, params, &ctx, out)
     }
 
-    pub fn decode_body(req: &Message) -> Result<Option<Value>, RegistryError> {
+    /// Borrow a request's body as parameters, rejecting a format code this
+    /// build does not recognize.
+    ///
+    /// Returns `None` for an empty body — the bodiless frame a no-argument call
+    /// arrives on. Nothing is parsed here: a [`RequestBody`] is the frame's
+    /// bytes plus the format its header declared, and the handler decides what
+    /// to read them as.
+    ///
+    /// All four known formats pass, [`BodyFormat::RawBinary`] included. A
+    /// handler reading one of those as a value gets it through the JSON parser,
+    /// which is the reader `RequestBody` falls back to; a handler that means to
+    /// treat it as bytes calls [`RequestBody::bytes`] and never parses it.
+    pub fn body_of(req: &Message) -> Result<Option<RequestBody<'_>>, RegistryError> {
         if req.body.is_empty() {
             return Ok(None);
         }
-
         match BodyFormat::try_from(req.header.body_format) {
-            Ok(BodyFormat::Json) => Ok(Some(serde_json::from_slice::<Value>(&req.body)?)),
-            Ok(BodyFormat::Beve) => Ok(Some(beve::from_slice::<Value>(&req.body)?)),
-            Ok(BodyFormat::Utf8) => {
-                let text = std::str::from_utf8(&req.body).map_err(RegistryError::InvalidUtf8)?;
-                Ok(Some(Value::String(text.to_string())))
-            }
-            Ok(BodyFormat::RawBinary) => Ok(Some(Value::Array(
-                req.body.iter().map(|byte| Value::from(*byte)).collect(),
-            ))),
-            // A code this build does not recognize, or a `BodyFormat` variant it
-            // does not know — the spec can add one, and neither is decodable here.
-            Ok(_) | Err(_) => Err(RegistryError::UnsupportedBodyFormat {
+            Ok(format) => Ok(Some(RequestBody::new(&req.body, format))),
+            // A code this build does not recognize. The spec can add one, and
+            // handing a handler bytes under a format it cannot name is worse
+            // than refusing.
+            Err(_) => Err(RegistryError::UnsupportedBodyFormat {
                 format: req.header.body_format,
             }),
         }
     }
 
-    fn read_state(&self) -> std::sync::RwLockReadGuard<'_, RegistryState> {
+    fn read_state(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, RegistryFunction>> {
         match self.state.read() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
     }
 
-    fn write_state(&self) -> std::sync::RwLockWriteGuard<'_, RegistryState> {
+    fn write_state(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, RegistryFunction>> {
         match self.state.write() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -461,114 +362,31 @@ impl Registry {
     }
 }
 
-fn parse_registration_path(path: &str) -> Result<Vec<String>, RegistryError> {
-    if path.is_empty() {
-        return Ok(Vec::new());
+/// Wrap a JSON Pointer syntax failure as this module's error, naming the
+/// pointer the caller passed in.
+fn invalid(pointer: &str) -> RegistryError {
+    RegistryError::InvalidPointer {
+        pointer: pointer.to_string(),
     }
-    // Registration is not on the hot path; own the segments so they outlive the
-    // (possibly synthesized) normalized pointer and slot into the value tree.
-    let normalized: Cow<'_, str> = if path.starts_with('/') {
-        Cow::Borrowed(path)
-    } else {
-        Cow::Owned(format!("/{path}"))
-    };
-    Ok(parse_pointer(&normalized)?
-        .into_iter()
-        .map(Cow::into_owned)
-        .collect())
 }
 
-/// Compute the canonical JSON-Pointer key used to probe `RegistryState::functions`,
-/// borrowing the input when possible.
+/// The canonical JSON-Pointer key used to probe the registry's table.
 ///
-/// The function map is keyed by `canonical_pointer(parse_pointer(p))`. For any
-/// valid `/`-prefixed pointer, `escape ∘ unescape` round-trips each reference
-/// token, so that canonical form is byte-identical to `p` itself — meaning an
-/// escape-free pointer (the overwhelmingly common case) is *already* its own
-/// canonical key and can be returned as a borrow with zero allocation. Only
-/// pointers containing a `~` escape need the parse + re-escape round-trip, and
-/// only those allocate.
+/// Escaping and unescaping are inverse on every valid pointer, so the canonical
+/// form of one *is* the pointer itself, byte for byte — which leaves this with
+/// nothing to build and only something to check. It borrows in every case and
+/// allocates in none.
 ///
-/// Errors exactly where [`parse_pointer`] would: a non-empty pointer without a
-/// leading `/`, or a malformed `~` escape.
-fn canonical_key(pointer: &str) -> Result<Cow<'_, str>, RegistryError> {
-    if pointer.is_empty() || pointer == "/" {
+/// Errors on a non-empty pointer without a leading `/`, or a malformed `~`
+/// escape.
+fn canonical_key(pointer: &str) -> Result<&str, RegistryError> {
+    if crate::json_pointer::addresses_root(pointer) {
         // No function can register at the root, so this never matches a
-        // callable; normalize to "/" to mirror `canonical_pointer(&[])`.
-        return Ok(Cow::Borrowed("/"));
+        // callable; normalize to "/" to give the root one spelling here.
+        return Ok("/");
     }
-    if !pointer.starts_with('/') {
-        return Err(RegistryError::InvalidPointer {
-            pointer: pointer.to_string(),
-        });
-    }
-    if !pointer.contains('~') {
-        // Already canonical: slash-prefixed and escape-free.
-        return Ok(Cow::Borrowed(pointer));
-    }
-    // Escaped tokens need validation (rejecting malformed `~` sequences) and
-    // re-canonicalization; this allocates, but escapes are rare in practice.
-    Ok(Cow::Owned(canonical_pointer(&parse_pointer(pointer)?)))
-}
-
-/// Parse a JSON Pointer into its reference tokens, borrowing each token from
-/// `pointer` when it needs no unescaping (the common case) and allocating only
-/// for tokens that contain a `~` escape. The returned tokens borrow `pointer`,
-/// so the value-tree walk in `resolve_ref`/`resolve_mut`/`set_pointer` resolves
-/// without a per-segment `String` allocation.
-/// Whether `pointer` addresses the registry root.
-///
-/// The root has more than one spelling — `""` and `"/"` both parse to no
-/// segments — and a caller that gates on *writing* the root has to agree with
-/// [`parse_pointer`] about which those are. Two independent answers to that
-/// question is a policy check that can be walked around: the REST gateway's
-/// `//` maps to `"/"`, which is not the empty string but is the root.
-pub(crate) fn addresses_root(pointer: &str) -> bool {
-    pointer.is_empty() || pointer == "/"
-}
-
-fn parse_pointer(pointer: &str) -> Result<Vec<Cow<'_, str>>, RegistryError> {
-    if addresses_root(pointer) {
-        return Ok(Vec::new());
-    }
-    if !pointer.starts_with('/') {
-        return Err(RegistryError::InvalidPointer {
-            pointer: pointer.to_string(),
-        });
-    }
-
-    pointer[1..]
-        .split('/')
-        .map(unescape_token)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| RegistryError::InvalidPointer {
-            pointer: pointer.to_string(),
-        })
-}
-
-fn unescape_token(token: &str) -> Result<Cow<'_, str>, ()> {
-    // Escape-free tokens are already their own unescaped form: borrow them
-    // rather than allocating a fresh `String` per segment.
-    if !token.contains('~') {
-        return Ok(Cow::Borrowed(token));
-    }
-    let mut out = String::with_capacity(token.len());
-    let mut chars = token.chars();
-    while let Some(c) = chars.next() {
-        if c != '~' {
-            out.push(c);
-            continue;
-        }
-        let Some(next) = chars.next() else {
-            return Err(());
-        };
-        match next {
-            '0' => out.push('~'),
-            '1' => out.push('/'),
-            _ => return Err(()),
-        }
-    }
-    Ok(Cow::Owned(out))
+    crate::json_pointer::validate_escapes(pointer).map_err(|_| invalid(pointer))?;
+    Ok(pointer)
 }
 
 /// Normalize a mount prefix: absolute, no trailing separator, empty for the root.
@@ -596,277 +414,136 @@ pub(crate) fn normalize_mount(prefix: &str) -> String {
     }
 }
 
-/// RFC 6901 escaping. `~` first: doing `/` first would turn a literal `/` into
-/// `~1`, and the following pass would then escape that `~` into `~01`.
-pub(crate) fn escape_token(token: &str) -> String {
-    if !token.contains('~') && !token.contains('/') {
-        return token.to_string();
-    }
-    token.replace('~', "~0").replace('/', "~1")
-}
-
-fn canonical_pointer<S: AsRef<str>>(segments: &[S]) -> String {
-    if segments.is_empty() {
-        "/".to_string()
-    } else {
-        let mut out = String::new();
-        for segment in segments {
-            out.push('/');
-            out.push_str(&escape_token(segment.as_ref()));
-        }
-        out
-    }
-}
-
-fn ensure_object_root(value: &mut Value) -> Result<&mut Map<String, Value>, RegistryError> {
-    if !value.is_object() {
-        *value = Value::Object(Map::new());
-    }
-    value
-        .as_object_mut()
-        .ok_or_else(|| RegistryError::PathNotFound {
-            path: "/".to_string(),
-        })
-}
-
-fn ensure_object_parent<'a>(
-    root: &'a mut Value,
-    segments: &[String],
-) -> Result<&'a mut Map<String, Value>, RegistryError> {
-    let mut current = ensure_object_root(root)?;
-    if segments.len() <= 1 {
-        return Ok(current);
-    }
-    for segment in &segments[..segments.len() - 1] {
-        let entry = current
-            .entry(segment.clone())
-            .or_insert_with(|| Value::Object(Map::new()));
-        if !entry.is_object() {
-            *entry = Value::Object(Map::new());
-        }
-        current = entry
-            .as_object_mut()
-            .ok_or_else(|| RegistryError::PathNotFound {
-                path: canonical_pointer(segments),
-            })?;
-    }
-    Ok(current)
-}
-
-fn resolve_ref<'a, S: AsRef<str>>(
-    root: &'a Value,
-    segments: &[S],
-) -> Result<&'a Value, RegistryError> {
-    let mut current = root;
-    for (i, segment) in segments.iter().enumerate() {
-        // Error paths are computed lazily from `segments[..=i]`, so the success
-        // path neither clones segments nor grows a `walked` vector.
-        let segment = segment.as_ref();
-        match current {
-            Value::Object(map) => {
-                current = map
-                    .get(segment)
-                    .ok_or_else(|| RegistryError::PathNotFound {
-                        path: canonical_pointer(&segments[..=i]),
-                    })?;
-            }
-            Value::Array(array) => {
-                let index =
-                    segment
-                        .parse::<usize>()
-                        .map_err(|_| RegistryError::InvalidArrayIndex {
-                            path: canonical_pointer(&segments[..=i]),
-                            segment: segment.to_string(),
-                        })?;
-                current = array
-                    .get(index)
-                    .ok_or_else(|| RegistryError::ArrayIndexOutOfBounds {
-                        path: canonical_pointer(&segments[..=i]),
-                        segment: segment.to_string(),
-                    })?;
-            }
-            _ => {
-                return Err(RegistryError::PathNotFound {
-                    path: canonical_pointer(&segments[..=i]),
-                });
-            }
-        }
-    }
-    Ok(current)
-}
-
-fn resolve_mut<'a, S: AsRef<str>>(
-    root: &'a mut Value,
-    segments: &[S],
-) -> Result<&'a mut Value, RegistryError> {
-    let mut current = root;
-    for (i, segment) in segments.iter().enumerate() {
-        let segment = segment.as_ref();
-        match current {
-            Value::Object(map) => {
-                current = map
-                    .get_mut(segment)
-                    .ok_or_else(|| RegistryError::PathNotFound {
-                        path: canonical_pointer(&segments[..=i]),
-                    })?;
-            }
-            Value::Array(array) => {
-                let index =
-                    segment
-                        .parse::<usize>()
-                        .map_err(|_| RegistryError::InvalidArrayIndex {
-                            path: canonical_pointer(&segments[..=i]),
-                            segment: segment.to_string(),
-                        })?;
-                current =
-                    array
-                        .get_mut(index)
-                        .ok_or_else(|| RegistryError::ArrayIndexOutOfBounds {
-                            path: canonical_pointer(&segments[..=i]),
-                            segment: segment.to_string(),
-                        })?;
-            }
-            _ => {
-                return Err(RegistryError::PathNotFound {
-                    path: canonical_pointer(&segments[..=i]),
-                });
-            }
-        }
-    }
-    Ok(current)
-}
-
-fn set_pointer<S: AsRef<str>>(
-    root: &mut Value,
-    segments: &[S],
-    value: Value,
-) -> Result<(), RegistryError> {
-    if segments.is_empty() {
-        *root = value;
-        return Ok(());
-    }
-
-    let parent_len = segments.len() - 1;
-    let mut current = root;
-    for (i, segment) in segments[..parent_len].iter().enumerate() {
-        let segment = segment.as_ref();
-        match current {
-            Value::Object(map) => {
-                current = map
-                    .get_mut(segment)
-                    .ok_or_else(|| RegistryError::PathNotFound {
-                        path: canonical_pointer(&segments[..=i]),
-                    })?;
-            }
-            Value::Array(array) => {
-                let index =
-                    segment
-                        .parse::<usize>()
-                        .map_err(|_| RegistryError::InvalidArrayIndex {
-                            path: canonical_pointer(&segments[..=i]),
-                            segment: segment.to_string(),
-                        })?;
-                current =
-                    array
-                        .get_mut(index)
-                        .ok_or_else(|| RegistryError::ArrayIndexOutOfBounds {
-                            path: canonical_pointer(&segments[..=i]),
-                            segment: segment.to_string(),
-                        })?;
-            }
-            _ => {
-                return Err(RegistryError::PathNotFound {
-                    path: canonical_pointer(&segments[..=i]),
-                });
-            }
-        }
-    }
-
-    let last = segments[parent_len].as_ref();
-    match current {
-        Value::Object(map) => {
-            map.insert(last.to_string(), value);
-            Ok(())
-        }
-        Value::Array(array) => {
-            let index = last
-                .parse::<usize>()
-                .map_err(|_| RegistryError::InvalidArrayIndex {
-                    path: canonical_pointer(segments),
-                    segment: last.to_string(),
-                })?;
-            if let Some(slot) = array.get_mut(index) {
-                *slot = value;
-                Ok(())
-            } else {
-                Err(RegistryError::ArrayIndexOutOfBounds {
-                    path: canonical_pointer(segments),
-                    segment: last.to_string(),
-                })
-            }
-        }
-        _ => Err(RegistryError::PathNotFound {
-            path: canonical_pointer(segments),
-        }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_pointer_unescapes_tokens() {
-        let segments = parse_pointer("/a~1b/m~0n").unwrap();
-        assert_eq!(segments, vec!["a/b".to_string(), "m~n".to_string()]);
+    /// Run a call and return the JSON body the handler wrote.
+    fn call(registry: &Registry, pointer: &str, params: Option<RequestBody<'_>>) -> String {
+        let mut buf = Vec::new();
+        let mut out = ResponseBody::new(&mut buf);
+        registry
+            .call_detached(pointer, params, &mut out)
+            .expect("call");
+        String::from_utf8(buf).expect("json is utf-8")
     }
 
     #[test]
-    fn parse_pointer_rejects_invalid_tilde_escape() {
-        let err = parse_pointer("/a~2b").unwrap_err();
-        assert!(matches!(err, RegistryError::InvalidPointer { .. }));
-    }
-
-    #[test]
-    fn registry_dispatch_read_write_call() {
+    fn a_handler_can_write_its_own_body() {
+        // The shape a streaming or typed-slice answer needs, and the reason
+        // `WithBody` exists: `out` is the frame's buffer, not a value to encode.
         let registry = Registry::new();
         registry
-            .register_value("/counter", Value::from(0))
-            .expect("register counter");
+            .register_function(
+                "/samples",
+                WithBody(
+                    |_params: Option<RequestBody<'_>>, out: &mut ResponseBody<'_>| {
+                        out.write_typed_slice(&[1.0f64, 2.0, 3.0]);
+                        Ok(())
+                    },
+                ),
+            )
+            .expect("register");
+
+        let mut buf = Vec::new();
+        let mut out = ResponseBody::new(&mut buf);
         registry
-            .register_function("/add", |params| {
-                let Some(Value::Object(map)) = params else {
-                    return Err((ErrorCode::InvalidBody, "expected object".into()));
-                };
-                let a = map.get("a").and_then(Value::as_i64).unwrap_or(0);
-                let b = map.get("b").and_then(Value::as_i64).unwrap_or(0);
-                Ok(Value::from(a + b))
-            })
-            .expect("register function");
-
-        let read_counter = registry.dispatch("/counter", None).expect("read");
-        assert_eq!(read_counter, Value::from(0));
-
-        let write_result = registry
-            .dispatch("/counter", Some(Value::from(42)))
-            .expect("write");
-        assert_eq!(write_result["status"], "ok");
-
-        let read_counter = registry.dispatch("/counter", None).expect("read");
-        assert_eq!(read_counter, Value::from(42));
-
-        let function_info = registry.dispatch("/add", None).expect("function info");
-        assert_eq!(function_info["type"], "function");
-        assert_eq!(function_info["path"], "/add");
-
-        let call_result = registry
-            .dispatch("/add", Some(json!({"a": 2, "b": 3})))
+            .call_detached("/samples", None, &mut out)
             .expect("call");
-        assert_eq!(call_result, Value::from(5));
+        assert_eq!(out.format(), BodyFormat::Beve);
+        assert_eq!(
+            structio::from_beve::<Vec<f64>>(&buf).unwrap(),
+            vec![1.0, 2.0, 3.0]
+        );
     }
 
     #[test]
-    fn dispatch_resolves_functions_at_escaped_pointers() {
+    fn a_beve_request_is_answered_in_beve() {
+        // The registry used to hand back a value and let the caller encode it,
+        // so the format followed the request. It writes into the frame now, and
+        // it still has to.
+        let registry = Registry::new();
+        registry
+            .register_function("/echo", |_: Option<RequestBody<'_>>| Ok(7u64))
+            .expect("register");
+
+        let mut buf = Vec::new();
+        let mut out = ResponseBody::with_format(&mut buf, BodyFormat::Beve);
+        registry
+            .call_detached("/echo", None, &mut out)
+            .expect("call");
+        assert_eq!(out.format(), BodyFormat::Beve);
+        assert_eq!(structio::from_beve::<u64>(&buf).unwrap(), 7);
+    }
+
+    #[test]
+    fn a_malformed_pointer_is_refused_at_registration_and_at_lookup() {
+        let registry = Registry::new();
+        assert!(matches!(
+            registry.register_function("/a~2b", |_: Option<RequestBody<'_>>| Ok(0u64)),
+            Err(RegistryError::InvalidPointer { .. })
+        ));
+        assert!(!registry.is_function("/a~2b"));
+    }
+
+    #[test]
+    fn an_escaped_pointer_registers_and_resolves() {
+        // The canonical key is the pointer itself, so an escaped one has to
+        // match byte for byte on both sides rather than through a rebuild.
+        let registry = Registry::new();
+        registry
+            .register_function("/a~1b/run", |_: Option<RequestBody<'_>>| Ok(true))
+            .expect("register");
+        registry
+            .register_function("/m~0n", |_: Option<RequestBody<'_>>| Ok(true))
+            .expect("register");
+        assert!(registry.is_function("/a~1b/run"));
+        assert!(registry.is_function("/m~0n"));
+    }
+
+    #[test]
+    fn a_call_reads_its_parameters_and_writes_its_result() {
+        let registry = Registry::new();
+        registry
+            .register_function("/double", |params: Option<RequestBody<'_>>| {
+                let n: i64 = params
+                    .ok_or((ErrorCode::InvalidBody, String::from("body required")))?
+                    .read("/double")
+                    .map_err(|err| (ErrorCode::InvalidBody, err.to_string()))?;
+                Ok(n * 2)
+            })
+            .expect("register");
+
+        let body = RequestBody::new(b"21", BodyFormat::Json);
+        assert_eq!(call(&registry, "/double", Some(body)), "42");
+    }
+
+    #[test]
+    fn a_bodiless_frame_calls_with_no_parameters() {
+        let registry = Registry::new();
+        registry
+            .register_function("/ping", |params: Option<RequestBody<'_>>| {
+                assert!(params.is_none());
+                Ok("pong")
+            })
+            .expect("register");
+
+        assert_eq!(call(&registry, "/ping", None), "\"pong\"");
+    }
+
+    #[test]
+    fn an_unregistered_pointer_is_not_found() {
+        let registry = Registry::new();
+        let mut buf = Vec::new();
+        let mut out = ResponseBody::new(&mut buf);
+        let err = registry
+            .call_detached("/missing", None, &mut out)
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::PathNotFound { .. }));
+    }
+
+    #[test]
+    fn calls_resolve_at_escaped_pointers() {
         // The function map is keyed by the canonical pointer string. A pointer
         // whose reference token contains an escaped `/` (`~1`) or `~` (`~0`)
         // must still register and dispatch: registration stores the canonical
@@ -875,42 +552,23 @@ mod tests {
         // borrow-the-wire-pointer fast path cannot cover.
         let registry = Registry::new();
         registry
-            .register_function("/a~1b/run", |_params| Ok(Value::from("slash")))
+            .register_function("/a~1b/run", |_params: Option<RequestBody<'_>>| Ok("slash"))
             .expect("register escaped-slash function");
         registry
-            .register_function("/m~0n", |_params| Ok(Value::from("tilde")))
+            .register_function("/m~0n", |_params: Option<RequestBody<'_>>| Ok("tilde"))
             .expect("register escaped-tilde function");
 
-        // Metadata read echoes the canonical (re-escaped) pointer.
-        let info = registry.dispatch("/a~1b/run", None).expect("info");
-        assert_eq!(info["type"], "function");
-        assert_eq!(info["path"], "/a~1b/run");
+        assert_eq!(call(&registry, "/a~1b/run", None), "\"slash\"");
+        assert_eq!(call(&registry, "/m~0n", None), "\"tilde\"");
+        assert!(registry.is_function("/a~1b/run"));
 
-        // Calls resolve to the correct handler through the owned canonical key.
-        assert_eq!(
-            registry
-                .dispatch("/a~1b/run", Some(json!({})))
-                .expect("call slash"),
-            Value::from("slash")
-        );
-        assert_eq!(
-            registry
-                .dispatch("/m~0n", Some(json!({})))
-                .expect("call tilde"),
-            Value::from("tilde")
-        );
-
-        // Write fallback still works after the lookup reorder: an escaped
-        // non-function pointer parses to segments and writes under the parent.
-        let written = registry
-            .dispatch("/a~1b/note", Some(json!("hi")))
-            .expect("write");
-        assert_eq!(written["status"], "ok");
-        assert_eq!(written["path"], "/a~1b/note");
+        let mut endpoints = registry.endpoints();
+        endpoints.sort();
+        assert_eq!(endpoints, vec!["/a~1b/run", "/m~0n"]);
     }
 
     #[test]
-    fn dispatch_with_ctx_threads_peer_to_callable() {
+    fn a_context_aware_call_reaches_the_peer() {
         use crate::peer::{NotifyBody, PeerHandle, PeerId, PeerSendError, PeerSink};
         use std::sync::Mutex;
 
@@ -934,59 +592,64 @@ mod tests {
         registry
             .register_function(
                 "/run",
-                WithContext(move |ctx: &CallContext, _params| {
+                WithContext(move |ctx: &CallContext, _params: Option<RequestBody<'_>>| {
                     if let Some(p) = ctx.peer() {
                         *observed_peer_clone.lock().unwrap() = Some(p.peer_id());
                         p.send_notify("/progress", NotifyBody::Json(b"{}".to_vec()))
                             .ok();
                     }
-                    Ok(Value::from("ok"))
+                    Ok("ok")
                 }),
             )
             .expect("register WithContext function");
 
         let ctx = CallContext::new("/run", &peer);
-        let result = registry
-            .dispatch_with_ctx("/run", Some(json!({})), &ctx)
-            .expect("dispatch");
-        assert_eq!(result, Value::from("ok"));
+        let mut buf = Vec::new();
+        let mut out = ResponseBody::new(&mut buf);
+        registry.call("/run", None, &ctx, &mut out).expect("call");
+        assert_eq!(buf, b"\"ok\"");
         assert_eq!(*observed_peer.lock().unwrap(), Some(PeerId(7)));
         assert_eq!(sink.captured.lock().unwrap().as_slice(), &["/progress"]);
     }
 
     #[test]
-    fn dispatch_default_context_is_detached() {
+    fn call_detached_uses_a_detached_context() {
         let registry = Registry::new();
         let observed = Arc::new(std::sync::Mutex::new(false));
         let observed_clone = Arc::clone(&observed);
         registry
             .register_function(
                 "/probe",
-                WithContext(move |ctx: &CallContext, _params| {
+                WithContext(move |ctx: &CallContext, _params: Option<RequestBody<'_>>| {
                     *observed_clone.lock().unwrap() = ctx.peer().is_none();
-                    Ok(Value::from("ok"))
+                    Ok("ok")
                 }),
             )
             .expect("register");
 
-        registry
-            .dispatch("/probe", Some(json!({})))
-            .expect("dispatch");
+        call(&registry, "/probe", None);
         assert!(
             *observed.lock().unwrap(),
-            "dispatch must use a detached context"
+            "call_detached must use a detached context"
         );
     }
 
     #[test]
-    fn decode_body_maps_utf8_to_string_value() {
+    fn body_of_borrows_the_frame_under_its_declared_format() {
         let req = Message::builder()
             .id(1)
             .query_str("/name")
             .query_format(crate::constants::QueryFormat::JsonPointer)
             .body_utf8("alice")
             .build();
-        let decoded = Registry::decode_body(&req).expect("decode");
-        assert_eq!(decoded, Some(Value::String("alice".into())));
+        let body = Registry::body_of(&req).expect("body").expect("present");
+        assert_eq!(body.bytes(), b"alice");
+        assert_eq!(body.format(), BodyFormat::Utf8);
+    }
+
+    #[test]
+    fn body_of_is_none_for_a_bodiless_frame() {
+        let req = Message::builder().id(1).query_str("/ping").build();
+        assert!(Registry::body_of(&req).expect("body").is_none());
     }
 }

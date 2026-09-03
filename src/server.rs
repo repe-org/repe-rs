@@ -2,6 +2,7 @@ use crate::constants::{BodyFormat, ErrorCode, HEADER_SIZE};
 use crate::error::RepeError;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::io::read_message_into;
+use crate::json_pointer::MalformedPointer;
 use crate::message::{
     Message, MessageView, create_body_response_unstamped, create_error_response_like,
     create_error_response_unstamped_view, create_response_unstamped,
@@ -12,11 +13,9 @@ use crate::peer::{CallContext, PeerHandle};
 use crate::registry::Registry;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::server_request::route_request_view;
-use crate::structs::{RepeStruct, ResponseBody, StructResult};
-use beve::from_slice as beve_from_slice;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
-use serde_json::Value;
+use crate::structs::{
+    RepeStruct, RequestBody, ResponseBody, ServableOwned, ServableWrite, StructResult,
+};
 use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::io::Write;
@@ -105,8 +104,8 @@ pub trait HandlerErased: Send + Sync {
     /// The default implementation materializes an owned [`Message`] from the view
     /// (copying the query and body) and delegates to
     /// [`handle_with_ctx`](Self::handle_with_ctx), so existing handlers work
-    /// unchanged. The built-in JSON and typed handlers ([`Router::with_json`] /
-    /// [`Router::with_typed`]) override it to decode straight from the borrowed
+    /// unchanged. The built-in typed handlers ([`Router::with_typed`] and
+    /// friends) override it to decode straight from the borrowed
     /// body and skip those copies; the other built-ins (context-aware, struct,
     /// registry, and any middleware-wrapped route) use the owning default until
     /// they are likewise overridden.
@@ -283,98 +282,6 @@ impl HandlerErased for Arc<dyn HandlerErased> {
     }
 }
 
-fn decode_json_param(req: &Message) -> Result<Result<Value, Message>, RepeError> {
-    let value: Value = match BodyFormat::try_from(req.header.body_format) {
-        // JSON requires UTF-8, so a Utf8-framed body parses straight from the
-        // bytes too — strict and allocation-free, matching the borrowing path.
-        Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => serde_json::from_slice(&req.body)?,
-        Ok(BodyFormat::Beve) => beve_from_slice(&req.body)?,
-        _ => {
-            return Ok(Err(create_error_response_like(
-                req,
-                ErrorCode::InvalidBody,
-                "Expected JSON body",
-            )));
-        }
-    };
-    Ok(Ok(value))
-}
-
-/// Borrowing twin of [`decode_json_param`]: decode the request body straight
-/// from the borrowed view, with no owned `Message`. The UTF-8 branch parses the
-/// bytes directly (`from_slice`) rather than via an intermediate `String`.
-fn decode_json_param_view(view: &MessageView) -> Result<Result<Value, Message>, RepeError> {
-    let value: Value = match BodyFormat::try_from(view.header.body_format) {
-        Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => serde_json::from_slice(view.body)?,
-        Ok(BodyFormat::Beve) => beve_from_slice(view.body)?,
-        _ => {
-            return Ok(Err(create_error_response_unstamped_view(
-                view,
-                ErrorCode::InvalidBody,
-                "Expected JSON body",
-            )));
-        }
-    };
-    Ok(Ok(value))
-}
-
-struct JsonHandler<F>(F)
-where
-    F: Fn(Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static;
-
-impl<F> HandlerErased for JsonHandler<F>
-where
-    F: Fn(Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static,
-{
-    fn handle(&self, req: &Message) -> Result<Message, RepeError> {
-        let param = match decode_json_param(req)? {
-            Ok(v) => v,
-            Err(err) => return Ok(err),
-        };
-        match (self.0)(param) {
-            Ok(value) => create_response_unstamped(req, value, BodyFormat::Json),
-            Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
-        }
-    }
-
-    fn handle_view(&self, view: &MessageView, _ctx: &CallContext) -> Result<Message, RepeError> {
-        let param = match decode_json_param_view(view)? {
-            Ok(v) => v,
-            Err(err) => return Ok(err),
-        };
-        match (self.0)(param) {
-            Ok(value) => create_response_unstamped_view(view, value, BodyFormat::Json),
-            Err((code, msg)) => Ok(create_error_response_unstamped_view(view, code, msg)),
-        }
-    }
-}
-
-struct JsonHandlerCtx<F>(F)
-where
-    F: Fn(&CallContext, Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static;
-
-impl<F> HandlerErased for JsonHandlerCtx<F>
-where
-    F: Fn(&CallContext, Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static,
-{
-    fn handle(&self, req: &Message) -> Result<Message, RepeError> {
-        let path = req.query_str().unwrap_or("");
-        let ctx = CallContext::detached(path);
-        self.handle_with_ctx(req, &ctx)
-    }
-
-    fn handle_with_ctx(&self, req: &Message, ctx: &CallContext) -> Result<Message, RepeError> {
-        let param = match decode_json_param(req)? {
-            Ok(v) => v,
-            Err(err) => return Ok(err),
-        };
-        match (self.0)(ctx, param) {
-            Ok(value) => create_response_unstamped(req, value, BodyFormat::Json),
-            Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
-        }
-    }
-}
-
 /// Wrapper that lets typed handlers override the response [`BodyFormat`].
 /// Use helpers like [`TypedResponse::json`] or [`TypedResponse::beve`] to keep call sites concise.
 pub struct TypedResponse<R> {
@@ -422,8 +329,8 @@ impl<R> IntoTypedResponse<R> for TypedResponse<R> {
 
 pub trait TypedHandlerFn<T, R>: Send + Sync + 'static
 where
-    T: DeserializeOwned + Send + Sync + 'static,
-    R: Serialize + Send + Sync + 'static,
+    T: ServableOwned + Send + Sync + 'static,
+    R: ServableWrite + Send + Sync + 'static,
 {
     type Response: IntoTypedResponse<R>;
     fn call(&self, input: T) -> Result<Self::Response, (ErrorCode, String)>;
@@ -431,8 +338,8 @@ where
 
 impl<T, R, S, F> TypedHandlerFn<T, R> for F
 where
-    T: DeserializeOwned + Send + Sync + 'static,
-    R: Serialize + Send + Sync + 'static,
+    T: ServableOwned + Send + Sync + 'static,
+    R: ServableWrite + Send + Sync + 'static,
     S: IntoTypedResponse<R>,
     F: Fn(T) -> Result<S, (ErrorCode, String)> + Send + Sync + 'static,
 {
@@ -443,55 +350,64 @@ where
     }
 }
 
-fn decode_typed_param<T>(req: &Message) -> Result<Result<T, Message>, RepeError>
-where
-    T: DeserializeOwned,
-{
-    let value: T = match BodyFormat::try_from(req.header.body_format) {
-        Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => serde_json::from_slice(&req.body)?,
-        Ok(BodyFormat::Beve) => beve_from_slice(&req.body)?,
-        _ => {
-            return Ok(Err(create_error_response_like(
-                req,
-                ErrorCode::InvalidBody,
-                "Expected JSON body",
-            )));
+/// Decode a request body into `T` under whichever format the frame declared.
+///
+/// JSON and UTF-8 both parse as JSON: JSON requires UTF-8, so a `Utf8`-framed
+/// body parses straight from the bytes with no intermediate `String`. Anything
+/// else has no value structure to decode and is answered with
+/// [`ErrorCode::InvalidBody`] rather than coerced.
+fn decode_typed_body<T: ServableOwned>(
+    body: &[u8],
+    body_format: u16,
+    on_bad_format: impl FnOnce() -> Message,
+) -> Result<Result<T, Message>, RepeError> {
+    let mut value = T::default();
+    match BodyFormat::try_from(body_format) {
+        Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => {
+            let text = std::str::from_utf8(body).map_err(|err| {
+                RepeError::Json(structio::Error::new(
+                    structio::ErrorCode::InvalidUtf8,
+                    err.valid_up_to(),
+                ))
+            })?;
+            structio::json::read_into_with::<crate::structs::WirePolicy, _>(&mut value, text)
+                .map_err(RepeError::Json)?;
         }
-    };
+        Ok(BodyFormat::Beve) => {
+            structio::beve::read_into_with::<crate::structs::WirePolicy, _>(&mut value, body)
+                .map_err(RepeError::Beve)?;
+        }
+        _ => return Ok(Err(on_bad_format())),
+    }
     Ok(Ok(value))
 }
 
-/// Borrowing twin of [`decode_typed_param`]: deserialize `T` straight from the
-/// borrowed view body, with no owned `Message` and no intermediate `String` on
-/// the UTF-8 branch.
-fn decode_typed_param_view<T>(view: &MessageView) -> Result<Result<T, Message>, RepeError>
-where
-    T: DeserializeOwned,
-{
-    let value: T = match BodyFormat::try_from(view.header.body_format) {
-        Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => serde_json::from_slice(view.body)?,
-        Ok(BodyFormat::Beve) => beve_from_slice(view.body)?,
-        _ => {
-            return Ok(Err(create_error_response_unstamped_view(
-                view,
-                ErrorCode::InvalidBody,
-                "Expected JSON body",
-            )));
-        }
-    };
-    Ok(Ok(value))
+fn decode_typed_param<T: ServableOwned>(req: &Message) -> Result<Result<T, Message>, RepeError> {
+    decode_typed_body(&req.body, req.header.body_format, || {
+        create_error_response_like(req, ErrorCode::InvalidBody, "Expected JSON body")
+    })
+}
+
+/// Borrowing twin of [`decode_typed_param`]: decode `T` straight from the
+/// borrowed view body, with no owned `Message`.
+fn decode_typed_param_view<T: ServableOwned>(
+    view: &MessageView,
+) -> Result<Result<T, Message>, RepeError> {
+    decode_typed_body(view.body, view.header.body_format, || {
+        create_error_response_unstamped_view(view, ErrorCode::InvalidBody, "Expected JSON body")
+    })
 }
 
 struct TypedHandler<T, R, F>(F, std::marker::PhantomData<(T, R)>)
 where
-    T: DeserializeOwned + Send + Sync + 'static,
-    R: Serialize + Send + Sync + 'static,
+    T: ServableOwned + Send + Sync + 'static,
+    R: ServableWrite + Send + Sync + 'static,
     F: TypedHandlerFn<T, R>;
 
 impl<T, R, F> HandlerErased for TypedHandler<T, R, F>
 where
-    T: DeserializeOwned + Send + Sync + 'static,
-    R: Serialize + Send + Sync + 'static,
+    T: ServableOwned + Send + Sync + 'static,
+    R: ServableWrite + Send + Sync + 'static,
     F: TypedHandlerFn<T, R>,
 {
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
@@ -502,7 +418,7 @@ where
         match self.0.call(t) {
             Ok(r) => {
                 let (value, format) = r.into_typed_response();
-                create_response_unstamped(req, value, format)
+                Ok(create_response_unstamped(req, &value, format))
             }
             Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
         }
@@ -516,7 +432,7 @@ where
         match self.0.call(t) {
             Ok(r) => {
                 let (value, format) = r.into_typed_response();
-                create_response_unstamped_view(view, value, format)
+                Ok(create_response_unstamped_view(view, &value, format))
             }
             Err((code, msg)) => Ok(create_error_response_unstamped_view(view, code, msg)),
         }
@@ -524,21 +440,56 @@ where
 }
 
 /// Decode a BEVE typed-numeric-array request body into `Vec<T>` via the bulk
-/// `read_typed_slice` path (one `copy_nonoverlapping`, no serde walk). The
-/// typed-slice twin of [`decode_typed_param`].
+/// `read_typed_slice` path (one `copy_nonoverlapping`, no per-element walk).
+/// The typed-slice twin of `decode_typed_param`.
 ///
-/// Unlike the serde decoders, this accepts only [`BodyFormat::Beve`]: a typed
-/// numeric array has no JSON/UTF-8 on-wire form, so any other body format is a
-/// client error rather than something to coerce. A `Beve` body that is not a
-/// typed array of `T` (wrong element class/width, or truncated) surfaces as a
-/// [`RepeError::Beve`], matching how [`decode_typed_param`] propagates a serde
-/// parse failure.
+/// The element type of a bulk numeric route: a scalar whose in-memory bytes
+/// *are* its BEVE payload, which is what makes the encode and decode one
+/// `copy_nonoverlapping` rather than a per-element walk.
+///
+/// One name for both halves of a [`with_typed_slice`] route. The request side
+/// has to be readable and the response side writable, but the scalars this can
+/// be (`f32`, `f64`, the integer widths, ...) are all of those things, so
+/// splitting the bound in two would name a distinction with no members on
+/// either side of it.
+///
+/// [`with_typed_slice`]: Router::with_typed_slice
+pub trait SliceElement:
+    structio::beve::NumericBytes + structio::beve::Write + for<'de> structio::beve::Read<'de> + Default
+{
+}
+
+impl<T> SliceElement for T where
+    T: structio::beve::NumericBytes
+        + structio::beve::Write
+        + for<'de> structio::beve::Read<'de>
+        + Default
+{
+}
+
+/// Bulk-decode a `Vec<T>` out of a BEVE typed array.
+///
+/// One reader takes both the regular and the aligned wire forms, so this is
+/// just a `Vec<T>` read: structio recognizes the payload as contiguous and
+/// bulk-copies it.
+fn read_typed_slice<T: SliceElement>(body: &[u8]) -> Result<Vec<T>, RepeError> {
+    let mut out = Vec::new();
+    structio::beve::read_into(&mut out, body).map_err(RepeError::Beve)?;
+    Ok(out)
+}
+
+/// This accepts only [`BodyFormat::Beve`]: a typed numeric array has no
+/// JSON/UTF-8 on-wire form, so any other body format is a client error rather
+/// than something to coerce. A `Beve` body that is not a typed array of `T`
+/// (wrong element class or width, or truncated) surfaces as a
+/// [`RepeError::Beve`], matching how [`decode_typed_param`] propagates a parse
+/// failure.
 fn decode_typed_slice_param<T>(req: &Message) -> Result<Result<Vec<T>, Message>, RepeError>
 where
-    T: beve::BeveTypedSlice,
+    T: SliceElement,
 {
     match BodyFormat::try_from(req.header.body_format) {
-        Ok(BodyFormat::Beve) => Ok(Ok(beve::read_typed_slice(&req.body)?)),
+        Ok(BodyFormat::Beve) => Ok(Ok(read_typed_slice(&req.body)?)),
         _ => Ok(Err(create_error_response_like(
             req,
             ErrorCode::InvalidBody,
@@ -553,10 +504,10 @@ fn decode_typed_slice_param_view<T>(
     view: &MessageView,
 ) -> Result<Result<Vec<T>, Message>, RepeError>
 where
-    T: beve::BeveTypedSlice,
+    T: SliceElement,
 {
     match BodyFormat::try_from(view.header.body_format) {
-        Ok(BodyFormat::Beve) => Ok(Ok(beve::read_typed_slice(view.body)?)),
+        Ok(BodyFormat::Beve) => Ok(Ok(read_typed_slice(view.body)?)),
         _ => Ok(Err(create_error_response_unstamped_view(
             view,
             ErrorCode::InvalidBody,
@@ -567,18 +518,18 @@ where
 
 /// Bulk numeric handler registered by [`Router::with_typed_slice`]: decodes a
 /// contiguous `Vec<T>` request and frames a contiguous `Vec<R>` response, both
-/// through BEVE's typed-slice fast path, bypassing serde's per-element walk on
-/// the hot numeric path.
+/// through BEVE's typed-slice fast path, bypassing the per-element walk on the
+/// hot numeric path.
 struct TypedSliceHandler<T, R, F>(F, std::marker::PhantomData<(T, R)>)
 where
-    T: beve::BeveTypedSlice + Send + Sync + 'static,
-    R: beve::BeveTypedSlice + Send + Sync + 'static,
+    T: SliceElement + Send + Sync + 'static,
+    R: SliceElement + Send + Sync + 'static,
     F: Fn(Vec<T>) -> Result<Vec<R>, (ErrorCode, String)> + Send + Sync + 'static;
 
 impl<T, R, F> HandlerErased for TypedSliceHandler<T, R, F>
 where
-    T: beve::BeveTypedSlice + Send + Sync + 'static,
-    R: beve::BeveTypedSlice + Send + Sync + 'static,
+    T: SliceElement + Send + Sync + 'static,
+    R: SliceElement + Send + Sync + 'static,
     F: Fn(Vec<T>) -> Result<Vec<R>, (ErrorCode, String)> + Send + Sync + 'static,
 {
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
@@ -604,15 +555,6 @@ where
     }
 }
 
-/// BEVE aligned-typed-array marker byte (`0x5C`): a typed array (type 4) in the
-/// bool/string/aligned sub-category (3) with the aligned discriminator (2), per
-/// BEVE spec §4. It opens the aligned wire form that
-/// [`MessageBuilder::body_aligned_typed_slice`](crate::message::MessageBuilder::body_aligned_typed_slice)
-/// emits and the borrowing route decodes. Kept as a local constant rather than reaching into BEVE's
-/// header internals; [`aligned_marker_matches_beve`] pins it to BEVE's actual
-/// output so a future BEVE change cannot drift past us silently.
-const BEVE_ALIGNED_TYPED_ARRAY_MARKER: u8 = 0x5C;
-
 /// A decoded typed-slice request body: either borrowed straight from the receive
 /// buffer (the zero-copy win) or owned after a bulk copy (the fallback). Both
 /// expose the payload as `&[T]`, so the handler closure is oblivious to which
@@ -635,33 +577,22 @@ impl<T> SliceInput<'_, T> {
 /// Decode a typed-slice request body for the borrowing route, preferring a
 /// zero-copy borrow and degrading gracefully.
 ///
-/// Accepts both wire forms so a [`Router::with_typed_slice_ref`] route is a
-/// drop-in superset of [`Router::with_typed_slice`]:
-///
-/// * An *aligned* typed array (marker `0x5C`, what `call_typed_slice_aligned`
-///   sends) is borrowed as `&[T]` when the buffer permits, else bulk-copied (the
-///   aligned payload is unaligned in this particular buffer). A genuine
-///   element-type mismatch or truncation surfaces as an error from the owned
-///   re-read.
-/// * A *regular* typed array (what `call_typed_slice` / the serde path send) has
-///   no padding to borrow through, so it is always bulk-copied via
-///   [`beve::read_typed_slice`].
+/// Accepts both wire forms, so a [`Router::with_typed_slice_ref`] route is a
+/// drop-in superset of [`Router::with_typed_slice`]. There is no branch on the
+/// wire form because there is nothing to branch on:
+/// [`structio::beve_slice_ref`] declines with `None` for every reason a borrow
+/// can be unavailable — the payload is the regular unpadded form, the buffer's
+/// base address is not aligned for `T`, the target is big-endian, or the
+/// document is simply not a typed array of `T`. `None` is not a diagnosis, so
+/// the fallback is the owned read, which copies and then either succeeds or
+/// reports what is actually wrong with the bytes.
 fn decode_typed_slice_ref_body<T>(body: &[u8]) -> Result<SliceInput<'_, T>, RepeError>
 where
-    T: beve::BeveTypedSlice,
+    T: SliceElement,
 {
-    if body.first() == Some(&BEVE_ALIGNED_TYPED_ARRAY_MARKER) {
-        match beve::read_aligned_typed_slice_ref::<T>(body) {
-            Ok(slice) => Ok(SliceInput::Borrowed(slice)),
-            // Borrow refused (buffer base not aligned, or big-endian target) or a
-            // real decode error: re-read owned, which copies and either succeeds
-            // or reports the definitive error.
-            Err(_) => Ok(SliceInput::Owned(beve::read_aligned_typed_slice::<T>(
-                body,
-            )?)),
-        }
-    } else {
-        Ok(SliceInput::Owned(beve::read_typed_slice::<T>(body)?))
+    match structio::beve_slice_ref::<T>(body) {
+        Some(slice) => Ok(SliceInput::Borrowed(slice)),
+        None => Ok(SliceInput::Owned(read_typed_slice(body)?)),
     }
 }
 
@@ -676,7 +607,7 @@ fn decode_typed_slice_ref_param<'a, T>(
     on_bad_format: impl FnOnce() -> Message,
 ) -> Result<Result<SliceInput<'a, T>, Message>, RepeError>
 where
-    T: beve::BeveTypedSlice,
+    T: SliceElement,
 {
     match BodyFormat::try_from(body_format) {
         Ok(BodyFormat::Beve) => Ok(Ok(decode_typed_slice_ref_body::<T>(body)?)),
@@ -691,14 +622,14 @@ where
 /// and buffer alignment allow it.
 struct TypedSliceRefHandler<T, R, F>(F, std::marker::PhantomData<(T, R)>)
 where
-    T: beve::BeveTypedSlice + Send + Sync + 'static,
-    R: beve::BeveTypedSlice + Send + Sync + 'static,
+    T: SliceElement + Send + Sync + 'static,
+    R: SliceElement + Send + Sync + 'static,
     F: Fn(&[T]) -> Result<Vec<R>, (ErrorCode, String)> + Send + Sync + 'static;
 
 impl<T, R, F> HandlerErased for TypedSliceRefHandler<T, R, F>
 where
-    T: beve::BeveTypedSlice + Send + Sync + 'static,
-    R: beve::BeveTypedSlice + Send + Sync + 'static,
+    T: SliceElement + Send + Sync + 'static,
+    R: SliceElement + Send + Sync + 'static,
     F: Fn(&[T]) -> Result<Vec<R>, (ErrorCode, String)> + Send + Sync + 'static,
 {
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
@@ -743,8 +674,8 @@ where
 /// `Fn(&CallContext, T) -> Result<R, (ErrorCode, String)>`.
 pub trait TypedHandlerFnCtx<T, R>: Send + Sync + 'static
 where
-    T: DeserializeOwned + Send + Sync + 'static,
-    R: Serialize + Send + Sync + 'static,
+    T: ServableOwned + Send + Sync + 'static,
+    R: ServableWrite + Send + Sync + 'static,
 {
     type Response: IntoTypedResponse<R>;
     fn call(&self, ctx: &CallContext, input: T) -> Result<Self::Response, (ErrorCode, String)>;
@@ -752,8 +683,8 @@ where
 
 impl<T, R, S, F> TypedHandlerFnCtx<T, R> for F
 where
-    T: DeserializeOwned + Send + Sync + 'static,
-    R: Serialize + Send + Sync + 'static,
+    T: ServableOwned + Send + Sync + 'static,
+    R: ServableWrite + Send + Sync + 'static,
     S: IntoTypedResponse<R>,
     F: Fn(&CallContext, T) -> Result<S, (ErrorCode, String)> + Send + Sync + 'static,
 {
@@ -766,14 +697,14 @@ where
 
 struct TypedHandlerCtx<T, R, F>(F, std::marker::PhantomData<(T, R)>)
 where
-    T: DeserializeOwned + Send + Sync + 'static,
-    R: Serialize + Send + Sync + 'static,
+    T: ServableOwned + Send + Sync + 'static,
+    R: ServableWrite + Send + Sync + 'static,
     F: TypedHandlerFnCtx<T, R>;
 
 impl<T, R, F> HandlerErased for TypedHandlerCtx<T, R, F>
 where
-    T: DeserializeOwned + Send + Sync + 'static,
-    R: Serialize + Send + Sync + 'static,
+    T: ServableOwned + Send + Sync + 'static,
+    R: ServableWrite + Send + Sync + 'static,
     F: TypedHandlerFnCtx<T, R>,
 {
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
@@ -790,7 +721,7 @@ where
         match self.0.call(ctx, t) {
             Ok(r) => {
                 let (value, format) = r.into_typed_response();
-                create_response_unstamped(req, value, format)
+                Ok(create_response_unstamped(req, &value, format))
             }
             Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
         }
@@ -1186,16 +1117,6 @@ impl Router {
         self.inner = Arc::new(map);
     }
 
-    /// Add a JSON Value-based handler. Alias: `with`.
-    pub fn with_json(
-        mut self,
-        path: &str,
-        handler: impl Fn(Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static,
-    ) -> Self {
-        self.insert_route(path, Arc::new(JsonHandler(handler)));
-        self
-    }
-
     /// Register a custom [`HandlerErased`] at `path`, the low-level escape hatch
     /// beneath the typed/JSON registrars.
     ///
@@ -1267,7 +1188,7 @@ impl Router {
     ///         if let Some(rest) = path.strip_prefix("/dynamic/") {
     ///             return Ok(Message::builder()
     ///                 .id(req.header.id)
-    ///                 .body_json(&rest)?
+    ///                 .body_json(rest)
     ///                 .build());
     ///         }
     ///         // Not ours: the router no longer frames this for us.
@@ -1343,7 +1264,7 @@ impl Router {
     /// to the fallback instead. The rule is uniform — a mount's miss is still a
     /// miss, at the empty root or at any prefix — and it does not reorder
     /// anything: a mount that *does* serve the path still answers it, and a
-    /// fixed route registered with [`with_json`](Self::with_json) and friends
+    /// fixed route registered with [`with_typed`](Self::with_typed) and friends
     /// still wins over both.
     ///
     /// Registration order does not matter. The composition is rebuilt whenever
@@ -1380,13 +1301,17 @@ impl Router {
     ///
     /// struct Root;
     /// impl RepeStruct for Root {
-    ///     fn repe_handle(
+    ///     fn repe_handle_into(
     ///         &mut self,
     ///         segments: &[&str],
-    ///         _body: Option<serde_json::Value>,
-    ///     ) -> StructResult<Option<serde_json::Value>> {
+    ///         _body: Option<repe::structs::RequestBody<'_>>,
+    ///         out: &mut repe::structs::ResponseBody<'_>,
+    ///     ) -> StructResult<()> {
     ///         match segments {
-    ///             ["voltages"] => Ok(Some(serde_json::json!([1, 2, 3]))),
+    ///             ["voltages"] => {
+    ///                 out.write(&vec![1i64, 2, 3]);
+    ///                 Ok(())
+    ///             }
     ///             _ => Err(StructError::InvalidPath {
     ///                 path: repe::structs::path_from_segments(segments),
     ///             }),
@@ -1399,7 +1324,7 @@ impl Router {
     ///     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
     ///         let path = req.query_str().unwrap_or("");
     ///         if path.starts_with("/plugins/") {
-    ///             return Ok(Message::builder().id(req.header.id).body_json(&path)?.build());
+    ///             return Ok(Message::builder().id(req.header.id).body_json(&path).build());
     ///         }
     ///         Ok(create_error_response_like(
     ///             req,
@@ -1507,22 +1432,13 @@ impl Router {
         arc
     }
 
-    /// Backwards-compatible alias for `with_json`.
-    pub fn with(
-        self,
-        path: &str,
-        handler: impl Fn(Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static,
-    ) -> Self {
-        self.with_json(path, handler)
-    }
-
     /// Add a typed handler that auto-deserializes JSON/UTF-8/BEVE into `T` and serializes `R`.
     /// Return `Ok(value)` for JSON responses or wrap results with [`TypedResponse`] to pick a
     /// different [`BodyFormat`].
     pub fn with_typed<T, R, F>(mut self, path: &str, f: F) -> Self
     where
-        T: DeserializeOwned + Send + Sync + 'static,
-        R: Serialize + Send + Sync + 'static,
+        T: ServableOwned + Send + Sync + 'static,
+        R: ServableWrite + Send + Sync + 'static,
         F: TypedHandlerFn<T, R>,
     {
         self.insert_route(
@@ -1539,11 +1455,11 @@ impl Router {
     ///
     /// This is the high-throughput counterpart to [`with_typed`](Self::with_typed)
     /// for whole-body numeric arrays. `with_typed` routes `Vec<f64>` through
-    /// serde, which visits every element on both decode and encode; `with_typed_slice`
+    /// the generic encoder, which visits every element on both decode and encode; `with_typed_slice`
     /// moves the whole contiguous block in a single bounds-checked
     /// `copy_nonoverlapping` each way (on little-endian targets), bypassing the
     /// per-element walk. The bytes on the wire are identical, so a `with_typed_slice`
-    /// route interoperates freely with a serde peer and with
+    /// route interoperates freely with a `with_typed` peer and with
     /// [`AsyncClient::call_typed_slice`](crate::AsyncClient::call_typed_slice) /
     /// [`Client::call_typed_slice`](crate::Client::call_typed_slice).
     ///
@@ -1562,8 +1478,8 @@ impl Router {
     /// [`MessageBuilder::body_typed_slice`]: crate::message::MessageBuilder::body_typed_slice
     pub fn with_typed_slice<T, R, F>(mut self, path: &str, f: F) -> Self
     where
-        T: beve::BeveTypedSlice + Send + Sync + 'static,
-        R: beve::BeveTypedSlice + Send + Sync + 'static,
+        T: SliceElement + Send + Sync + 'static,
+        R: SliceElement + Send + Sync + 'static,
         F: Fn(Vec<T>) -> Result<Vec<R>, (ErrorCode, String)> + Send + Sync + 'static,
     {
         self.insert_route(
@@ -1583,7 +1499,7 @@ impl Router {
     /// little-endian targets), the handler receives a `&[T]` pointing straight
     /// into that buffer: no allocation and no element copy on the way in. When the
     /// buffer is not aligned, or the client used the regular
-    /// [`call_typed_slice`](crate::AsyncClient::call_typed_slice) / serde path, the
+    /// [`call_typed_slice`](crate::AsyncClient::call_typed_slice) / `call_typed` path, the
     /// body is bulk-copied into an owned buffer first and the handler sees a `&[T]`
     /// over that. Either way the closure is identical, so a `with_typed_slice_ref`
     /// route is a drop-in superset of `with_typed_slice`: it accepts every client
@@ -1605,8 +1521,8 @@ impl Router {
     /// [`Client::call_typed_slice_aligned`]: crate::Client::call_typed_slice_aligned
     pub fn with_typed_slice_ref<T, R, F>(mut self, path: &str, f: F) -> Self
     where
-        T: beve::BeveTypedSlice + Send + Sync + 'static,
-        R: beve::BeveTypedSlice + Send + Sync + 'static,
+        T: SliceElement + Send + Sync + 'static,
+        R: SliceElement + Send + Sync + 'static,
         F: Fn(&[T]) -> Result<Vec<R>, (ErrorCode, String)> + Send + Sync + 'static,
     {
         self.insert_route(
@@ -1616,51 +1532,14 @@ impl Router {
         self
     }
 
-    /// Context-aware JSON handler. Same shape as [`with_json`] but the
-    /// closure also receives a [`CallContext`] carrying the calling
-    /// peer (when one is available) and the dispatched method.
-    ///
-    /// Typical use: push a notify back to the calling peer during
-    /// request handling, e.g. progress updates while a long-running
-    /// call is in flight.
-    ///
-    /// ```ignore
-    /// use repe::server::Router;
-    /// use repe::NotifyBody;
-    ///
-    /// let router = Router::new().with_json_ctx("/start", |ctx, params| {
-    ///     if let Some(peer) = ctx.peer() {
-    ///         let _ = peer.send_notify(
-    ///             "/progress",
-    ///             NotifyBody::Json(serde_json::to_vec(&serde_json::json!({
-    ///                 "stage": "begin"
-    ///             })).unwrap()),
-    ///         );
-    ///     }
-    ///     Ok(serde_json::json!({ "started": true }))
-    /// });
-    /// ```
-    ///
-    /// When dispatched without a peer (TCP transports, direct
-    /// in-process calls), `ctx.peer()` returns `None`.
-    ///
-    /// [`with_json`]: Self::with_json
-    pub fn with_json_ctx<F>(mut self, path: &str, handler: F) -> Self
-    where
-        F: Fn(&CallContext, Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static,
-    {
-        self.insert_route(path, Arc::new(JsonHandlerCtx(handler)));
-        self
-    }
-
     /// Context-aware typed handler. Same shape as [`with_typed`] but
     /// the closure also receives a [`CallContext`].
     ///
     /// [`with_typed`]: Self::with_typed
     pub fn with_typed_ctx<T, R, F>(mut self, path: &str, f: F) -> Self
     where
-        T: DeserializeOwned + Send + Sync + 'static,
-        R: Serialize + Send + Sync + 'static,
+        T: ServableOwned + Send + Sync + 'static,
+        R: ServableWrite + Send + Sync + 'static,
         F: TypedHandlerFnCtx<T, R>,
     {
         self.insert_route(
@@ -1670,38 +1549,17 @@ impl Router {
         self
     }
 
-    /// Off-reader variant of [`with_json`](Self::with_json): on the
+    /// Off-reader variant of [`with_typed`](Self::with_typed): on the
     /// WebSocket server the handler runs on a blocking thread (see
     /// [`Execution::OffReader`]) so the reader stays free to decode
     /// further inbound frames while it runs or parks. Use for handlers
     /// that block — e.g. a `repe::stream` producer waiting on
     /// `wait_for_credit`. On the TCP servers it behaves exactly like
-    /// [`with_json`](Self::with_json).
-    pub fn with_json_blocking(
-        mut self,
-        path: &str,
-        handler: impl Fn(Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static,
-    ) -> Self {
-        self.insert_route(path, Arc::new(OffReaderHandler(JsonHandler(handler))));
-        self
-    }
-
-    /// Off-reader variant of [`with_json_ctx`](Self::with_json_ctx).
-    /// See [`with_json_blocking`](Self::with_json_blocking).
-    pub fn with_json_ctx_blocking<F>(mut self, path: &str, handler: F) -> Self
-    where
-        F: Fn(&CallContext, Value) -> Result<Value, (ErrorCode, String)> + Send + Sync + 'static,
-    {
-        self.insert_route(path, Arc::new(OffReaderHandler(JsonHandlerCtx(handler))));
-        self
-    }
-
-    /// Off-reader variant of [`with_typed`](Self::with_typed).
-    /// See [`with_json_blocking`](Self::with_json_blocking).
+    /// [`with_typed`](Self::with_typed).
     pub fn with_typed_blocking<T, R, F>(mut self, path: &str, f: F) -> Self
     where
-        T: DeserializeOwned + Send + Sync + 'static,
-        R: Serialize + Send + Sync + 'static,
+        T: ServableOwned + Send + Sync + 'static,
+        R: ServableWrite + Send + Sync + 'static,
         F: TypedHandlerFn<T, R>,
     {
         self.insert_route(
@@ -1715,11 +1573,11 @@ impl Router {
     }
 
     /// Off-reader variant of [`with_typed_ctx`](Self::with_typed_ctx).
-    /// See [`with_json_blocking`](Self::with_json_blocking).
+    /// See [`with_typed_blocking`](Self::with_typed_blocking).
     pub fn with_typed_ctx_blocking<T, R, F>(mut self, path: &str, f: F) -> Self
     where
-        T: DeserializeOwned + Send + Sync + 'static,
-        R: Serialize + Send + Sync + 'static,
+        T: ServableOwned + Send + Sync + 'static,
+        R: ServableWrite + Send + Sync + 'static,
         F: TypedHandlerFnCtx<T, R>,
     {
         self.insert_route(
@@ -1917,16 +1775,13 @@ impl Router {
     /// ```
     /// use repe::{Message, QueryFormat, server::Router};
     ///
-    /// let router = Router::new().with_json("/double", |v: serde_json::Value| {
-    ///     Ok(serde_json::json!(v.as_i64().unwrap_or(0) * 2))
-    /// });
+    /// let router = Router::new().with_typed("/double", |v: i64| Ok(v * 2));
     ///
     /// let request = Message::builder()
     ///     .id(1)
     ///     .query_str("/double")
     ///     .query_format(QueryFormat::JsonPointer)
-    ///     .body_json(&21)
-    ///     .unwrap()
+    ///     .body_json(&21i64)
     ///     .build()
     ///     .to_vec();
     ///
@@ -2035,43 +1890,50 @@ impl RegisteredRegistry {
     }
 }
 
+impl RegisteredRegistry {
+    /// The body of both [`HandlerErased`] entry points, which differ only in
+    /// whether they have a calling peer to offer the function.
+    ///
+    /// The registry writes its result straight into the response buffer, so
+    /// there is no intermediate value between the function and the frame. The
+    /// response format follows the request's, the same rule the struct
+    /// dispatcher uses.
+    fn dispatch(&self, req: &Message, ctx: &CallContext) -> Message {
+        let path = req.query_str().unwrap_or("");
+        let Some(pointer) = self.pointer_for(path) else {
+            return create_error_response_like(
+                req,
+                ErrorCode::MethodNotFound,
+                format!("path is not below registry prefix: {path}"),
+            );
+        };
+        let params = match Registry::body_of(req) {
+            Ok(params) => params,
+            Err(err) => return create_error_response_like(req, err.code(), err.to_string()),
+        };
+
+        let mut buf = response_buffer(req);
+        let requested = BodyFormat::try_from(req.header.body_format).unwrap_or(BodyFormat::Json);
+        let mut out = ResponseBody::with_format(&mut buf, requested);
+        match self.registry.call(pointer, params, ctx, &mut out) {
+            Ok(()) => {
+                let body_format = out.format();
+                create_body_response_unstamped(req, buf, body_format)
+            }
+            Err(err) => create_error_response_like(req, err.code(), err.to_string()),
+        }
+    }
+}
+
 impl HandlerErased for RegisteredRegistry {
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
         let path = req.query_str().unwrap_or("");
-        let Some(pointer) = self.pointer_for(path) else {
-            return Ok(create_error_response_like(
-                req,
-                ErrorCode::MethodNotFound,
-                format!("path is not below registry prefix: {path}"),
-            ));
-        };
-        let body = match Registry::decode_body(req) {
-            Ok(value) => value,
-            Err(err) => return Ok(create_error_response_like(req, err.code(), err.to_string())),
-        };
-        match self.registry.dispatch(pointer, body) {
-            Ok(value) => create_response_unstamped(req, value, BodyFormat::Json),
-            Err(err) => Ok(create_error_response_like(req, err.code(), err.to_string())),
-        }
+        let ctx = CallContext::detached(path);
+        Ok(self.dispatch(req, &ctx))
     }
 
     fn handle_with_ctx(&self, req: &Message, ctx: &CallContext) -> Result<Message, RepeError> {
-        let path = req.query_str().unwrap_or("");
-        let Some(pointer) = self.pointer_for(path) else {
-            return Ok(create_error_response_like(
-                req,
-                ErrorCode::MethodNotFound,
-                format!("path is not below registry prefix: {path}"),
-            ));
-        };
-        let body = match Registry::decode_body(req) {
-            Ok(value) => value,
-            Err(err) => return Ok(create_error_response_like(req, err.code(), err.to_string())),
-        };
-        match self.registry.dispatch_with_ctx(pointer, body, ctx) {
-            Ok(value) => create_response_unstamped(req, value, BodyFormat::Json),
-            Err(err) => Ok(create_error_response_like(req, err.code(), err.to_string())),
-        }
+        Ok(self.dispatch(req, ctx))
     }
 }
 
@@ -2128,32 +1990,38 @@ where
             ));
         };
 
-        // Decoded before either attempt, because the shared one is offered the
+        // Wrapped, not parsed. The body reaches the struct as the bytes that
+        // arrived plus the format the header declared, and is decoded once
+        // directly into the live member it is destined for. Nothing here knows
+        // what shape the endpoint expects, and a request no endpoint claims
+        // never parses at all.
+        //
+        // Prepared before either attempt, because the shared one is offered the
         // body too: a `&self` method taking arguments is a call, not a
         // mutation, and gating the shared path on an empty frame put every such
         // call behind the write guard. The struct decides from the receiver it
         // was generated from; this side only has to make the body available.
-        let mut body = if req.body.is_empty() {
+        let body_format = match BodyFormat::try_from(req.header.body_format) {
+            Ok(format @ (BodyFormat::Json | BodyFormat::Utf8 | BodyFormat::Beve)) => format,
+            // Raw binary, an unrecognized code, and a `BodyFormat` this build
+            // does not know. An empty frame is a read and carries no body to
+            // have a format, so it is exempt.
+            _ if req.body.is_empty() => BodyFormat::Json,
+            _ => {
+                return Ok(create_error_response_like(
+                    req,
+                    ErrorCode::InvalidBody,
+                    format!(
+                        "struct handler `{path}` requires JSON or BEVE body, got format {}",
+                        req.header.body_format
+                    ),
+                ));
+            }
+        };
+        let body = if req.body.is_empty() {
             None
         } else {
-            match BodyFormat::try_from(req.header.body_format) {
-                Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => {
-                    Some(serde_json::from_slice::<Value>(&req.body).map_err(RepeError::from)?)
-                }
-                Ok(BodyFormat::Beve) => Some(beve_from_slice(&req.body)?),
-                // Raw binary, an unrecognized code, and a `BodyFormat` this
-                // build does not know: none of them is a JSON tree.
-                Ok(_) | Err(_) => {
-                    return Ok(create_error_response_like(
-                        req,
-                        ErrorCode::InvalidBody,
-                        format!(
-                            "struct handler `{path}` requires JSON or BEVE body, got format {}",
-                            req.header.body_format
-                        ),
-                    ));
-                }
-            }
+            Some(RequestBody::new(&req.body, body_format))
         };
 
         // One buffer for both attempts: a declining shared attempt leaves it
@@ -2166,7 +2034,7 @@ where
         // re-split, and for an escaped pointer that is `json_pointer::parse`
         // run twice — the `Vec<String>` and its `str::replace` per token, paid
         // again to reach the identical segments.
-        let response = with_segments(relative, |segments| {
+        let response = match with_segments(relative, |segments| {
             // The shared attempt, which is the whole point of registering the
             // struct behind an `RwLock`. A mutex answers `None` from a defaulted
             // method with no work in it, so it compiles out.
@@ -2181,7 +2049,7 @@ where
             // identically.
             if body.is_none() || T::REPE_SHARED_SERVES_BODIES {
                 match self.shared.with_read(|handler| {
-                    shared_struct_segments(handler, segments, &mut body, &mut buf, req)
+                    shared_struct_segments(handler, segments, body, body_format, &mut buf, req)
                 }) {
                     Some(Ok(Some(response))) => return response,
                     // The struct declined: this path needs `&mut self`. Nothing
@@ -2199,8 +2067,21 @@ where
                 Err(err) => return lock_error_response(req, path, err),
             };
 
-            dispatch_struct_segments(&mut *guard, segments, body, buf, req)
-        });
+            dispatch_struct_segments(&mut *guard, segments, body, body_format, buf, req)
+        }) {
+            Ok(response) => response,
+            // A pointer with a bad `~` escape names nothing. It is refused
+            // here, before any lock is taken, because the derived impls read an
+            // *empty* segment list as the struct root: letting it through would
+            // serve the whole listing to a bodiless request and overwrite the
+            // whole struct on a write. `MethodNotFound` matches what the derive
+            // answers for a well-formed path that names no member.
+            Err(MalformedPointer) => create_error_response_like(
+                req,
+                ErrorCode::MethodNotFound,
+                format!("malformed JSON Pointer: {path}"),
+            ),
+        };
         Ok(response)
     }
 }
@@ -2224,6 +2105,9 @@ fn lock_error_response(req: &Message, path: &str, err: LockError) -> Message {
 /// * `"/"` → one reference token, empty; calls `f(&[""])`. The derive-macro
 ///   impls treat this as `InvalidPath`, matching RFC 6901 semantics ("/" points
 ///   at a field named `""`).
+/// * a malformed `~` escape → `Err(MalformedPointer)` without calling `f`. An
+///   unparseable pointer has no segments, and an empty list would be read as
+///   the root, so the caller has to answer it rather than dispatch it.
 ///
 /// The escape-free fast path (`!relative.contains('~')`, the common case for
 /// JSON Pointers) avoids the `Vec<String>` from `json_pointer::parse` and drops
@@ -2231,26 +2115,26 @@ fn lock_error_response(req: &Message, path: &str, err: LockError) -> Message {
 /// only when the path is unusually deep. The escape path keeps the original
 /// `Vec<String>` + `Vec<&str>` shape because each escaped segment genuinely
 /// needs an owned `String`.
-fn with_segments<R, F>(relative: &str, f: F) -> R
+fn with_segments<R, F>(relative: &str, f: F) -> Result<R, MalformedPointer>
 where
     F: FnOnce(&[&str]) -> R,
 {
     const STACK_SEGS: usize = 16;
 
     if relative.contains('~') {
-        let owned = crate::json_pointer::parse(relative);
-        let seg_refs: Vec<&str> = owned.iter().map(String::as_str).collect();
-        return f(&seg_refs);
+        let owned = crate::json_pointer::parse(relative)?;
+        let seg_refs: Vec<&str> = owned.iter().map(AsRef::as_ref).collect();
+        return Ok(f(&seg_refs));
     }
     if relative.is_empty() {
-        return f(&[]);
+        return Ok(f(&[]));
     }
     if relative == "/" {
         // RFC 6901: "/" decodes to a single empty reference token. The old
         // `json_pointer::parse("/")` path returned `vec![""]`; the fast path
         // must match so trailing-slash requests still surface as `InvalidPath`
         // rather than silently serving the whole struct.
-        return f(&[""]);
+        return Ok(f(&[""]));
     }
 
     let trimmed = relative.strip_prefix('/').unwrap_or(relative);
@@ -2270,10 +2154,10 @@ where
             overflow = Some(v);
         }
     }
-    match overflow.as_deref() {
+    Ok(match overflow.as_deref() {
         Some(v) => f(v),
         None => f(&stack[..count]),
-    }
+    })
 }
 
 /// A response buffer sized for one leaf read.
@@ -2293,21 +2177,22 @@ fn response_buffer(req: &Message) -> Vec<u8> {
 /// the result back to a `Message`.
 ///
 /// The handler encodes through [`RepeStruct::repe_handle_into`], writing the
-/// response body straight into the buffer rather than returning a
-/// [`serde_json::Value`] for this function to re-serialize. The buffer is then
+/// response body straight into the buffer rather than returning a value tree
+/// for this function to re-serialize. The buffer is then
 /// grown by the wire prefix so [`Message::into_wire_bytes`] reuses it instead of
 /// allocating a frame, making a leaf read one allocation end to end.
 fn dispatch_struct_segments<T>(
     handler: &mut T,
     segments: &[&str],
-    body: Option<Value>,
+    body: Option<RequestBody<'_>>,
+    requested: BodyFormat,
     mut buf: Vec<u8>,
     req: &Message,
 ) -> Message
 where
     T: RepeStruct + ?Sized,
 {
-    let mut out = ResponseBody::new(&mut buf);
+    let mut out = ResponseBody::with_format(&mut buf, requested);
     let result = handler.repe_handle_into(segments, body, &mut out);
     let body_format = out.format();
     finish_struct_response(req, buf, body_format, result)
@@ -2327,14 +2212,15 @@ where
 fn shared_struct_segments<T>(
     handler: &T,
     segments: &[&str],
-    body: &mut Option<Value>,
+    body: Option<RequestBody<'_>>,
+    requested: BodyFormat,
     buf: &mut Vec<u8>,
     req: &Message,
 ) -> Option<Message>
 where
     T: RepeStruct + ?Sized,
 {
-    let mut out = ResponseBody::new(buf);
+    let mut out = ResponseBody::with_format(buf, requested);
     let Some(result) = handler.repe_shared_into(segments, body, &mut out) else {
         buf.clear();
         return None;
@@ -2362,11 +2248,12 @@ fn finish_struct_response(
     }
 }
 
-/// Pluggable trait for typed JSON handlers: auto-deserializes request JSON to `In`,
-/// returns `Out` which is serialized to JSON response.
+/// Pluggable trait for typed handlers: decodes the request body (JSON or BEVE,
+/// as the frame declares) into `In`, and encodes the returned `Out` in the
+/// format the request asked for.
 pub trait JsonTypedHandler: Send + Sync {
-    type In: DeserializeOwned + Send + 'static;
-    type Out: Serialize + Send + 'static;
+    type In: ServableOwned + Send + 'static;
+    type Out: ServableWrite + Send + 'static;
     fn call(&self, input: Self::In) -> Result<Self::Out, (ErrorCode, String)>;
 }
 
@@ -2374,19 +2261,12 @@ struct JsonTypedAdapter<H: JsonTypedHandler>(H);
 
 impl<H: JsonTypedHandler> HandlerErased for JsonTypedAdapter<H> {
     fn handle(&self, req: &Message) -> Result<Message, RepeError> {
-        let t: H::In = match BodyFormat::try_from(req.header.body_format) {
-            Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => serde_json::from_slice(&req.body)?,
-            Ok(BodyFormat::Beve) => beve_from_slice(&req.body)?,
-            _ => {
-                return Ok(create_error_response_like(
-                    req,
-                    ErrorCode::InvalidBody,
-                    "Expected JSON body",
-                ));
-            }
+        let t: H::In = match decode_typed_param(req)? {
+            Ok(v) => v,
+            Err(err) => return Ok(err),
         };
         match self.0.call(t) {
-            Ok(r) => create_response_unstamped(req, r, BodyFormat::Json),
+            Ok(r) => Ok(create_response_unstamped(req, &r, BodyFormat::Json)),
             Err((code, msg)) => Ok(create_error_response_like(req, code, msg)),
         }
     }
@@ -2504,18 +2384,68 @@ mod tests {
     use crate::io::{read_message, write_message};
     use crate::message::create_response;
     use crate::{QueryFormat, REPE_VERSION};
-    use serde::{Deserialize, Serialize};
     use std::io::Read;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
-    /// Pin [`BEVE_ALIGNED_TYPED_ARRAY_MARKER`] to BEVE's actual aligned-array
-    /// output, so the borrowing route's marker dispatch can never silently drift
-    /// from the format BEVE emits.
-    #[test]
-    fn aligned_marker_matches_beve() {
-        let encoded = beve::to_vec_aligned_typed_slice(&[1.0_f64]);
-        assert_eq!(encoded.first(), Some(&BEVE_ALIGNED_TYPED_ARRAY_MARKER));
+    // ---- test fixtures -----------------------------------------------------
+    //
+    // Most bodies here are markers (the frame needs *a* body) or one asserted
+    // field. `Ack` covers the markers; the rest exist because a test names the
+    // field.
+
+    /// An empty body: `{}` on the wire.
+    #[derive(Default, Debug, PartialEq)]
+    struct Empty;
+    structio::object!(Empty {});
+
+    #[derive(Default, Debug, PartialEq)]
+    struct Ack {
+        ok: bool,
     }
+    structio::object!(Ack { ok });
+
+    #[derive(Default, Debug, PartialEq)]
+    struct Count {
+        n: i64,
+    }
+    structio::object!(Count { n });
+
+    #[derive(Default, Debug, PartialEq)]
+    struct Payload {
+        payload: i64,
+    }
+    structio::object!(Payload { payload });
+
+    #[derive(Default, Debug, PartialEq)]
+    struct Status {
+        status: String,
+    }
+    structio::object!(Status { status });
+
+    #[derive(Default, Debug, PartialEq)]
+    struct Operands {
+        a: i64,
+        b: i64,
+    }
+    structio::object!(Operands { a, b });
+
+    #[derive(Default, Debug, PartialEq)]
+    struct SumBody {
+        sum: i64,
+    }
+    structio::object!(SumBody { sum });
+
+    #[derive(Default, Debug, PartialEq)]
+    struct Doubled {
+        double: i64,
+    }
+    structio::object!(Doubled { double });
+
+    #[derive(Default, Debug, PartialEq)]
+    struct Point {
+        x: i64,
+    }
+    structio::object!(Point { x });
 
     /// The borrowing decoder's owned fallback: a well-formed aligned body whose
     /// payload is not aligned in this buffer (here, forced by placing it at an odd
@@ -2526,7 +2456,7 @@ mod tests {
     #[test]
     fn ref_decode_falls_back_to_owned_when_payload_unaligned() {
         let data: Vec<f64> = (0..16).map(|i| i as f64 * 3.0).collect();
-        let aligned = beve::to_vec_aligned_typed_slice(&data);
+        let aligned = structio::to_beve_aligned(&data);
 
         // Place the aligned body at offset 1 in a genuinely 8-aligned backing
         // buffer (`Vec<u64>`), so its DATA pointer is deterministically odd and the
@@ -2547,7 +2477,7 @@ mod tests {
         assert_eq!(decoded.as_slice(), data.as_slice());
 
         // And the regular (unaligned wire) typed array always decodes owned too.
-        let regular = beve::to_vec_typed_slice(&data);
+        let regular = structio::to_beve(&data);
         let decoded = decode_typed_slice_ref_body::<f64>(&regular).expect("decode regular");
         assert_eq!(decoded.as_slice(), data.as_slice());
     }
@@ -2562,14 +2492,13 @@ mod tests {
                 hits_for_middleware.fetch_add(1, Ordering::SeqCst);
                 next.run(req)
             })
-            .with_json("/echo", |v: Value| Ok(v));
+            .with_typed("/echo", |v: Payload| Ok(v));
 
         let request = Message::builder()
             .id(7)
             .query_str("/echo")
             .query_format(QueryFormat::JsonPointer)
-            .body_json(&serde_json::json!({"payload": 42}))
-            .unwrap()
+            .body_json(&Payload { payload: 42 })
             .build();
 
         let handler = router.get("/echo").expect("handler to exist");
@@ -2585,56 +2514,66 @@ mod tests {
 
         let router = Router::new()
             .with_middleware(|req: &Message, _next: Next<'_>| {
-                create_response(
+                Ok(create_response(
                     req,
-                    serde_json::json!({"status": "blocked"}),
+                    &Status {
+                        status: "blocked".into(),
+                    },
                     BodyFormat::Json,
-                )
+                ))
             })
-            .with_json("/blocked", move |_v: Value| {
+            .with_typed("/blocked", move |_v: Empty| {
                 handler_called_inner.store(true, Ordering::SeqCst);
-                Ok(serde_json::json!({"status": "allowed"}))
+                Ok(Status {
+                    status: "allowed".into(),
+                })
             });
 
         let request = Message::builder()
             .id(11)
             .query_str("/blocked")
             .query_format(QueryFormat::JsonPointer)
-            .body_json(&serde_json::json!({}))
-            .unwrap()
+            .body_json(&Empty)
             .build();
 
         let handler = router.get("/blocked").expect("handler to exist");
         let response = handler.handle(&request).unwrap();
 
         assert_eq!(response.header.ec, ErrorCode::Ok as u32);
-        let body: serde_json::Value = response.json_body().unwrap();
-        assert_eq!(body.get("status").and_then(|v| v.as_str()), Some("blocked"));
+        let body: Status = response.json_body().unwrap();
+        assert_eq!(body.status, "blocked");
         assert!(!handler_called.load(Ordering::SeqCst));
     }
 
     #[test]
     fn typed_handler_accepts_beve_payload() {
-        #[derive(Serialize, Deserialize, Debug)]
+        #[derive(Default, Debug)]
         struct DeviceMeta {
             id: String,
             location: String,
         }
+        structio::object!(DeviceMeta { id, location });
 
-        #[derive(Serialize, Deserialize, Debug)]
+        #[derive(Default, Debug)]
         struct SampleStream {
             channel: String,
             samples: Vec<f64>,
         }
+        structio::object!(SampleStream { channel, samples });
 
-        #[derive(Serialize, Deserialize, Debug)]
+        #[derive(Default, Debug)]
         struct SensorFrame {
             device: DeviceMeta,
             streams: Vec<SampleStream>,
             tags: std::collections::HashMap<String, String>,
         }
+        structio::object!(SensorFrame {
+            device,
+            streams,
+            tags
+        });
 
-        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        #[derive(Default, Debug, PartialEq)]
         struct Aggregate {
             device: String,
             location: String,
@@ -2642,6 +2581,13 @@ mod tests {
             average: f64,
             tags: std::collections::HashMap<String, String>,
         }
+        structio::object!(Aggregate {
+            device,
+            location,
+            sample_count,
+            average,
+            tags
+        });
 
         let router = Router::new().with_typed::<SensorFrame, Aggregate, _>(
             "/aggregate",
@@ -2704,7 +2650,6 @@ mod tests {
             .query_str("/aggregate")
             .query_format(QueryFormat::JsonPointer)
             .body_beve(&frame)
-            .unwrap()
             .build();
 
         let handler = router.get("/aggregate").expect("handler to exist");
@@ -2722,18 +2667,20 @@ mod tests {
 
     #[test]
     fn router_with_json_and_typed_handlers() {
-        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        #[derive(Default, Debug, PartialEq)]
         struct In {
             x: i32,
             y: i32,
         }
-        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        structio::object!(In { x, y });
+        #[derive(Default, Debug, PartialEq)]
         struct Out {
             sum: i32,
         }
+        structio::object!(Out { sum });
 
         let router = Router::new()
-            .with_json("/echo", |v: Value| Ok(v))
+            .with_typed("/echo", |v: Payload| Ok(v))
             .with_typed::<In, Out, _>("/sum", |inp: In| Ok(Out { sum: inp.x + inp.y }));
 
         let msg = Message::builder()
@@ -2741,7 +2688,6 @@ mod tests {
             .query_str("/sum")
             .query_format(QueryFormat::JsonPointer)
             .body_json(&In { x: 2, y: 3 })
-            .unwrap()
             .build();
         let h = router.get("/sum").expect("handler");
         let resp = h.handle(&msg).unwrap();
@@ -2753,22 +2699,20 @@ mod tests {
     #[test]
     fn server_handle_connection_with_client() {
         // Router with a simple add method
-        let router = Router::new().with_json("/add", |v: Value| {
-            let a = v.get("a").and_then(|x| x.as_i64()).unwrap_or(0);
-            let b = v.get("b").and_then(|x| x.as_i64()).unwrap_or(0);
-            Ok(serde_json::json!({"sum": a + b}))
-        });
+        let router = Router::new().with_typed("/add", |v: Operands| Ok(SumBody { sum: v.a + v.b }));
 
-        #[derive(Serialize, Deserialize)]
+        #[derive(Default)]
         struct AddReq {
             a: i64,
             b: i64,
         }
+        structio::object!(AddReq { a, b });
 
-        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        #[derive(Default, Debug, PartialEq)]
         struct AddResp {
             sum: i64,
         }
+        structio::object!(AddResp { sum });
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2787,10 +2731,10 @@ mod tests {
 
         // Use the public Client API
         let client = crate::client::Client::connect(addr).unwrap();
-        let out = client
-            .call_json("/add", &serde_json::json!({"a": 3, "b": 4}))
+        let out: SumBody = client
+            .call_typed_json("/add", &Operands { a: 3, b: 4 })
             .unwrap();
-        assert_eq!(out["sum"], 7);
+        assert_eq!(out.sum, 7);
 
         let typed: AddResp = client
             .call_typed_json("/add", &AddReq { a: 5, b: 6 })
@@ -2809,32 +2753,45 @@ mod tests {
 
     #[test]
     fn beve_request_roundtrip_over_tcp() {
-        #[derive(Serialize, Deserialize, Debug)]
+        #[derive(Default, Debug)]
         struct DeviceMeta {
             id: String,
             location: String,
         }
+        structio::object!(DeviceMeta { id, location });
 
-        #[derive(Serialize, Deserialize, Debug)]
+        #[derive(Default, Debug)]
         struct SampleStream {
             channel: String,
             samples: Vec<f64>,
         }
+        structio::object!(SampleStream { channel, samples });
 
-        #[derive(Serialize, Deserialize, Debug)]
+        #[derive(Default, Debug)]
         struct SensorFrame {
             device: DeviceMeta,
             streams: Vec<SampleStream>,
             alerts: Vec<String>,
         }
+        structio::object!(SensorFrame {
+            device,
+            streams,
+            alerts
+        });
 
-        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        #[derive(Default, Debug, PartialEq)]
         struct Summary {
             device: String,
             max_sample: f64,
             average_sample: f64,
             alert_count: usize,
         }
+        structio::object!(Summary {
+            device,
+            max_sample,
+            average_sample,
+            alert_count
+        });
 
         let router = Router::new().with_typed::<SensorFrame, Summary, _>(
             "/telemetry",
@@ -2919,7 +2876,6 @@ mod tests {
             .query_str("/telemetry")
             .query_format(QueryFormat::JsonPointer)
             .body_beve(&frame)
-            .unwrap()
             .build();
 
         let socket = TcpStream::connect(addr).unwrap();
@@ -2968,7 +2924,7 @@ mod tests {
 
         let client = crate::client::Client::connect(addr).unwrap();
         let err = client
-            .call_json("/nope", &serde_json::json!({}))
+            .call_typed_json::<_, _, Empty>("/nope", &Empty)
             .unwrap_err();
         match err {
             RepeError::ServerError { code, message } => {
@@ -3004,8 +2960,7 @@ mod tests {
             .id(42)
             .query_str("/any")
             .query_format(QueryFormat::JsonPointer)
-            .body_json(&serde_json::json!({"x": 1}))
-            .unwrap()
+            .body_json(&Point { x: 1 })
             .build();
         req.header.version = REPE_VERSION.wrapping_add(1);
 
@@ -3052,8 +3007,7 @@ mod tests {
             .id(99)
             .query_bytes(vec![0, 1, 2])
             .query_format(QueryFormat::RawBinary)
-            .body_json(&serde_json::json!({}))
-            .unwrap()
+            .body_json(&Empty)
             .build();
 
         {
@@ -3078,16 +3032,15 @@ mod tests {
 
     #[test]
     fn handler_error_code_propagates() {
-        let router = Router::new().with_json("/err", |_v: Value| {
-            Err((ErrorCode::ApplicationErrorBase, "oops".into()))
+        let router = Router::new().with_typed::<Empty, Empty, _>("/err", |_v| {
+            Err::<Empty, _>((ErrorCode::ApplicationErrorBase, "oops".into()))
         });
         // Build a request and invoke handler directly
         let msg = Message::builder()
             .id(2)
             .query_str("/err")
             .query_format(QueryFormat::JsonPointer)
-            .body_json(&serde_json::json!({}))
-            .unwrap()
+            .body_json(&Empty)
             .build();
         let h = router.get("/err").unwrap();
         let resp = h.handle(&msg).unwrap();
@@ -3097,14 +3050,21 @@ mod tests {
 
     #[test]
     fn typed_handler_bad_json_maps_to_parse_error_over_wire() {
-        #[derive(Deserialize)]
+        #[derive(Default)]
         #[allow(dead_code)]
         struct NeedsI32 {
             a: i32,
         }
-        let router = Router::new().with_typed::<NeedsI32, serde_json::Value, _>("/typed", |_inp| {
-            Ok(serde_json::json!({"ok": true}))
-        });
+        structio::object!(NeedsI32 { a });
+
+        #[derive(Default)]
+        struct WrongType {
+            a: String,
+        }
+        structio::object!(WrongType { a });
+
+        let router =
+            Router::new().with_typed::<NeedsI32, Ack, _>("/typed", |_inp| Ok(Ack { ok: true }));
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3124,7 +3084,12 @@ mod tests {
         let client = crate::client::Client::connect(addr).unwrap();
         // Provide invalid JSON for NeedsI32 (string instead of number)
         let err = client
-            .call_json("/typed", &serde_json::json!({"a": "not-a-number"}))
+            .call_typed_json::<_, _, Ack>(
+                "/typed",
+                &WrongType {
+                    a: "not-a-number".into(),
+                },
+            )
             .unwrap_err();
         match err {
             RepeError::ServerError { code, .. } => assert_eq!(code, ErrorCode::ParseError),
@@ -3138,15 +3103,13 @@ mod tests {
     struct Doubler;
 
     impl JsonTypedHandler for Doubler {
-        type In = serde_json::Value;
-        type Out = serde_json::Value;
+        type In = Count;
+        type Out = Doubled;
 
         fn call(&self, input: Self::In) -> Result<Self::Out, (ErrorCode, String)> {
-            let n = input
-                .get("n")
-                .and_then(|v| v.as_i64())
-                .ok_or((ErrorCode::InvalidBody, "missing n".into()))?;
-            Ok(serde_json::json!({"double": n * 2}))
+            Ok(Doubled {
+                double: input.n * 2,
+            })
         }
     }
 
@@ -3157,19 +3120,18 @@ mod tests {
             .id(5)
             .query_str("/double")
             .query_format(QueryFormat::JsonPointer)
-            .body_json(&serde_json::json!({"n": 4}))
-            .unwrap()
+            .body_json(&Count { n: 4 })
             .build();
         let handler = router.get("/double").expect("handler");
         let resp = handler.handle(&msg).unwrap();
         assert_eq!(resp.header.ec, ErrorCode::Ok as u32);
-        let out: serde_json::Value = resp.json_body().unwrap();
-        assert_eq!(out["double"], 8);
+        let out: Doubled = resp.json_body().unwrap();
+        assert_eq!(out.double, 8);
     }
 
     #[test]
     fn notify_requests_do_not_emit_responses() {
-        let router = Router::new().with_json("/notify", |v: Value| Ok(v));
+        let router = Router::new().with_typed("/notify", |v: Ack| Ok(v));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let running = Arc::new(AtomicBool::new(true));
@@ -3189,8 +3151,7 @@ mod tests {
             .notify(true)
             .query_str("/notify")
             .query_format(QueryFormat::JsonPointer)
-            .body_json(&serde_json::json!({"ok": true}))
-            .unwrap()
+            .body_json(&Ack { ok: true })
             .build();
 
         {
@@ -3216,34 +3177,32 @@ mod tests {
 
     #[test]
     fn plain_constructors_default_to_inline_execution() {
-        let router = Router::new().with_json("/x", |_| Ok(serde_json::json!({})));
+        let router = Router::new().with_typed("/x", |_: Empty| Ok(Empty));
         assert_eq!(router.get("/x").unwrap().execution(), Execution::Inline);
     }
 
     #[test]
     fn blocking_constructors_mark_off_reader_execution() {
-        #[derive(Deserialize)]
+        #[derive(Default)]
         struct In {
             n: i64,
         }
+        structio::object!(In { n });
         // Named fns sidestep the higher-ranked-lifetime closure inference
         // quirk on the `&CallContext` parameter (it affects
         // `with_typed_ctx` too; it is not specific to the blocking
         // variant).
-        fn typed(inp: In) -> Result<serde_json::Value, (ErrorCode, String)> {
-            Ok(serde_json::json!({ "n": inp.n }))
+        fn typed(inp: In) -> Result<Count, (ErrorCode, String)> {
+            Ok(Count { n: inp.n })
         }
-        fn typed_ctx(
-            _ctx: &CallContext,
-            inp: In,
-        ) -> Result<serde_json::Value, (ErrorCode, String)> {
-            Ok(serde_json::json!({ "n": inp.n }))
+        fn typed_ctx(_ctx: &CallContext, inp: In) -> Result<Count, (ErrorCode, String)> {
+            Ok(Count { n: inp.n })
         }
         let router = Router::new()
-            .with_json_blocking("/j", |_| Ok(serde_json::json!({})))
-            .with_json_ctx_blocking("/jc", |_ctx, _v| Ok(serde_json::json!({})))
-            .with_typed_blocking::<In, serde_json::Value, _>("/t", typed)
-            .with_typed_ctx_blocking::<In, serde_json::Value, _>("/tc", typed_ctx);
+            .with_typed_blocking("/j", |_: Empty| Ok(Empty))
+            .with_typed_ctx_blocking("/jc", |_ctx: &CallContext, _v: Empty| Ok(Empty))
+            .with_typed_blocking::<In, Count, _>("/t", typed)
+            .with_typed_ctx_blocking::<In, Count, _>("/tc", typed_ctx);
         for path in ["/j", "/jc", "/t", "/tc"] {
             assert_eq!(
                 router.get(path).unwrap().execution(),
@@ -3261,18 +3220,18 @@ mod tests {
         // the streaming deadlock).
         let router = Router::new()
             .with_middleware(|req: &Message, next: Next<'_>| next.run(req))
-            .with_json_blocking("/x", |_| Ok(serde_json::json!({})));
+            .with_typed_blocking("/x", |_: Empty| Ok(Empty));
         assert_eq!(router.get("/x").unwrap().execution(), Execution::OffReader);
     }
 
     #[test]
     fn blocking_route_behaves_like_inline_over_tcp() {
         // The _blocking constructors are WebSocket-only: the TCP server
-        // never consults Execution, so a with_json_blocking route
-        // round-trips exactly like with_json. Both TCP servers share the
+        // never consults Execution, so a with_typed_blocking route
+        // round-trips exactly like with_typed. Both TCP servers share the
         // route_request -> resolve/dispatch path; this exercises the
         // sync Server end to end.
-        let router = Router::new().with_json_blocking("/echo", Ok);
+        let router = Router::new().with_typed_blocking("/echo", |v: Count| Ok(v));
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3290,10 +3249,8 @@ mod tests {
         });
 
         let client = crate::client::Client::connect(addr).unwrap();
-        let out = client
-            .call_json("/echo", &serde_json::json!({ "n": 7 }))
-            .unwrap();
-        assert_eq!(out, serde_json::json!({ "n": 7 }));
+        let out: Count = client.call_typed_json("/echo", &Count { n: 7 }).unwrap();
+        assert_eq!(out, Count { n: 7 });
 
         drop(client);
         let _ = srv.join().unwrap();
@@ -3302,38 +3259,48 @@ mod tests {
     // `Router::call` / `Router::call_into` — transport-free dispatch
     // ---------------------------------------------------------------------
 
-    fn call_request(path: &str, body: &serde_json::Value, notify: bool) -> Vec<u8> {
+    fn call_request<T: structio::json::Write + ?Sized>(
+        path: &str,
+        body: &T,
+        notify: bool,
+    ) -> Vec<u8> {
         Message::builder()
             .id(11)
             .notify(notify)
             .query_str(path)
             .query_format(crate::constants::QueryFormat::JsonPointer)
             .body_json(body)
-            .unwrap()
             .build()
             .to_vec()
     }
 
+    /// A route that echoes its body back. `String` rather than an object,
+    /// because these tests drive it with whatever body the case needs and only
+    /// care that the route was reached.
     fn echo_router() -> Router {
-        Router::new().with_json("/echo", Ok)
+        Router::new().with_typed("/echo", |v: String| Ok(v))
+    }
+
+    /// An erased typed handler, for the two tests that reach past the
+    /// registrars to `insert_route` / `register_fallback` directly.
+    fn typed_route<T, R, F>(f: F) -> Arc<dyn HandlerErased>
+    where
+        T: ServableOwned + Send + Sync + 'static,
+        R: ServableWrite + Send + Sync + 'static,
+        F: TypedHandlerFn<T, R>,
+    {
+        Arc::new(TypedHandler::<T, R, F>(f, std::marker::PhantomData))
     }
 
     #[test]
     fn call_round_trips_id_query_and_body() {
         let response = echo_router()
-            .call(&call_request(
-                "/echo",
-                &serde_json::json!({ "n": 3 }),
-                false,
-            ))
+            .call(&call_request("/echo", "round trip", false))
             .expect("a non-notify request produces a response");
         let message = Message::from_slice(&response).unwrap();
         assert_eq!(message.header.id, 11);
         assert_eq!(message.query_str().unwrap(), "/echo");
-        assert_eq!(
-            message.json_body::<serde_json::Value>().unwrap(),
-            serde_json::json!({ "n": 3 })
-        );
+        assert_eq!(message.json_body::<String>().unwrap(), "round trip");
     }
 
     #[test]
@@ -3342,7 +3309,7 @@ mod tests {
         // a hand-written carrier most often gets wrong.
         assert!(
             echo_router()
-                .call(&call_request("/echo", &serde_json::json!(1), true))
+                .call(&call_request("/echo", &1i64, true))
                 .is_none()
         );
     }
@@ -3350,7 +3317,7 @@ mod tests {
     #[test]
     fn call_frames_method_not_found_rather_than_returning_none() {
         let response = echo_router()
-            .call(&call_request("/absent", &serde_json::json!(1), false))
+            .call(&call_request("/absent", &1i64, false))
             .expect("an unknown method is still answered");
         let message = Message::from_slice(&response).unwrap();
         assert_eq!(message.error_code(), Some(ErrorCode::MethodNotFound));
@@ -3369,7 +3336,7 @@ mod tests {
 
     #[test]
     fn call_rejects_a_buffer_carrying_more_than_one_frame() {
-        let mut wire = call_request("/echo", &serde_json::json!(1), false);
+        let mut wire = call_request("/echo", &1i64, false);
         wire.extend_from_slice(b"trailing");
         let response = echo_router().call(&wire).expect("answered");
         assert!(
@@ -3387,13 +3354,10 @@ mod tests {
 
         // A long payload first, then a short one: if the buffer were not cleared,
         // the tail of the long response would trail the short one.
-        assert!(router.call_into(
-            &call_request("/echo", &serde_json::json!("a".repeat(64)), false),
-            &mut out
-        ));
+        assert!(router.call_into(&call_request("/echo", &"a".repeat(64), false), &mut out));
 
         assert!(router.call_into(
-            &call_request("/echo", &serde_json::json!("short"), false),
+            &call_request("/echo", &"short".to_string(), false),
             &mut out
         ));
         let message = Message::from_slice(&out).unwrap();
@@ -3406,10 +3370,7 @@ mod tests {
 
         // A notify leaves the buffer empty rather than stale, so a carrier that
         // writes `out` whenever it is non-empty cannot resend the last response.
-        assert!(!router.call_into(
-            &call_request("/echo", &serde_json::json!(0), true),
-            &mut out
-        ));
+        assert!(!router.call_into(&call_request("/echo", &0i64, true), &mut out));
         assert!(out.is_empty());
     }
 
@@ -3430,7 +3391,7 @@ mod tests {
 
         let router = Router::new().with_erased_handler("/here", Arc::new(Rerouting));
         let response = router
-            .call(&call_request("/here", &serde_json::json!(null), false))
+            .call(&call_request("/here", &None::<i64>, false))
             .unwrap();
         assert_eq!(
             Message::from_slice(&response).unwrap().query_str().unwrap(),
@@ -3453,7 +3414,6 @@ mod tests {
                 return Ok(Message::builder()
                     .id(req.header.id)
                     .body_json(&path)
-                    .unwrap()
                     .build());
             }
             Ok(create_error_response_like(
@@ -3477,7 +3437,7 @@ mod tests {
 
     fn served_path(router: &Router, path: &str) -> Message {
         let response = router
-            .call(&call_request(path, &serde_json::json!(null), false))
+            .call(&call_request(path, "", false))
             .expect("a non-notify request produces a response");
         Message::from_slice(&response).unwrap()
     }
@@ -3497,10 +3457,7 @@ mod tests {
         let router = echo_router().with_fallback(Arc::new(DynamicPrefix));
         let message = served_path(&router, "/echo");
         assert!(!message.is_error());
-        assert_eq!(
-            message.json_body::<serde_json::Value>().unwrap(),
-            serde_json::json!(null)
-        );
+        assert_eq!(message.json_body::<String>().unwrap(), "");
     }
 
     #[test]
@@ -3511,19 +3468,21 @@ mod tests {
         }
 
         impl RepeStruct for Counter {
-            fn repe_handle(
+            fn repe_handle_into(
                 &mut self,
                 segments: &[&str],
-                _body: Option<Value>,
-            ) -> crate::structs::StructResult<Option<Value>> {
+                _body: Option<RequestBody<'_>>,
+                out: &mut ResponseBody<'_>,
+            ) -> StructResult<()> {
                 assert_eq!(segments, ["value"]);
-                Ok(Some(serde_json::json!(self.value)))
+                out.write(&self.value);
+                Ok(())
             }
         }
 
         let registry = Arc::new(Registry::new());
         registry
-            .register_value("/flag", serde_json::json!(true))
+            .register_function("/flag", |_: Option<RequestBody<'_>>| Ok(true))
             .unwrap();
 
         let router = Router::new()
@@ -3564,7 +3523,7 @@ mod tests {
         let router = echo_router().with_fallback(Arc::new(DynamicPrefix));
         assert!(
             router
-                .call(&call_request("/dynamic/x", &serde_json::json!(null), true))
+                .call(&call_request("/dynamic/x", &None::<i64>, true))
                 .is_none()
         );
     }
@@ -3636,7 +3595,7 @@ mod tests {
         // whose root overlaps a mounted struct is shadowed by it.
         let registry = Arc::new(Registry::new());
         registry
-            .register_value("/flag", serde_json::json!(true))
+            .register_function("/flag", |_: Option<RequestBody<'_>>| Ok(true))
             .unwrap();
         let hits = Arc::new(AtomicUsize::new(0));
         let router = Router::new()
@@ -3670,13 +3629,17 @@ mod tests {
     struct RootObject;
 
     impl RepeStruct for RootObject {
-        fn repe_handle(
+        fn repe_handle_into(
             &mut self,
             segments: &[&str],
-            _body: Option<Value>,
-        ) -> crate::structs::StructResult<Option<Value>> {
+            _body: Option<RequestBody<'_>>,
+            out: &mut ResponseBody<'_>,
+        ) -> StructResult<()> {
             match segments {
-                ["value"] => Ok(Some(serde_json::json!(7))),
+                ["value"] => {
+                    out.write(&7i64);
+                    Ok(())
+                }
                 _ => Err(crate::structs::StructError::InvalidPath {
                     path: crate::structs::path_from_segments(segments),
                 }),
@@ -3730,7 +3693,7 @@ mod tests {
         // fixed route still beats the mount, and the mount still beats the
         // fallback for a path it serves.
         let mut router = root_mounted_router();
-        router.insert_route("/echo", Arc::new(JsonHandler(Ok)));
+        router.insert_route("/echo", typed_route(|v: String| Ok(v)));
         let router = router
             .with_fallback(Arc::new(DynamicPrefix))
             .with_mount_fallthrough();
@@ -3784,7 +3747,7 @@ mod tests {
         // Not struct-specific: a registry mounted at a prefix defers the same way.
         let registry = Arc::new(Registry::new());
         registry
-            .register_value("/flag", serde_json::json!(true))
+            .register_function("/flag", |_: Option<RequestBody<'_>>| Ok(true))
             .unwrap();
         let router = Router::new()
             .with_registry("/reg", registry)
@@ -3847,8 +3810,7 @@ mod tests {
             .get("/dynamic/x")
             .expect("the mount matches the root");
         let request =
-            Message::from_slice(&call_request("/dynamic/x", &serde_json::json!(null), false))
-                .unwrap();
+            Message::from_slice(&call_request("/dynamic/x", &None::<i64>, false)).unwrap();
 
         for (entry, response) in [
             ("handle", handler.handle(&request).unwrap()),
@@ -3929,9 +3891,7 @@ mod tests {
     fn registering_a_fallback_twice_replaces_the_first() {
         let mut router = echo_router();
         router.register_fallback(Arc::new(DynamicPrefix));
-        router.register_fallback(Arc::new(JsonHandler(|_: Value| {
-            Ok(serde_json::json!("second"))
-        })));
+        router.register_fallback(typed_route(|_: String| Ok("second".to_string())));
         assert_eq!(
             served_path(&router, "/dynamic/x")
                 .json_body::<String>()

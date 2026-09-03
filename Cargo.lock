@@ -95,18 +95,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "289b19888103ffd4e5ab90eeeaa92ac21738f73e3e3b6d1193084d115fdfdd53"
 
 [[package]]
-name = "beve"
-version = "10.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "570c062658715f899f2476a9ca9b7210ac6b3f339ae9b8b215fd55315f7c013e"
-dependencies = [
- "bytemuck",
- "half",
- "serde",
- "simdutf8",
-]
-
-[[package]]
 name = "bitflags"
 version = "2.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -136,12 +124,6 @@ name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
-
-[[package]]
-name = "bytemuck"
-version = "1.25.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8efb64bd706a16a1bdde310ae86b351e4d21550d98d056f22f8a7f7a2183fec"
 
 [[package]]
 name = "byteorder"
@@ -254,12 +236,6 @@ checksum = "3a47af21622d091a8f0fb295b88bc886ac74efcc613efc19f5d0b21de5c89e47"
 dependencies = [
  "rustc_version",
 ]
-
-[[package]]
-name = "crunchy"
-version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "crypto-common"
@@ -444,17 +420,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
-]
-
-[[package]]
-name = "half"
-version = "2.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "459196ed295495a68f7d7fe1d84f6c4b7ff0e21fe3017b2f283c6fac3ad803c9"
-dependencies = [
- "cfg-if",
- "crunchy",
- "serde",
 ]
 
 [[package]]
@@ -820,15 +785,13 @@ checksum = "5d902386f55ac0890d3d0f56c932daa0b80b55bcf56631565eed76f0f7f54b6f"
 
 [[package]]
 name = "repe"
-version = "12.0.0"
+version = "13.0.0"
 dependencies = [
  "benchit",
- "beve",
  "clap",
  "clap_complete",
  "futures-channel",
  "futures-util",
- "half",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -839,8 +802,7 @@ dependencies = [
  "rand",
  "repe-core",
  "repe-derive",
- "serde",
- "serde_json",
+ "structio",
  "thiserror",
  "tokio",
  "tokio-tungstenite",
@@ -855,18 +817,16 @@ dependencies = [
 
 [[package]]
 name = "repe-core"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
- "beve",
  "repe-derive",
- "serde",
- "serde_json",
+ "structio",
  "thiserror",
 ]
 
 [[package]]
 name = "repe-derive"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -896,12 +856,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
-name = "ryu"
-version = "1.0.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
-
-[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -912,49 +866,6 @@ name = "semver"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d767eb0aabc880b29956c35734170f26ed551a859dbd361d140cdbeca61ab1e2"
-
-[[package]]
-name = "serde"
-version = "1.0.225"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd6c24dee235d0da097043389623fb913daddf92c76e9f5a1db88607a0bcbd1d"
-dependencies = [
- "serde_core",
- "serde_derive",
-]
-
-[[package]]
-name = "serde_core"
-version = "1.0.225"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "659356f9a0cb1e529b24c01e43ad2bdf520ec4ceaf83047b83ddcc2251f96383"
-dependencies = [
- "serde_derive",
-]
-
-[[package]]
-name = "serde_derive"
-version = "1.0.225"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ea936adf78b1f766949a4977b91d2f5595825bd6ec079aa9543ad2685fc4516"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "serde_json"
-version = "1.0.145"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "402a6f66d8c709116cf22f558eab210f5a50187f702eb4d7e5ef38d9a7f1c79c"
-dependencies = [
- "itoa",
- "memchr",
- "ryu",
- "serde",
- "serde_core",
-]
 
 [[package]]
 name = "sha1"
@@ -985,12 +896,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
-name = "simdutf8"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
-
-[[package]]
 name = "slab"
 version = "0.4.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1017,6 +922,12 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
+
+[[package]]
+name = "structio"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb179952cc91a946507b28b886300d31891b5c0d6ab67594c2ae812aad3d0c2c"
 
 [[package]]
 name = "syn"

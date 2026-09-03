@@ -1,7 +1,6 @@
 use crate::constants::{BodyFormat, ErrorCode, HEADER_SIZE, QueryFormat};
 use crate::error::RepeError;
 use crate::header::Header;
-use beve::{from_slice as beve_from_slice, to_vec as beve_to_vec};
 use std::borrow::Cow;
 use std::io::{self, Write};
 
@@ -190,42 +189,115 @@ impl Message {
         String::from_utf8_lossy(&self.body).into_owned()
     }
 
-    pub fn json_body<T: serde::de::DeserializeOwned>(&self) -> Result<T, RepeError> {
-        self.require_body_format(BodyFormat::Json)?;
-        Ok(serde_json::from_slice(&self.body)?)
-    }
-
-    pub fn beve_body<T: serde::de::DeserializeOwned>(&self) -> Result<T, RepeError> {
-        self.require_body_format(BodyFormat::Beve)?;
-        Ok(beve_from_slice(&self.body)?)
-    }
-
-    /// Decode a BEVE typed-numeric-array body into a `Vec<T>` via a single
-    /// bounds-checked bulk read, bypassing serde.
+    /// Decode a JSON body.
     ///
-    /// The decode counterpart of [`MessageBuilder::body_typed_slice`], and the
-    /// whole-body fast path for a high-throughput numeric payload. Errors with
-    /// [`RepeError::UnexpectedBodyFormat`] if the body is not
-    /// [`BodyFormat::Beve`], or [`RepeError::Beve`] if the bytes are not a typed
-    /// numeric array of `T` (wrong element class/width, or a truncated payload).
-    /// Works on any BEVE typed numeric array, including one produced by serde via
-    /// [`body_beve`](MessageBuilder::body_beve) over a `Vec<T>`.
-    pub fn decode_typed_slice<T: beve::BeveTypedSlice>(&self) -> Result<Vec<T>, RepeError> {
-        self.require_body_format(BodyFormat::Beve)?;
-        Ok(beve::read_typed_slice(&self.body)?)
+    /// Bounded on the JSON *read* half alone: a body being decoded is never
+    /// written, and a type used only with one format should not have to be
+    /// declared for the other. The lifetime is the message's, so a `T` whose
+    /// fields borrow decodes without copying out of the body.
+    pub fn json_body<'a, T>(&'a self) -> Result<T, RepeError>
+    where
+        T: structio::json::Read<'a> + Default,
+    {
+        self.require_body_format(BodyFormat::Json)?;
+        let text = std::str::from_utf8(&self.body).map_err(|err| {
+            RepeError::Json(structio::Error::new(
+                structio::ErrorCode::InvalidUtf8,
+                err.valid_up_to(),
+            ))
+        })?;
+        let mut value = T::default();
+        structio::json::read_into_with::<crate::structs::WirePolicy, _>(&mut value, text)
+            .map_err(RepeError::Json)?;
+        Ok(value)
     }
 
-    /// Decode a BEVE complex-array body into a `Vec<Complex<T>>` via a single
-    /// bounds-checked bulk read, bypassing serde.
+    /// Decode a BEVE body. The mirror of [`json_body`](Self::json_body), and
+    /// bounded the same way.
+    pub fn beve_body<'a, T>(&'a self) -> Result<T, RepeError>
+    where
+        T: structio::beve::Read<'a> + Default,
+    {
+        self.require_body_format(BodyFormat::Beve)?;
+        let mut value = T::default();
+        structio::beve::read_into_with::<crate::structs::WirePolicy, _>(&mut value, &self.body)
+            .map_err(RepeError::Beve)?;
+        Ok(value)
+    }
+
+    /// Decode a BEVE typed-numeric-array body into a `Vec<T>`.
+    ///
+    /// The decode counterpart of [`MessageBuilder::body_typed_slice`], named for
+    /// the payload it is for. It is `beve_body::<Vec<T>>()` and nothing more:
+    /// structio has one reader, and it already takes the bulk path for a
+    /// `Vec<T: NumericBytes>` — one bounds-checked `copy_nonoverlapping` on a
+    /// little-endian target rather than a per-element walk. Under `beve` this
+    /// dispatched to a separate reader, which is why it was a separate method.
+    ///
+    /// The `NumericBytes` bound selects nothing; it is kept so the name cannot
+    /// be used for a body that would not take the bulk path after all.
+    pub fn decode_typed_slice<T>(&self) -> Result<Vec<T>, RepeError>
+    where
+        T: structio::beve::NumericBytes + for<'de> structio::beve::Read<'de> + Default,
+    {
+        self.beve_body()
+    }
+
+    /// Decode a BEVE complex-array body into a `Vec<Complex<T>>`.
     ///
     /// The complex counterpart of [`decode_typed_slice`](Self::decode_typed_slice)
     /// and the decode counterpart of
     /// [`MessageBuilder::body_complex_slice`]. Same error contract.
-    pub fn decode_complex_slice<T: beve::BeveTypedSlice>(
-        &self,
-    ) -> Result<Vec<beve::Complex<T>>, RepeError> {
-        self.require_body_format(BodyFormat::Beve)?;
-        Ok(beve::read_complex_slice(&self.body)?)
+    pub fn decode_complex_slice<T>(&self) -> Result<Vec<structio::Complex<T>>, RepeError>
+    where
+        structio::Complex<T>:
+            structio::beve::NumericBytes + for<'de> structio::beve::Read<'de> + Default,
+    {
+        self.beve_body()
+    }
+
+    /// Decode the body into `R` using whichever format the frame header
+    /// declares.
+    ///
+    /// The counterpart to [`json_body`](Self::json_body) and
+    /// [`beve_body`](Self::beve_body), which each demand one format and reject
+    /// the other. This is what a *client* wants: it chose the request's format,
+    /// but the response's is the server's to pick, so the decoder follows the
+    /// header rather than an assumption.
+    ///
+    /// [`BodyFormat::Utf8`] is parsed as JSON, which is what that code has
+    /// always meant on this path. [`BodyFormat::RawBinary`] has no structured
+    /// decode and is reported as [`RepeError::UnexpectedBodyFormat`], as is a
+    /// format code this build does not recognize — `BodyFormat` is
+    /// `#[non_exhaustive]`, so the spec can add one, and an unknown name
+    /// decodes no better than an unknown number.
+    pub fn decode_body<R: crate::structs::ServableOwned>(&self) -> Result<R, RepeError> {
+        let mut value = R::default();
+        match BodyFormat::try_from(self.header.body_format) {
+            Ok(BodyFormat::Json) | Ok(BodyFormat::Utf8) => {
+                let text = std::str::from_utf8(&self.body).map_err(|err| {
+                    RepeError::Json(structio::Error::new(
+                        structio::ErrorCode::InvalidUtf8,
+                        err.valid_up_to(),
+                    ))
+                })?;
+                structio::json::read_into_with::<crate::structs::WirePolicy, _>(&mut value, text)
+                    .map_err(RepeError::Json)?;
+            }
+            Ok(BodyFormat::Beve) => {
+                structio::beve::read_into_with::<crate::structs::WirePolicy, _>(
+                    &mut value, &self.body,
+                )
+                .map_err(RepeError::Beve)?;
+            }
+            Ok(_) | Err(_) => {
+                return Err(RepeError::UnexpectedBodyFormat {
+                    expected: BodyFormat::Json,
+                    got: self.header.body_format,
+                });
+            }
+        }
+        Ok(value)
     }
 
     /// `Ok(())` if the body's format matches `expected`, else
@@ -250,8 +322,9 @@ impl Message {
 ///
 /// Unlike [`Message::from_slice`], which copies the query and body out of the
 /// caller's buffer, `MessageView` keeps both as borrowed slices of the input.
-/// Useful when a large body (e.g. a multi-MiB chunk) will be deserialized with
-/// `serde_bytes::Bytes<'a>` so the bulk payload stays borrowed end-to-end.
+/// Useful when a large body (e.g. a multi-MiB chunk) will be read as a
+/// `&'a [u8]` or borrowed with [`structio::beve_slice_ref`], so the bulk payload
+/// stays borrowed end-to-end.
 ///
 /// The `header` is decoded by value because it's only 48 bytes and downstream
 /// code typically wants the parsed fields rather than the raw header bytes.
@@ -325,7 +398,6 @@ impl<'a> MessageView<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde::{Deserialize, Serialize};
 
     #[test]
     fn json_body_non_json_errors() {
@@ -335,7 +407,7 @@ mod tests {
             .query_format(QueryFormat::JsonPointer)
             .body_utf8("not json")
             .build();
-        let err = msg.json_body::<serde_json::Value>().unwrap_err();
+        let err = msg.json_body::<Pair>().unwrap_err();
         assert!(
             matches!(
                 err,
@@ -348,11 +420,20 @@ mod tests {
         );
     }
 
-    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    #[derive(Debug, Default, PartialEq)]
     struct Pair {
         a: i32,
         b: i32,
     }
+    structio::object!(Pair { a, b });
+
+    /// Stands in for the ad-hoc `json!({"ok": true})` bodies these tests used to
+    /// build. There is no tree to construct one from now: a body is a type.
+    #[derive(Debug, Default, PartialEq)]
+    struct Ok_ {
+        ok: bool,
+    }
+    structio::object!(Ok_ { ok });
 
     #[test]
     fn create_response_json_and_utf8() {
@@ -361,19 +442,16 @@ mod tests {
             .query_str("/sum")
             .query_format(QueryFormat::JsonPointer)
             .body_json(&Pair { a: 1, b: 2 })
-            .unwrap()
             .build();
 
         // JSON body
-        let resp_json =
-            create_response(&req, serde_json::json!({"ok": true}), BodyFormat::Json).unwrap();
+        let resp_json = create_response(&req, &Ok_ { ok: true }, BodyFormat::Json);
         assert_eq!(resp_json.header.id, 5);
         assert_eq!(resp_json.header.ec, ErrorCode::Ok as u32);
         assert_eq!(resp_json.header.body_format, BodyFormat::Json as u16);
 
         // UTF8 body (stringified JSON)
-        let resp_utf8 =
-            create_response(&req, serde_json::json!([1, 2, 3]), BodyFormat::Utf8).unwrap();
+        let resp_utf8 = create_response(&req, &vec![1, 2, 3], BodyFormat::Utf8);
         assert_eq!(resp_utf8.header.body_format, BodyFormat::Utf8 as u16);
         assert!(std::str::from_utf8(&resp_utf8.body).unwrap().contains("1"));
     }
@@ -427,15 +505,14 @@ mod tests {
             .body_utf8("{}");
         let req = req.build();
 
-        let resp =
-            create_response(&req, serde_json::json!({"ignored": true}), BodyFormat::Beve).unwrap();
+        let resp = create_response(&req, &Ok_ { ok: true }, BodyFormat::Beve);
         assert_eq!(resp.header.id, req.header.id);
         assert_eq!(resp.query, req.query);
         assert!(!resp.body.is_empty());
         assert_eq!(resp.header.body_format, BodyFormat::Beve as u16);
 
-        let value: serde_json::Value = resp.beve_body().unwrap();
-        assert_eq!(value["ignored"], true);
+        let value: Ok_ = resp.beve_body().unwrap();
+        assert_eq!(value, Ok_ { ok: true });
     }
 
     #[test]
@@ -445,17 +522,16 @@ mod tests {
             .query_str("/sum")
             .query_format(QueryFormat::JsonPointer)
             .body_json(&Pair { a: 1, b: 2 })
-            .unwrap()
             .build();
-        let value = serde_json::json!({"ok": true});
+        let value = Ok_ { ok: true };
 
         // The echoing path.
-        let echoed = create_response(&req, &value, BodyFormat::Json).unwrap();
+        let echoed = create_response(&req, &value, BodyFormat::Json);
 
         // The boundary path: build query-less, then stamp the request query in.
         // The off-reader boundary owns its request, so it moves the buffer in
         // (`Cow::Owned`, no copy).
-        let mut staged = create_response_unstamped(&req, &value, BodyFormat::Json).unwrap();
+        let mut staged = create_response_unstamped(&req, &value, BodyFormat::Json);
         assert!(staged.query.is_empty(), "handler leaves the query empty");
         assert_eq!(staged.header.query_length, 0);
         stamp_response_query(&mut staged, Cow::Owned(req.query.clone()));
@@ -512,36 +588,13 @@ mod tests {
     }
 
     #[test]
-    fn create_response_propagates_serialization_error() {
-        struct Fails;
-
-        impl serde::Serialize for Fails {
-            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
-            where
-                S: serde::Serializer,
-            {
-                Err(serde::ser::Error::custom("nope"))
-            }
-        }
-
-        let req = Message::builder()
-            .id(12)
-            .query_str("/bad")
-            .query_format(QueryFormat::JsonPointer)
-            .body_utf8("{}");
-        let req = req.build();
-
-        let err = create_response(&req, Fails, BodyFormat::Json).unwrap_err();
-        matches!(err, RepeError::Json(_));
-    }
-
-    #[test]
     fn body_beve_roundtrip() {
-        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        #[derive(Debug, Default, PartialEq)]
         struct Data {
             x: i32,
             y: String,
         }
+        structio::object!(Data { x, y });
 
         let msg = Message::builder()
             .id(7)
@@ -551,7 +604,6 @@ mod tests {
                 x: 10,
                 y: "ok".into(),
             })
-            .unwrap()
             .build();
 
         assert_eq!(msg.header.body_format, BodyFormat::Beve as u16);
@@ -762,8 +814,8 @@ mod tests {
     #[test]
     fn complex_slice_body_reserves_wire_prefix_headroom() {
         let query = b"/spectra/iq";
-        let data: Vec<beve::Complex<f64>> = (0..256)
-            .map(|i| beve::Complex {
+        let data: Vec<structio::Complex<f64>> = (0..256)
+            .map(|i| structio::Complex {
                 re: i as f64,
                 im: -(i as f64) * 0.5,
             })
@@ -820,7 +872,7 @@ mod tests {
             .body_utf8("text")
             .build();
 
-        let err = msg.beve_body::<serde_json::Value>().unwrap_err();
+        let err = msg.beve_body::<Pair>().unwrap_err();
         assert!(
             matches!(
                 err,
@@ -884,7 +936,7 @@ mod tests {
         assert_eq!(view.header.body_format, BodyFormat::Beve as u16);
         assert_eq!(view.query, b"/scale");
         assert_eq!(view.header.length as usize, frame.len());
-        let back = beve::read_aligned_typed_slice::<f64>(view.body).expect("owned decode");
+        let back = structio::from_beve::<Vec<f64>>(view.body).expect("owned decode");
         assert_eq!(back, data);
     }
 
@@ -903,7 +955,7 @@ mod tests {
 
         let view = MessageView::from_slice(bytes).expect("frame parses");
         let borrowed: &[f64] =
-            beve::read_aligned_typed_slice_ref::<f64>(view.body).expect("zero-copy borrow");
+            structio::beve_slice_ref::<f64>(view.body).expect("zero-copy borrow");
         assert_eq!(borrowed, data.as_slice());
     }
 
@@ -915,8 +967,7 @@ mod tests {
         let data: Vec<f64> = (0..130).map(|i| i as f64 - 64.0).collect();
         let frame = aligned_request(7, "/abcdef", &data).into_wire_bytes();
         assert_eq!(
-            beve::read_aligned_typed_slice::<f64>(MessageView::from_slice(&frame).unwrap().body)
-                .unwrap(),
+            structio::from_beve::<Vec<f64>>(MessageView::from_slice(&frame).unwrap().body).unwrap(),
             data
         );
 
@@ -925,7 +976,7 @@ mod tests {
             unsafe { std::slice::from_raw_parts(backing.as_ptr() as *const u8, frame.len()) };
         let view = MessageView::from_slice(bytes).expect("frame parses");
         let borrowed: &[f64] =
-            beve::read_aligned_typed_slice_ref::<f64>(view.body).expect("zero-copy borrow");
+            structio::beve_slice_ref::<f64>(view.body).expect("zero-copy borrow");
         assert_eq!(borrowed, data.as_slice());
     }
 }
@@ -987,30 +1038,35 @@ impl MessageBuilder {
         self.body_format = BodyFormat::Utf8 as u16;
         self
     }
-    pub fn body_json<T: serde::Serialize>(mut self, v: &T) -> Result<Self, RepeError> {
-        self.body = serde_json::to_vec(v)?;
+    /// Encode `v` as the JSON body.
+    ///
+    /// Infallible, and that is a change: it returned `Result<Self, RepeError>`
+    /// while serde could fail on a value it could not represent. A
+    /// [`structio::json::Write`] impl returns `()`, so there is no failure left
+    /// to report and no `?` to write at the call site.
+    pub fn body_json<T: structio::json::Write + ?Sized>(mut self, v: &T) -> Self {
+        self.body = structio::json::to_vec(v);
         self.body_format = BodyFormat::Json as u16;
-        Ok(self)
+        self
     }
 
-    pub fn body_beve<T: serde::Serialize>(mut self, v: &T) -> Result<Self, RepeError> {
-        self.body = beve_to_vec(v)?;
+    /// Encode `v` as the BEVE body. Infallible, for the same reason
+    /// [`body_json`](Self::body_json) is.
+    pub fn body_beve<T: structio::beve::Write + ?Sized>(mut self, v: &T) -> Self {
+        self.body = structio::to_beve(v);
         self.body_format = BodyFormat::Beve as u16;
-        Ok(self)
+        self
     }
 
     /// Encode a contiguous numeric slice as a BEVE typed array via a single bulk
-    /// write, bypassing serde, and set [`BodyFormat::Beve`].
+    /// write, and set [`BodyFormat::Beve`].
     ///
     /// This is the whole-body fast path for a high-throughput numeric payload
     /// (`&[f64]`, `&[i32]`, ...). The body bytes are identical to
-    /// `body_beve(&slice.to_vec())`, but the encode is O(1) in the element count
-    /// on little-endian targets (one `copy_nonoverlapping`) rather than the
-    /// per-element serde walk. Decode the result with
+    /// `body_beve(slice)` — structio writes a numeric sequence as a typed array
+    /// either way — and the encode is O(1) in the element count on little-endian
+    /// targets (one `copy_nonoverlapping`). Decode the result with
     /// [`Message::decode_typed_slice`].
-    ///
-    /// Infallible: the bulk encoder cannot fail (contrast [`body_beve`], whose
-    /// serde encode returns a `Result`).
     ///
     /// The body buffer is allocated with `HEADER_SIZE + query.len()` of spare
     /// capacity reserved after the encoded payload, so that shipping the built
@@ -1022,18 +1078,21 @@ impl MessageBuilder {
     /// back to a fresh frame, exactly as before.
     ///
     /// [`body_beve`]: Self::body_beve
-    pub fn body_typed_slice<T: beve::BeveTypedSlice>(mut self, slice: &[T]) -> Self {
-        let body_len = beve::typed_slice_size(slice) as usize;
+    pub fn body_typed_slice<T>(mut self, slice: &[T]) -> Self
+    where
+        T: structio::beve::NumericBytes + structio::beve::Write,
+    {
+        let body_len = structio::beve_size(slice);
         let mut body = Vec::with_capacity(body_len + HEADER_SIZE + self.query.len());
-        beve::to_writer_typed_slice(&mut body, slice)
-            .expect("writing a typed slice into a Vec is infallible");
+        structio::beve::append(slice, &mut body);
+        debug_assert_eq!(body.len(), body_len);
         self.body = body;
         self.body_format = BodyFormat::Beve as u16;
         self
     }
 
     /// Encode a contiguous complex slice as a BEVE complex array via a single
-    /// bulk write, bypassing serde, and set [`BodyFormat::Beve`].
+    /// bulk write, and set [`BodyFormat::Beve`].
     ///
     /// The complex counterpart of [`body_typed_slice`]; same O(1)-encode
     /// property, and the same `HEADER_SIZE + query.len()` wire-prefix headroom
@@ -1041,14 +1100,14 @@ impl MessageBuilder {
     /// [`Message::decode_complex_slice`].
     ///
     /// [`body_typed_slice`]: Self::body_typed_slice
-    pub fn body_complex_slice<T: beve::BeveTypedSlice>(
-        mut self,
-        slice: &[beve::Complex<T>],
-    ) -> Self {
-        let body_len = beve::complex_slice_size(slice) as usize;
+    pub fn body_complex_slice<T>(mut self, slice: &[structio::Complex<T>]) -> Self
+    where
+        structio::Complex<T>: structio::beve::NumericBytes + structio::beve::Write,
+    {
+        let body_len = structio::beve_size(slice);
         let mut body = Vec::with_capacity(body_len + HEADER_SIZE + self.query.len());
-        beve::to_writer_complex_slice(&mut body, slice)
-            .expect("writing a complex slice into a Vec is infallible");
+        structio::beve::append(slice, &mut body);
+        debug_assert_eq!(body.len(), body_len);
         self.body = body;
         self.body_format = BodyFormat::Beve as u16;
         self
@@ -1076,20 +1135,36 @@ impl MessageBuilder {
     /// [`body_typed_slice`], and [`Message::into_wire_bytes`] shifts the body to
     /// exactly that offset, so the alignment is preserved through that path too.
     ///
-    /// Unlike [`body_typed_slice`], the bytes are a distinct BEVE type and are *not*
-    /// interchangeable with the serde / regular typed-array path; they pair
-    /// specifically with a `with_typed_slice_ref` route.
+    /// The bytes are *not* a distinct BEVE type: they are the same typed array
+    /// [`body_typed_slice`] writes, with padding in front of the payload, and
+    /// every reader takes both forms — [`Message::decode_typed_slice`] included.
+    /// What the aligned form buys is that [`structio::beve_slice_ref`] can
+    /// borrow the payload in place rather than copying it, and a borrow that
+    /// cannot be taken declines rather than failing. (Under `beve` these were
+    /// two encodings with two readers, which is why this used to say otherwise.)
     ///
     /// [`body_typed_slice`]: Self::body_typed_slice
     /// [`Router::with_typed_slice_ref`]: crate::server::Router::with_typed_slice_ref
-    pub fn body_aligned_typed_slice<T: beve::BeveTypedSlice>(mut self, slice: &[T]) -> Self {
+    pub fn body_aligned_typed_slice<T>(mut self, slice: &[T]) -> Self
+    where
+        T: structio::beve::NumericBytes + structio::beve::Write,
+    {
         let base_offset = HEADER_SIZE + self.query.len();
-        let body_len = beve::aligned_typed_slice_size(slice, base_offset);
+        let body_len = structio::beve_size_aligned_after(slice, base_offset);
         // Reserve the `HEADER_SIZE + query.len()` wire-prefix headroom (== base_offset)
         // so `into_wire_bytes` reuses this allocation; its body shift lands the
         // payload at exactly `base_offset`, which is what the padding was sized for.
-        let mut body = Vec::with_capacity(body_len + base_offset);
-        beve::write_aligned_typed_slice_at(&mut body, slice, base_offset);
+        let body = Vec::with_capacity(body_len + base_offset);
+        // The buffer is the *body*, not the document: the padding has to be
+        // measured from where the payload will sit in the finished frame, which
+        // is `base_offset` bytes further on. `at` is what says so — appending
+        // into this buffer alone would pad against its own length and land the
+        // block on the wrong boundary once the header goes in front.
+        let mut w = structio::beve::Writer::<structio::Standard>::appending(body)
+            .aligned()
+            .at(base_offset);
+        structio::beve::Write::write(slice, &mut w);
+        let body = w.into_vec();
         debug_assert_eq!(body.len(), body_len);
         self.body = body;
         self.body_format = BodyFormat::Beve as u16;
@@ -1163,9 +1238,9 @@ pub fn create_error_response_for(
 
 pub fn create_response(
     request: &Message,
-    result: impl serde::Serialize,
+    result: &(impl crate::structs::ServableWrite + ?Sized),
     body_format: BodyFormat,
-) -> Result<Message, RepeError> {
+) -> Message {
     let builder = response_header_builder(request.header.id, request.header.query_format)
         .query_bytes(request.query.clone());
     finish_response(builder, result, body_format)
@@ -1185,9 +1260,9 @@ pub fn create_response(
 /// [`stamp_response_query`] has run with the originating request's query.
 pub(crate) fn create_response_unstamped(
     request: &Message,
-    result: impl serde::Serialize,
+    result: &(impl crate::structs::ServableWrite + ?Sized),
     body_format: BodyFormat,
-) -> Result<Message, RepeError> {
+) -> Message {
     let builder = response_header_builder(request.header.id, request.header.query_format);
     finish_response(builder, result, body_format)
 }
@@ -1196,8 +1271,8 @@ pub(crate) fn create_response_unstamped(
 ///
 /// The pre-encoded twin of [`create_response_unstamped`], used by the
 /// struct-handler dispatch: the handler serializes straight into a buffer via
-/// [`ResponseBody`](crate::structs::ResponseBody), so there is no `impl Serialize`
-/// left to run and the format is whatever that write settled on.
+/// [`ResponseBody`](crate::structs::ResponseBody), so there is no value left to
+/// encode and the format is whatever that write settled on.
 pub(crate) fn create_body_response_unstamped(
     request: &Message,
     body: Vec<u8>,
@@ -1261,12 +1336,14 @@ pub(crate) fn response_echo_query<'a>(response: &'a Message, request_query: &'a 
 
 /// Query-less success response whose entire body is a BEVE typed numeric array,
 /// written via the bulk [`MessageBuilder::body_typed_slice`] path (one
-/// `copy_nonoverlapping`, no per-element serde walk). The typed-slice twin of
+/// `copy_nonoverlapping`, no per-element walk). The typed-slice twin of
 /// [`create_response_unstamped`], used by [`Router::with_typed_slice`] so a numeric
 /// `Vec<R>` result is framed without serializing element by element.
 ///
 /// [`Router::with_typed_slice`]: crate::server::Router::with_typed_slice
-pub(crate) fn create_typed_slice_response_unstamped<T: beve::BeveTypedSlice>(
+pub(crate) fn create_typed_slice_response_unstamped<
+    T: structio::beve::NumericBytes + structio::beve::Write,
+>(
     request: &Message,
     result: &[T],
 ) -> Message {
@@ -1277,7 +1354,9 @@ pub(crate) fn create_typed_slice_response_unstamped<T: beve::BeveTypedSlice>(
 
 /// Borrowing twin of [`create_typed_slice_response_unstamped`]: same bulk typed-array
 /// framing, built from a [`MessageView`] for the allocation-free dispatch path.
-pub(crate) fn create_typed_slice_response_unstamped_view<T: beve::BeveTypedSlice>(
+pub(crate) fn create_typed_slice_response_unstamped_view<
+    T: structio::beve::NumericBytes + structio::beve::Write,
+>(
     view: &MessageView,
     result: &[T],
 ) -> Message {
@@ -1292,9 +1371,9 @@ pub(crate) fn create_typed_slice_response_unstamped_view<T: beve::BeveTypedSlice
 /// [`write_message_streaming`] with the borrowed query), not by this builder.
 pub(crate) fn create_response_unstamped_view(
     view: &MessageView,
-    result: impl serde::Serialize,
+    result: &(impl crate::structs::ServableWrite + ?Sized),
     body_format: BodyFormat,
-) -> Result<Message, RepeError> {
+) -> Message {
     let builder = response_header_builder(view.header.id, view.header.query_format);
     finish_response(builder, result, body_format)
 }
@@ -1328,27 +1407,28 @@ fn response_header_builder(id: u64, query_format: u16) -> MessageBuilder {
 /// `*_view` builders.
 fn finish_response(
     builder: MessageBuilder,
-    result: impl serde::Serialize,
+    result: &(impl crate::structs::ServableWrite + ?Sized),
     body_format: BodyFormat,
-) -> Result<Message, RepeError> {
+) -> Message {
     let builder = match body_format {
-        BodyFormat::Json => builder.body_json(&result)?,
+        BodyFormat::Json => builder.body_json(result),
         BodyFormat::Utf8 => {
-            let s = serde_json::to_string(&result)?; // convenience: stringify
+            let s = structio::json::to_string(result); // convenience: stringify
             builder.body_utf8(&s)
         }
         BodyFormat::RawBinary => {
             // Serialize JSON then treat as bytes; callers wanting true raw should supply bytes.
-            let v = serde_json::to_vec(&result)?;
-            builder.body_bytes(v).body_format(BodyFormat::RawBinary)
+            builder
+                .body_bytes(structio::json::to_vec(result))
+                .body_format(BodyFormat::RawBinary)
         }
-        BodyFormat::Beve => builder.body_beve(&result)?,
+        BodyFormat::Beve => builder.body_beve(result),
         // A `BodyFormat` this build does not know how to encode. `finish_response`
         // is handed one by a caller that already chose it, so refusing is not an
         // option here — but labelling JSON bytes with a code we did not encode
         // them in is worse than falling back honestly. `body_json` sets the
         // format to match what it wrote.
-        _ => builder.body_json(&result)?,
+        _ => builder.body_json(result),
     };
-    Ok(builder.build())
+    builder.build()
 }

@@ -10,7 +10,7 @@
 //!   `body_complex_slice` encode the slice in one bulk write; the receiver pulls
 //!   it back with `Message::decode_typed_slice` / `decode_complex_slice`.
 //! * **Streaming, no body buffer** -- `write_message_typed_slice` sizes the body
-//!   in closed form (`beve::typed_slice_size`) and writes the payload straight to
+//!   in closed form (`structio::beve_size`) and writes the payload straight to
 //!   the sink, so framing a multi-MiB `&[f64]` is a header write plus one bulk
 //!   write.
 //!
@@ -33,9 +33,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .body_typed_slice(&samples)
         .build();
 
-    // The bulk encoder produced exactly the bytes a serde body would have.
-    let serde_equivalent = Message::builder().body_beve(&samples)?.build();
-    assert_eq!(request.body, serde_equivalent.body);
+    // The bulk encoder produced exactly the bytes an ordinary BEVE body would
+    // have: structio has one writer, and it already takes the bulk path for a
+    // numeric vector. `body_typed_slice` differs only in measuring the length
+    // first so the buffer is allocated once.
+    let ordinary = Message::builder().body_beve(&samples).build();
+    assert_eq!(request.body, ordinary.body);
 
     let decoded: Vec<f64> = request.decode_typed_slice()?;
     assert_eq!(decoded, samples);

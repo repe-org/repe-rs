@@ -23,7 +23,6 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use repe::constants::QueryFormat;
 use repe::{Message, RepeStruct, Router};
-use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -31,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 /// The shape that motivates the attribute: a field-shaped endpoint whose
 /// logical place is in the middle of the fields, not after them.
-#[derive(Clone, Default, Serialize, Deserialize, RepeStruct)]
+#[derive(Clone, Default, RepeStruct)]
 #[repe(methods)]
 #[repe(listing_order("name", "count", "percent", "total", "identify", "reset"))]
 struct Ordered {
@@ -41,6 +40,12 @@ struct Ordered {
     #[repe(skip)]
     ratio: f64,
 }
+structio::object!(Ordered {
+    name,
+    count,
+    total,
+    ..
+});
 
 #[repe::methods]
 impl Ordered {
@@ -63,7 +68,7 @@ impl Ordered {
 
 /// The same surface with no `listing_order`, so the default is pinned beside the
 /// override rather than only implied by it.
-#[derive(Clone, Default, Serialize, Deserialize, RepeStruct)]
+#[derive(Clone, Default, RepeStruct)]
 #[repe(methods)]
 struct Appended {
     name: String,
@@ -72,6 +77,12 @@ struct Appended {
     #[repe(skip)]
     ratio: f64,
 }
+structio::object!(Appended {
+    name,
+    count,
+    total,
+    ..
+});
 
 #[repe::methods]
 impl Appended {
@@ -97,13 +108,14 @@ impl Appended {
 /// assertion also stood down here, `#[repe(listing_order("a", "typo"))]` would
 /// compile and then fail *every* whole-object read with `InvalidPath` while each
 /// endpoint still answered on its own path.
-#[derive(Clone, Default, Serialize, Deserialize, RepeStruct)]
+#[derive(Clone, Default, RepeStruct)]
 #[repe(methods)]
 #[repe(listing_order("beta", "alpha"))]
 struct Quiet {
     alpha: u32,
     beta: u32,
 }
+structio::object!(Quiet { alpha, beta });
 
 #[repe::methods]
 impl Quiet {
@@ -115,13 +127,14 @@ impl Quiet {
 
 /// A struct with no `#[repe::methods]` block: everything the order names is
 /// visible to the derive, so the whole check happens at macro time.
-#[derive(Clone, Default, Serialize, Deserialize, RepeStruct)]
+#[derive(Clone, Default, RepeStruct)]
 #[repe(methods(probe(&self) -> u32))]
 #[repe(listing_order("beta", "probe", "alpha"))]
 struct Reversed {
     alpha: u32,
     beta: u32,
 }
+structio::object!(Reversed { alpha, beta });
 
 impl Reversed {
     fn probe(&self) -> u32 {
@@ -144,56 +157,62 @@ fn read(query: &str) -> Vec<u8> {
 
 /// The top-level keys of a JSON object, in the order the document carries them.
 ///
-/// `serde_json::Value` cannot answer this: its map is sorted unless the
-/// `preserve_order` feature is on, and the whole point here is what the *bytes*
-/// say.
-struct KeyOrder(Vec<String>);
+/// A declared type cannot answer this: it names the keys it expects, and the
+/// question here is what order the *bytes* put them in. So this reads the text
+/// rather than a value — one scan for the key strings at depth 1, which is all
+/// the assertion needs and exactly what a client would see.
+fn key_order(json: &str) -> Vec<String> {
+    let bytes = json.as_bytes();
+    let mut keys = Vec::new();
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    let mut expecting_key = false;
 
-impl<'de> Deserialize<'de> for KeyOrder {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Keys;
-
-        impl<'de> serde::de::Visitor<'de> for Keys {
-            type Value = KeyOrder;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a JSON object")
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => {
+                depth += 1;
+                expecting_key = depth == 1;
             }
-
-            fn visit_map<A: serde::de::MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> Result<KeyOrder, A::Error> {
-                let mut keys = Vec::new();
-                while let Some(key) = map.next_key::<String>()? {
-                    map.next_value::<serde::de::IgnoredAny>()?;
-                    keys.push(key);
+            b'[' => depth += 1,
+            b'}' | b']' => {
+                depth -= 1;
+                expecting_key = false;
+            }
+            b',' => expecting_key = depth == 1,
+            b'"' => {
+                // Read the string, honoring escapes so a `\"` inside it does
+                // not end it early.
+                let start = i + 1;
+                let mut j = start;
+                while j < bytes.len() && bytes[j] != b'"' {
+                    j += if bytes[j] == b'\\' { 2 } else { 1 };
                 }
-                Ok(KeyOrder(keys))
+                if expecting_key {
+                    keys.push(json[start..j].to_string());
+                    expecting_key = false;
+                }
+                i = j;
             }
+            _ => {}
         }
-
-        deserializer.deserialize_map(Keys)
+        i += 1;
     }
+    keys
 }
 
-/// Deliberately driven through the `Router`, which encodes through
-/// `RepeStruct::repe_handle_into`. The `serde_json::Value` form,
-/// `RepeStruct::repe_handle`, assembles a `serde_json::Map` — a `BTreeMap`
-/// unless something in the dependency graph enables `serde_json/preserve_order`
-/// — so it sorts its keys and can carry no order at all. That is a property of
-/// `Value`, true of declaration order since long before this attribute, and not
-/// something the derive can fix; asserting it here would pin a `serde_json`
-/// build detail rather than anything this crate decides.
+/// `RepeStruct::repe_handle_into`, writes members straight into the response
+/// buffer in declaration order, so the order the derive emits *is* the order on
+/// the wire. Under `serde_json` this was not assertable at all: the listing was
+/// assembled into a `Map` — a `BTreeMap` unless something in the graph enabled
+/// `preserve_order` — which sorted its keys and could carry no order.
 fn listing_keys(router: &Router, query: &str) -> Vec<String> {
     let frame = router
         .call(&read(query))
         .expect("a non-notify request is answered");
     let message = Message::from_slice(&frame).expect("the response is a REPE frame");
-    message
-        .json_body::<KeyOrder>()
-        .expect("the listing body is valid JSON")
-        .0
+    let text = std::str::from_utf8(&message.body).expect("the listing body is UTF-8");
+    key_order(text)
 }
 
 // ---------------------------------------------------------------------------
@@ -258,19 +277,16 @@ fn reordering_the_listing_changes_nothing_else() {
         .call(&read("/o"))
         .expect("a non-notify request is answered");
     let message = Message::from_slice(&frame).expect("the response is a REPE frame");
-    let value = message
-        .json_body::<serde_json::Value>()
-        .expect("the listing body is valid JSON");
+    // Compared as text, and that is the point: the assertion is on the bytes
+    // the listing produced, order included. A declared type would have named
+    // the keys and told us nothing about their order.
+    let text = std::str::from_utf8(&message.body).expect("the listing body is UTF-8");
     assert_eq!(
-        value,
-        serde_json::json!({
-            "name": "sn-1",
-            "count": 4,
-            "percent": 25.0,
-            "total": 36.5,
-            "identify": "fn(&self) -> String",
-            "reset": "fn(&mut self) -> ()",
-        }),
+        text,
+        concat!(
+            r#"{"name":"sn-1","count":4,"percent":25,"total":36.5,"#,
+            r#""identify":"fn(&self) -> String","reset":"fn(&mut self) -> ()"}"#
+        ),
         "the attribute reorders emission and nothing else: same keys, same values"
     );
 

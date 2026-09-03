@@ -1,33 +1,55 @@
 # Registry Support
 
-`repe-rs` includes a dynamic `Registry` that can be mounted on a `Router` for JSON Pointer style access to values and callable endpoints.
+`repe-rs` includes a dynamic `Registry` that can be mounted on a `Router` for JSON Pointer access to callable endpoints.
 
 ## Semantics
 
-For a request path resolved within a registry:
+A registry is a flat table of functions keyed by canonical JSON Pointer. Resolving a path is one hash lookup on the whole pointer, and then the handler runs.
 
-- Empty body: READ the value at the path.
-- Non-empty body + function target: CALL the function with decoded params.
-- Non-empty body + non-function target: WRITE the value at the path.
+- A pointer names a **function**. There is no other kind of entry.
+- The **body is the arguments**. An empty frame calls the function with `None`.
+- What the function writes is the response.
 
-This matches the intended Glaze-style registry behavior.
+There used to be a third thing here: a pointer could name a stored `serde_json::Value`, an empty body meant READ, and a non-empty body against a non-function meant WRITE. That went with the document model. A stateful endpoint is now a function that owns its state and decides for itself what a body means — which is also what lets it validate, reject, or apply rather than being assigned to blind.
 
 ## Quick Start
 
 ```rust
+use repe::structs::RequestBody;
 use repe::{ErrorCode, Registry, Router, Server};
-use serde_json::{Value, json};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+
+#[derive(Default)]
+struct Operands { a: i64, b: i64 }
+structio::object!(Operands { a, b });
+
+#[derive(Default)]
+struct Sum { result: i64 }
+structio::object!(Sum { result });
 
 let registry = Arc::new(Registry::new());
-registry.register_value("/counter", json!(0))?;
-registry.register_function("/add", |params| {
-    let Some(Value::Object(map)) = params else {
-        return Err((ErrorCode::InvalidBody, "expected object body".into()));
+
+// A counter behind a function: a body sets it, no body reads it.
+let counter = Arc::new(AtomicI64::new(0));
+registry.register_function("/counter", move |params: Option<RequestBody<'_>>| {
+    if let Some(body) = params {
+        let next: i64 = body
+            .read("/counter")
+            .map_err(|e| (ErrorCode::InvalidBody, e.to_string()))?;
+        counter.store(next, Ordering::SeqCst);
+    }
+    Ok(counter.load(Ordering::SeqCst))
+})?;
+
+registry.register_function("/add", |params: Option<RequestBody<'_>>| {
+    let Some(body) = params else {
+        return Err((ErrorCode::InvalidBody, "expected an object body".into()));
     };
-    let a = map.get("a").and_then(Value::as_i64).unwrap_or(0);
-    let b = map.get("b").and_then(Value::as_i64).unwrap_or(0);
-    Ok(json!({"result": a + b}))
+    let operands: Operands = body
+        .read("/add")
+        .map_err(|e| (ErrorCode::InvalidBody, e.to_string()))?;
+    Ok(Sum { result: operands.a + operands.b })
 })?;
 
 let router = Router::new().with_registry("/api/v1", Arc::clone(&registry));
@@ -37,25 +59,36 @@ server.serve(listener)?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+## Migrating a registered value
+
+Where the value has a type, declare it as a field and mount the struct — the derive publishes every field as an endpoint, which is what `register_value` was approximating:
+
+```rust,ignore
+// Before: registry.register_value("/counter", json!(0))?;
+#[derive(Default, repe::RepeStruct)]
+struct State { counter: i64 }
+structio::object!(State { counter });
+
+let (router, state) = router.with_struct("", State::default());
+```
+
+Where it genuinely has no type — a passthrough blob — it is a function that returns it.
+
 ## Path Prefix
 
 Mounting with a prefix strips that prefix from incoming paths before registry lookup.
 
-Example:
 - Router mount: `with_registry("/api/v1", registry)`
 - Incoming request: `/api/v1/counter`
 - Registry pointer resolved as: `/counter`
 
-## Supported Body Formats
+## Body Formats
 
-Registry request bodies are decoded as:
+The registry does not decode a body. It hands the handler a `RequestBody` — the frame's bytes plus the format its header declared — and the handler reads them as whatever type it expects. A request no endpoint claims is never parsed at all.
 
-- `BodyFormat::Json` -> JSON value
-- `BodyFormat::Beve` -> JSON value decoded from BEVE
-- `BodyFormat::Utf8` -> JSON string value
-- `BodyFormat::RawBinary` -> JSON array of byte integers
+All four known formats reach a handler, `RawBinary` included: a handler that means to treat the body as bytes calls `RequestBody::bytes` and never parses it. A format code this build does not recognize is rejected with `InvalidBody`, because handing a handler bytes under a format it cannot name is worse than refusing.
 
-Unknown body formats are rejected with `InvalidBody`.
+The response follows the request: a BEVE call is answered in BEVE, a JSON call in JSON. Nothing is transcoded — the handler writes into the response buffer in the negotiated format.
 
 ## Examples
 
@@ -64,37 +97,34 @@ Unknown body formats are rejected with `InvalidBody`.
 
 ## Client APIs
 
-Registry reads require an empty body, and the client API now supports this directly:
+- `Client::call_typed_json(path, body)` / `AsyncClient::call_typed_json(path, body)` — call with a JSON body
+- `Client::call_typed_beve(path, body)` / async equivalent — the same, in BEVE
+- `Client::registry_read_typed::<_, R>(path)` / async equivalent — call with an empty body
+- `Client::call_message(path)` / async equivalent — full `Message` access
 
-- `Client::registry_read(path)` / `AsyncClient::registry_read(path)`
-- `Client::registry_read_typed::<_, R>(path)` / `AsyncClient::registry_read_typed::<_, R>(path)`
-- `Client::call_message(path)` / `AsyncClient::call_message(path)` for full `Message` access
-
-WRITE/CALL operations keep the JSON helper shape:
-
-- `Client::registry_write_json(path, body)` / async equivalent
-- `Client::registry_call_json(path, body)` / async equivalent
+Every one of them names the type it expects back. There is no untyped call: with no document model a response has to be decoded into something, and naming that something turns a wrong answer into a decode error rather than a `None` found three lines later.
 
 ### Sync Client Example
 
 ```rust
 use repe::Client;
-use serde_json::json;
+
+#[derive(Default)]
+struct Operands { a: i64, b: i64 }
+structio::object!(Operands { a, b });
+
+#[derive(Default)]
+struct Sum { result: i64 }
+structio::object!(Sum { result });
 
 let client = Client::connect("127.0.0.1:8082")?;
 
-let counter = client.registry_read("/api/v1/counter")?;
+let counter: i64 = client.registry_read_typed("/api/v1/counter")?;
 println!("counter={counter}");
 
-let _ = client.registry_write_json("/api/v1/counter", &json!(42))?;
-let sum = client.registry_call_json("/api/v1/add", &json!({"a": 2, "b": 3}))?;
-println!("sum={sum}");
-
-#[derive(serde::Deserialize)]
-struct Snapshot {
-    counter: i64,
-}
-let _snapshot: Snapshot = client.registry_read_typed("/api/v1/state")?;
+let _: i64 = client.call_typed_json("/api/v1/counter", &42i64)?;
+let sum: Sum = client.call_typed_json("/api/v1/add", &Operands { a: 2, b: 3 })?;
+println!("sum={}", sum.result);
 
 let raw_message = client.call_message("/api/v1/counter")?;
 println!("raw response body format={}", raw_message.header.body_format);
@@ -110,5 +140,5 @@ For non-standard query/body formats, use:
 
 These APIs allow:
 - custom `query_format` code
-- optional raw body bytes (including true empty body)
+- optional raw body bytes (including a true empty body)
 - custom `body_format` code

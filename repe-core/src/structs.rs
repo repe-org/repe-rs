@@ -1,11 +1,15 @@
 use crate::constants::{BodyFormat, ErrorCode};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
-use serde_json::Value;
+
 /// Errors produced while handling struct-backed endpoints.
 ///
 /// Non-exhaustive: match with a wildcard arm, or use [`StructError::code`] to
 /// map any error onto its protocol [`ErrorCode`].
+///
+/// There is no `Serialize` variant. structio's writers cannot fail — a
+/// [`structio::json::Write`] impl returns `()` — so encoding a response is
+/// infallible and the only failures left are about the request: a path that
+/// does not resolve, a body that should or should not be there, a body that
+/// does not parse, and a handler that reported its own failure.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum StructError {
@@ -17,18 +21,25 @@ pub enum StructError {
     BodyExpected { path: String },
     #[error("body not allowed for `{path}`")]
     BodyUnexpected { path: String },
-    #[error("serialization error for `{path}`: {source}")]
-    Serialize {
+    /// The request body did not parse as the endpoint's type.
+    ///
+    /// `source` is [`structio::Error`], a `Copy` code-and-offset pair rather
+    /// than an allocated message, and it carries the offending key when the
+    /// reader knew one.
+    #[error("could not decode body for `{path}`: {source}")]
+    Decode {
         path: String,
         #[source]
-        source: serde_json::Error,
+        source: structio::Error,
     },
-    #[error("deserialization error for `{path}`: {source}")]
-    Deserialize {
-        path: String,
-        #[source]
-        source: serde_json::Error,
-    },
+    /// The body of a multi-argument method call was the wrong *shape* — the
+    /// wrong number of positional arguments, or neither an array nor an object.
+    ///
+    /// Distinct from [`Decode`](StructError::Decode), which is one argument
+    /// failing to parse as its own type. This one is about the envelope, and it
+    /// carries a message of repe's own because no parser produced it.
+    #[error("invalid arguments for `{path}`: {message}")]
+    Arguments { path: String, message: String },
     #[error("method `{path}` failed: {message}")]
     Execution { path: String, message: String },
 }
@@ -42,9 +53,7 @@ impl StructError {
             StructError::BodyExpected { .. } | StructError::BodyUnexpected { .. } => {
                 ErrorCode::InvalidBody
             }
-            StructError::Serialize { .. } | StructError::Deserialize { .. } => {
-                ErrorCode::InvalidBody
-            }
+            StructError::Decode { .. } | StructError::Arguments { .. } => ErrorCode::InvalidBody,
             StructError::Execution { .. } => ErrorCode::ParseError,
         }
     }
@@ -53,51 +62,283 @@ impl StructError {
 /// Convenience alias for results returned by struct handlers.
 pub type StructResult<T> = Result<T, StructError>;
 
-/// Trait implemented by structs that can be exposed directly through the REPE router.
+/// Everything a served field needs to cross the wire in both of REPE's body
+/// formats: readable and writable as JSON and as BEVE.
 ///
-/// The implementation should interpret the provided JSON Pointer path segments and
-/// either return a JSON value (for reads) or mutate the struct (for writes).
+/// A served *field* is read by one peer and written by the other, and the frame
+/// header decides the format per request rather than per type, so all four
+/// halves are genuinely required of it.
+///
+/// The halves are separately nameable, and the crate names them separately
+/// wherever only one is used: [`ServableRead`] for a body being decoded,
+/// [`ServableWrite`] for a response being encoded. Asking a type that is only
+/// ever sent to also be readable — or a method parameter that is only ever
+/// received to also be writable — is the bound doing more than the code does.
+///
+/// Declare a type with structio's [`object!`](structio::object) (or
+/// [`tagged_enum!`](structio::tagged_enum), or [`array!`](structio::array)) and
+/// it satisfies all three by construction; there is no derive to add.
+pub trait Servable: for<'de> ServableRead<'de> + ServableWrite {}
+impl<T: for<'de> ServableRead<'de> + ServableWrite> Servable for T {}
+
+/// The read half of [`Servable`]: decodable from either body format.
+///
+/// Carries the body's lifetime, so a type whose fields borrow out of the frame
+/// satisfies it for that frame.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot be decoded from a REPE body: it has no structio declaration",
+    label = "no JSON/BEVE encoding for `{Self}`",
+    note = "declare it with `structio::object!({Self} {{ field, .. }})` — or `tagged_enum!` / `array!` / `unit_enum!`",
+    note = "`#[derive(RepeStruct)]` publishes endpoints; the structio declaration is what gives the type a wire encoding. A served type needs both."
+)]
+pub trait ServableRead<'de>: structio::json::Read<'de> + structio::beve::Read<'de> {}
+impl<'de, T> ServableRead<'de> for T where T: structio::json::Read<'de> + structio::beve::Read<'de> {}
+
+/// The read policy every REPE body is decoded under: unknown keys are stepped
+/// over rather than refused.
+///
+/// This is the protocol's rule, not a preference. REPE's schema-evolution
+/// guarantee is that a peer may add object members without breaking one built
+/// against an older declaration — see `docs/protocol.md` — and it is pinned
+/// cross-language by Glaze-authored interop fixtures that carry a key this
+/// crate never declared. structio's [`Standard`](structio::Standard) refuses an
+/// unknown key, which is the right default for a document you own and the wrong
+/// one for a frame that arrived from someone else's build.
+///
+/// It applies to what the *body* may contain, and not to what a type demands of
+/// it: an endpoint marks its mandatory members `#[required]` in its structio
+/// declaration, and that is unaffected by this.
+pub type WirePolicy = structio::SkipUnknown;
+
+/// A response a client decodes into: readable in both formats, and owning its
+/// own contents.
+///
+/// [`ServableRead`] carries the frame's lifetime, which is what lets a *server*
+/// borrow out of the body it was handed. A client cannot: it decodes out of a
+/// response message it owns locally and then returns the value, so the value
+/// has to outlive the frame it came from. `for<'de>` says exactly that, and
+/// `Default` is there because structio reads *into* an existing value.
+///
+/// The bound is both formats rather than the one the request used, because a
+/// server answers in the format the frame asked for and a client that names a
+/// result type does not get to assume which one came back.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot be decoded from a REPE response",
+    label = "not decodable as an owned JSON/BEVE value",
+    note = "declare it with `structio::object!({Self} {{ field, .. }})` — or `tagged_enum!` / `array!` / `unit_enum!`",
+    note = "a type whose fields borrow (`&'de str`) satisfies `ServableRead` but not this: a decoded response outlives the frame, so borrowing fields must be owned (`String`)"
+)]
+pub trait ServableOwned: for<'de> ServableRead<'de> + Default {}
+impl<T: for<'de> ServableRead<'de> + Default> ServableOwned for T {}
+
+/// The write half of [`Servable`]: encodable into either body format.
+///
+/// Both halves, because the frame header picks the format per request and a
+/// response is encoded in whichever one the request asked for.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot be encoded into a REPE body: it has no structio declaration",
+    label = "no JSON/BEVE encoding for `{Self}`",
+    note = "declare it with `structio::object!({Self} {{ field, .. }})` — or `tagged_enum!` / `array!` / `unit_enum!`",
+    note = "`#[derive(RepeStruct)]` publishes endpoints; the structio declaration is what gives the type a wire encoding. A served type needs both."
+)]
+pub trait ServableWrite: structio::json::Write + structio::beve::Write {}
+impl<T: structio::json::Write + structio::beve::Write + ?Sized> ServableWrite for T {}
+
+/// The request body handed to a [`RepeStruct`], as the bytes that arrived plus
+/// the format the frame header declared.
+///
+/// This is the mirror of [`ResponseBody`], and it is what replaced the
+/// `Option<serde_json::Value>` the trait used to take. A body is now parsed
+/// **once, into the live member it is destined for** — Glaze's `read_params` —
+/// rather than into a tree that is then walked and re-parsed. Nothing here
+/// allocates until a reader does, and a request that no endpoint claims never
+/// parses at all.
+///
+/// The bytes are borrowed from the frame, so a `RequestBody` cannot outlive it.
+/// That is deliberate: it is what lets a `&'de str` field borrow from the
+/// request instead of copying out of it.
+#[derive(Debug, Clone, Copy)]
+pub struct RequestBody<'a> {
+    bytes: &'a [u8],
+    format: BodyFormat,
+}
+
+impl<'a> RequestBody<'a> {
+    /// Wrap the body bytes of a frame, under the format its header declared.
+    pub fn new(bytes: &'a [u8], format: BodyFormat) -> Self {
+        Self { bytes, format }
+    }
+
+    /// The raw body bytes, unparsed.
+    ///
+    /// For an endpoint that forwards a body onward without looking inside it —
+    /// a proxy, a plugin boundary — and for [`BodyFormat::RawBinary`], where
+    /// there is nothing to parse.
+    pub fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// The body format the frame header declared.
+    pub fn format(&self) -> BodyFormat {
+        self.format
+    }
+
+    /// Whether the body is the literal `null`.
+    ///
+    /// Asked by the paths that distinguish "no body" from "a body saying
+    /// nothing" — an optional child refusing a presence write, most of all.
+    /// Cheap in both formats: one tag byte in BEVE, a four-byte compare in
+    /// JSON. JSON whitespace is ASCII, so the compare needs no UTF-8 pass over
+    /// a body that may be megabytes long.
+    pub fn is_null(&self) -> bool {
+        match self.format {
+            BodyFormat::Beve => structio::beve::Reader::new(self.bytes)
+                .try_null()
+                .unwrap_or(false),
+            _ => self.bytes.trim_ascii() == b"null",
+        }
+    }
+
+    /// Parse the body into `value`, in place.
+    ///
+    /// `path` names the endpoint for the error message and is only read when
+    /// parsing fails.
+    ///
+    /// Reading *into* rather than returning a new value is what makes this the
+    /// live-member read: a `Vec` or `String` already in the destination keeps
+    /// its allocation, and a field absent from the body keeps the value it had.
+    /// That last part is a **merge**, and it is the behaviour a whole-object
+    /// write wants — a client updating one key of a wide object should not
+    /// blank the rest.
+    ///
+    /// Read under [`WirePolicy`], so a member the sender added and this build
+    /// never declared is stepped over rather than refusing the frame.
+    ///
+    /// An endpoint that wants some members to be mandatory marks them
+    /// `#[required]` in its structio declaration, which is per field and unions
+    /// with whatever policy is in force.
+    ///
+    /// **A failed read is not transactional.** structio parses straight into
+    /// `value`, so a body that is malformed partway through leaves the members
+    /// before the fault already updated and the rest as they were, and the
+    /// error goes back to the client. That is the price of the merge: there is
+    /// no scratch copy to discard, and building one would need `T: Clone` and
+    /// cost the allocation the live read exists to avoid. An endpoint that
+    /// must not expose a torn write reads into a fresh `T::default()` with
+    /// [`read`](Self::read) and assigns on success — replace semantics — or
+    /// validates the body against the schema before applying it.
+    pub fn read_into<T>(&self, path: &str, value: &mut T) -> StructResult<()>
+    where
+        T: ServableRead<'a>,
+    {
+        self.read_into_with::<WirePolicy, T>(path, value)
+    }
+
+    /// [`read_into`](Self::read_into) under an explicit structio
+    /// [read policy](structio::Options).
+    ///
+    /// For a policy that changes what the *body* may contain:
+    /// [`AllowComments`](structio::AllowComments) for a body written by hand,
+    /// or [`Standard`](structio::Standard) to refuse a key this build does not
+    /// declare — the opposite of [`WirePolicy`], and a deliberate narrowing of
+    /// what the protocol permits.
+    ///
+    /// Not for making members mandatory. [`RequireKeys`](structio::RequireKeys)
+    /// demands *every* declared member, and an `Option<T>` is not exempt — the
+    /// test is whether the key is present, not what it holds, so `null`
+    /// satisfies it and absence does not, and a struct with one optional member
+    /// cannot be read under it at all. Mark the mandatory members `#[required]`
+    /// instead.
+    pub fn read_into_with<O, T>(&self, path: &str, value: &mut T) -> StructResult<()>
+    where
+        O: structio::Options,
+        T: ServableRead<'a>,
+    {
+        self.read_raw_with::<O, T>(value)
+            .map_err(|source| StructError::Decode {
+                path: path.to_string(),
+                source,
+            })
+    }
+
+    /// [`read_into`](Self::read_into) without the path, for a caller that
+    /// builds the error label only when there is an error to label.
+    fn read_into_raw<T>(&self, value: &mut T) -> Result<(), structio::Error>
+    where
+        T: ServableRead<'a>,
+    {
+        self.read_raw_with::<WirePolicy, T>(value)
+    }
+
+    fn read_raw_with<O, T>(&self, value: &mut T) -> Result<(), structio::Error>
+    where
+        O: structio::Options,
+        T: ServableRead<'a>,
+    {
+        match self.format {
+            BodyFormat::Beve => structio::beve::read_into_with::<O, T>(value, self.bytes),
+            _ => match core::str::from_utf8(self.bytes) {
+                Ok(text) => structio::json::read_into_with::<O, T>(value, text),
+                Err(err) => Err(structio::Error::new(
+                    structio::ErrorCode::InvalidUtf8,
+                    err.valid_up_to(),
+                )),
+            },
+        }
+    }
+
+    /// Parse the body as a fresh `T`.
+    ///
+    /// [`read_into`](Self::read_into) is the one to reach for when a
+    /// destination already exists; this is for the case where it does not, such
+    /// as a method's parameter struct. The `Default` bound is what structio's
+    /// read-into model costs here: the value has to exist before it can be read
+    /// into.
+    pub fn read<T>(&self, path: &str) -> StructResult<T>
+    where
+        T: ServableRead<'a> + Default,
+    {
+        let mut value = T::default();
+        self.read_into(path, &mut value)?;
+        Ok(value)
+    }
+}
+
+/// Trait implemented by structs that can be exposed directly through the REPE
+/// router.
+///
+/// The implementation interprets the JSON Pointer path segments and either
+/// writes a response into `out` (for reads) or mutates the struct (for writes).
+///
+/// There is one dispatch method rather than two. The `Value`-returning
+/// `repe_handle` is gone with `serde_json::Value` itself: a read now serializes
+/// the live field straight into the outgoing frame, and a write parses the
+/// request bytes straight into it, so there is no tree for a second method to
+/// hand back.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot be served over REPE: it does not implement `RepeStruct`",
     label = "not a REPE-servable type",
-    note = "derive it with `#[derive(RepeStruct)]`, or, for a field of a type you do not own, use `#[repe(nested_serde)]` to route through its `Serialize`/`Deserialize` impls instead of `#[repe(nested)]`",
+    note = "derive it with `#[derive(RepeStruct)]`",
+    note = "a field's own type needs a structio declaration — `structio::object!(Field {{ .. }})` — not a derive",
     note = "a type in a crate that depends only on `repe-core` can derive this too; `repe` re-exports the same trait"
 )]
 pub trait RepeStruct: Send + Sync {
-    /// Handle a read or write against this struct.
+    /// Handle a read or write against this struct, writing any response into
+    /// `out`.
     ///
-    /// * `segments` – JSON Pointer path split into unescaped segments.
-    /// * `body` – `Some(value)` when the request contains a JSON body, `None` for reads.
-    ///
-    /// Return `Ok(Some(value))` to send a JSON response payload, `Ok(None)` to send `null`.
-    fn repe_handle(
-        &mut self,
-        segments: &[&str],
-        body: Option<Value>,
-    ) -> StructResult<Option<Value>>;
-
-    /// Encode-in-place counterpart of [`repe_handle`](Self::repe_handle): write the
-    /// response body straight into `out` instead of returning an owned
-    /// [`serde_json::Value`] for the caller to re-serialize.
-    ///
-    /// This is the method the router calls. The default implementation delegates
-    /// to [`repe_handle`](Self::repe_handle) and encodes whatever it returns, so a
-    /// hand-written impl only needs `repe_handle`; `#[derive(RepeStruct)]`
-    /// overrides it so a leaf read serializes the live field directly into the
-    /// outgoing frame buffer with no intermediate `Value`.
-    ///
-    /// Writes are unaffected — a request body still arrives as a `Value`.
-    ///
-    /// [`repe_handle`]: Self::repe_handle
+    /// * `segments` — JSON Pointer path split into unescaped segments.
+    /// * `body` — `Some(..)` when the frame carried a body, `None` for a bare
+    ///   read.
+    /// * `out` — the response body under construction. Write exactly one
+    ///   top-level value into it: a value, a [`null`](ResponseBody::write_null),
+    ///   or an [`object`](ResponseBody::object). A write endpoint answers with
+    ///   `null`.
     fn repe_handle_into(
         &mut self,
         segments: &[&str],
-        body: Option<Value>,
+        body: Option<RequestBody<'_>>,
         out: &mut ResponseBody<'_>,
-    ) -> StructResult<()> {
-        let value = self.repe_handle(segments, body)?;
-        write_optional(out, segments, value)
-    }
+    ) -> StructResult<()>;
 
     /// Serve a request through a **shared** borrow, or decline it.
     ///
@@ -109,8 +350,8 @@ pub trait RepeStruct: Send + Sync {
     /// A body-carrying frame is offered here too, and that is deliberate: REPE
     /// separates read from write at the *frame* level, but a `&self` method
     /// taking arguments is a call, not a mutation. Deciding from the frame
-    /// alone put a long-running `&self` call behind the write guard and
-    /// stalled every read of the object for as long as it ran. The receiver is known
+    /// alone put a long-running `&self` call behind the write guard and stalled
+    /// every read of the object for as long as it ran. The receiver is known
     /// where these arms are generated, so it is the receiver that decides.
     ///
     /// Return `None` for any path this borrow cannot serve: a field write, a
@@ -120,7 +361,7 @@ pub trait RepeStruct: Send + Sync {
     /// correctness nothing — it is the default, and a hand-written impl that
     /// never overrides this behaves exactly as it did before the path existed.
     ///
-    /// Three obligations come with overriding it:
+    /// Two obligations come with overriding it:
     ///
     /// * **Answer identically.** Whatever this returns for a path is what the
     ///   client sees; the exclusive path is not consulted afterwards. Decline
@@ -130,14 +371,12 @@ pub trait RepeStruct: Send + Sync {
     ///   [`ObjectBody::entry_try_with`] exists to make that mechanical when the
     ///   decline surfaces partway through an object: it rewinds the whole
     ///   object, so propagating its `None` is all a caller has to do.
-    /// * **Leave the body alone when declining.** `body` is handed over as
-    ///   `&mut Option<Value>` rather than by value precisely so the exclusive
-    ///   retry can re-dispatch the same request without a clone. Call
-    ///   [`Option::take`] on it only once this borrow has committed to
-    ///   answering — an `Err` counts as an answer — and never on a path that
-    ///   goes on to return `None`. A body taken and then declined reaches the
-    ///   exclusive path as `None`, where it surfaces as a spurious
-    ///   [`BodyExpected`](StructError::BodyExpected).
+    ///
+    /// The third obligation this trait used to carry — leave `body` alone when
+    /// declining — is gone. [`RequestBody`] is `Copy` and borrows the frame
+    /// rather than owning a parsed tree, so the exclusive retry re-dispatches
+    /// the same body with no clone and nothing to take. That is the second
+    /// thing removing `Value` bought, after the allocation.
     ///
     /// A derived impl settles the whole-object listing before it writes or
     /// invokes anything, through
@@ -149,7 +388,7 @@ pub trait RepeStruct: Send + Sync {
     fn repe_shared_into(
         &self,
         segments: &[&str],
-        body: &mut Option<Value>,
+        body: Option<RequestBody<'_>>,
         out: &mut ResponseBody<'_>,
     ) -> Option<StructResult<()>> {
         let _ = (segments, body, out);
@@ -181,10 +420,10 @@ pub trait RepeStruct: Send + Sync {
     /// nesting it gives up its own shared listing.
     ///
     /// **Overriding it is a promise**, and it is the promise the invariant rests
-    /// on: returning `false` asserts that `repe_shared_into(&[], &mut None, ..)`
-    /// answers `Some(..)`. Breaking it still yields a correct response — the listing
-    /// rewinds and the exclusive path retries — but anything the shared attempt
-    /// had already invoked runs twice.
+    /// on: returning `false` asserts that `repe_shared_into(&[], None, ..)`
+    /// answers `Some(..)`. Breaking it still yields a correct response — the
+    /// listing rewinds and the exclusive path retries — but anything the shared
+    /// attempt had already invoked runs twice.
     fn repe_listing_declines(&self) -> bool {
         true
     }
@@ -245,25 +484,13 @@ pub trait RepeStruct: Send + Sync {
 /// This matches what Glaze publishes for an unmapped optional member, so a
 /// port's wire shape does not change with the language.
 impl<T: RepeStruct> RepeStruct for Option<T> {
-    fn repe_handle(
-        &mut self,
-        segments: &[&str],
-        body: Option<Value>,
-    ) -> StructResult<Option<Value>> {
-        refuse_presence_write(segments, body.as_ref())?;
-        match self {
-            Some(inner) => inner.repe_handle(segments, body),
-            None => absent_child(segments, body.is_some()).map(|()| None),
-        }
-    }
-
     fn repe_handle_into(
         &mut self,
         segments: &[&str],
-        body: Option<Value>,
+        body: Option<RequestBody<'_>>,
         out: &mut ResponseBody<'_>,
     ) -> StructResult<()> {
-        refuse_presence_write(segments, body.as_ref())?;
+        refuse_presence_write(segments, body)?;
         match self {
             Some(inner) => inner.repe_handle_into(segments, body, out),
             None => {
@@ -277,19 +504,19 @@ impl<T: RepeStruct> RepeStruct for Option<T> {
     fn repe_shared_into(
         &self,
         segments: &[&str],
-        body: &mut Option<Value>,
+        body: Option<RequestBody<'_>>,
         out: &mut ResponseBody<'_>,
     ) -> Option<StructResult<()>> {
         // Refusing touches nothing, so it needs no exclusive borrow — and it has
         // to be decided here rather than left to the retry, or a present child
         // would forward the `null` to its inner value under both guards.
-        if let Err(err) = refuse_presence_write(segments, body.as_ref()) {
+        if let Err(err) = refuse_presence_write(segments, body) {
             return Some(Err(err));
         }
         match self {
             Some(inner) => inner.repe_shared_into(segments, body, out),
             // Absent is a constant: no state to borrow exclusively, so every
-            // answer above is servable here and none of them touches `body`.
+            // answer above is servable here.
             None => Some(absent_child(segments, body.is_some()).map(|()| out.write_null())),
         }
     }
@@ -313,7 +540,7 @@ impl<T: RepeStruct> RepeStruct for Option<T> {
 /// `null` is what that path *reads* when the child is absent, so a client will
 /// try writing it back, and without this it lands on whichever branch happens to
 /// be live: a present child forwards it to its inner value and answers with that
-/// type's serde complaint, an absent one answers `InvalidPath`. Neither says
+/// type's parse complaint, an absent one answers `InvalidPath`. Neither says
 /// what is actually true, which is that presence is not settable here.
 ///
 /// It is refused rather than honoured because honouring it would open a one-way
@@ -323,8 +550,8 @@ impl<T: RepeStruct> RepeStruct for Option<T> {
 /// Presence belongs to the host on both sides of that. A whole-object write at
 /// the *parent* still replaces the field, `null` included; that is a replace of
 /// the parent, not a write to this path.
-fn refuse_presence_write(segments: &[&str], body: Option<&Value>) -> StructResult<()> {
-    if segments.is_empty() && matches!(body, Some(Value::Null)) {
+fn refuse_presence_write(segments: &[&str], body: Option<RequestBody<'_>>) -> StructResult<()> {
+    if segments.is_empty() && body.is_some_and(|b| b.is_null()) {
         return Err(StructError::BodyUnexpected {
             path: path_from_segments(segments),
         });
@@ -377,14 +604,14 @@ pub trait RepeMethods: MethodsDeclared {
     /// have no signature to publish: a client reads and writes one the way it
     /// reads and writes a field, so the whole-struct listing shows each one's
     /// current value rather than a signature string. The derived listing reads
-    /// those values back through [`repe_call`](Self::repe_call), or through
-    /// [`repe_call_shared_into`](Self::repe_call_shared_into) when it is being
-    /// served under a shared borrow.
+    /// those values back through [`repe_call_into`](Self::repe_call_into), or
+    /// through [`repe_call_shared_into`](Self::repe_call_shared_into) when it is
+    /// being served under a shared borrow.
     ///
     /// Defaults to empty, so a hand-written impl need not mention it. One
     /// invariant comes with listing a name here, and the derived listing relies
-    /// on it: [`repe_call`](Self::repe_call) must answer
-    /// `segments = &[name], body = None` with `Ok(Some(value))`. A name the
+    /// on it: [`repe_call_into`](Self::repe_call_into) must answer
+    /// `segments = &[name], body = None` with the endpoint's value. A name the
     /// table cannot dispatch turns every whole-struct read into that name's
     /// error. `#[repe::methods]` upholds it by construction, because it emits
     /// this list from the getters it generated arms for. The shared-borrow
@@ -419,8 +646,7 @@ pub trait RepeMethods: MethodsDeclared {
     /// So this is `true` exactly when some accessor's getter takes `&mut self`.
     ///
     /// The default is the conservative one: any accessor at all forces the
-    /// exclusive path, which is what a hand-written table gets for free and what
-    /// this crate did for every table before the receiver was carried here.
+    /// exclusive path, which is what a hand-written table gets for free.
     /// `#[repe::methods]` overrides it with the answer it computed from the
     /// receivers it has already seen, so a struct whose computed values are pure
     /// reads keeps its shared listing — and so does every ancestor that nests
@@ -449,29 +675,21 @@ pub trait RepeMethods: MethodsDeclared {
     /// serves no body, slower than it needs to be.
     const REPE_SHARED_SERVES_BODIES: bool = true;
 
-    /// Invoke the method named by `segments[0]`.
+    /// Invoke the method named by `segments[0]`, writing its result into `out`.
     ///
     /// `segments` is the remaining path relative to the struct root, so error
-    /// paths match the ones [`RepeStruct::repe_handle`] produces for fields.
-    /// Returns [`StructError::InvalidPath`] when no method matches.
-    fn repe_call(&mut self, segments: &[&str], body: Option<Value>) -> StructResult<Option<Value>>;
-
-    /// Encode-in-place counterpart of [`repe_call`](Self::repe_call), mirroring
-    /// [`RepeStruct::repe_handle_into`].
+    /// paths match the ones [`RepeStruct::repe_handle_into`] produces for
+    /// fields. Returns [`StructError::InvalidPath`] when no method matches.
     fn repe_call_into(
         &mut self,
         segments: &[&str],
-        body: Option<Value>,
+        body: Option<RequestBody<'_>>,
         out: &mut ResponseBody<'_>,
-    ) -> StructResult<()> {
-        let value = self.repe_call(segments, body)?;
-        write_optional(out, segments, value)
-    }
+    ) -> StructResult<()>;
 
     /// Shared-borrow counterpart of [`repe_call_into`](Self::repe_call_into),
-    /// mirroring [`RepeStruct::repe_shared_into`] and carrying the same three
-    /// obligations: answer identically, decline without writing, and leave
-    /// `body` in place when declining.
+    /// mirroring [`RepeStruct::repe_shared_into`] and carrying the same two
+    /// obligations: answer identically, and decline without writing.
     ///
     /// `#[repe::methods]` serves every `&self` method here — including one
     /// taking arguments, which is a call rather than a mutation however the
@@ -480,7 +698,7 @@ pub trait RepeMethods: MethodsDeclared {
     fn repe_call_shared_into(
         &self,
         segments: &[&str],
-        body: &mut Option<Value>,
+        body: Option<RequestBody<'_>>,
         out: &mut ResponseBody<'_>,
     ) -> Option<StructResult<()>> {
         let _ = (segments, body, out);
@@ -507,16 +725,12 @@ pub trait MethodsDeclared {}
 
 /// Build a path string from segments for error messages.
 pub fn path_from_segments(segments: &[&str]) -> String {
-    if segments.is_empty() {
-        String::from("")
-    } else {
-        let mut s = String::new();
-        for segment in segments {
-            s.push('/');
-            s.push_str(segment);
-        }
-        s
+    let mut s = String::new();
+    for segment in segments {
+        s.push('/');
+        s.push_str(segment);
     }
+    s
 }
 
 /// Prefix error paths with an additional segment when bubbling errors from nested structs.
@@ -538,8 +752,8 @@ pub fn prepend_path(mut err: StructError, prefix: &str) -> StructError {
         | StructError::InvalidSubpath { path }
         | StructError::BodyExpected { path }
         | StructError::BodyUnexpected { path }
-        | StructError::Serialize { path, .. }
-        | StructError::Deserialize { path, .. }
+        | StructError::Decode { path, .. }
+        | StructError::Arguments { path, .. }
         | StructError::Execution { path, .. } => {
             *path = with_prefix(std::mem::take(path));
         }
@@ -547,86 +761,73 @@ pub fn prepend_path(mut err: StructError, prefix: &str) -> StructError {
     err
 }
 
-/// The bound on [`ResponseBody::write_typed_slice`] without the `typed`
-/// feature. Deliberately unimplementable — it is sealed, so no type satisfies
-/// it *and none can be made to* — which makes the method uncallable and a
-/// `#[repe(typed)]` field an error against a named feature rather than against
-/// a method that does not exist.
-///
-/// It exists **only** in that configuration. With the feature on, the method
-/// takes `beve::BeveTypedSlice + Serialize` directly and this trait is not
-/// there at all — a diagnostic device has no business being public API of the
-/// build everyone ships, and, since every type BEVE accepts would satisfy it
-/// through a blanket impl, nothing would ever name it there anyway.
-/// Seals [`TypedSliceElement`] so that "no type implements it" is a fact this
-/// crate enforces rather than one it merely asserts. Without this a downstream
-/// crate could write `impl TypedSliceElement for T {}` — the trait is public and
-/// has no members, so nothing stops it — and reach a `write_typed_slice` whose
-/// body is an `unreachable!`.
-#[cfg(not(feature = "typed"))]
-mod sealed {
-    pub trait Sealed {}
-}
-
-#[cfg(not(feature = "typed"))]
-#[diagnostic::on_unimplemented(
-    message = "`#[repe(typed)]` needs the `typed` feature of `repe-core`",
-    label = "no BEVE typed-array encoding is compiled in",
-    note = "enable it with `repe-core = {{ version = \"2\", features = [\"typed\"] }}`, or drop \
-            `#[repe(typed)]` from the field to serve it as a JSON array",
-    note = "crates that depend on `repe` rather than `repe-core` already have it on"
-)]
-pub trait TypedSliceElement: sealed::Sealed {}
-
 /// Response body under construction for a [`RepeStruct`] read.
 ///
-/// Handed to [`RepeStruct::repe_handle_into`] so a read serializes the live field
-/// straight into the outgoing frame buffer. The alternative — returning a
-/// [`serde_json::Value`] that the router then re-serializes — allocates an
-/// intermediate tree per read, which is what a client polling a wide object at
-/// kilohertz pays for.
+/// Handed to [`RepeStruct::repe_handle_into`] so a read serializes the live
+/// field straight into the outgoing frame buffer, with no intermediate tree —
+/// which is what a client polling a wide object at kilohertz used to pay for.
 ///
-/// The body starts out empty and [`BodyFormat::Json`]; the write that fills it
-/// also settles the format, so a [`write_typed_slice`](Self::write_typed_slice)
-/// body reports [`BodyFormat::Beve`]. Exactly one top-level write is expected —
-/// a value, a null, or an [`object`](Self::object).
+/// The body starts out empty, encoding in the format the request asked for.
+/// [`new`](Self::new) defaults that to [`BodyFormat::Json`];
+/// [`with_format`](Self::with_format) is what a server uses to answer a BEVE
+/// request in BEVE. The write that fills the body settles the format it
+/// actually reports, which is normally the requested one and is always
+/// [`BodyFormat::Beve`] for [`write_typed_slice`](Self::write_typed_slice).
+/// Exactly one top-level write is expected — a value, a null, or an
+/// [`object`](Self::object).
 ///
-/// Any failed write — including one that fails partway through an
-/// [`object`](Self::object) — rewinds the buffer to where that write began, so a
-/// caller that recovers from a [`StructError`] never ships half-serialized
-/// bytes.
+/// A whole-object [`object`](Self::object) listing honours the requested format
+/// too: a BEVE object carries its member count in its header, so the listing
+/// declares its count up front and rewinds whole if an entry declines.
+///
+/// Writing itself cannot fail: a [`structio::json::Write`] impl returns `()`.
+/// What can still fail is the *handler* around it — a nested child that
+/// declines, a method that errors — so [`object`](Self::object) entries that run
+/// arbitrary code keep their `Result`, and rewind the buffer to where the write
+/// began, so a caller that recovers from a [`StructError`] never ships
+/// half-serialized bytes.
 pub struct ResponseBody<'a> {
     buf: &'a mut Vec<u8>,
+    /// The format the request asked to be answered in. Only ever
+    /// [`BodyFormat::Json`] or [`BodyFormat::Beve`]; a request in one of the
+    /// other two is answered in JSON.
+    requested: BodyFormat,
     format: BodyFormat,
-    /// True while this body is a value *inside* an enclosing JSON object, where
-    /// the frame format is already committed to JSON.
+    /// True while this body is a value *inside* an enclosing object, where the
+    /// frame's format is already settled and a member cannot change it.
     ///
-    /// Reached from generated code by exactly one path: the whole-struct listing
-    /// writes each accessor endpoint's value through
-    /// [`ObjectBody::entry_with`] or [`ObjectBody::entry_try_with`], so a
-    /// `#[repe(typed)]` getter listed inside the object emits a JSON array
-    /// rather than switching the enclosing frame to BEVE. (A `#[repe(nested)]`
-    /// field also gets a nested body, but its child is always entered with empty
-    /// segments and so always takes its own object branch.) The flag also covers
-    /// hand-written `repe_handle_into` impls, which can call anything from
-    /// anywhere; a JSON-array fallback beats corrupting the frame.
+    /// It gates exactly one thing: [`write_typed_slice`](Self::write_typed_slice).
+    /// A `#[repe(typed)]` field read *on its own* answers in BEVE whatever the
+    /// request asked for, that being what the attribute means. The same field
+    /// listed *inside* an object cannot do that without corrupting the frame, so
+    /// there it writes through [`write`](Self::write) and comes out as whatever
+    /// the enclosing object is — a BEVE typed array in a BEVE listing, a JSON
+    /// array in a JSON one.
     ///
-    /// [`write_typed_slice`](Self::write_typed_slice) is the only reader, and
-    /// without the `typed` feature there is no typed encoding to divert — the
-    /// flag is still set where an object is entered, so that turning the
-    /// feature on needs no other change.
-    ///
-    /// `expect` rather than `allow`: if this ever gains a second reader that is
-    /// not feature-gated, the attribute becomes wrong and says so.
-    #[cfg_attr(not(feature = "typed"), expect(dead_code))]
+    /// Every other write follows `requested`, which an enclosing object sets to
+    /// its own format, so nothing else needs to consult this.
     nested: bool,
 }
 
 impl<'a> ResponseBody<'a> {
-    /// Wrap an output buffer. `buf` is normally empty; writes append to it.
+    /// Wrap an output buffer, answering in JSON. `buf` is normally empty; writes
+    /// append to it.
     pub fn new(buf: &'a mut Vec<u8>) -> Self {
+        Self::with_format(buf, BodyFormat::Json)
+    }
+
+    /// Wrap an output buffer, answering in the format the request declared.
+    ///
+    /// [`BodyFormat::RawBinary`] and [`BodyFormat::Utf8`] describe bodies with
+    /// no value structure to mirror, so a request in either is answered in
+    /// JSON.
+    pub fn with_format(buf: &'a mut Vec<u8>, requested: BodyFormat) -> Self {
         Self {
             buf,
+            requested: match requested {
+                BodyFormat::Beve => BodyFormat::Beve,
+                _ => BodyFormat::Json,
+            },
             format: BodyFormat::Json,
             nested: false,
         }
@@ -637,45 +838,31 @@ impl<'a> ResponseBody<'a> {
         self.format
     }
 
-    /// Serialize `value` as the whole body, as JSON.
+    /// Serialize `value` as the whole body, in the requested format.
     ///
-    /// `path` names the field for the error message and is only read when
-    /// serialization fails.
-    pub fn write<T>(&mut self, path: &str, value: &T) -> StructResult<()>
+    /// Inside an enclosing object the frame is already committed to JSON, and
+    /// this writes JSON regardless.
+    pub fn write<T>(&mut self, value: &T)
     where
-        T: Serialize + ?Sized,
+        T: ServableWrite + ?Sized,
     {
-        self.write_with_path(|| String::from(path), value)
-    }
-
-    /// [`write`](Self::write) with the error path built only if one is needed.
-    ///
-    /// The derived arms pass a `&'static str` literal and pay nothing either
-    /// way, but the [`RepeStruct::repe_handle_into`] default has to *assemble*
-    /// its path from the segments — on every successful read, for a string it
-    /// then throws away.
-    fn write_with_path<T, F>(&mut self, path: F, value: &T) -> StructResult<()>
-    where
-        T: Serialize + ?Sized,
-        F: FnOnce() -> String,
-    {
-        let start = self.buf.len();
-        match serde_json::to_writer(&mut *self.buf, value) {
-            Ok(()) => Ok(()),
-            Err(source) => {
-                self.buf.truncate(start);
-                Err(StructError::Serialize {
-                    path: path(),
-                    source,
-                })
-            }
+        if self.requested == BodyFormat::Beve {
+            structio::beve::append(value, self.buf);
+            self.format = BodyFormat::Beve;
+        } else {
+            structio::append(value, self.buf);
         }
     }
 
-    /// Write a JSON `null` body — the response to a write, or to a read that has
+    /// Write a `null` body — the response to a write, or to a read that has
     /// nothing to return.
     pub fn write_null(&mut self) {
-        self.buf.extend_from_slice(b"null");
+        if self.requested == BodyFormat::Beve {
+            structio::beve::append(&(), self.buf);
+            self.format = BodyFormat::Beve;
+        } else {
+            self.buf.extend_from_slice(b"null");
+        }
     }
 
     /// Write `slice` as a BEVE typed numeric array and set the body format to
@@ -683,9 +870,9 @@ impl<'a> ResponseBody<'a> {
     ///
     /// The same bulk encode `repe::message::MessageBuilder::body_typed_slice`
     /// produces — one `copy_nonoverlapping` on little-endian targets rather than
-    /// a per-element serde walk, and byte-identical to what Glaze emits for the
-    /// same array. This is what `#[repe(typed)]` routes a numeric field to.
-    /// (Named rather than linked: the builder lives in `repe`, which this crate
+    /// a per-element walk, and byte-identical to what Glaze emits for the same
+    /// array. This is what `#[repe(typed)]` routes a numeric field to. (Named
+    /// rather than linked: the builder lives in `repe`, which this crate
     /// deliberately does not depend on.)
     ///
     /// Inside an enclosing object — the whole-struct listing — the frame is
@@ -693,64 +880,64 @@ impl<'a> ResponseBody<'a> {
     /// instead. A field only reaches the typed encoding when it is read on its
     /// own.
     ///
-    /// Requires the `typed` feature, which is what carries `beve`. It is on
-    /// through `repe` and off for a direct `repe-core` dependency, where this
-    /// signature is replaced by one whose bound no type satisfies, so that
-    /// calling it is a compile error naming the feature.
-    #[cfg(feature = "typed")]
-    pub fn write_typed_slice<T>(&mut self, path: &str, slice: &[T]) -> StructResult<()>
+    /// This used to sit behind a `typed` feature, because the encoder arrived
+    /// with `beve` and six transitive packages behind it and a crate that only
+    /// *declares* a served type should not link one to say so. structio has no
+    /// dependencies, so there is nothing left to gate and the feature is gone.
+    pub fn write_typed_slice<T>(&mut self, slice: &[T])
     where
-        T: beve::BeveTypedSlice + Serialize,
+        T: structio::beve::NumericBytes + ServableWrite,
     {
         if self.nested {
-            return self.write(path, slice);
+            self.write(slice);
+            return;
         }
-        let encoded_len = beve::typed_slice_size(slice) as usize;
-        self.buf.reserve(encoded_len);
-        let start = self.buf.len();
-        beve::to_writer_typed_slice(&mut *self.buf, slice)
-            .expect("writing a typed slice into a Vec is infallible");
-        debug_assert_eq!(self.buf.len() - start, encoded_len);
+        structio::beve::append(slice, self.buf);
         self.format = BodyFormat::Beve;
-        Ok(())
     }
 
-    /// The `typed`-less stand-in for [`write_typed_slice`], kept so a
-    /// `#[repe(typed)]` field reports a missing *feature* rather than a missing
-    /// *method*.
+    /// Begin an object body of exactly `entries` members, written key by key.
     ///
-    /// No type implements [`TypedSliceElement`] without the feature, so this is
-    /// uncallable and the diagnostic on that trait is what a caller actually
-    /// reads.
+    /// Used by the whole-struct listing so a wide object is emitted in one pass.
     ///
-    /// **The `E0277` this produces is the deliverable, not a side effect.**
-    /// `#[cfg]`-ing this method away instead is the obvious simplification and
-    /// silently degrades it to `E0599`, "no method named `write_typed_slice`",
-    /// pointing at a derive rather than at a feature — and nothing in CI would
-    /// notice. Falling back to the JSON array here would be worse still: it
-    /// compiles and changes the wire.
+    /// `entries` is what lets the object be BEVE as readily as JSON: a BEVE
+    /// object carries its member count in its header, before any member, so a
+    /// listing that discovered its count by finishing could only ever have been
+    /// JSON. A derived listing knows the count when it is generated, and an
+    /// entry that fails or declines rewinds the whole object rather than
+    /// emitting a short one, so the declared count is never wrong.
     ///
-    /// [`write_typed_slice`]: ResponseBody::write_typed_slice
-    #[cfg(not(feature = "typed"))]
-    pub fn write_typed_slice<T>(&mut self, path: &str, slice: &[T]) -> StructResult<()>
-    where
-        T: TypedSliceElement,
-    {
-        let _ = (path, slice);
-        unreachable!("`TypedSliceElement` is sealed and implemented by nothing")
-    }
-
-    /// Begin a JSON object body, written key by key.
-    ///
-    /// Used by the whole-struct listing so a wide object is emitted in one pass
-    /// instead of through a [`serde_json::Map`].
-    pub fn object(&mut self) -> ObjectBody<'_> {
+    /// Under JSON the count is unused. Under BEVE, writing a number of entries
+    /// other than `entries` would produce a corrupt document, so
+    /// [`finish`](ObjectBody::finish) panics on a disagreement rather than
+    /// letting it reach a peer. The derive never miscounts; a hand-written
+    /// listing that does has a bug, and the panic names it.
+    pub fn object(&mut self, entries: usize) -> ObjectBody<'_> {
         let start = self.buf.len();
-        self.buf.push(b'{');
+        let format = if self.nested {
+            // Already inside an object, so the frame's format is settled and
+            // this one follows it.
+            self.format
+        } else {
+            self.format = self.requested;
+            self.requested
+        };
+        match format {
+            BodyFormat::Beve => {
+                let mut w = beve_writer(self.buf);
+                w.push(structio::beve::header::OBJECT);
+                w.size(entries as u64);
+                *self.buf = w.into_vec();
+            }
+            _ => self.buf.push(b'{'),
+        }
         ObjectBody {
             buf: self.buf,
             start,
+            format,
             first: true,
+            declared: entries,
+            written: 0,
         }
     }
 }
@@ -760,79 +947,98 @@ impl<'a> ResponseBody<'a> {
 ///
 /// An entry that fails — or that [`entry_try_with`](Self::entry_try_with)
 /// declines — rewinds the buffer past the opening brace, so a partly written
-/// object is never left behind for a caller that recovers from it. Dropping
-/// without calling [`finish`](Self::finish) is the same situation and leaves
-/// nothing behind either, since both ways out without finishing have already
-/// rewound.
+/// object is never left behind for a caller that recovers from it.
+///
+/// Those are the only two exits that rewind. There is no `Drop` impl, so
+/// abandoning an object after a successful [`entry`](Self::entry) — an early
+/// return, a panic — leaves the open brace and its entries in the buffer.
+/// Generated code never does that: every listing either runs to
+/// [`finish`](Self::finish) or leaves through an arm that has already rewound.
+/// A hand-written listing owes the same.
 pub struct ObjectBody<'a> {
     buf: &'a mut Vec<u8>,
-    /// Buffer length before the opening brace, to rewind to on failure.
+    /// Buffer length before the object's header, to rewind to on failure.
     start: usize,
+    /// The format this object and everything nested inside it is written in.
+    format: BodyFormat,
     first: bool,
+    declared: usize,
+    written: usize,
+}
+
+/// A BEVE writer appending to `buf`, keeping what it already holds.
+///
+/// `Writer::appending` owns its buffer, so this moves the `Vec` out and the
+/// caller moves it back with `into_vec`. Both are three-word moves; nothing is
+/// copied and the allocation is preserved.
+fn beve_writer(buf: &mut Vec<u8>) -> structio::beve::Writer<'static, structio::Standard> {
+    structio::beve::Writer::appending(std::mem::take(buf))
 }
 
 impl ObjectBody<'_> {
-    fn key(&mut self, key: &str) -> StructResult<()> {
-        if self.first {
-            self.first = false;
-        } else {
-            self.buf.push(b',');
-        }
-        serde_json::to_writer(&mut *self.buf, key).map_err(|source| StructError::Serialize {
-            path: format!("/{key}"),
-            source,
-        })?;
-        self.buf.push(b':');
-        Ok(())
-    }
-
-    /// Run one entry, rewinding the whole object if it fails.
-    fn entry_with_rewind<F>(&mut self, f: F) -> StructResult<()>
-    where
-        F: FnOnce(&mut Self) -> StructResult<()>,
-    {
-        match f(self) {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                self.buf.truncate(self.start);
-                Err(err)
+    /// Write one member's key and open its value position.
+    fn key(&mut self, key: &str) {
+        self.written += 1;
+        match self.format {
+            // A BEVE key is a bare length-prefixed string: no header byte, no
+            // separator, and no comma between members, the count in the header
+            // having said how many to expect.
+            BodyFormat::Beve => {
+                let mut w = beve_writer(self.buf);
+                w.write_str_body(key);
+                *self.buf = w.into_vec();
+            }
+            _ => {
+                if self.first {
+                    self.first = false;
+                } else {
+                    self.buf.push(b',');
+                }
+                // `str`'s JSON encoding is the quoted, escaped form, which is
+                // exactly a key. Going through structio rather than quoting by
+                // hand is what keeps escaping in one place.
+                structio::append(key, self.buf);
+                self.buf.push(b':');
             }
         }
     }
 
-    /// Write one `"key": value` entry.
-    pub fn entry<T>(&mut self, key: &str, value: &T) -> StructResult<()>
-    where
-        T: Serialize + ?Sized,
-    {
-        self.entry_with_rewind(|this| {
-            this.key(key)?;
-            serde_json::to_writer(&mut *this.buf, value).map_err(|source| StructError::Serialize {
-                path: format!("/{key}"),
-                source,
-            })
-        })
+    /// A body for one member's value, in this object's format.
+    fn value_body(&mut self) -> ResponseBody<'_> {
+        ResponseBody {
+            buf: self.buf,
+            requested: self.format,
+            format: self.format,
+            nested: true,
+        }
     }
 
-    /// Write one `"key": <value>` entry whose value is produced by `f`, for a
+    /// Write one `key: value` entry.
+    pub fn entry<T>(&mut self, key: &str, value: &T)
+    where
+        T: ServableWrite + ?Sized,
+    {
+        self.key(key);
+        self.value_body().write(value);
+    }
+
+    /// Write one `key: <value>` entry whose value is produced by `f`, for a
     /// nested [`RepeStruct`] that fills the body itself.
     ///
-    /// The body handed to `f` is marked as nested: the enclosing frame is
-    /// already JSON, so a [`ResponseBody::write_typed_slice`] inside it falls
-    /// back to a JSON array rather than switching the frame to BEVE.
+    /// The body handed to `f` is marked as nested: the frame's format is
+    /// settled by the enclosing object, so nothing inside can switch it. A
+    /// [`ResponseBody::write_typed_slice`] there writes a BEVE typed array
+    /// inside a BEVE listing and a JSON array inside a JSON one.
     pub fn entry_with<F>(&mut self, key: &str, f: F) -> StructResult<()>
     where
         F: FnOnce(&mut ResponseBody<'_>) -> StructResult<()>,
     {
-        self.entry_with_rewind(|this| {
-            this.key(key)?;
-            let mut body = ResponseBody {
-                buf: this.buf,
-                format: BodyFormat::Json,
-                nested: true,
-            };
-            f(&mut body)
-        })
+        self.key(key);
+        let outcome = f(&mut self.value_body());
+        if outcome.is_err() {
+            self.buf.truncate(self.start);
+        }
+        outcome
     }
 
     /// [`entry_with`](Self::entry_with) for a value the source may decline to
@@ -841,24 +1047,14 @@ impl ObjectBody<'_> {
     ///
     /// `None` rewinds the whole object, exactly as an `Err` does, so a caller
     /// that declines in turn leaves the buffer as it found it without a second
-    /// step. Dropping the object without calling [`finish`](Self::finish) then
-    /// leaves nothing behind, because the only ways out without finishing are
-    /// an error and a decline, and both have already rewound.
+    /// step. That is also why a declared count can never be short: an object
+    /// that did not write every entry does not survive at all.
     pub fn entry_try_with<F>(&mut self, key: &str, f: F) -> Option<StructResult<()>>
     where
         F: FnOnce(&mut ResponseBody<'_>) -> Option<StructResult<()>>,
     {
-        let outcome = match self.key(key) {
-            Ok(()) => {
-                let mut body = ResponseBody {
-                    buf: self.buf,
-                    format: BodyFormat::Json,
-                    nested: true,
-                };
-                f(&mut body)
-            }
-            Err(err) => Some(Err(err)),
-        };
+        self.key(key);
+        let outcome = f(&mut self.value_body());
         if !matches!(outcome, Some(Ok(()))) {
             self.buf.truncate(self.start);
         }
@@ -866,27 +1062,22 @@ impl ObjectBody<'_> {
     }
 
     /// Close the object.
+    ///
+    /// # Panics
+    ///
+    /// If the number of entries written differs from the number declared to
+    /// [`ResponseBody::object`]. Under BEVE the count is already in the header,
+    /// so a disagreement is a corrupt document, and a panic in a handler is
+    /// caught and reported by the server where corrupt bytes would not be.
     pub fn finish(self) {
-        self.buf.push(b'}');
-    }
-}
-
-/// Write the `Option<Value>` a [`RepeStruct::repe_handle`] returned as the whole
-/// body: the payload, or `null` when there is nothing to send.
-///
-/// Shared by the [`RepeStruct::repe_handle_into`] and
-/// [`RepeMethods::repe_call_into`] defaults, which differ only in which method
-/// they delegate to.
-fn write_optional(
-    out: &mut ResponseBody<'_>,
-    segments: &[&str],
-    value: Option<Value>,
-) -> StructResult<()> {
-    match value {
-        Some(value) => out.write_with_path(|| path_from_segments(segments), &value),
-        None => {
-            out.write_null();
-            Ok(())
+        assert_eq!(
+            self.written, self.declared,
+            "repe: a listing declared {} entries and wrote {}; under BEVE the \
+             count is in the header and a disagreement corrupts the document",
+            self.declared, self.written,
+        );
+        if self.format != BodyFormat::Beve {
+            self.buf.push(b'}');
         }
     }
 }
@@ -899,9 +1090,9 @@ fn write_optional(
 /// struct-level `#[repe(methods(..))]` list — and the two generated
 /// [`RepeMethods`] tables. Without it a collision is silent and costly: one
 /// declaration wins dispatch, the other becomes permanently unreachable, and
-/// the whole-struct listing emits the same key twice. The two listings do not
-/// even agree on that last part, since a `serde_json::Map` deduplicates the key
-/// and the streaming encoder does not.
+/// the whole-struct listing emits the same key twice — a duplicate key in the
+/// response body, which every listing now streams rather than deduplicating in
+/// a map on the way out.
 ///
 /// Collisions the macros *can* see on their own — two fields, two listed
 /// methods, a field against a listed method, two endpoints in one
@@ -1054,57 +1245,6 @@ const fn const_contains(list: &[&str], name: &str) -> bool {
     false
 }
 
-/// Resolve path `segments` against a [`serde_json::Value`], for a
-/// `#[repe(nested_serde)]` field.
-///
-/// Objects are indexed by key and arrays by decimal position, matching RFC 6901
-/// evaluation; this takes already-split segments because the struct router has
-/// them in that form and the pointer string does not exist.
-///
-/// `None` means the path does not resolve, which the caller reports as
-/// [`StructError::InvalidPath`].
-pub fn serde_pointer<'a>(value: &'a Value, segments: &[&str]) -> Option<&'a Value> {
-    let mut cursor = value;
-    for segment in segments {
-        cursor = match cursor {
-            Value::Object(map) => map.get(*segment)?,
-            Value::Array(items) => items.get(segment.parse::<usize>().ok()?)?,
-            _ => return None,
-        };
-    }
-    Some(cursor)
-}
-
-/// The mutable counterpart of [`serde_pointer`], for a write below a
-/// `#[repe(nested_serde)]` field.
-///
-/// `segments` must be non-empty: replacing the whole value is the caller's own
-/// assignment, not a walk. Every segment, the last included, has to name
-/// something that is **already there** — a key an object does not have is
-/// rejected rather than inserted, because the value is about to be deserialized
-/// back into a typed field where an invented key is either dropped or an error,
-/// and a client that misspelled one deserves to hear about it here.
-///
-/// Contrast [`crate::structs`]' sibling in `repe`'s registry, `set_pointer`,
-/// which deliberately *inserts* a missing object key: that one is building a
-/// free-form document, this one is editing a value with a type. Do not unify
-/// them.
-pub fn serde_pointer_set(value: &mut Value, segments: &[&str], new: Value) -> Option<()> {
-    if segments.is_empty() {
-        return None;
-    }
-    let mut cursor = value;
-    for segment in segments {
-        cursor = match cursor {
-            Value::Object(map) => map.get_mut(*segment)?,
-            Value::Array(items) => items.get_mut(segment.parse::<usize>().ok()?)?,
-            _ => return None,
-        };
-    }
-    *cursor = new;
-    Some(())
-}
-
 /// `str` equality usable in a `const` context, which `PartialEq` is not.
 const fn const_str_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
@@ -1129,74 +1269,297 @@ const fn const_str_eq(a: &str, b: &str) -> bool {
 ///
 /// * a JSON/BEVE **array** of exactly N values, positionally, or
 /// * an **object** keyed by parameter name, where a missing key decodes as
-///   `null` (so an `Option<T>` parameter may be omitted).
+///   `null` (so an `Option<T>` parameter may be omitted) and a repeated key
+///   takes its last value.
+///
+/// All three BEVE array encodings work: generic, typed, and complex. They are
+/// not read the same way — a generic array's elements are self-contained values
+/// in the input and are sliced out as spans, while a typed or complex array's
+/// element headers are supplied by the reader rather than present in the bytes,
+/// so those are pulled through `structio::beve::Documents::array` instead — but
+/// that is an implementation detail and not a wire distinction. A client encodes
+/// a homogeneous argument list however its library naturally would.
 ///
 /// Generated code names this, and a hand-written [`RepeMethods`] impl that
 /// publishes a multi-argument method should too: it is what makes such a table
 /// accept the same two body shapes a derived one does, instead of inventing a
 /// third that no client of a derived struct would speak. That is why it is
-/// public and documented rather than hidden — it carries a wire contract, not
-/// an implementation detail.
+/// public and documented rather than hidden — it carries a wire contract, not an
+/// implementation detail.
+///
+/// # How it works without a tree
+///
+/// It used to split a `serde_json::Value` into owned `Value`s. There is no tree
+/// now, so it does the same job by **recording byte spans**: one pass over the
+/// body notes where each element starts and ends, and
+/// [`next_arg`](Self::next_arg) parses one span into one argument. Nothing
+/// between the two is materialized, no key is copied, and an argument the caller
+/// never asks for is never parsed.
+///
+/// The spans borrow the frame, which is why this carries the body's lifetime.
 pub struct MethodArgs<'a> {
     path: &'a str,
     names: &'a [&'a str],
-    values: std::vec::IntoIter<Value>,
+    format: BodyFormat,
+    source: ArgSource<'a>,
     index: usize,
+}
+
+/// Where [`MethodArgs::next_arg`] gets one argument's bytes.
+///
+/// Two arms, because BEVE has two kinds of array. In a generic array — and in
+/// every JSON body — an element is a self-contained value in the input, so a
+/// span cut between two reader positions is a document and can be parsed on its
+/// own. In a *typed* or *complex* array it is not: the element's header is
+/// supplied by the reader rather than present in the bytes, so those spans are
+/// headerless payload, and a boolean run's are empty and not even monotonic.
+///
+/// `structio::beve::Documents::array` is the seam for the second kind. It hands
+/// each element out as a document of its own with the header installed, and
+/// `next_value_into` is generic per call, so a heterogeneous argument list still
+/// works. It costs a copy of the body into a window sized to the body — which is
+/// an argument list, never a bulk payload, since a method taking one large array
+/// takes the body *as* its single argument and never reaches here.
+enum ArgSource<'a> {
+    /// One slot per name, in declaration order. `None` is a key the object form
+    /// left out, which [`MethodArgs::next_arg`] reads as `null`.
+    Spans(Vec<Option<&'a [u8]>>),
+    /// Elements pulled in order from an array whose headers the reader supplies.
+    Cursor(structio::beve::Documents<&'a [u8], WirePolicy>),
 }
 
 impl<'a> MethodArgs<'a> {
     /// Split `body` into the argument list for `names`.
-    pub fn new(path: &'a str, names: &'a [&'a str], body: Value) -> StructResult<Self> {
-        let values = match body {
-            Value::Array(items) => {
-                if items.len() != names.len() {
-                    return Err(arg_error(
-                        path,
-                        format!("expected {} arguments, got {}", names.len(), items.len()),
-                    ));
-                }
-                items
-            }
-            Value::Object(mut map) => names
-                .iter()
-                .map(|name| map.remove(*name).unwrap_or(Value::Null))
-                .collect(),
-            _ => {
-                return Err(arg_error(
-                    path,
-                    format!(
-                        "expected an array of {} arguments or an object with keys [{}]",
-                        names.len(),
-                        names.join(", ")
-                    ),
-                ));
-            }
+    pub fn new(path: &'a str, names: &'a [&'a str], body: RequestBody<'a>) -> StructResult<Self> {
+        let source = match body.format() {
+            BodyFormat::Beve => split_beve(path, names, body.bytes())?,
+            _ => ArgSource::Spans(split_json(path, names, body.bytes())?),
         };
         Ok(Self {
             path,
             names,
-            values: values.into_iter(),
+            format: body.format(),
+            source,
             index: 0,
         })
     }
 
     /// Decode the next argument in declaration order.
-    pub fn next_arg<T: DeserializeOwned>(&mut self) -> StructResult<T> {
+    pub fn next_arg<T>(&mut self) -> StructResult<T>
+    where
+        T: for<'de> ServableRead<'de> + Default,
+    {
         let name = self.names.get(self.index).copied().unwrap_or("?");
+        let index = self.index;
         self.index += 1;
-        let value = self.values.next().unwrap_or(Value::Null);
-        serde_json::from_value(value).map_err(|source| StructError::Deserialize {
-            path: format!("{path}({name})", path = self.path),
-            source,
+        let mut value = T::default();
+        // The label is built on the error branch only: a multi-argument call
+        // would otherwise format one `String` per argument on every success.
+        let label = || format!("{}({name})", self.path);
+
+        match &mut self.source {
+            ArgSource::Spans(spans) => {
+                // An omitted key is the JSON `null` whatever the frame's format
+                // is: the stand-in never came off the wire, so there is no BEVE
+                // encoding of it to prefer.
+                let (bytes, format) = match spans.get(index).copied().flatten() {
+                    Some(bytes) => (bytes, self.format),
+                    None => (&b"null"[..], BodyFormat::Json),
+                };
+                RequestBody::new(bytes, format)
+                    .read_into_raw(&mut value)
+                    .map_err(|source| StructError::Decode {
+                        path: label(),
+                        source,
+                    })?;
+            }
+            ArgSource::Cursor(documents) => {
+                // Arity was settled in `split_beve`, so running out here would
+                // mean the count in the header disagreed with the elements
+                // behind it — a malformed document, not a short call.
+                let outcome =
+                    documents
+                        .next_value_into(&mut value)
+                        .ok_or_else(|| StructError::Decode {
+                            path: label(),
+                            source: structio::Error::new(structio::ErrorCode::UnexpectedEnd, 0),
+                        })?;
+                outcome.map_err(|err| StructError::Decode {
+                    path: label(),
+                    source: stream_parse_error(err),
+                })?;
+            }
+        }
+        Ok(value)
+    }
+}
+
+/// Turn a structio parse failure into the error this module reports. Callers
+/// pass a whole-body offset, which is what the parser's `position` already is.
+fn decode_error(path: &str, code: structio::ErrorCode, at: usize) -> StructError {
+    StructError::Decode {
+        path: path.to_string(),
+        source: structio::Error::new(code, at),
+    }
+}
+
+/// Record one span per name from a JSON argument body.
+fn split_json<'a>(
+    path: &str,
+    names: &[&str],
+    bytes: &'a [u8],
+) -> StructResult<Vec<Option<&'a [u8]>>> {
+    let text = core::str::from_utf8(bytes)
+        .map_err(|err| decode_error(path, structio::ErrorCode::InvalidUtf8, err.valid_up_to()))?;
+    let mut p = structio::json::Parser::new(text);
+    p.skip_ws();
+
+    // Decide the shape from the opening byte rather than from whether a walk
+    // succeeded. A walk can fail half way through a body whose shape was never
+    // in doubt — one malformed element in an otherwise well-formed array — and
+    // reporting that as "neither an array nor an object" hides the real fault.
+    match p.rest().first() {
+        Some(b'[') => {
+            let mut positional: Vec<Option<&'a [u8]>> = Vec::new();
+            p.read_seq(|p, _| {
+                let start = p.position();
+                p.skip_value()?;
+                positional.push(Some(&bytes[start..p.position()]));
+                Ok(())
+            })
+            .and_then(|_| p.finish())
+            .map_err(|code| decode_error(path, code, p.position()))?;
+            check_arity(path, names, positional.len())?;
+            Ok(positional)
+        }
+        Some(b'{') => {
+            let mut spans: Vec<Option<&'a [u8]>> = vec![None; names.len()];
+            p.read_map(|p, key| {
+                // Matched during the walk, so a key no parameter has costs
+                // nothing and a repeated key overwrites — last-wins, as the
+                // `serde_json::Map` this replaced did.
+                let slot = names.iter().position(|name| *name == key.as_str());
+                let start = p.position();
+                p.skip_value()?;
+                if let Some(i) = slot {
+                    spans[i] = Some(&bytes[start..p.position()]);
+                }
+                Ok(())
+            })
+            .and_then(|()| p.finish())
+            .map_err(|code| decode_error(path, code, p.position()))?;
+            Ok(spans)
+        }
+        _ => Err(shape_error(path, names)),
+    }
+}
+
+/// A parse failure out of a streaming read, as this module reports it.
+///
+/// The source is an in-memory slice, so `StreamError::Io` is unreachable in
+/// practice; it is mapped rather than unwrapped because a reader is entitled to
+/// report one and a panic here would be a worse answer than a decode error.
+fn stream_parse_error(err: structio::StreamError) -> structio::Error {
+    match err {
+        structio::StreamError::Parse(err) => err,
+        _ => structio::Error::new(structio::ErrorCode::UnexpectedEnd, 0),
+    }
+}
+
+/// Decide how a BEVE argument body is split.
+fn split_beve<'a>(path: &str, names: &[&str], bytes: &'a [u8]) -> StructResult<ArgSource<'a>> {
+    // The shape is decided from the header, for the reason `split_json` decides
+    // it from the opening byte, and for a second reason particular to BEVE.
+    //
+    // `Reader::read_seq` accepts a *typed* array as readily as a generic one,
+    // and a *complex* array through the same door, installing each element's
+    // header out of band rather than reading it from the input. A span cut
+    // between two reader positions is therefore not a document those elements
+    // can be read from — for a typed array of booleans the spans are empty and
+    // not even monotonic. Those two shapes go to `Documents::array`, which hands
+    // each element out with the header installed; only the shapes whose elements
+    // are self-contained in the input are sliced.
+    match bytes.first().map(|&h| structio::beve::header::ty(h)) {
+        Some(structio::beve::header::TY_GENERIC_ARRAY) => {
+            let mut positional: Vec<Option<&'a [u8]>> = Vec::new();
+            let mut r = structio::beve::Reader::new(bytes);
+            r.read_seq(|r, _| {
+                let start = r.position();
+                r.skip_value()?;
+                positional.push(Some(&bytes[start..r.position()]));
+                Ok(())
+            })
+            .and_then(|_| r.finish())
+            .map_err(|code| decode_error(path, code, r.position()))?;
+            check_arity(path, names, positional.len())?;
+            Ok(ArgSource::Spans(positional))
+        }
+        Some(structio::beve::header::TY_OBJECT) => {
+            let mut spans: Vec<Option<&'a [u8]>> = vec![None; names.len()];
+            let mut r = structio::beve::Reader::new(bytes);
+            r.read_map(|r, key| {
+                // Argument names are identifiers, so only the string form of a
+                // BEVE key can match one; a numeric key matches nothing and its
+                // value is skipped like any other unclaimed key.
+                let slot = match key {
+                    structio::beve::Key::Str(key) => names.iter().position(|name| *name == key),
+                    _ => None,
+                };
+                let start = r.position();
+                r.skip_value()?;
+                if let Some(i) = slot {
+                    spans[i] = Some(&bytes[start..r.position()]);
+                }
+                Ok(())
+            })
+            .and_then(|()| r.finish())
+            .map_err(|code| decode_error(path, code, r.position()))?;
+            Ok(ArgSource::Spans(spans))
+        }
+        // The two header-synthesizing forms. `TY_EXTENSION` is where
+        // `header::COMPLEX` lives.
+        Some(structio::beve::header::TY_TYPED_ARRAY | structio::beve::header::TY_EXTENSION) => {
+            // Arity is settled before any argument is decoded, as it is for
+            // every other shape, so a wrong-length call fails the same way
+            // whichever encoding it arrived in. This walk skips elements rather
+            // than reading them; it is one pass over an argument list.
+            let mut r = structio::beve::Reader::new(bytes);
+            let count = r
+                .read_seq(|r, _| r.skip_value())
+                .and_then(|count| r.finish().map(|()| count))
+                .map_err(|code| decode_error(path, code, r.position()))?;
+            check_arity(path, names, count)?;
+            // Sized to the body, so the first fill takes it whole and the window
+            // never grows. The body is an argument list, so this is bounded by
+            // the arity and the element width, not by any payload.
+            Ok(ArgSource::Cursor(
+                structio::beve::Documents::array(bytes)
+                    .with_options::<WirePolicy>()
+                    .read_size(bytes.len().max(1)),
+            ))
+        }
+        _ => Err(shape_error(path, names)),
+    }
+}
+
+fn check_arity(path: &str, names: &[&str], got: usize) -> StructResult<()> {
+    if got == names.len() {
+        Ok(())
+    } else {
+        Err(StructError::Arguments {
+            path: path.to_string(),
+            message: format!("expected {} arguments, got {got}", names.len()),
         })
     }
 }
 
-/// A `StructError::Deserialize` carrying a message of our own rather than one
-/// from serde, so argument-shape complaints read like every other body error.
-fn arg_error(path: &str, message: String) -> StructError {
-    StructError::Deserialize {
+fn shape_error(path: &str, names: &[&str]) -> StructError {
+    StructError::Arguments {
         path: path.to_string(),
-        source: <serde_json::Error as serde::de::Error>::custom(message),
+        message: format!(
+            "expected an array of {} arguments or an object with keys [{}]",
+            names.len(),
+            names.join(", ")
+        ),
     }
 }

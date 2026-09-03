@@ -3,12 +3,12 @@
 mod common;
 
 use common::{
-    TestServer, TransportFlakyServer, error_response_for, json_response_for, unused_port,
+    Ack, Attempt, Computed, Empty, Id, Input, Status, TestServer, TransportFlakyServer,
+    error_response_for, json_response_for, unused_port,
 };
 use repe::{
     ErrorCode, Fleet, FleetError, FleetOptions, NodeConfig, RemoteResult, RepeError, RetryPolicy,
 };
-use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -95,31 +95,47 @@ fn fleet_dynamic_node_management() {
 #[test]
 fn fleet_connection_invocation_health_and_retries() {
     let server1 = TestServer::spawn(Arc::new(|req| match req.query_utf8().as_str() {
-        "/status" => json_response_for(req, &json!({"status": "ok", "node": 1})),
+        "/status" => json_response_for(
+            req,
+            &Status {
+                status: "ok".into(),
+                node: 1,
+            },
+        ),
         "/compute" => {
-            let value = req
-                .json_body::<Value>()
-                .ok()
-                .and_then(|v| v.get("value").and_then(Value::as_i64))
-                .unwrap_or(0);
-            json_response_for(req, &json!({"result": value * 2, "node": 1}))
+            let value = req.json_body::<Input>().map(|v| v.value).unwrap_or(0);
+            json_response_for(
+                req,
+                &Computed {
+                    result: value * 2,
+                    node: 1,
+                },
+            )
         }
         "/echo" => {
-            let value = req.json_body::<Value>().unwrap_or_else(|_| json!({}));
+            let value = req.json_body::<Id>().unwrap_or_default();
             json_response_for(req, &value)
         }
         _ => error_response_for(req, ErrorCode::MethodNotFound, "unknown route"),
     }));
 
     let server2 = TestServer::spawn(Arc::new(|req| match req.query_utf8().as_str() {
-        "/status" => json_response_for(req, &json!({"status": "ok", "node": 2})),
+        "/status" => json_response_for(
+            req,
+            &Status {
+                status: "ok".into(),
+                node: 2,
+            },
+        ),
         "/compute" => {
-            let value = req
-                .json_body::<Value>()
-                .ok()
-                .and_then(|v| v.get("value").and_then(Value::as_i64))
-                .unwrap_or(0);
-            json_response_for(req, &json!({"result": value * 3, "node": 2}))
+            let value = req.json_body::<Input>().map(|v| v.value).unwrap_or(0);
+            json_response_for(
+                req,
+                &Computed {
+                    result: value * 3,
+                    node: 2,
+                },
+            )
         }
         _ => error_response_for(req, ErrorCode::MethodNotFound, "unknown route"),
     }));
@@ -162,28 +178,28 @@ fn fleet_connection_invocation_health_and_retries() {
     assert!(fleet.is_connected("server-1").unwrap());
     assert!(!fleet.is_connected("server-3").unwrap());
 
-    let single = fleet
-        .call_json("server-1", "/compute", Some(&json!({"value": 10})))
+    let single: RemoteResult<Computed> = fleet
+        .call_json("server-1", "/compute", Some(&Input { value: 10 }))
         .unwrap();
     assert!(single.succeeded());
-    assert_eq!(single.value.as_ref().unwrap()["result"], 20);
+    assert_eq!(single.value.as_ref().unwrap().result, 20);
 
-    let missing = fleet.call_json("missing", "/status", None);
+    let missing = fleet.call_json::<Empty, Status>("missing", "/status", None);
     assert!(matches!(missing, Err(FleetError::NodeNotFound(_))));
 
-    let all_status = fleet.broadcast_json("/status", None, &[] as &[&str]);
+    let all_status = fleet.broadcast_json::<_, Empty, Status>("/status", None, &[] as &[&str]);
     assert_eq!(all_status.len(), 3);
     assert!(all_status["server-1"].succeeded());
     assert!(all_status["server-2"].succeeded());
     assert!(all_status["server-3"].failed());
 
-    let primary_only = fleet.broadcast_json("/status", None, &["primary"]);
+    let primary_only = fleet.broadcast_json::<_, Empty, Status>("/status", None, &["primary"]);
     assert_eq!(primary_only.len(), 1);
     assert!(primary_only.contains_key("server-2"));
 
     let total = fleet.map_reduce_json(
         "/compute",
-        Some(&json!({"value": 10})),
+        Some(&Input { value: 10 }),
         &["compute"],
         |results| {
             results
@@ -192,9 +208,7 @@ fn fleet_connection_invocation_health_and_retries() {
                     if !result.succeeded() {
                         return None;
                     }
-                    result
-                        .value
-                        .and_then(|value| value.get("result").and_then(Value::as_i64))
+                    result.value.map(|computed: Computed| computed.result)
                 })
                 .sum::<i64>()
         },
@@ -222,7 +236,7 @@ fn fleet_connection_invocation_health_and_retries() {
     for i in 0..10 {
         let fleet = Arc::clone(&fleet);
         workers.push(thread::spawn(move || {
-            fleet.broadcast_json("/echo", Some(&json!({"id": i})), &[] as &[&str])
+            fleet.broadcast_json::<_, _, Id>("/echo", Some(&Id { id: i }), &[] as &[&str])
         }));
     }
 
@@ -259,13 +273,11 @@ fn fleet_retry_policy_recovers_from_transport_errors() {
     let connected = fleet.connect_all();
     assert_eq!(connected.connected, vec!["flaky".to_string()]);
 
-    let result = fleet
-        .call_json("flaky", "/flaky", Some(&json!({})))
-        .unwrap();
+    let result: RemoteResult<Attempt> = fleet.call_json("flaky", "/flaky", Some(&Empty)).unwrap();
     assert!(result.succeeded());
     let payload = result.value.as_ref().unwrap();
-    assert_eq!(payload["success"], true);
-    assert!(payload["attempt"].as_u64().unwrap() >= 3);
+    assert!(payload.success);
+    assert!(payload.attempt >= 3);
     assert!(attempts.load(Ordering::SeqCst) >= 3);
 }
 
@@ -303,9 +315,7 @@ fn fleet_retry_policy_does_not_retry_application_errors() {
     let connected = fleet.connect_all();
     assert_eq!(connected.connected, vec!["flaky".to_string()]);
 
-    let result = fleet
-        .call_json("flaky", "/flaky", Some(&json!({})))
-        .unwrap();
+    let result: RemoteResult<Attempt> = fleet.call_json("flaky", "/flaky", Some(&Empty)).unwrap();
     assert!(result.failed());
     assert!(matches!(
         result.error.as_ref(),
@@ -321,13 +331,13 @@ fn fleet_retry_policy_does_not_retry_application_errors() {
 fn remote_result_into_result_behaves_like_result() {
     let ok_result = RemoteResult {
         node: "node-1".to_string(),
-        value: Some(json!({"ok": true})),
+        value: Some(Ack { ok: true }),
         error: None,
         elapsed: Duration::from_millis(1),
     };
-    assert_eq!(ok_result.into_result().unwrap()["ok"], true);
+    assert!(ok_result.into_result().unwrap().ok);
 
-    let err_result: RemoteResult<Value> = RemoteResult {
+    let err_result: RemoteResult<Ack> = RemoteResult {
         node: "node-1".to_string(),
         value: None,
         error: Some(RepeError::Io(std::io::Error::other("failed"))),

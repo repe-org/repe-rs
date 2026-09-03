@@ -8,19 +8,24 @@ use repe::{
     BodyFormat, Client, RepeError, Router, Server, pull_consume, pull_stream, pull_to_beve_file,
     pull_to_file, pull_to_file_trailer_verified, pull_to_vec, pull_value,
 };
-use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::thread;
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Default, Clone, Debug, PartialEq)]
 struct Payload {
     id: u64,
     label: String,
     samples: Vec<f64>,
     tags: Vec<String>,
 }
+structio::object!(Payload {
+    id,
+    label,
+    samples,
+    tags
+});
 
 fn sample_payload() -> Payload {
     // Large enough (~1.6 MiB of f64 plus strings) to span many chunks once the
@@ -90,7 +95,7 @@ fn beve_zst_file_decodes_back_to_the_value() {
     // The file is the raw compressed stream: decompress, then BEVE-decode.
     let compressed = std::fs::read(&path).expect("read file");
     let beve_bytes = zstd::decode_all(&compressed[..]).expect("zstd decode");
-    let decoded: Payload = beve::from_slice(&beve_bytes).expect("beve decode");
+    let decoded: Payload = structio::from_beve(&beve_bytes).expect("beve decode");
     assert_eq!(decoded, payload);
 
     std::fs::remove_dir_all(&dir).ok();
@@ -109,7 +114,7 @@ fn beve_file_is_decompressed_and_decodes_back_to_the_value() {
 
     // The file is already-decompressed BEVE: decode directly.
     let beve_bytes = std::fs::read(&path).expect("read file");
-    let decoded: Payload = beve::from_slice(&beve_bytes).expect("beve decode");
+    let decoded: Payload = structio::from_beve(&beve_bytes).expect("beve decode");
     assert_eq!(decoded, payload);
 
     std::fs::remove_dir_all(&dir).ok();
@@ -344,7 +349,7 @@ fn writer_stream_with_beve_tag_pulls_as_a_value() {
             (resource == "payload").then(|| {
                 let value = payload.clone();
                 move |w: &mut dyn Write| -> std::io::Result<()> {
-                    beve::to_writer_streaming(w, &value)
+                    structio::beve::to_writer(&value, w)
                         .map_err(|e| std::io::Error::other(e.to_string()))
                 }
             })
@@ -369,7 +374,7 @@ fn serve_writer_digest(payload: Payload, opts: StreamOpts) -> Client {
                     // the logical bytes, then append the digest as a trailer. No
                     // second serialization pass, no buffering of the whole value.
                     let mut tee = HashTee::new(w);
-                    beve::to_writer_streaming(&mut tee, &value)
+                    structio::beve::to_writer(&value, &mut tee)
                         .map_err(|e| std::io::Error::other(e.to_string()))?;
                     let digest = tee.finish();
                     w.write_all(&digest.to_le_bytes())?;
@@ -398,7 +403,7 @@ fn pull_split_and_verify(client: &Client, path: &Path) -> Payload {
         got_digest,
         "trailer digest must match the streamed payload (end-to-end integrity)"
     );
-    beve::from_slice(payload_bytes).expect("beve decode of payload prefix")
+    structio::from_beve(payload_bytes).expect("beve decode of payload prefix")
 }
 
 #[test]
@@ -476,11 +481,11 @@ fn check_fnv(digest: FnvDigest, trailer: &[u8]) -> Result<(), RepeError> {
     }
 }
 
-/// The exact bytes `beve::to_writer_streaming` produces for `payload` — what the
+/// The exact bytes `structio::beve::to_writer` produces for `payload` — what the
 /// committed file must equal once the 8-byte trailer is stripped.
 fn streamed_payload_bytes(payload: &Payload) -> Vec<u8> {
     let mut buf = Vec::new();
-    beve::to_writer_streaming(&mut buf, payload).expect("stream-encode payload");
+    structio::beve::to_writer(payload, &mut buf).expect("stream-encode payload");
     buf
 }
 
@@ -504,7 +509,7 @@ fn trailer_verified_commits_payload_only_uncompressed() {
         streamed_payload_bytes(&payload),
         "committed file must be the payload with the 8-byte trailer stripped"
     );
-    let decoded: Payload = beve::from_slice(&bytes).expect("decode payload-only file");
+    let decoded: Payload = structio::from_beve(&bytes).expect("decode payload-only file");
     assert_eq!(decoded, payload);
 
     std::fs::remove_dir_all(&dir).ok();
@@ -526,7 +531,7 @@ fn trailer_verified_commits_payload_only_through_compression() {
 
     let bytes = std::fs::read(&path).expect("read committed file");
     assert_eq!(bytes, streamed_payload_bytes(&payload));
-    let decoded: Payload = beve::from_slice(&bytes).expect("decode payload-only file");
+    let decoded: Payload = structio::from_beve(&bytes).expect("decode payload-only file");
     assert_eq!(decoded, payload);
 
     std::fs::remove_dir_all(&dir).ok();
@@ -542,7 +547,7 @@ fn serve_writer_bad_digest(payload: Payload, opts: StreamOpts) -> Client {
                 let value = payload.clone();
                 move |w: &mut dyn Write| -> std::io::Result<()> {
                     let mut tee = HashTee::new(w);
-                    beve::to_writer_streaming(&mut tee, &value)
+                    structio::beve::to_writer(&value, &mut tee)
                         .map_err(|e| std::io::Error::other(e.to_string()))?;
                     let corrupt = tee.finish() ^ u64::MAX;
                     w.write_all(&corrupt.to_le_bytes())?;
@@ -683,7 +688,8 @@ fn pull_consume_decodes_a_value_through_the_reader_hatch() {
     let payload = sample_payload();
     let client = serve(payload.clone(), small_chunks(Compression::Zstd));
     let got: Payload = pull_consume(&client, "payload", |reader| {
-        beve::from_reader_streaming(reader).map_err(RepeError::from)
+        structio::beve::from_reader(reader)
+            .map_err(|err| RepeError::decode_stream(repe::BodyFormat::Beve, err))
     })
     .expect("consume decode");
     assert_eq!(got, payload);

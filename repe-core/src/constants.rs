@@ -11,7 +11,7 @@ pub const HEADER_SIZE: usize = 48;
 
 /// REPE high-level error codes.
 #[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ErrorCode {
     /// Success. The response carries a normal result, not an error.
@@ -84,7 +84,7 @@ impl core::convert::TryFrom<u32> for ErrorCode {
 
 /// Reserved Query formats (0..=4095 reserved for REPE)
 #[repr(u16)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum QueryFormat {
     RawBinary = 0,
@@ -110,7 +110,7 @@ impl core::convert::TryFrom<u16> for QueryFormat {
 
 /// Reserved Body formats (0..=4095 reserved for REPE)
 #[repr(u16)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BodyFormat {
     RawBinary = 0,
@@ -156,3 +156,37 @@ impl std::fmt::Display for ErrorCode {
         f.write_str(s)
     }
 }
+
+// The three protocol enums cross the wire as their variant names, in both
+// formats, which is what `#[derive(Serialize, Deserialize)]` gave them and what
+// `unit_enum!` gives them now. Declared here rather than beside each enum so the
+// `#[non_exhaustive]` attribute and the explicit discriminants stay legible.
+//
+// `#[non_exhaustive]` is about downstream `match`, not about the wire: an
+// unknown name is `UnknownVariant`, exactly as an out-of-range integer is an
+// `Err` from the `TryFrom` impls above.
+structio::unit_enum!(ErrorCode {
+    Ok,
+    VersionMismatch,
+    InvalidHeader,
+    InvalidQuery,
+    InvalidBody,
+    ParseError,
+    MethodNotFound,
+    Timeout,
+    ResourceExhausted,
+    InternalError,
+    ApplicationErrorBase,
+});
+
+structio::unit_enum!(QueryFormat {
+    RawBinary,
+    JsonPointer
+});
+
+structio::unit_enum!(BodyFormat {
+    RawBinary,
+    Beve,
+    Json,
+    Utf8,
+});

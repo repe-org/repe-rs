@@ -1,12 +1,26 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use repe::*;
-use serde::{Deserialize, Serialize};
 use std::io::{BufReader, BufWriter, Write};
 use std::net::TcpListener;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+
+// ---- wire fixtures ----
+
+#[derive(Default, Debug, PartialEq)]
+struct Ack {
+    ok: bool,
+}
+structio::object!(Ack { ok });
+
+#[derive(Default, Debug, PartialEq)]
+struct Operands {
+    a: i64,
+    b: i64,
+}
+structio::object!(Operands { a, b });
 
 #[test]
 fn client_unrecognized_response_id_is_discarded() {
@@ -22,8 +36,7 @@ fn client_unrecognized_response_id_is_discarded() {
             .query_bytes(req.query.clone())
             .query_format(QueryFormat::try_from(req.header.query_format).unwrap())
             .error_code(ErrorCode::Ok)
-            .body_json(&serde_json::json!({"ok": true}))
-            .unwrap()
+            .body_json(&Ack { ok: true })
             .build();
         // Fix length field
         resp.header.length =
@@ -38,7 +51,7 @@ fn client_unrecognized_response_id_is_discarded() {
     let client = client::Client::connect(addr).unwrap();
     let (done_tx, done_rx) = mpsc::channel();
     let worker = thread::spawn(move || {
-        let result = client.call_json("/x", &serde_json::json!({"a": 1}));
+        let result = client.call_typed_json::<_, _, Ack>("/x", &Operands { a: 1, b: 0 });
         let _ = done_tx.send(result);
     });
 
@@ -66,8 +79,7 @@ fn client_preserves_structured_fatal_response_loop_error() {
             .query_bytes(req.query.clone())
             .query_format(QueryFormat::try_from(req.header.query_format).unwrap())
             .error_code(ErrorCode::Ok)
-            .body_json(&serde_json::json!({"ok": true}))
-            .unwrap()
+            .body_json(&Ack { ok: true })
             .build();
         resp.header.spec = 0;
 
@@ -78,7 +90,7 @@ fn client_preserves_structured_fatal_response_loop_error() {
 
     let client = client::Client::connect(addr).unwrap();
     let err = client
-        .call_json("/fatal", &serde_json::json!({"a": 1}))
+        .call_typed_json::<_, _, Ack>("/fatal", &Operands { a: 1, b: 0 })
         .unwrap_err();
     match err {
         RepeError::InvalidSpec(0) => {}
@@ -90,15 +102,17 @@ fn client_preserves_structured_fatal_response_loop_error() {
 
 #[test]
 fn client_notify_sets_flag_and_does_not_wait_for_response() {
-    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    #[derive(Default, Debug, PartialEq)]
     struct NotifyPayload {
         ok: bool,
     }
+    structio::object!(NotifyPayload { ok });
 
-    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    #[derive(Default, Debug, PartialEq)]
     struct BevePayload {
         value: i32,
     }
+    structio::object!(BevePayload { value });
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -108,12 +122,11 @@ fn client_notify_sets_flag_and_does_not_wait_for_response() {
         let msg = read_message(&mut reader).unwrap();
         assert_eq!(msg.header.notify, 1);
         assert_eq!(msg.query_utf8(), "/notify");
-        let body: serde_json::Value = serde_json::from_slice(&msg.body).unwrap();
-        assert_eq!(body["ok"], true);
+        assert!(structio::from_slice::<Ack>(&msg.body).unwrap().ok);
         let typed_msg = read_message(&mut reader).unwrap();
         assert_eq!(typed_msg.header.notify, 1);
         assert_eq!(typed_msg.query_utf8(), "/notify_typed_json");
-        let typed_body: NotifyPayload = serde_json::from_slice(&typed_msg.body).unwrap();
+        let typed_body: NotifyPayload = structio::from_slice(&typed_msg.body).unwrap();
         assert_eq!(typed_body, NotifyPayload { ok: true });
 
         let beve_msg = read_message(&mut reader).unwrap();
@@ -126,16 +139,14 @@ fn client_notify_sets_flag_and_does_not_wait_for_response() {
     });
 
     let client = client::Client::connect(addr).unwrap();
+    client.notify_json("/notify", &Ack { ok: true }).unwrap();
+
     client
-        .notify_json("/notify", &serde_json::json!({"ok": true}))
+        .notify_json("/notify_typed_json", &NotifyPayload { ok: true })
         .unwrap();
 
     client
-        .notify_typed_json("/notify_typed_json", &NotifyPayload { ok: true })
-        .unwrap();
-
-    client
-        .notify_typed_beve("/notify_beve", &BevePayload { value: 42 })
+        .notify_beve("/notify_beve", &BevePayload { value: 42 })
         .unwrap();
 
     drop(client);
